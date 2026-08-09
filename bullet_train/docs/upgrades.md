@@ -4,7 +4,7 @@
 >
 > These instructions assume that you're doing a stepwise upgrade on an app that's already on version `1.4.0` or later.
 >
-> <a href="/docs/upgrades/options">Learn about other upgrade options.</a
+> [Learn about other upgrade options.](upgrades/options.md)
 
 ## The Stepwise Upgrade Method
 

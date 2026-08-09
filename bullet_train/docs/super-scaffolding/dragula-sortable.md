@@ -2,7 +2,7 @@
 
 > **Note: These docs are for the old sortable controller based on `dragula`.**
 >
-> <a href="/docs/super-scaffolding/sortable">You can find the new documentation here.</a
+> [You can find the new documentation here.](sortable.md)
 
 ## Continuing to use the `dragula` based sortable controller
 

@@ -2,7 +2,7 @@
 
 > Note: We don't really recommend using this method. [Learn about other upgrade options.](options.md)
 >
-> If you're already on version `1.4.0` or later you should use <a href="/docs/upgrades">The Stepwise Upgrade Method</a
+> If you're already on version `1.4.0` or later you should use [The Stepwise Upgrade Method](../upgrades.md)
 
 ## Pulling Updates from the Starter Repository
 

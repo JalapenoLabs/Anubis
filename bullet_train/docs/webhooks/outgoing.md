@@ -28,7 +28,7 @@ payment.generate_webhook(:succeeded)
 Webhooks are delivered asynchronously in a background job by default. If the resulting HTTP request results in a status code other than those in the 2XX series, it will be considered a failed attempt and delivery will be reattempted a number of times.
 
 ## Security
-Your outgoing webhook events come with a signature that your users can verify on the receiving end. More info in the [Security section of the Incoming Webhooks docs](incoming.md#security)
+Your outgoing webhook events come with a signature that your users can verify on the receiving end. More info in the [Security section of the Incoming Webhooks docs](./incoming.md#security)
 
 ## Endpoint Deactivation
 

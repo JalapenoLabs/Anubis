@@ -4,7 +4,7 @@
 >
 > These instructions are for the new `sortable_controller.js` which has removed the dependency on `dragula` and which works slightly differently.
 >
-> <a href="/docs/super-scaffolding/dragula-sortable">You can find the old documentation for the `dragula` based controller here.</a
+> [You can find the old documentation for the `dragula` based controller here.](dragula-sortable.md)
 
 When issuing a `rails generate super_scaffold` command, you can pass the `--sortable` option like this:
 

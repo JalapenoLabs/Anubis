@@ -181,7 +181,7 @@ We say "within" because while a `shared` view partial directory does exist, the 
 
 ### Dealing with Indirection
 
-This small piece of indirection buys us an incredible amount of power in building and extending themes, but as with any indirection, it could potentially come at the cost of developer experience. That's why Bullet Train includes additional tools for smoothing over this experience. Be sure to read the section on [dealing with indirection](indirection.md).
+This small piece of indirection buys us an incredible amount of power in building and extending themes, but as with any indirection, it could potentially come at the cost of developer experience. That's why Bullet Train includes additional tools for smoothing over this experience. Be sure to read the section on [dealing with indirection](./indirection.md).
 
 ## Restoring Theme Configuration
 

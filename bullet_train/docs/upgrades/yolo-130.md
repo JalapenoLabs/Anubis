@@ -2,7 +2,7 @@
 
 > If you're already on version `1.4.0` or later you should use [The Stepwise Upgrade Method](../upgrades.md)
 >
-> <a href="/docs/upgrades/options">Learn about other upgrade options.</a
+> [Learn about other upgrade options.](options.md)
 
 ## Getting to `1.3.0`
 
