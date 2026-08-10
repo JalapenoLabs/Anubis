@@ -14,7 +14,7 @@ User ─< TeamMembership >─ Team ─> Organization
 - **Team**: the working tenant. All domain resources chain their ownership back to a Team.
 - **OrganizationMembership**: joins a User to an Organization, carrying org-level roles (org admin, billing).
 - **TeamMembership**: joins a User to a Team, carrying team-level roles. Domain resources are assigned to TeamMemberships, never directly to Users. This allows assigning work to invited people who have not signed up yet, and keeps assignments intact when a user leaves.
-- **Invitation**: created when someone is added to a Team or Organization by email. Claimable by new or existing users; discarded once claimed.
+- **Invitation**: created when someone is added to a Team or Organization by email. The emailed 256-bit token (hashed at rest, 14-day expiry) is the credential; whichever signed-in account holds it may claim, and claiming consumes the invitation. Team invitations pre-create the unclaimed TeamMembership, so the membership (id, roles, and any resource assignments) survives the claim intact; organization invitations create the OrganizationMembership at claim time. Re-inviting an email replaces the pending invitation. Inviting requires the admin role on the target, and organization admins may invite to any team in their organization.
 - **Role**: declared in `roles.yml`, granted through memberships at either level.
 
 At signup, every user gets a personal Organization containing a default Team, so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.

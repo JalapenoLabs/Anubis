@@ -87,7 +87,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Pending invitations to a team or an organization. Rows hold a hash of
+    /// the invitation token, never the token.
+    invitations (id) {
+        id -> Uuid,
+        email -> Text,
+        organization_id -> Uuid,
+        team_id -> Nullable<Uuid>,
+        team_membership_id -> Nullable<Uuid>,
+        roles -> Array<Text>,
+        invited_by -> Nullable<Uuid>,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
+diesel::joinable!(invitations -> organizations (organization_id));
+diesel::joinable!(invitations -> teams (team_id));
 diesel::joinable!(user_tokens -> users (user_id));
 diesel::joinable!(teams -> organizations (organization_id));
 diesel::joinable!(organization_memberships -> organizations (organization_id));
@@ -100,5 +119,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     teams,
     organization_memberships,
     team_memberships,
+    invitations,
     users,
 );

@@ -47,7 +47,14 @@ async fn main() {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .nest("/auth", anubis::auth::router(pool, mailer, &config));
+        .nest(
+            "/auth",
+            anubis::auth::router(pool.clone(), mailer.clone(), &config),
+        )
+        .nest(
+            "/tenancy",
+            anubis::tenancy::router(pool, mailer, roles, &config),
+        );
 
     let address = config.server.socket_addr();
     let listener = tokio::net::TcpListener::bind(address)

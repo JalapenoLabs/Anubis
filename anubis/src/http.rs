@@ -36,6 +36,15 @@ impl ApiError {
         }
     }
 
+    /// A `403 Forbidden` for authenticated users lacking permission.
+    #[must_use]
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     /// A `409 Conflict` for requests that collide with existing state.
     #[must_use]
     pub fn conflict(message: impl Into<String>) -> Self {
