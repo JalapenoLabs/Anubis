@@ -38,6 +38,7 @@ const MAX_FIELD_CHARS: usize = 100;
 
 pub(crate) fn router() -> Router<AuthState> {
     Router::new()
+        .merge(crate::auth::avatar::account_routes())
         .route("/profile", patch(update_profile))
         .route("/change-password", post(change_password))
         .route("/change-email/request", post(request_email_change))

@@ -47,6 +47,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        // Public profile pictures at /users/{user_id}/avatar.
+        .merge(anubis::auth::avatar_router(pool.clone()))
         .nest(
             "/auth",
             anubis::auth::router(pool.clone(), mailer.clone(), &config),

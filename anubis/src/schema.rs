@@ -134,7 +134,20 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Optimized avatar images, one per user, served at
+    /// `/users/{user_id}/avatar`.
+    user_avatars (user_id) {
+        user_id -> Uuid,
+        image -> Bytea,
+        content_type -> Text,
+        etag -> Text,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
+diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(platform_applications -> teams (team_id));
 diesel::joinable!(platform_tokens -> platform_applications (platform_application_id));
 diesel::joinable!(invitations -> organizations (organization_id));

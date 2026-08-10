@@ -10,6 +10,7 @@
 pub mod password;
 
 mod account;
+mod avatar;
 mod extract;
 mod model;
 mod routes;
@@ -17,6 +18,8 @@ mod session;
 pub(crate) mod token;
 mod user_token;
 
+#[doc(inline)]
+pub use avatar::public_router as avatar_router;
 #[doc(inline)]
 pub use extract::CurrentUser;
 #[doc(inline)]
