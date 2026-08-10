@@ -1,7 +1,64 @@
 {
   "app": {
     "title": "Anubis",
-    "tagline": "Your application starts here.",
     "frameworkVersion": "Framework version {{version}}"
+  },
+  "common": {
+    "loading": "Loading...",
+    "somethingWentWrong": "Something went wrong. Try again.",
+    "email": "Email",
+    "password": "Password",
+    "signOut": "Sign out"
+  },
+  "auth": {
+    "signIn": {
+      "title": "Welcome back",
+      "subtitle": "Sign in to your account.",
+      "action": "Sign in",
+      "noAccount": "New here?",
+      "goToSignUp": "Create an account",
+      "forgotPassword": "Forgot your password?"
+    },
+    "signUp": {
+      "title": "Create your account",
+      "subtitle": "A minute from now, you're in.",
+      "action": "Create account",
+      "haveAccount": "Already have an account?",
+      "goToSignIn": "Sign in"
+    },
+    "forgotPassword": {
+      "title": "Reset your password",
+      "subtitle": "Enter your email and we'll send a reset link.",
+      "action": "Send reset link",
+      "backToSignIn": "Back to sign in"
+    },
+    "resetPassword": {
+      "title": "Choose a new password",
+      "subtitle": "The link is valid for 30 minutes.",
+      "newPassword": "New password",
+      "action": "Set new password",
+      "missingToken": "This reset link is incomplete. Request a new one."
+    },
+    "verifyEmail": {
+      "title": "Email verification",
+      "verifying": "Verifying your email address...",
+      "verified": "Your email address is verified. Welcome!",
+      "failed": "That link is invalid or has expired.",
+      "resend": "Send a new verification email",
+      "resent": "Check your inbox for a fresh link.",
+      "goToDashboard": "Go to the dashboard"
+    },
+    "validation": {
+      "emailInvalid": "Enter a valid email address.",
+      "passwordTooShort": "Passwords must be at least {{count}} characters.",
+      "fillAllFields": "Fill in every field to continue."
+    }
+  },
+  "dashboard": {
+    "greeting": "Signed in as {{email}}",
+    "welcomeTitle": "Your application starts here",
+    "welcomeBody": "This dashboard is the blank canvas. Scaffold your first model and it will show up in the navigation.",
+    "unverifiedBanner": "Confirm your email address to secure your account. Check your inbox for the link.",
+    "resendVerification": "Re-send verification email"
   }
 }

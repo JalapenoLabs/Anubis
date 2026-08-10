@@ -26,7 +26,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Concern | Choice |
 |---|---|
 | Framework | React SPA (client-side rendered), Vite + SWC, TypeScript |
-| UI components | HeroUI + Jalapeno Labs UI Kit |
+| UI components | HeroUI (pinned to the v2.8 line; the v3 major requires React 19 and a new component API, so migrating is a deliberate decision tracked in GitHub issues) + Jalapeno Labs UI Kit |
 | Styling | TailwindCSS, themed via the Jalapeno Labs Brand package |
 | State | Redux Toolkit |
 | Routing | React Router with a central `UrlTree` |

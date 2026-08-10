@@ -29,6 +29,8 @@ export default defineConfig({
         'react',
         'react-dom',
         'react/jsx-runtime',
+        'ky',
+        'swr',
       ],
     },
     sourcemap: true,

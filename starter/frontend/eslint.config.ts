@@ -25,12 +25,14 @@ export default defineConfig([
     },
   },
   // Tooling configs (`export default defineConfig(...)`) legitimately rely on
-  // default exports. The repo bans default exports everywhere else, so the
-  // exception is scoped tightly.
+  // default exports, and Tailwind's `@plugin` directive requires one from
+  // hero.ts. The repo bans default exports everywhere else, so the exception
+  // is scoped tightly.
   {
     files: [
       '*.config.ts',
       'eslint.config.ts',
+      'src/hero.ts',
     ],
     rules: {
       'import/no-default-export': 'off',

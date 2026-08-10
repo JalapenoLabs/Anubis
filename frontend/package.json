@@ -58,6 +58,10 @@
     "test": "vitest run",
     "test:dev": "vitest"
   },
+  "dependencies": {
+    "ky": "^2.0.2",
+    "swr": "^2.5.0"
+  },
   "peerDependencies": {
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"
