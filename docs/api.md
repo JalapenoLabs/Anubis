@@ -23,7 +23,7 @@ The SPA consumes the same public API it documents, so the API can never lag the 
 
 ## Authentication
 
-- **Browser**: cookie sessions (Postgres-backed via tower middleware), argon2id passwords, optional TOTP 2FA, OAuth providers via OpenID Connect.
+- **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor. Optional TOTP 2FA and OAuth providers via OpenID Connect are on the roadmap.
 - **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens are provisioned in a "Developers" section of the app UI.
 
 Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.

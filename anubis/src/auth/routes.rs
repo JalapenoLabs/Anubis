@@ -1,24 +1,30 @@
-//! Registration and login endpoints.
+//! Registration, login, logout, and current-user endpoints.
 //!
 //! [`router`] returns the routes an application mounts (conventionally under
 //! `/auth`): `POST /register` creates an account, `POST /login` verifies
-//! credentials. Login responds identically, in both message and timing,
-//! whether the email is unknown or the password is wrong, so responses do not
-//! leak which emails are registered. Session issuance arrives with the next
-//! milestone step.
+//! credentials, `POST /logout` ends the session, and `GET /me` returns the
+//! signed-in user. Registration and login both establish a session cookie.
+//! Login responds identically, in both message and timing, whether the email
+//! is unknown or the password is wrong, so responses do not leak which emails
+//! are registered.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use axum_extra::extract::CookieJar;
+use axum_extra::extract::cookie::{Cookie, SameSite};
 use diesel::prelude::*;
 use diesel::result::DatabaseErrorKind;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
-use crate::auth::password;
+use crate::auth::{password, session};
+use crate::config::Environment;
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::schema::users;
@@ -27,16 +33,27 @@ use crate::schema::users;
 const MAX_EMAIL_CHARS: usize = 320;
 
 /// Returns the authentication routes for an application to mount.
-pub fn router(pool: DbPool) -> Router {
+///
+/// The environment decides whether session cookies are `Secure`; pass the
+/// application's configured environment.
+pub fn router(pool: DbPool, environment: Environment) -> Router {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
-        .with_state(AuthState { pool })
+        .route("/logout", post(logout))
+        .route("/me", get(me))
+        .with_state(AuthState {
+            pool: pool.clone(),
+            environment,
+        })
+        // CurrentUser resolves its pool from request extensions.
+        .layer(Extension(pool))
 }
 
 #[derive(Clone)]
 struct AuthState {
     pool: DbPool,
+    environment: Environment,
 }
 
 #[derive(Deserialize)]
@@ -77,10 +94,11 @@ async fn register(
             other => log_internal(other),
         })?;
 
+    let jar = signed_in_jar(&state, &mut connection, created.id).await?;
     let body = UserBody {
         user: UserResponse::from(&created),
     };
-    Ok((StatusCode::CREATED, Json(body)))
+    Ok((jar, (StatusCode::CREATED, Json(body))))
 }
 
 async fn login(
@@ -114,10 +132,55 @@ async fn login(
         return Err(invalid_credentials());
     }
 
+    let jar = signed_in_jar(&state, &mut connection, user.id).await?;
     let body = UserBody {
         user: UserResponse::from(&user),
     };
-    Ok((StatusCode::OK, Json(body)))
+    Ok((jar, (StatusCode::OK, Json(body))))
+}
+
+async fn logout(
+    State(state): State<AuthState>,
+    jar: CookieJar,
+) -> Result<impl IntoResponse, ApiError> {
+    if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
+        let mut connection = state.pool.get().await.map_err(log_internal)?;
+        session::delete(&mut connection, cookie.value())
+            .await
+            .map_err(log_internal)?;
+    }
+
+    let removal = Cookie::build((session::SESSION_COOKIE, ""))
+        .path("/")
+        .build();
+    Ok((jar.remove(removal), StatusCode::NO_CONTENT))
+}
+
+async fn me(CurrentUser(user): CurrentUser) -> Json<UserBody> {
+    Json(UserBody {
+        user: UserResponse::from(&user),
+    })
+}
+
+/// Creates a session for `user_id` and returns a jar carrying its cookie.
+async fn signed_in_jar(
+    state: &AuthState,
+    connection: &mut diesel_async::AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<CookieJar, ApiError> {
+    let token = session::create(connection, user_id)
+        .await
+        .map_err(log_internal)?;
+
+    let cookie = Cookie::build((session::SESSION_COOKIE, token))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(time::Duration::days(session::SESSION_TTL_DAYS))
+        .secure(state.environment.is_production())
+        .build();
+
+    Ok(CookieJar::new().add(cookie))
 }
 
 struct ValidCredentials {
