@@ -59,7 +59,7 @@ Scaffolding a model or field regenerates the contract; anything the frontend mus
 
 ## Deployment
 
-A production deployment is one static Rust binary (serving the API and the built SPA assets), PostgreSQL, and optionally Redis. Docker images are small and versions are pinned everywhere.
+The target: a production deployment is one static Rust binary serving the API and the built SPA assets, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere. Serving the SPA from the binary is not implemented yet (tracked in GitHub issues, M5), so today the frontend requires its own static host.
 
 ## Roadmap
 
