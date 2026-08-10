@@ -1,9 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { TangibleThing } from '../api/routes/tangibleThingRoutes'
-
 // Core
-import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate, useParams } from 'react-router'
 import useSWR from 'swr'
@@ -11,20 +8,11 @@ import { useCurrentUser } from '@jalapenolabs/anubis'
 import { useTeamContext } from '../context/TeamProvider'
 
 // UI
-import {
-  Button,
-  Card,
-  CardBody,
-  Pagination,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from '@heroui/react'
+import { Button, Card, CardBody } from '@heroui/react'
 import { AppShell } from '../components/AppShell'
-import { TangibleThingForm } from '../components/TangibleThingForm'
+import { CreativeConceptForm } from '../components/CreativeConceptForm'
+import { TangibleThingsSection } from '../components/TangibleThingsSection' // 🐺 anubis:template-only
+// 🐺 anubis:child-imports
 
 // Misc
 import {
@@ -32,15 +20,8 @@ import {
   deleteCreativeConcept,
   getCreativeConcept,
 } from '../api/routes/creativeConceptRoutes'
-import {
-  TANGIBLE_THING_MODEL,
-  deleteTangibleThing,
-  listTangibleThings,
-} from '../api/routes/tangibleThingRoutes'
 import { can } from '../roles.generated'
 import { UrlTree } from '../urls'
-
-const PAGE_LIMIT = 10
 
 export function CreativeConceptPage() {
   const { t } = useTranslation()
@@ -49,20 +30,9 @@ export function CreativeConceptPage() {
   const { current } = useTeamContext()
   const { creativeConceptId } = useParams()
 
-  const [ page, setPage ] = useState(1)
-  const [ editing, setEditing ] = useState<TangibleThing | null>(null)
-
-  const concept = useSWR(
+  const creativeConcept = useSWR(
     creativeConceptId ? [ 'creative-concept', creativeConceptId ] : null,
     () => getCreativeConcept(creativeConceptId ?? ''),
-  )
-  const things = useSWR(
-    creativeConceptId ? [ 'tangible-things', creativeConceptId, page ] : null,
-    () => listTangibleThings(creativeConceptId ?? '', {
-      page,
-      limit: PAGE_LIMIT,
-      sort: 'name',
-    }),
   )
 
   // RequireAuth guarantees a user before this page renders.
@@ -70,7 +40,7 @@ export function CreativeConceptPage() {
     return null
   }
 
-  if (concept.error || !creativeConceptId) {
+  if (creativeConcept.error || !creativeConceptId) {
     return <AppShell user={user}>
       <p className='relaxed opacity-70'>{
           t('creativeConcepts.notFound')
@@ -81,31 +51,41 @@ export function CreativeConceptPage() {
     </AppShell>
   }
 
+  const record = creativeConcept.data?.creative_concept ?? null
   const heldRoles = current?.team.roles ?? []
-  const mayWriteThings = can(heldRoles, 'create', TANGIBLE_THING_MODEL)
-  const mayDestroyThings = can(heldRoles, 'destroy', TANGIBLE_THING_MODEL)
-  const mayDestroyConcept = can(heldRoles, 'destroy', CREATIVE_CONCEPT_MODEL)
-  const pagination = things.data?.pagination
+  const mayUpdate = can(heldRoles, 'update', CREATIVE_CONCEPT_MODEL)
+  const mayDestroy = can(heldRoles, 'destroy', CREATIVE_CONCEPT_MODEL)
 
-  async function onDeleteConcept() {
+  const breadcrumbs = [
+    {
+      label: t('app.title'),
+      to: UrlTree.root,
+    },
+    {
+      label: t('creativeConcepts.title'),
+      to: UrlTree.creativeConcepts,
+    },
+    {
+      label: record?.name ?? t('common.loading'),
+    },
+  ]
+
+  async function onDelete() {
     await deleteCreativeConcept(creativeConceptId ?? '')
     await navigate(UrlTree.creativeConcepts)
   }
 
-  return <AppShell user={user}>
+  return <AppShell user={user} breadcrumbs={breadcrumbs}>
     <div className='relaxed'>
-      <Link to={UrlTree.creativeConcepts} className='text-sm text-primary'>{
-          t('creativeConcepts.backToList')
-        }</Link>
       <div className='level'>
         <h2 className='title'>{
-            concept.data?.creative_concept.name ?? t('common.loading')
+            record?.name ?? t('common.loading')
           }</h2>
-        { mayDestroyConcept
+        { mayDestroy
           ? <Button
               color='danger'
               variant='flat'
-              onPress={onDeleteConcept}
+              onPress={onDelete}
             >
               <span>{
                   t('creativeConcepts.deleteAction')
@@ -115,112 +95,24 @@ export function CreativeConceptPage() {
         }
       </div>
       <p className='opacity-70'>{
-          t('tangibleThings.subtitle')
+          record?.description ?? t('creativeConcepts.noDescription')
         }</p>
     </div>
-    <Card className='relaxed p-2'>
-      <CardBody>
-        <Table
-          removeWrapper
-          aria-label={t('tangibleThings.title')}
-        >
-          <TableHeader>
-            <TableColumn>{
-                t('tangibleThings.name')
-              }</TableColumn>
-            <TableColumn>{
-                t('tangibleThings.description')
-              }</TableColumn>
-            <TableColumn>{
-                t('common.actions')
-              }</TableColumn>
-          </TableHeader>
-          <TableBody
-            items={things.data?.tangible_things ?? []}
-            isLoading={things.isLoading}
-            emptyContent={things.isLoading ? t('common.loading') : t('tangibleThings.empty')}
-          >
-            {
-              (thing: TangibleThing) => (
-                <TableRow key={thing.id}>
-                  <TableCell>{
-                      thing.name
-                    }</TableCell>
-                  <TableCell>
-                    <span className={thing.description ? undefined : 'opacity-50'}>{
-                        thing.description ?? t('tangibleThings.noDescription')
-                      }</span>
-                  </TableCell>
-                  <TableCell>
-                    <div className='level-left gap-2'>
-                      { mayWriteThings
-                        ? <Button
-                            size='sm'
-                            variant='flat'
-                            onPress={() => setEditing(thing)}
-                          >
-                            <span>{
-                                t('common.edit')
-                              }</span>
-                          </Button>
-                        : null
-                      }
-                      { mayDestroyThings
-                        ? <Button
-                            size='sm'
-                            variant='flat'
-                            color='danger'
-                            onPress={async () => {
-                              await deleteTangibleThing(thing.id)
-                              if (editing?.id === thing.id) {
-                                setEditing(null)
-                              }
-                              await things.mutate()
-                            }}
-                          >
-                            <span>{
-                                t('common.delete')
-                              }</span>
-                          </Button>
-                        : null
-                      }
-                    </div>
-                  </TableCell>
-                </TableRow>
-              )
-            }
-          </TableBody>
-        </Table>
-        { pagination && pagination.total_pages > 1
-          ? <div className='level-center mt-4'>
-              <Pagination
-                page={pagination.page}
-                total={pagination.total_pages}
-                onChange={setPage}
-                aria-label={t('common.pageOf', {
-                  page: pagination.page,
-                  totalPages: pagination.total_pages,
-                })}
-              />
-            </div>
-          : null
-        }
-      </CardBody>
-    </Card>
-    { mayWriteThings
+    { record && mayUpdate
       ? <Card className='relaxed p-2'>
           <CardBody>
-            <TangibleThingForm
-              creativeConceptId={creativeConceptId}
-              editing={editing}
+            <CreativeConceptForm
+              teamId={record.team_id}
+              editing={record}
               onDone={() => {
-                setEditing(null)
-                void things.mutate()
+                void creativeConcept.mutate()
               }}
             />
           </CardBody>
         </Card>
       : null
     }
+    <TangibleThingsSection creativeConceptId={creativeConceptId} /> {/* 🐺 anubis:template-only */}
+    {/* 🐺 anubis:children */}
   </AppShell>
 }

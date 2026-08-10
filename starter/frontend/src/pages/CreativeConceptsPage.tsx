@@ -4,16 +4,14 @@ import type { CreativeConcept } from '../api/routes/creativeConceptRoutes'
 
 // Core
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
 import useSWR from 'swr'
-import { useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
+import { useCurrentUser } from '@jalapenolabs/anubis'
 import { useTeamContext } from '../context/TeamProvider'
 
 // UI
 import {
-  Button,
   Card,
   CardBody,
   Input,
@@ -26,28 +24,17 @@ import {
   TableRow,
 } from '@heroui/react'
 import { AppShell } from '../components/AppShell'
-
-// Utility
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
+import { CreativeConceptForm } from '../components/CreativeConceptForm'
 
 // Misc
 import {
   CREATIVE_CONCEPT_MODEL,
-  createCreativeConcept,
   listCreativeConcepts,
 } from '../api/routes/creativeConceptRoutes'
 import { can } from '../roles.generated'
-import { getCreativeConceptUrl } from '../urls'
+import { UrlTree, getCreativeConceptUrl } from '../urls'
 
 const PAGE_LIMIT = 10
-
-const createSchema = z.object({
-  name: z.string().trim().min(1),
-})
-
-type CreateFormValues = z.infer<typeof createSchema>
-const resolver = zodResolver(createSchema)
 
 export function CreativeConceptsPage() {
   const { t } = useTranslation()
@@ -56,10 +43,9 @@ export function CreativeConceptsPage() {
 
   const [ page, setPage ] = useState(1)
   const [ search, setSearch ] = useState('')
-  const [ formError, setFormError ] = useState<string | null>(null)
 
   const teamId = current?.team.id ?? null
-  const concepts = useSWR(
+  const creativeConcepts = useSWR(
     teamId ? [ 'creative-concepts', teamId, page, search ] : null,
     () => listCreativeConcepts(teamId ?? '', {
       page,
@@ -69,39 +55,23 @@ export function CreativeConceptsPage() {
     }),
   )
 
-  const form = useForm<CreateFormValues>({
-    resolver,
-    mode: 'onChange',
-    defaultValues: {
-      name: '',
-    },
-  })
-
-  const onCreate = form.handleSubmit(async (data) => {
-    if (!teamId) {
-      console.debug('creative concept submitted without a selected team')
-      return
-    }
-
-    setFormError(null)
-    try {
-      await createCreativeConcept(teamId, { name: data.name.trim() })
-      form.reset()
-      await concepts.mutate()
-    }
-    catch (error) {
-      const message = getApiErrorMessage(error)
-      setFormError(message ?? t('common.somethingWentWrong'))
-    }
-  })
-
   // RequireAuth guarantees a user before this page renders.
   if (!user) {
     return null
   }
 
+  const breadcrumbs = [
+    {
+      label: t('app.title'),
+      to: UrlTree.root,
+    },
+    {
+      label: t('creativeConcepts.title'),
+    },
+  ]
+
   if (!current) {
-    return <AppShell user={user}>
+    return <AppShell user={user} breadcrumbs={breadcrumbs}>
       <p className='opacity-70'>{
           t('creativeConcepts.noTeamSelected')
         }</p>
@@ -109,9 +79,9 @@ export function CreativeConceptsPage() {
   }
 
   const mayCreate = can(current.team.roles, 'create', CREATIVE_CONCEPT_MODEL)
-  const pagination = concepts.data?.pagination
+  const pagination = creativeConcepts.data?.pagination
 
-  return <AppShell user={user}>
+  return <AppShell user={user} breadcrumbs={breadcrumbs}>
     <div className='relaxed'>
       <h2 className='title'>{
           t('creativeConcepts.title')
@@ -147,6 +117,9 @@ export function CreativeConceptsPage() {
                 t('creativeConcepts.name')
               }</TableColumn>
             <TableColumn>{
+                t('creativeConcepts.description')
+              }</TableColumn>
+            <TableColumn>{
                 t('creativeConcepts.created')
               }</TableColumn>
             <TableColumn>{
@@ -154,22 +127,31 @@ export function CreativeConceptsPage() {
               }</TableColumn>
           </TableHeader>
           <TableBody
-            items={concepts.data?.creative_concepts ?? []}
-            isLoading={concepts.isLoading}
-            emptyContent={concepts.isLoading ? t('common.loading') : t('creativeConcepts.empty')}
+            items={creativeConcepts.data?.creative_concepts ?? []}
+            isLoading={creativeConcepts.isLoading}
+            emptyContent={
+              creativeConcepts.isLoading
+                ? t('common.loading')
+                : t('creativeConcepts.empty')
+            }
           >
             {
-              (concept: CreativeConcept) => (
-                <TableRow key={concept.id}>
+              (creativeConcept: CreativeConcept) => (
+                <TableRow key={creativeConcept.id}>
                   <TableCell>{
-                      concept.name
+                      creativeConcept.name
                     }</TableCell>
+                  <TableCell>
+                    <span className={creativeConcept.description ? undefined : 'opacity-50'}>{
+                        creativeConcept.description ?? t('creativeConcepts.noDescription')
+                      }</span>
+                  </TableCell>
                   <TableCell>{
-                      new Date(concept.created_at).toLocaleDateString()
+                      new Date(creativeConcept.created_at).toLocaleDateString()
                     }</TableCell>
                   <TableCell>
                     <Link
-                      to={getCreativeConceptUrl(concept.id)}
+                      to={getCreativeConceptUrl(creativeConcept.id)}
                       className='text-primary'
                     >{
                         t('creativeConcepts.open')
@@ -199,41 +181,13 @@ export function CreativeConceptsPage() {
     { mayCreate
       ? <Card className='relaxed p-2'>
           <CardBody>
-            <h3 className='compact text-xl font-semibold'>{
-                t('creativeConcepts.createTitle')
-              }</h3>
-            <form onSubmit={onCreate}>
-              <div className='level items-start'>
-                <Input
-                  label={t('creativeConcepts.name')}
-                  className='w-full'
-                  value={form.watch('name')}
-                  onChange={(event) => {
-                    form.setValue('name', event.currentTarget.value, {
-                      shouldDirty: true,
-                      shouldValidate: true,
-                    })
-                  }}
-                />
-                <Button
-                  type='submit'
-                  color='primary'
-                  className='shrink-0 self-center'
-                  isDisabled={!form.formState.isValid || form.formState.isSubmitting}
-                  isLoading={form.formState.isSubmitting}
-                >
-                  <span>{
-                      t('creativeConcepts.createAction')
-                    }</span>
-                </Button>
-              </div>
-              { formError
-                ? <p className='mt-4 text-danger'>{
-                    formError
-                  }</p>
-                : null
-              }
-            </form>
+            <CreativeConceptForm
+              teamId={current.team.id}
+              editing={null}
+              onDone={() => {
+                void creativeConcepts.mutate()
+              }}
+            />
           </CardBody>
         </Card>
       : null

@@ -3,11 +3,12 @@
 //!
 //! The templates are application code, not framework assets: this command
 //! reads `backend/src/scaffolding/`, the migration that created the template's
-//! table, and the template's integration test straight out of the application
-//! it is run in, rewrites every template name into the target model's names,
-//! and writes the result beside them. Shared files (`lib.rs`, `schema.rs`,
-//! `config/roles.yml`) receive one line each above their magic anchors, which
-//! is idempotent, so re-running a scaffold never duplicates an insertion.
+//! table, the template's integration test, and the template model's pages
+//! straight out of the application it is run in, rewrites every template name
+//! into the target model's names, and writes the result beside them. Shared
+//! files (`lib.rs`, `schema.rs`, `config/roles.yml`, `urls.ts`, `App.tsx`,
+//! `AppShell.tsx`, `i18n.ts`) receive their lines above magic anchors, which is
+//! idempotent, so re-running a scaffold never duplicates an insertion.
 //!
 //! Everything is planned before anything is written: a missing template, a
 //! missing anchor, or a module that already exists stops the command with the
@@ -97,16 +98,17 @@ fn plan(root: &Path, scaffold: &ModelScaffold) -> Result<Plan, String> {
     let mut created = stamp_module(root, scaffold, template, &replacements)?;
     created.push(stamp_test(root, scaffold, template, &replacements)?);
     created.extend(stamp_migration(root, scaffold, template, &replacements)?);
+    created.extend(stamp_frontend(root, scaffold, template, &replacements)?);
 
     let schema = update_schema(root, scaffold, template, &replacements)?;
     let library = update_lib(root, scaffold)?;
     let roles = update_roles(root, scaffold)?;
     let roles_client = regenerate_roles_client(root, &roles.1)?;
 
-    Ok(Plan {
-        created,
-        updated: vec![schema, library, roles, roles_client],
-    })
+    let mut updated = vec![schema, library, roles, roles_client];
+    updated.extend(update_frontend(root, scaffold)?);
+
+    Ok(Plan { created, updated })
 }
 
 /// Stamps the template module into the application's own module directory.
@@ -128,7 +130,7 @@ fn stamp_module(
     let entries = std::fs::read_dir(root.join(&source))
         .map_err(|error| format!("failed to read {}: {error}", display(&source)))?;
 
-    let note = scaffold.manual_fields_note();
+    let note = scaffold.backend_manual_fields_note();
     let mut files = Vec::new();
     for entry in entries {
         let path = entry
@@ -161,9 +163,14 @@ fn stamp_module(
     Ok(files)
 }
 
-/// Plants the manual-work note above a stamped model's first import.
+/// Plants the manual-work note above a stamped file's first import.
+///
+/// Rust and TypeScript both put their imports at the top under the file's own
+/// header, which is exactly where a developer looks first.
 fn plant_note(contents: &str, note: &str) -> Option<String> {
-    let first_import = contents.lines().find(|line| line.starts_with("use "))?;
+    let first_import = contents
+        .lines()
+        .find(|line| line.starts_with("use ") || line.starts_with("import "))?;
     // The whole import line is the needle, so nothing else in the file can
     // match it, and the note lands with a blank line under it.
     insert_above_anchor(contents, first_import, &format!("{note}\n")).ok()
@@ -220,6 +227,136 @@ fn stamp_migration(
         (destination.join("up.sql"), up),
         (destination.join("down.sql"), down),
     ])
+}
+
+/// Stamps the template model's frontend files into the application.
+///
+/// A team-owned model gets its route module, its form, its locale file, and
+/// its two pages; a nested model gets its route module, its form, its locale
+/// file, and the section component its parent's page renders. Template-only
+/// lines are dropped: the template's parent page renders the template's own
+/// child, which belongs to no other model.
+fn stamp_frontend(
+    root: &Path,
+    scaffold: &ModelScaffold,
+    template: ModelTemplate,
+    replacements: &Replacements,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let note = scaffold.frontend_manual_fields_note();
+    let form = scaffold.frontend_form_file();
+
+    let mut files = Vec::new();
+    for source in template.frontend_files() {
+        let destination = replacements.apply(source);
+        if root.join(&destination).exists() {
+            return Err(format!(
+                "{destination} already exists; scaffolding never overwrites a model",
+            ));
+        }
+
+        let stamped = replacements.apply(&read(&root.join(source))?);
+        let mut contents = drop_template_only(&stamped);
+        if destination == form
+            && let Some(note) = note.as_deref()
+        {
+            contents = plant_note(&contents, note)
+                .ok_or_else(|| format!("{destination} imports nothing to plant a note above"))?;
+        }
+        files.push((PathBuf::from(destination), contents));
+    }
+
+    Ok(files)
+}
+
+/// Removes the lines that belong to the living template alone.
+fn drop_template_only(contents: &str) -> String {
+    let mut kept = String::with_capacity(contents.len());
+    for line in contents.lines() {
+        if line.contains(anchor::TEMPLATE_ONLY) {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Wires the model's frontend slice into the files the application shares.
+///
+/// Every model registers its locale file. Beyond that the two depths differ:
+/// a team-owned model owns urls, routes, and a navigation entry, while a
+/// nested model attaches a section to the show page its parent's scaffold
+/// generated.
+fn update_frontend(
+    root: &Path,
+    scaffold: &ModelScaffold,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut updated = vec![update_anchors(
+        root,
+        "frontend/src/i18n.ts",
+        &[
+            (anchor::LOCALE_IMPORTS, scaffold.locale_import()),
+            (anchor::LOCALES, scaffold.locale_spread()),
+        ],
+    )?];
+
+    if let Some(attachment) = scaffold.child_attachment() {
+        if !root.join(&attachment.page).is_file() {
+            return Err(format!(
+                "{} is missing; scaffold the parent model before the models it owns, so there \
+                 is a show page for this one to attach to",
+                attachment.page,
+            ));
+        }
+        updated.push(update_anchors(
+            root,
+            &attachment.page,
+            &[
+                (anchor::CHILD_IMPORTS, attachment.import),
+                (anchor::CHILDREN, attachment.element),
+            ],
+        )?);
+        return Ok(updated);
+    }
+
+    updated.push(update_anchors(
+        root,
+        "frontend/src/urls.ts",
+        &[
+            (anchor::URLS, scaffold.url_entries()),
+            (anchor::URL_FACTORIES, scaffold.url_factory()),
+        ],
+    )?);
+    updated.push(update_anchors(
+        root,
+        "frontend/src/App.tsx",
+        &[
+            (anchor::PAGE_IMPORTS, scaffold.page_imports()),
+            (anchor::ROUTES, scaffold.route_elements()),
+        ],
+    )?);
+    updated.push(update_anchors(
+        root,
+        "frontend/src/components/AppShell.tsx",
+        &[(anchor::NAV, scaffold.nav_item())],
+    )?);
+
+    Ok(updated)
+}
+
+/// Applies anchor insertions to one file the application already owns.
+fn update_anchors(
+    root: &Path,
+    relative: &str,
+    insertions: &[(&str, String)],
+) -> Result<(PathBuf, String), String> {
+    let relative = PathBuf::from(relative);
+    let mut contents = read(&root.join(&relative))?;
+    for (anchor, addition) in insertions {
+        contents = insert_above_anchor(&contents, anchor, addition)
+            .map_err(|error| format!("{}: {error}", display(&relative)))?;
+    }
+    Ok((relative, contents))
 }
 
 /// The migration directory that created `table`.
@@ -334,28 +471,20 @@ fn update_schema(
 
 /// Declares the model's module and mounts its router in `backend/src/lib.rs`.
 fn update_lib(root: &Path, scaffold: &ModelScaffold) -> Result<(PathBuf, String), String> {
-    let relative = PathBuf::from("backend/src/lib.rs");
-    let source = read(&root.join(&relative))?;
-
-    let declared = insert_above_anchor(&source, anchor::MODULES, &scaffold.module_declaration())
-        .map_err(|error| format!("{}: {error}", display(&relative)))?;
-    let mounted = insert_above_anchor(&declared, anchor::ROUTES, &scaffold.route_mount())
-        .map_err(|error| format!("{}: {error}", display(&relative)))?;
-
-    Ok((relative, mounted))
+    update_anchors(
+        root,
+        "backend/src/lib.rs",
+        &[
+            (anchor::MODULES, scaffold.module_declaration()),
+            (anchor::ROUTES, scaffold.route_mount()),
+        ],
+    )
 }
 
 /// Grants the model to the `default` and `editor` roles in `config/roles.yml`.
 fn update_roles(root: &Path, scaffold: &ModelScaffold) -> Result<(PathBuf, String), String> {
-    let relative = PathBuf::from("config/roles.yml");
-    let mut roles = read(&root.join(&relative))?;
-
-    for (anchor, actions) in ROLE_GRANTS {
-        roles = insert_above_anchor(&roles, anchor, &scaffold.role_grant(actions))
-            .map_err(|error| format!("{}: {error}", display(&relative)))?;
-    }
-
-    Ok((relative, roles))
+    let grants = ROLE_GRANTS.map(|(anchor, actions)| (anchor, scaffold.role_grant(actions)));
+    update_anchors(root, "config/roles.yml", &grants)
 }
 
 /// Recompiles the frontend's permissions module from the updated roles.
@@ -438,8 +567,8 @@ fn report(scaffold: &ModelScaffold, plan: &Plan) {
         println!();
         println!(
             "note: the migration and schema.rs carry these fields as nullable columns and \
-             nothing else does: {names}. The generated model.rs opens with a TODO naming \
-             every place that still needs them."
+             nothing else does: {names}. The generated model.rs and form component each \
+             open with a TODO naming every place that still needs them."
         );
     }
 

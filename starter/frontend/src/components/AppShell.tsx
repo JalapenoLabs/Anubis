@@ -1,5 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
+import type { Breadcrumb } from './Breadcrumbs'
 import type { User } from '@jalapenolabs/anubis'
 import type { ReactNode } from 'react'
 
@@ -23,16 +24,19 @@ import {
   NavbarContent,
   NavbarItem,
 } from '@heroui/react'
+import { Breadcrumbs } from './Breadcrumbs'
 
 // Misc
 import { UrlTree } from '../urls'
 
 type Props = {
   user: User
+  /** The page's trail, rendered above the content. */
+  breadcrumbs?: Breadcrumb[]
   children: ReactNode
 }
 
-/** Signed-in application frame: navbar with team switcher and user menu. */
+/** Signed-in application frame: navbar, breadcrumbs, and the page content. */
 export function AppShell(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
@@ -125,8 +129,14 @@ export function AppShell(props: Props) {
         </NavbarItem>
       </NavbarContent>
     </Navbar>
-    <main className='container mx-auto max-w-5xl p-6'>{
-        props.children
-      }</main>
+    <main className='container mx-auto max-w-5xl p-6'>
+      { props.breadcrumbs?.length
+        ? <div className='relaxed'>
+            <Breadcrumbs items={props.breadcrumbs} />
+          </div>
+        : null
+      }
+      {props.children}
+    </main>
   </div>
 }

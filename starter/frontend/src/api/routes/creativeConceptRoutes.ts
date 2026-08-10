@@ -14,6 +14,7 @@ export type CreativeConcept = {
   id: string
   team_id: string
   name: string
+  description: string | null
   created_at: string
   updated_at: string
 }
@@ -47,13 +48,27 @@ export function getCreativeConcept(creativeConceptId: string) {
     .json<CreativeConceptResponse>()
 }
 
-export function createCreativeConcept(teamId: string, body: { name: string }) {
+type CreateCreativeConceptRequest = {
+  name: string
+  description?: string
+}
+
+export function createCreativeConcept(teamId: string, body: CreateCreativeConceptRequest) {
   return appClient
     .post(`teams/${teamId}/creative-concepts`, { json: body })
     .json<CreativeConceptResponse>()
 }
 
-export function updateCreativeConcept(creativeConceptId: string, body: { name?: string }) {
+type UpdateCreativeConceptRequest = {
+  name?: string
+  /** A blank description clears the column. */
+  description?: string
+}
+
+export function updateCreativeConcept(
+  creativeConceptId: string,
+  body: UpdateCreativeConceptRequest,
+) {
   return appClient
     .patch(`creative-concepts/${creativeConceptId}`, { json: body })
     .json<CreativeConceptResponse>()

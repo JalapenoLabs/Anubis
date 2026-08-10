@@ -14,6 +14,8 @@ The template models mirror Bullet Train's naming for the same reason Bullet Trai
 
 The templates are ordinary application code in `starter/`. `CreativeConcept` belongs to a Team; `TangibleThing` belongs to a `CreativeConcept`. Both carry a required `name` and a nullable `description`, so the two ownership depths differ only in ownership. Between them they cover every artifact one `scaffold model` run produces, which is what makes them a specification rather than a demo.
 
+The frontend halves mirror the same split. A team-owned model owns a list page, a show page, a form component, a route module, and a locale file. A nested model owns a form component, a route module, a locale file, and one section component (`TangibleThingsSection`) holding its table and its form, which the parent's show page renders. Reducing a child's whole slice to one element is what lets a later scaffold attach a child to a page an earlier scaffold wrote, by inserting a single line.
+
 Each depth has its own narrative test, `starter/backend/tests/creative_concepts_flow.rs` and `starter/backend/tests/tangible_things_flow.rs`, running against a real Postgres. They are templates too: one scaffold stamps the matching narrative for the generated model, so a new model arrives with the same proof its template carries. The plumbing they share (booting the router, registering an account, inviting a teammate) lives in `starter/backend/tests/support/mod.rs`, which is application code the scaffolder never rewrites.
 
 The starter backend is a library plus a thin binary. `main.rs` is the composition root; the application itself (models, routes, schema, migrations, role constants) lives in `lib.rs` and its modules, so integration tests drive the real routers. Model modules are public, because an application's library is what its binary and its tests build on.
@@ -35,14 +37,25 @@ Anchors are `🐺 anubis:<name>` inside the host language's comment syntax. `ins
 | `# 🐺 anubis:models:editor` | `config/roles.yml` | the `editor` role's model grants |
 | `// 🐺 anubis:urls` | `frontend/src/urls.ts` | `UrlTree` entries |
 | `// 🐺 anubis:url-factories` | `frontend/src/urls.ts` | link factory functions |
+| `// 🐺 anubis:page-imports` | `frontend/src/App.tsx` | page imports |
 | `{/* 🐺 anubis:routes */}` | `frontend/src/App.tsx` | `<Route>` elements |
 | `{/* 🐺 anubis:nav */}` | `frontend/src/components/AppShell.tsx` | navigation entries |
 | `// 🐺 anubis:locale-imports` | `frontend/src/i18n.ts` | per-model locale imports |
 | `// 🐺 anubis:locales` | `frontend/src/i18n.ts` | per-model locale spreads |
+| `// 🐺 anubis:child-imports` | every show page | imports of child section components |
+| `{/* 🐺 anubis:children */}` | every show page | child section elements |
 
 Each `roles.yml` anchor names its role: grants differ per role, and one insertion point can only be found once. `default` gets `read` and `editor` gets `manage`; `billing` and `admin` inherit and need no entries. A role added by hand carries its own anchor.
 
+`anubis:routes` appears in two files, `backend/src/lib.rs` and `frontend/src/App.tsx`, spelled in each one's comment syntax. The rule is one spelling per file, not one per repository.
+
+The two show-page anchors are what make a scaffolded page a host for later scaffolds: `scaffold model Goal Project,Team` inserts `import { GoalsSection } ...` and `<GoalsSection projectId={projectId} />` into `ProjectPage.tsx`, which `scaffold model Project Team` wrote. A nested model whose parent has no page is refused by name rather than generated half-wired.
+
 `account_router` mounts one router per statement rather than one long method chain, so an inserted line is already `rustfmt`-clean.
+
+### The template-only marker
+
+`🐺 anubis:template-only` is a marker, not an insertion point: nothing is ever written above it, and every line carrying it is dropped when the page is stamped. The template's show page renders the template's own child, which belongs to no other model, so those two lines (the import and the element) are the template's alone. Keeping such content to one line per marker is the whole of the rule.
 
 ### App-owned migrations and schema
 
@@ -60,6 +73,12 @@ The app's own endpoints get a ky client in `frontend/src/api/index.ts` and one r
 
 JSON carries no comments, so each scaffolded model gets its own locale file at `frontend/src/locales/models/<models>.<locale>.json`, and `i18n.ts` carries the anchors that import and merge them. The base application strings stay in `locales/en-US.json`.
 
+Forms are field components from `@jalapenolabs/anubis`, one per model attribute, bound to react-hook-form through `control` and `name`. The page passes translated strings down (`label={t('tangibleThings.name')}`, `help={t('tangibleThings.nameHelp')}`), which is why the locale keys the scaffolder emits are named after the props.
+
+### Breadcrumbs
+
+Every page hands `AppShell` a `breadcrumbs` array and the frame renders it, so the trail is decided in one place and every scaffolded page inherits it. Crumbs are page-provided rather than derived from the route: a show page's last crumb is the record's own name, and only the page has it. A crumb with a `to` renders as a router link, the last one as plain text. `Breadcrumbs` is a starter component like `AppShell`, so an application owns and restyles it.
+
 ### Deferred: `/api/v1` for application models
 
 A scaffolded model currently generates account handlers only. Extending the framework-owned v1 OpenAPI document from an application is its own design problem (who owns the document, how an application merges paths into it, how versions freeze per application), and it is settled with the `scaffold model` generator itself rather than here. Until then the template stays honest: no `/api/v1` handlers, no half-built merge hook.
@@ -69,7 +88,7 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | Command | Purpose |
 |---|---|
 | `anubis new <name>` | Stamp a new application from the starter template |
-| `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold (backend today) |
+| `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold |
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
 | `anubis scaffold join <JoinModel> <a_id{class=A}> <b_id{class=B}>` | Join model for has-many-through |
 | `anubis scaffold oauth <provider>` | Add an OAuth login provider (the one-line Google Auth moment) |
@@ -78,7 +97,7 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 
-`anubis new`, `anubis routes`, `anubis doctor`, and the backend half of `anubis scaffold model` are implemented; the frontend half of `scaffold model`, the rest of the `scaffold` family, and `eject` are the remainder of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, and `anubis scaffold model` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
@@ -89,7 +108,7 @@ The generator accepts the types the living templates prove. Each row knows its c
 | `text_field` | `TEXT` | `Text` | `String` | no |
 | `text_area` | `TEXT` | `Text` | `Option<String>` | yes |
 
-## `anubis scaffold model`: the backend slice
+## `anubis scaffold model`: one command, both ends
 
 ```
 anubis scaffold model Project Team name:text_field
@@ -100,7 +119,7 @@ The command runs inside an application, which is a directory holding `backend/`,
 
 The ownership chain ends in `Team`, because every application record reaches a team. `Team` selects the team-owned template and `<Parent>,Team` the nested one. Deeper chains are refused with a pointer at the roadmap rather than generated half-right.
 
-One run produces:
+One run produces, on the backend:
 
 - a timestamped migration (`up.sql` and `down.sql`) with the table, its ownership index, and the shared `set_updated_at()` trigger
 - a `diesel::table!` block in `backend/src/schema.rs`, plus the `joinable!` and `allow_tables_to_appear_in_same_query!` declarations for a nested model
@@ -109,7 +128,15 @@ One run produces:
 - `read` and `manage` grants in `config/roles.yml`, and a regenerated `frontend/src/roles.generated.ts`
 - the model's own integration test in `backend/tests/<models>_flow.rs`
 
-Every artifact is a transformation of the application's own files: the migration comes from the migration that created the template's table, the schema block from the template's `table!` block, the module from the template module, the test from the template's narrative. Improving a template improves every later scaffold.
+and on the frontend:
+
+- the ky route module (`frontend/src/api/routes/<model>Routes.ts`) with the wire type, the permission model key, and one function per endpoint
+- the form component (`frontend/src/components/<Model>Form.tsx`), one field component per attribute, creating or editing
+- the model's locale file (`frontend/src/locales/models/<models>.en-US.json`), and its import and spread in `i18n.ts`
+- for a team-owned model: the list page and the show page under `frontend/src/pages/`, the `UrlTree` entries and link factory in `urls.ts`, the page imports and `<Route>` elements in `App.tsx`, and the navigation entry in `AppShell.tsx`
+- for a nested model: the section component (`frontend/src/components/<Models>Section.tsx`) holding its table and form, plus its import and element inside the parent's show page
+
+Every artifact is a transformation of the application's own files: the migration comes from the migration that created the template's table, the schema block from the template's `table!` block, the module from the template module, the test from the template's narrative, the pages from the template model's pages. Improving a template improves every later scaffold.
 
 The run is planned before anything is written, so a missing template, a missing anchor, or an existing module stops the command with the application untouched. Anchor insertions are idempotent, and a model whose module already exists is refused rather than overwritten. Generated Rust is formatted with `rustfmt` when it is on `PATH`: transformation cannot preserve line widths, since a shorter model name lets a wrapped statement fit again, and the formatter settles it.
 
@@ -117,9 +144,11 @@ The run is planned before anything is written, so a missing template, a missing 
 
 Every scaffolded model carries the template's own columns: `name` (required text) and `description` (optional text), wired end to end through the model, the handlers, and the test. Naming either in the field list is the identity case; naming one with the other type is refused.
 
-Any other field reaches the migration and `schema.rs` as a nullable column, and nothing else. Nullable is deliberate: nothing writes the column yet, and a `NOT NULL` column with no writer would fail every insert. The generated `model.rs` opens with a `TODO(anubis)` comment naming each field and every place it still needs (the record, insert, and changeset structs, the request bodies, the create and update handlers), and the command says the same at the end of its output. `anubis scaffold field` closes this gap by adding the per-field anchors those files need.
+Any other field reaches the migration and `schema.rs` as a nullable column, and nothing else. Nullable is deliberate: nothing writes the column yet, and a `NOT NULL` column with no writer would fail every insert. Two `TODO(anubis)` comments say so where the work is: the generated `model.rs` names each field and every backend place it still needs (the record, insert, and changeset structs, the request bodies, the create and update handlers), and the generated form component names each field with the field component its type wants, the wire type and request bodies in its route module, and the form itself. The command repeats the summary at the end of its output. `anubis scaffold field` closes this gap by adding the per-field anchors those files need.
 
-Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`.
+Per-field anchors are that issue's design, not this one's. A form's fields are a list of sibling components with nothing between them, and the same is true of a table's columns and a wire type's members, so the insertion points `scaffold field` needs are settled together with the propagation rules it follows. Adding them here would freeze half a design against an unwritten one.
+
+Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`. On the frontend the generator pre-wraps the one construct a long model name can push past the 120-column lint limit, the link factory.
 
 ## The field component library
 
@@ -182,18 +211,18 @@ These field types have no component yet, and each waits on something specific:
 
 ### Styling
 
-The package ships TypeScript source, so a consuming application's Tailwind build must scan it. Add `@source '../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';` to the application stylesheet next to the HeroUI globs. The fields also use the vertical rhythm helpers (`compact`, `relaxed`) and the HeroUI theme scale, both of which the starter stylesheet defines.
+The package ships TypeScript source, so a consuming application's Tailwind build must scan it. The starter stylesheet carries the glob twice, `../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}` and `../../../node_modules/...`, exactly as it does for HeroUI: yarn workspaces hoist the package to the repo root while a standalone install keeps it local, and Tailwind skips whichever glob matches nothing. Without it a field's own utilities never reach the stylesheet. The fields also use the vertical rhythm helpers (`compact`, `relaxed`) and the HeroUI theme scale, both of which the starter stylesheet defines.
 
 ## The stamping engine
 
 All scaffolders share one pure engine, `anubis::scaffold`:
 
-- **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangible_things`, `tangible-thing`, `Tangible Things`, `tangible thing`, ...). Pluralization covers standard English rules plus a table of common irregulars.
+- **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangibleThings`, `tangible_things`, `TANGIBLE_THING`, `tangible-thing`, `Tangible Things`, `tangible thing`, ...). Pluralization covers standard English rules plus a table of common irregulars.
 - **Replacements**: ordered find-and-replace over paths and file bodies, longest pattern first so `tangible_things` wins over `tangible_thing`. `Replacements::between(template, target)` maps every variant pair at once, and sets compose, which is how a nested model rewrites its own name and its parent's in one pass.
 - **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent so re-running a scaffold never duplicates lines. The `anubis::scaffold::anchor` module names every anchor the framework recognizes.
 - **Extraction**: `table_block` and `line_containing` read declarations back out of an application's own files, so a generated table inherits the template's shape instead of a shape hard-coded in the framework.
 - **Field types**: `FieldType` and `Field` map a `name:type` argument to a column, a schema type, and a Rust type.
-- **Planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and inserted lines.
+- **Planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
 
@@ -214,18 +243,20 @@ Backend, implemented today:
 - Entry in `roles.yml` permission grants, and the regenerated frontend permissions module
 - Account CRUD handlers, routes wired into the router, and the model's integration test
 
-Backend, still to come:
+Frontend, implemented today:
+
+- ky route module per model, with the wire type and the permission model key
+- List page (table, search, pagination), show page, and the form component built from field components
+- Navigation entry, `UrlTree` entries and link factory, routes, and breadcrumbs
+- Per-model i18next locale file (labels, headings, help text), imported and merged in `i18n.ts`
+- A nested model's section component, attached to its parent's show page
+
+Still to come:
 
 - `/api/v1` handlers (separate, like Bullet Train's account vs api controllers), once [the ownership question](#deferred-apiv1-for-application-models) is settled
 - Serializer registered with utoipa (OpenAPI 3.1), shared by the API and outgoing webhooks
-
-Frontend:
-
-- Generated ky route functions and SWR hooks from the refreshed OpenAPI document
-- List page (table), show page, and create/edit form pages built from field components
-- Navigation entry and breadcrumbs
-- Per-model i18next locale file (labels, headings, placeholders, help text, option lists)
-- Vitest unit tests and Playwright E2E tests
+- A generated-client refresh per scaffold. The generated client is rendered from the `/api/v1` OpenAPI document, and an application model has no `/api/v1` handlers yet, so there is nothing for a scaffold to refresh. Generated pages call the hand-written route module instead, which is the same contract typed by hand.
+- Per-model frontend tests. The starter runs Vitest and the scaffolder's own frontend output is covered by `tsc`, ESLint, the production build, and the integration test that scaffolds two models and reads the result. Playwright end-to-end tests wait on Playwright itself, which the starter does not have.
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
 

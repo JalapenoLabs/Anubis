@@ -5,7 +5,8 @@
 //! copied to a scratch directory, two models are scaffolded into it (one owned
 //! by a team, one owned through the first), and the result is inspected as
 //! text. Compiling the copy is left to the workspace's own `cargo test`, which
-//! builds the starter after a scaffold during development.
+//! builds the starter after a scaffold during development, and to the frontend
+//! toolchain, which typechecks and lints it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -16,12 +17,16 @@ const ANUBIS: &str = env!("CARGO_BIN_EXE_anubis");
 const SKIPPED: [&str; 5] = ["target", "node_modules", "dist", ".vite", "coverage"];
 
 /// Names the living templates use that must never survive a transformation.
-const TEMPLATE_TOKENS: [&str; 7] = [
+const TEMPLATE_TOKENS: [&str; 11] = [
     "CreativeConcept",
+    "creativeConcept",
     "creative_concept",
+    "CREATIVE_CONCEPT",
     "creative-concept",
     "TangibleThing",
+    "tangibleThing",
     "tangible_thing",
+    "TANGIBLE_THING",
     "absolutely_abstract",
     "completely_concrete",
 ];
@@ -31,7 +36,7 @@ const TEMPLATE_TOKENS: [&str; 7] = [
     clippy::too_many_lines,
     reason = "one scaffold run inspected artifact by artifact"
 )]
-fn scaffolding_two_models_writes_a_full_backend_slice() {
+fn scaffolding_two_models_writes_a_full_stack_slice() {
     let app = copy_starter("full-slice");
 
     let output = scaffold(&app, &["Project", "Team", "name:text_field"]);
@@ -58,9 +63,20 @@ fn scaffolding_two_models_writes_a_full_backend_slice() {
         "backend/src/goals/routes.rs",
         "backend/tests/projects_flow.rs",
         "backend/tests/goals_flow.rs",
+        "frontend/src/api/routes/projectRoutes.ts",
+        "frontend/src/components/ProjectForm.tsx",
+        "frontend/src/pages/ProjectPage.tsx",
+        "frontend/src/pages/ProjectsPage.tsx",
+        "frontend/src/locales/models/projects.en-US.json",
+        "frontend/src/api/routes/goalRoutes.ts",
+        "frontend/src/components/GoalForm.tsx",
+        "frontend/src/components/GoalsSection.tsx",
+        "frontend/src/locales/models/goals.en-US.json",
     ] {
         assert!(app.join(expected).is_file(), "missing {expected}");
     }
+    // A nested model owns no pages of its own.
+    assert!(!app.join("frontend/src/pages/GoalPage.tsx").exists());
     let project_migration = migration(&app, "_create_projects");
     assert!(project_migration.join("up.sql").is_file());
     assert!(project_migration.join("down.sql").is_file());
@@ -96,6 +112,14 @@ fn scaffolding_two_models_writes_a_full_backend_slice() {
         "backend/src/goals/routes.rs",
         "backend/tests/projects_flow.rs",
         "backend/tests/goals_flow.rs",
+        "frontend/src/api/routes/projectRoutes.ts",
+        "frontend/src/api/routes/goalRoutes.ts",
+        "frontend/src/components/ProjectForm.tsx",
+        "frontend/src/components/GoalsSection.tsx",
+        "frontend/src/pages/ProjectPage.tsx",
+        "frontend/src/pages/ProjectsPage.tsx",
+        "frontend/src/locales/models/projects.en-US.json",
+        "frontend/src/locales/models/goals.en-US.json",
     ] {
         let contents = read(&app.join(generated));
         for token in TEMPLATE_TOKENS {
@@ -139,6 +163,53 @@ fn scaffolding_two_models_writes_a_full_backend_slice() {
     let generated_roles = read(&app.join("frontend/src/roles.generated.ts"));
     assert!(generated_roles.contains("Project"), "{generated_roles}");
     assert!(generated_roles.contains("Goal"));
+
+    // A team-owned model owns its urls, its routes, and a navigation entry.
+    let urls = read(&app.join("frontend/src/urls.ts"));
+    assert!(urls.contains("projects: '/projects',"), "{urls}");
+    assert!(urls.contains("project: '/projects/:projectId',"));
+    assert!(urls.contains("export function getProjectUrl(projectId: string): string {"));
+    assert_anchored(&urls, "🐺 anubis:urls", "projects: '/projects',");
+    assert_anchored(&urls, "🐺 anubis:url-factories", "getProjectUrl");
+
+    let application = read(&app.join("frontend/src/App.tsx"));
+    assert!(
+        application.contains("import { ProjectsPage } from './pages/ProjectsPage'"),
+        "{application}",
+    );
+    assert!(application.contains("path={UrlTree.project}"));
+    assert_anchored(&application, "🐺 anubis:page-imports", "ProjectsPage }");
+    assert_anchored(&application, "🐺 anubis:routes", "<ProjectsPage />");
+
+    let shell = read(&app.join("frontend/src/components/AppShell.tsx"));
+    assert!(shell.contains("t('projects.navLink')"), "{shell}");
+    assert_anchored(&shell, "🐺 anubis:nav", "UrlTree.projects");
+
+    let i18n = read(&app.join("frontend/src/i18n.ts"));
+    assert!(i18n.contains("import goalsEnUS from './locales/models/goals.en-US.json'"));
+    assert!(i18n.contains("...projectsEnUS,"), "{i18n}");
+    assert_anchored(&i18n, "🐺 anubis:locale-imports", "projectsEnUS from");
+    assert_anchored(&i18n, "🐺 anubis:locales", "...goalsEnUS,");
+
+    // The generated form renders the field components, one per attribute.
+    let form = read(&app.join("frontend/src/components/ProjectForm.tsx"));
+    assert!(
+        form.contains("import { TextAreaField, TextField }"),
+        "{form}"
+    );
+    assert!(form.contains("label={t('projects.name')}"));
+    assert!(form.contains("help={t('projects.descriptionHelp')}"));
+
+    // The nested model attaches to the page the parent's own scaffold wrote,
+    // and the template's own child is not carried along with it.
+    let page = read(&app.join("frontend/src/pages/ProjectPage.tsx"));
+    assert!(
+        page.contains("<GoalsSection projectId={projectId} />"),
+        "{page}"
+    );
+    assert!(!page.contains("🐺 anubis:template-only"), "{page}");
+    assert_anchored(&page, "🐺 anubis:children", "<GoalsSection");
+    assert_anchored(&page, "🐺 anubis:child-imports", "import { GoalsSection }");
 
     // A second run refuses cleanly, leaving the first run's work alone.
     let rerun = scaffold(&app, &["Project", "Team", "name:text_field"]);
@@ -223,6 +294,14 @@ fn arguments_and_locations_are_rejected_with_a_reason() {
     let unowned = scaffold(&app, &["Task", "Project"]);
     assert!(!unowned.status.success());
     assert!(stderr(&unowned).contains("must end in `Team`"));
+
+    let orphan = scaffold(&app, &["Task", "Missing,Team"]);
+    assert!(!orphan.status.success());
+    assert!(
+        stderr(&orphan).contains("frontend/src/pages/MissingPage.tsx is missing"),
+        "a nested model needs its parent's page to attach to: {}",
+        stderr(&orphan),
+    );
 
     let unsupported = scaffold(&app, &["Task", "Team", "due:date_field"]);
     assert!(!unsupported.status.success());

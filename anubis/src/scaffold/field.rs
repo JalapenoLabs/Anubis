@@ -22,6 +22,7 @@ use super::error::ScaffoldError;
 /// let text_area = FieldType::lookup("text_area").unwrap();
 /// assert_eq!(text_area.sql_type(), "TEXT");
 /// assert_eq!(text_area.rust_type(), "Option<String>");
+/// assert_eq!(text_area.component(), "TextAreaField");
 /// assert!(text_area.is_nullable());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub struct FieldType {
     sql_type: &'static str,
     schema_type: &'static str,
     rust_type: &'static str,
+    component: &'static str,
     nullable: bool,
 }
 
@@ -40,6 +42,7 @@ pub const FIELD_TYPES: [FieldType; 2] = [
         sql_type: "TEXT",
         schema_type: "Text",
         rust_type: "String",
+        component: "TextField",
         nullable: false,
     },
     FieldType {
@@ -47,6 +50,7 @@ pub const FIELD_TYPES: [FieldType; 2] = [
         sql_type: "TEXT",
         schema_type: "Text",
         rust_type: "String",
+        component: "TextAreaField",
         nullable: true,
     },
 ];
@@ -86,6 +90,16 @@ impl FieldType {
         } else {
             self.rust_type.to_owned()
         }
+    }
+
+    /// The `@jalapenolabs/anubis` field component a form renders for this type.
+    ///
+    /// The field library is one component per scaffolder field type, so the
+    /// type table is where the pairing belongs: a new type adds a row here
+    /// rather than a branch in the generator.
+    #[must_use]
+    pub fn component(self) -> &'static str {
+        self.component
     }
 
     /// Whether the column accepts `NULL`.
@@ -233,6 +247,7 @@ mod tests {
         assert_eq!(text_field.sql_type(), "TEXT");
         assert_eq!(text_field.schema_type(), "Text");
         assert_eq!(text_field.rust_type(), "String");
+        assert_eq!(text_field.component(), "TextField");
         assert!(!text_field.is_nullable());
 
         let text_area = FieldType::lookup("text_area").expect("text_area is supported");

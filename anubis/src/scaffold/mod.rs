@@ -49,6 +49,6 @@ pub use field::{FIELD_TYPES, Field, FieldType};
 #[doc(inline)]
 pub use inflect::{NameError, Names, pluralize};
 #[doc(inline)]
-pub use model::{ModelScaffold, ModelTemplate};
+pub use model::{ChildAttachment, ModelScaffold, ModelTemplate};
 #[doc(inline)]
 pub use stamp::{AnchorError, Replacements, insert_above_anchor};

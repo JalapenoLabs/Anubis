@@ -118,6 +118,21 @@ impl Names {
         self.plural_words.join("_")
     }
 
+    /// The singular `SCREAMING_SNAKE_CASE` form, e.g. `TANGIBLE_THING`.
+    ///
+    /// This is the form module-level constants take in both Rust and
+    /// TypeScript, as in `TANGIBLE_THING_MODEL`.
+    #[must_use]
+    pub fn screaming(&self) -> String {
+        self.snake().to_ascii_uppercase()
+    }
+
+    /// The plural `SCREAMING_SNAKE_CASE` form, e.g. `TANGIBLE_THINGS`.
+    #[must_use]
+    pub fn screaming_plural(&self) -> String {
+        self.snake_plural().to_ascii_uppercase()
+    }
+
     /// The singular `kebab-case` form, e.g. `tangible-thing`.
     #[must_use]
     pub fn kebab(&self) -> String {
@@ -358,6 +373,8 @@ mod tests {
         assert_eq!(names.camel_plural(), "creativeConcepts");
         assert_eq!(names.snake(), "creative_concept");
         assert_eq!(names.snake_plural(), "creative_concepts");
+        assert_eq!(names.screaming(), "CREATIVE_CONCEPT");
+        assert_eq!(names.screaming_plural(), "CREATIVE_CONCEPTS");
         assert_eq!(names.kebab(), "creative-concept");
         assert_eq!(names.kebab_plural(), "creative-concepts");
         assert_eq!(names.title(), "Creative Concept");

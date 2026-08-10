@@ -32,6 +32,7 @@ pub struct ModelTemplate {
     model: &'static str,
     parent: Option<&'static str>,
     module: &'static str,
+    frontend: &'static [&'static str],
 }
 
 /// The template for a model owned directly by a team.
@@ -39,13 +40,29 @@ const TEAM_OWNED: ModelTemplate = ModelTemplate {
     model: "CreativeConcept",
     parent: None,
     module: "absolutely_abstract",
+    frontend: &[
+        "frontend/src/api/routes/creativeConceptRoutes.ts",
+        "frontend/src/components/CreativeConceptForm.tsx",
+        "frontend/src/locales/models/creativeConcepts.en-US.json",
+        "frontend/src/pages/CreativeConceptPage.tsx",
+        "frontend/src/pages/CreativeConceptsPage.tsx",
+    ],
 };
 
 /// The template for a model owned through a team-owned parent.
+///
+/// A nested model has no pages of its own: its whole slice is the section
+/// component its parent's show page renders.
 const NESTED: ModelTemplate = ModelTemplate {
     model: "TangibleThing",
     parent: Some("CreativeConcept"),
     module: "completely_concrete",
+    frontend: &[
+        "frontend/src/api/routes/tangibleThingRoutes.ts",
+        "frontend/src/components/TangibleThingForm.tsx",
+        "frontend/src/components/TangibleThingsSection.tsx",
+        "frontend/src/locales/models/tangibleThings.en-US.json",
+    ],
 };
 
 impl ModelTemplate {
@@ -65,6 +82,15 @@ impl ModelTemplate {
     #[must_use]
     pub fn module(self) -> &'static str {
         self.module
+    }
+
+    /// The template's frontend files, relative to the application root.
+    ///
+    /// Each one transforms into the target model's file: the paths carry the
+    /// template's name too, so the destination is the transformed path.
+    #[must_use]
+    pub fn frontend_files(self) -> &'static [&'static str] {
+        self.frontend
     }
 
     /// The template model's table, e.g. `tangible_things`.
@@ -91,6 +117,9 @@ const TEMPLATE_FIELDS: [(&str, &str); 2] = [("name", "text_field"), ("descriptio
 /// `rustfmt`'s default `max_width`. Generated statements that would exceed it
 /// are emitted pre-wrapped, so `cargo fmt --check` passes on untouched output.
 const MAX_WIDTH: usize = 100;
+
+/// The `max-len` the frontend's `ESLint` configuration enforces.
+const TS_MAX_WIDTH: usize = 120;
 
 /// The indentation the `account_router` body sits at.
 const ROUTER_INDENT: usize = 4;
@@ -290,7 +319,7 @@ impl ModelScaffold {
     ///
     /// Returns `None` when every requested field comes from the template.
     #[must_use]
-    pub fn manual_fields_note(&self) -> Option<String> {
+    pub fn backend_manual_fields_note(&self) -> Option<String> {
         let extra = self.extra_fields();
         if extra.is_empty() {
             return None;
@@ -315,6 +344,193 @@ impl ModelScaffold {
              // will automate this.\n",
         ))
     }
+
+    /// The comment planted at the top of a generated form whose model carries
+    /// fields the generator could not wire all the way through.
+    ///
+    /// The backend note names the Rust structs; this one names the field
+    /// component each type wants, which is the whole of the frontend's work.
+    /// Returns `None` when every requested field comes from the template.
+    #[must_use]
+    pub fn frontend_manual_fields_note(&self) -> Option<String> {
+        let extra = self.extra_fields();
+        if extra.is_empty() {
+            return None;
+        }
+
+        let routes = format!("{}Routes.ts", self.model.camel());
+        let names = extra
+            .iter()
+            .map(|field| format!("`{}` ({})", field.name(), field.field_type().component()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (verb, pronoun) = if extra.len() == 1 {
+            ("reaches", "it")
+        } else {
+            ("reach", "them")
+        };
+        Some(format!(
+            "// TODO(anubis): {names} {verb} the database and nowhere else.\n\
+             // Add {pronoun} to the schema and the values below, to the wire type and the\n\
+             // request bodies in ../api/routes/{routes}, and render the named component\n\
+             // in this form. `anubis scaffold field` will automate this.\n",
+        ))
+    }
+}
+
+/// The frontend slice: the lines shared application files receive, and the
+/// names the generated components carry.
+impl ModelScaffold {
+    /// The `UrlTree` entries inserted into `frontend/src/urls.ts`.
+    #[must_use]
+    pub fn url_entries(&self) -> String {
+        let list = self.model.camel_plural();
+        let show = self.model.camel();
+        let path = self.model.kebab_plural();
+        format!("{list}: '/{path}',\n{show}: '/{path}/:{show}Id',")
+    }
+
+    /// The link factory inserted into `frontend/src/urls.ts`.
+    ///
+    /// Emitted pre-wrapped when a long model name would push the signature or
+    /// the body past the frontend's `max-len`, the way [`route_mount`] handles
+    /// `rustfmt`'s width, so the output lints clean untouched.
+    ///
+    /// [`route_mount`]: ModelScaffold::route_mount
+    #[must_use]
+    pub fn url_factory(&self) -> String {
+        let show = self.model.camel();
+        let parameter = format!("{show}Id");
+        let function = format!("get{}Url", self.model.pascal());
+
+        let signature = format!("export function {function}({parameter}: string): string {{");
+        let signature = if signature.len() <= TS_MAX_WIDTH {
+            signature
+        } else {
+            format!("export function {function}(\n  {parameter}: string,\n): string {{")
+        };
+
+        let body = format!("  return UrlTree.{show}.replace(':{parameter}', {parameter})");
+        let body = if body.len() <= TS_MAX_WIDTH {
+            body
+        } else {
+            format!("  return UrlTree.{show}\n    .replace(':{parameter}', {parameter})")
+        };
+
+        format!("{signature}\n{body}\n}}\n\n")
+    }
+
+    /// The page imports inserted into `frontend/src/App.tsx`.
+    #[must_use]
+    pub fn page_imports(&self) -> String {
+        let show = self.show_page();
+        let list = self.list_page();
+        format!(
+            "import {{ {show} }} from './pages/{show}'\n\
+             import {{ {list} }} from './pages/{list}'",
+        )
+    }
+
+    /// The `<Route>` elements inserted into `frontend/src/App.tsx`.
+    #[must_use]
+    pub fn route_elements(&self) -> String {
+        format!(
+            "{}\n{}",
+            route_element(&self.model.camel_plural(), &self.list_page()),
+            route_element(&self.model.camel(), &self.show_page()),
+        )
+    }
+
+    /// The navigation entry inserted into `AppShell.tsx`.
+    #[must_use]
+    pub fn nav_item(&self) -> String {
+        let list = self.model.camel_plural();
+        format!(
+            "<NavbarItem>
+  <Link to={{UrlTree.{list}}} className='opacity-80 hover:opacity-100'>{{
+      t('{list}.navLink')
+    }}</Link>
+</NavbarItem>",
+        )
+    }
+
+    /// The locale import inserted into `frontend/src/i18n.ts`.
+    #[must_use]
+    pub fn locale_import(&self) -> String {
+        let models = self.model.camel_plural();
+        format!("import {models}EnUS from './locales/models/{models}.en-US.json'")
+    }
+
+    /// The locale spread inserted into `frontend/src/i18n.ts`.
+    #[must_use]
+    pub fn locale_spread(&self) -> String {
+        format!("...{}EnUS,", self.model.camel_plural())
+    }
+
+    /// How a nested model attaches to the page its parent's scaffold wrote.
+    ///
+    /// `None` for a team-owned model, which owns its own pages instead of
+    /// attaching to someone else's.
+    #[must_use]
+    pub fn child_attachment(&self) -> Option<ChildAttachment> {
+        let parent = self.parent.as_ref()?;
+        let section = format!("{}Section", self.model.pascal_plural());
+        let parent_id = format!("{}Id", parent.camel());
+        Some(ChildAttachment {
+            page: format!("frontend/src/pages/{}Page.tsx", parent.pascal()),
+            import: format!("import {{ {section} }} from '../components/{section}'"),
+            // The parent page reads its own id out of the route, under the
+            // name the parent's own scaffold gave it.
+            element: format!("<{section} {parent_id}={{{parent_id}}} />"),
+        })
+    }
+
+    /// The generated form component, relative to the application root.
+    ///
+    /// This is where the fields the generator could not wire are reported, so
+    /// the CLI needs to recognize it among the stamped frontend files.
+    #[must_use]
+    pub fn frontend_form_file(&self) -> String {
+        format!("frontend/src/components/{}Form.tsx", self.model.pascal())
+    }
+
+    /// The list page component, e.g. `ProjectsPage`.
+    fn list_page(&self) -> String {
+        format!("{}Page", self.model.pascal_plural())
+    }
+
+    /// The show page component, e.g. `ProjectPage`.
+    fn show_page(&self) -> String {
+        format!("{}Page", self.model.pascal())
+    }
+}
+
+/// The page a nested model attaches to, and the two lines it inserts there.
+///
+/// Both anchors live in every show page a scaffold writes, so a child can
+/// attach to a parent generated long before it.
+#[derive(Debug, Clone)]
+pub struct ChildAttachment {
+    /// The parent's show page, relative to the application root.
+    pub page: String,
+    /// The import inserted above `🐺 anubis:child-imports`.
+    pub import: String,
+    /// The section element inserted above `🐺 anubis:children`.
+    pub element: String,
+}
+
+/// One `<Route>` element, wrapped in the workspace gate like every app page.
+fn route_element(path: &str, page: &str) -> String {
+    format!(
+        "<Route
+  path={{UrlTree.{path}}}
+  element={{
+    <Workspace>
+      <{page} />
+    </Workspace>
+  }}
+/>",
+    )
 }
 
 /// Parses the ownership chain, returning the parent of a nested model.
@@ -437,7 +653,7 @@ mod tests {
             scaffold.migration_directory("2026-08-15-101112"),
             "2026-08-15-101112_create_projects"
         );
-        assert!(scaffold.manual_fields_note().is_none());
+        assert!(scaffold.backend_manual_fields_note().is_none());
     }
 
     #[test]
@@ -498,7 +714,22 @@ mod tests {
             ["summary -> Nullable<Text>,"]
         );
 
-        let note = scaffold.manual_fields_note().expect("a note is planted");
+        let frontend = scaffold
+            .frontend_manual_fields_note()
+            .expect("the form is told too");
+        assert!(frontend.contains("`summary` (TextAreaField)"), "{frontend}");
+        assert!(
+            frontend.contains("../api/routes/projectRoutes.ts"),
+            "{frontend}"
+        );
+        assert!(
+            frontend.lines().all(|line| line.starts_with("// ")),
+            "the note must be a comment block: {frontend}",
+        );
+
+        let note = scaffold
+            .backend_manual_fields_note()
+            .expect("a note is planted");
         assert!(note.contains("`summary`"));
         assert!(note.contains("a nullable column"), "note: {note}");
         assert!(note.contains("NewProject"));
@@ -519,6 +750,90 @@ mod tests {
         assert!(
             mount.lines().all(|line| line.len() + 4 <= 100),
             "wrapped mount must fit rustfmt's width: {mount}",
+        );
+    }
+
+    #[test]
+    fn a_team_owned_model_wires_its_pages_into_the_shared_frontend_files() {
+        let scaffold = ModelScaffold::parse("Project", "Team", &[]).unwrap();
+
+        assert_eq!(
+            scaffold.url_entries(),
+            "projects: '/projects',\nproject: '/projects/:projectId',",
+        );
+        assert_eq!(
+            scaffold.url_factory(),
+            "export function getProjectUrl(projectId: string): string {\n  \
+             return UrlTree.project.replace(':projectId', projectId)\n}\n\n",
+        );
+        assert_eq!(
+            scaffold.page_imports(),
+            "import { ProjectPage } from './pages/ProjectPage'\n\
+             import { ProjectsPage } from './pages/ProjectsPage'",
+        );
+        assert!(
+            scaffold
+                .route_elements()
+                .contains("path={UrlTree.projects}")
+        );
+        assert!(scaffold.route_elements().contains("<ProjectPage />"));
+        assert!(scaffold.nav_item().contains("t('projects.navLink')"));
+        assert_eq!(
+            scaffold.locale_import(),
+            "import projectsEnUS from './locales/models/projects.en-US.json'",
+        );
+        assert_eq!(scaffold.locale_spread(), "...projectsEnUS,");
+        assert_eq!(
+            scaffold.frontend_form_file(),
+            "frontend/src/components/ProjectForm.tsx",
+        );
+        assert!(scaffold.child_attachment().is_none());
+        assert!(
+            scaffold
+                .template()
+                .frontend_files()
+                .contains(&"frontend/src/pages/CreativeConceptsPage.tsx"),
+        );
+    }
+
+    #[test]
+    fn a_nested_model_attaches_to_its_parents_page() {
+        let scaffold = ModelScaffold::parse("Goal", "Project,Team", &[]).unwrap();
+
+        let attachment = scaffold
+            .child_attachment()
+            .expect("a nested model attaches to its parent");
+        assert_eq!(attachment.page, "frontend/src/pages/ProjectPage.tsx");
+        assert_eq!(
+            attachment.import,
+            "import { GoalsSection } from '../components/GoalsSection'",
+        );
+        assert_eq!(attachment.element, "<GoalsSection projectId={projectId} />");
+
+        let replacements = scaffold.replacements();
+        assert_eq!(
+            replacements.apply("frontend/src/components/TangibleThingsSection.tsx"),
+            "frontend/src/components/GoalsSection.tsx",
+        );
+        assert_eq!(
+            replacements.apply("frontend/src/locales/models/tangibleThings.en-US.json"),
+            "frontend/src/locales/models/goals.en-US.json",
+        );
+    }
+
+    #[test]
+    fn a_long_model_name_wraps_the_link_factory_the_way_eslint_wants() {
+        let scaffold =
+            ModelScaffold::parse("InternationalDistributionAgreementAmendment", "Team", &[])
+                .unwrap();
+        let factory = scaffold.url_factory();
+        assert!(
+            factory
+                .contains("export function getInternationalDistributionAgreementAmendmentUrl(\n")
+        );
+        assert!(
+            factory.lines().all(|line| line.len() <= 120),
+            "the wrapped factory must fit the lint width: {factory}",
         );
     }
 

@@ -68,6 +68,8 @@ impl Replacements {
             (template.camel_plural(), target.camel_plural()),
             (template.snake(), target.snake()),
             (template.snake_plural(), target.snake_plural()),
+            (template.screaming(), target.screaming()),
+            (template.screaming_plural(), target.screaming_plural()),
             (template.kebab(), target.kebab()),
             (template.kebab_plural(), target.kebab_plural()),
             (template.title(), target.title()),
@@ -229,11 +231,13 @@ mod tests {
         let source = "\
 struct TangibleThing; // Tangible Thing
 let tangibleThings = list_tangible_things();
+const TANGIBLE_THING_MODEL = 'TangibleThing';
 GET /tangible-things
 A Tangible thing.";
         let expected = "\
 struct PurchaseOrder; // Purchase Order
 let purchaseOrders = list_purchase_orders();
+const PURCHASE_ORDER_MODEL = 'PurchaseOrder';
 GET /purchase-orders
 A Purchase order.";
         assert_eq!(replacements.apply(source), expected);

@@ -31,3 +31,37 @@ pub const ROLES_DEFAULT: &str = "🐺 anubis:models:default";
 
 /// `config/roles.yml`: the `editor` role's model grants.
 pub const ROLES_EDITOR: &str = "🐺 anubis:models:editor";
+
+/// `frontend/src/urls.ts`: `UrlTree` entries.
+pub const URLS: &str = "🐺 anubis:urls";
+
+/// `frontend/src/urls.ts`: link factory functions.
+pub const URL_FACTORIES: &str = "🐺 anubis:url-factories";
+
+/// `frontend/src/App.tsx`: page imports.
+///
+/// The `<Route>` elements themselves go above [`ROUTES`], which `App.tsx`
+/// spells as a JSX comment and `lib.rs` as a Rust one.
+pub const PAGE_IMPORTS: &str = "🐺 anubis:page-imports";
+
+/// `frontend/src/components/AppShell.tsx`: navigation entries.
+pub const NAV: &str = "🐺 anubis:nav";
+
+/// `frontend/src/i18n.ts`: per-model locale imports.
+pub const LOCALE_IMPORTS: &str = "🐺 anubis:locale-imports";
+
+/// `frontend/src/i18n.ts`: per-model locale spreads.
+pub const LOCALES: &str = "🐺 anubis:locales";
+
+/// A show page: imports of the section components its children render through.
+pub const CHILD_IMPORTS: &str = "🐺 anubis:child-imports";
+
+/// A show page: the section elements of the models it owns.
+pub const CHILDREN: &str = "🐺 anubis:children";
+
+/// Marks a line that belongs to the living template alone.
+///
+/// The template's parent page renders the template's own child, which no other
+/// model owns, so those lines are dropped when the page is stamped. It is a
+/// marker rather than an insertion point: nothing is ever written above it.
+pub const TEMPLATE_ONLY: &str = "🐺 anubis:template-only";

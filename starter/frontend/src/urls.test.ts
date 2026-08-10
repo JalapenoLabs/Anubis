@@ -4,7 +4,12 @@
 import { describe, expect, it } from 'vitest'
 
 // Misc
-import { UrlTree, getUrlWithDestination, sanitizeDestination } from './urls'
+import {
+  UrlTree,
+  getCreativeConceptUrl,
+  getUrlWithDestination,
+  sanitizeDestination,
+} from './urls'
 
 describe('sanitizeDestination', () => {
   it('should keep a root-relative path', () => {
@@ -55,5 +60,17 @@ describe('getUrlWithDestination', () => {
 
   it('should drop a destination that leaves the app', () => {
     expect(getUrlWithDestination(UrlTree.signIn, 'https://evil.example')).toBe('/sign-in')
+  })
+})
+
+// The link factory a model scaffold writes above the `url-factories` anchor.
+// Every generated page navigates through one, so the shape is worth pinning.
+describe('getCreativeConceptUrl', () => {
+  it('should fill the record id into the show route', () => {
+    expect(getCreativeConceptUrl('9f8b7c6d')).toBe('/creative-concepts/9f8b7c6d')
+  })
+
+  it('should leave the rest of the url tree alone', () => {
+    expect(UrlTree.creativeConcept).toBe('/creative-concepts/:creativeConceptId')
   })
 })

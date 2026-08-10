@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { TangibleThing } from '../api/routes/tangibleThingRoutes'
+import type { CreativeConcept } from '../api/routes/creativeConceptRoutes'
 
 // Core
 import { useEffect } from 'react'
@@ -18,31 +18,31 @@ import { z } from 'zod'
 
 // Misc
 import {
-  createTangibleThing,
-  updateTangibleThing,
-} from '../api/routes/tangibleThingRoutes'
+  createCreativeConcept,
+  updateCreativeConcept,
+} from '../api/routes/creativeConceptRoutes'
 
-const tangibleThingSchema = z.object({
+const creativeConceptSchema = z.object({
   name: z.string().trim().min(1),
   description: z.string(),
 })
 
-type TangibleThingFormValues = z.infer<typeof tangibleThingSchema>
-const resolver = zodResolver(tangibleThingSchema)
+type CreativeConceptFormValues = z.infer<typeof creativeConceptSchema>
+const resolver = zodResolver(creativeConceptSchema)
 
 type Props = {
-  creativeConceptId: string
-  /** The tangible thing being edited, or null to create a new one. */
-  editing: TangibleThing | null
+  teamId: string
+  /** The creative concept being edited, or null to create a new one. */
+  editing: CreativeConcept | null
   /** Called after a successful write, and when an edit is abandoned. */
   onDone: () => void
 }
 
-/** Creates a tangible thing, or edits the one passed in `editing`. */
-export function TangibleThingForm(props: Props) {
+/** Creates a creative concept, or edits the one passed in `editing`. */
+export function CreativeConceptForm(props: Props) {
   const { t } = useTranslation()
 
-  const form = useForm<TangibleThingFormValues>({
+  const form = useForm<CreativeConceptFormValues>({
     resolver,
     mode: 'onChange',
     defaultValues: {
@@ -64,13 +64,13 @@ export function TangibleThingForm(props: Props) {
     form.clearErrors('root')
     try {
       if (editing) {
-        await updateTangibleThing(editing.id, {
+        await updateCreativeConcept(editing.id, {
           name: data.name.trim(),
           description: data.description.trim(),
         })
       }
       else {
-        await createTangibleThing(props.creativeConceptId, {
+        await createCreativeConcept(props.teamId, {
           name: data.name.trim(),
           description: data.description.trim(),
         })
@@ -90,21 +90,21 @@ export function TangibleThingForm(props: Props) {
   return <form onSubmit={onSubmit}>
     <h3 className='compact text-xl font-semibold'>{
         editing
-          ? t('tangibleThings.editTitle', { name: editing.name })
-          : t('tangibleThings.createTitle')
+          ? t('creativeConcepts.editTitle', { name: editing.name })
+          : t('creativeConcepts.createTitle')
       }</h3>
     <TextField
       control={form.control}
       name='name'
-      label={t('tangibleThings.name')}
-      help={t('tangibleThings.nameHelp')}
+      label={t('creativeConcepts.name')}
+      help={t('creativeConcepts.nameHelp')}
       isRequired
     />
     <TextAreaField
       control={form.control}
       name='description'
-      label={t('tangibleThings.description')}
-      help={t('tangibleThings.descriptionHelp')}
+      label={t('creativeConcepts.description')}
+      help={t('creativeConcepts.descriptionHelp')}
       minRows={2}
     />
     { form.formState.errors.root
@@ -134,7 +134,7 @@ export function TangibleThingForm(props: Props) {
         <span>{
             editing
               ? t('common.save')
-              : t('tangibleThings.createAction')
+              : t('creativeConcepts.createAction')
           }</span>
       </Button>
     </div>
