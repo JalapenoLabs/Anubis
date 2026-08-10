@@ -24,7 +24,7 @@ clap = { version = "4.5", features = ["derive"] }
 data-encoding = "2"
 # The libpq-linked "postgres" feature stays off; connections go through
 # diesel-async's pure-Rust tokio-postgres backend so builds need no native libs.
-diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid"] }
+diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid", "serde_json"] }
 diesel-async = { version = "0.9", features = ["postgres", "deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2.3"
 getrandom = "0.4"
@@ -44,9 +44,18 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Pinned exactly: the 0.6 prerelease is the pure-Rust-crypto line (0.5 links
+# native OpenSSL, which the build policy forbids). State serialisation is
+# safe here because ceremony states live server-side behind hashed tokens.
+webauthn-rs = { version = "=0.6.1-dev", features = [
+  "danger-allow-state-serialisation",
+  # Username-less (discoverable) login, the password-manager passkey flow.
+  "conditional-ui",
+] }
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

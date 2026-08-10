@@ -70,6 +70,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .merge(crate::auth::account::router())
         .merge(crate::auth::email_code::router())
         .merge(crate::auth::mfa::router())
+        .merge(crate::auth::passkey::router())
         .with_state(state)
         // CurrentUser resolves its pool from request extensions.
         .layer(Extension(pool))

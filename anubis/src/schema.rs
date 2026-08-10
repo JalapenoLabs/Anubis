@@ -167,10 +167,36 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Registered passkeys (WebAuthn credentials), any number per user.
+    user_passkeys (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        name -> Text,
+        credential -> Jsonb,
+        created_at -> Timestamptz,
+        last_used_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// In-flight WebAuthn ceremonies. Rows hold a hash of the state token.
+    webauthn_states (id) {
+        id -> Uuid,
+        purpose -> Text,
+        user_id -> Nullable<Uuid>,
+        token_hash -> Text,
+        state -> Jsonb,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
 diesel::joinable!(user_recovery_codes -> users (user_id));
+diesel::joinable!(user_passkeys -> users (user_id));
 diesel::joinable!(platform_applications -> teams (team_id));
 diesel::joinable!(platform_tokens -> platform_applications (platform_application_id));
 diesel::joinable!(invitations -> organizations (organization_id));

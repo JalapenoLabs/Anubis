@@ -16,6 +16,7 @@ mod email_code;
 mod extract;
 mod mfa;
 mod model;
+mod passkey;
 mod routes;
 mod session;
 pub(crate) mod token;
