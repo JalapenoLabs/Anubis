@@ -17,6 +17,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
 | Background jobs | Postgres-backed queue | Job enqueue commits in the same transaction as the domain write that caused it |
 | Passwords | argon2id | |
+| Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
 | OAuth / SSO | OpenID Connect (`openidconnect` crate) | Providers added via `anubis scaffold oauth <provider>` |
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
@@ -35,6 +36,8 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | i18n | i18next, per-model locale files emitted by the scaffolder |
 | Unit tests | Vitest |
 | E2E tests | Playwright |
+
+Route guards preserve where the user was headed. When the auth guard turns a signed-out visitor away, it sends them to `/sign-in?next=<path>`, and the guest guard returns them to that path the moment a session exists. The destination rides in the query string because the flow that needs it most, an invitation link opened from an email, is a cold page load that router state would not survive. Every destination passes through `sanitizeDestination` in the app's `urls.ts`, which accepts root-relative paths only, so the parameter cannot become an open redirect.
 
 ## Packaging
 

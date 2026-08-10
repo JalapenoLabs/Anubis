@@ -25,6 +25,20 @@
   gap: 1rem;
 }
 
+.level-left {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 1rem;
+}
+
+.level-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
 .level-right {
   display: flex;
   align-items: center;

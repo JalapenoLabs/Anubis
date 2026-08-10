@@ -8,7 +8,9 @@
 //!
 //! Call [`init`] once, first thing in `main`. A second call returns an
 //! [`Error`], since the global subscriber can only be installed once per
-//! process.
+//! process. Because it is the first thing with both a live subscriber and the
+//! configuration in hand, [`init`] also announces insecure development
+//! defaults, such as the built-in `ANUBIS_SECRET_KEY` fallback.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -18,6 +20,8 @@ use tracing_subscriber::EnvFilter;
 use crate::config::AppConfig;
 
 /// Installs the global tracing subscriber for the application.
+///
+/// Also warns about insecure development defaults that are in effect.
 ///
 /// # Errors
 /// Returns an [`Error`] when a global subscriber is already installed.
@@ -34,7 +38,22 @@ pub fn init(config: &AppConfig) -> Result<(), Error> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .try_init()
-        .map_err(Error::from_source)
+        .map_err(Error::from_source)?;
+
+    warn_about_development_defaults(config);
+    Ok(())
+}
+
+/// Announces defaults that are fine locally and dangerous anywhere else.
+fn warn_about_development_defaults(config: &AppConfig) {
+    if config.secret_key.is_development() {
+        tracing::warn!(
+            app.environment = %config.environment,
+            "ANUBIS_SECRET_KEY is unset: secrets at rest are encrypted with the built-in \
+             development key, which is public. Set ANUBIS_SECRET_KEY before storing anything \
+             real. (environment: {{app.environment}})",
+        );
+    }
 }
 
 /// The global tracing subscriber could not be installed.

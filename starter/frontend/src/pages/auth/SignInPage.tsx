@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
 
 // UI
@@ -16,7 +16,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
 // Misc
-import { UrlTree } from '../../urls'
+import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
 
 const signInSchema = z.object({
   email: z.email(),
@@ -30,7 +30,12 @@ export function SignInPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const { refresh } = useCurrentUser()
+  const [ searchParams ] = useSearchParams()
   const [ formError, setFormError ] = useState<string | null>(null)
+
+  // The page the guard sent the user away from, kept on the links out of here
+  // so a detour through sign-up or a password reset does not lose it.
+  const destination = searchParams.get(DESTINATION_PARAM)
 
   const emailRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
@@ -50,7 +55,8 @@ export function SignInPage() {
     setFormError(null)
     try {
       await api.login(data)
-      // RequireGuest redirects to the dashboard once the user refreshes in.
+      // RequireGuest redirects to the preserved destination, or to the
+      // dashboard, once the user refreshes in.
       await refresh()
     }
     catch (error) {
@@ -124,7 +130,10 @@ export function SignInPage() {
       </Tooltip>
     </form>
     <div className='level mt-4 text-sm'>
-      <Link to={UrlTree.forgotPassword} className='opacity-70 hover:opacity-100'>{
+      <Link
+        to={getUrlWithDestination(UrlTree.forgotPassword, destination)}
+        className='opacity-70 hover:opacity-100'
+      >{
           t('auth.signIn.forgotPassword')
         }</Link>
       <span>
@@ -132,7 +141,7 @@ export function SignInPage() {
             t('auth.signIn.noAccount')
           }</span>
         {' '}
-        <Link to={UrlTree.signUp} className='text-primary'>{
+        <Link to={getUrlWithDestination(UrlTree.signUp, destination)} className='text-primary'>{
             t('auth.signIn.goToSignUp')
           }</Link>
       </span>

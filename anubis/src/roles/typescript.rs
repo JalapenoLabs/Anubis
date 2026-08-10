@@ -46,7 +46,8 @@ pub(crate) fn render(resolved: &BTreeMap<String, ModelGrants>) -> String {
                 .map(|action| format!("'{}'", action.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(out, "    {}: [{rendered_actions}],", key(model));
+            // House style pads array literals: `[ 'read' ]`, not `['read']`.
+            let _ = writeln!(out, "    {}: [ {rendered_actions} ],", key(model));
         }
         out.push_str("  },\n");
     }
@@ -122,7 +123,7 @@ roles:
         assert!(rendered.contains("| 'admin'"), "got:\n{rendered}");
         assert!(rendered.contains("| 'billing'"), "got:\n{rendered}");
         assert!(
-            rendered.contains("Project: ['read', 'create', 'update', 'destroy'],"),
+            rendered.contains("Project: [ 'read', 'create', 'update', 'destroy' ],"),
             "got:\n{rendered}"
         );
         assert!(rendered.contains("billing: {},"), "got:\n{rendered}");

@@ -14,6 +14,9 @@ authors = ["Jalapeno Labs"]
 repository = "https://github.com/JalapenoLabs/Anubis"
 
 [workspace.dependencies]
+# Pure-Rust AES-256-GCM for secrets that must be read back, such as TOTP seeds.
+# Default features add a second RNG stack; nonces come from `getrandom` instead.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 anubis = { path = "anubis", version = "0.1.0" }
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"

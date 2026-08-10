@@ -20,6 +20,7 @@ name = "anubis"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }

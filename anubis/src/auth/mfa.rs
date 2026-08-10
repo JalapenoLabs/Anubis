@@ -11,6 +11,13 @@
 //! exchanges the challenge plus a TOTP or recovery code for the session.
 //! Challenges allow a few wrong codes before dying, so a typo never forces a
 //! fresh password login.
+//!
+//! A TOTP seed has to be read back to compute the expected code, so it cannot
+//! be hashed like a recovery code. It is sealed instead with
+//! [`crate::auth::secret_box`] under the application's `ANUBIS_SECRET_KEY`, and
+//! only ever decrypted to verify a code or render a provisioning QR. A stored
+//! seed that no longer opens is unusable, so the enrollment is discarded and
+//! the user enrolls again; see [`open_or_discard`].
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -27,6 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::model::UserResponse;
 use crate::auth::routes::AuthState;
+use crate::auth::secret_box::{self, SecretKey};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{CurrentUser, password, token, totp, user_token};
 use crate::http::ApiError;
@@ -55,7 +63,7 @@ async fn status(
     CurrentUser(user): CurrentUser,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let enabled = confirmed_secret(&mut connection, user.id)
+    let enabled = confirmed_secret(&mut connection, &state.secret_key, user.id)
         .await
         .map_err(log_internal)?
         .is_some();
@@ -79,7 +87,7 @@ async fn setup(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    if confirmed_secret(&mut connection, user.id)
+    if confirmed_secret(&mut connection, &state.secret_key, user.id)
         .await
         .map_err(log_internal)?
         .is_some()
@@ -90,15 +98,16 @@ async fn setup(
     }
 
     let secret = totp::generate_secret();
+    let sealed = secret_box::encrypt(&state.secret_key, &secret);
     diesel::insert_into(user_mfa::table)
         .values((
             user_mfa::user_id.eq(user.id),
-            user_mfa::totp_secret.eq(&secret),
+            user_mfa::totp_secret.eq(&sealed),
         ))
         .on_conflict(user_mfa::user_id)
         .do_update()
         .set((
-            user_mfa::totp_secret.eq(&secret),
+            user_mfa::totp_secret.eq(&sealed),
             user_mfa::confirmed_at.eq(None::<chrono::DateTime<Utc>>),
         ))
         .execute(&mut connection)
@@ -117,15 +126,10 @@ async fn qr_svg(
 ) -> Result<Response, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let pending: Option<String> = user_mfa::table
-        .filter(user_mfa::user_id.eq(user.id))
-        .filter(user_mfa::confirmed_at.is_null())
-        .select(user_mfa::totp_secret)
-        .first(&mut connection)
+    let Some(secret) = pending_secret(&mut connection, &state.secret_key, user.id)
         .await
-        .optional()
-        .map_err(log_internal)?;
-    let Some(secret) = pending else {
+        .map_err(log_internal)?
+    else {
         return Err(ApiError::not_found());
     };
 
@@ -157,15 +161,10 @@ async fn confirm(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let pending: Option<String> = user_mfa::table
-        .filter(user_mfa::user_id.eq(user.id))
-        .filter(user_mfa::confirmed_at.is_null())
-        .select(user_mfa::totp_secret)
-        .first(&mut connection)
+    let Some(secret) = pending_secret(&mut connection, &state.secret_key, user.id)
         .await
-        .optional()
-        .map_err(log_internal)?;
-    let Some(secret) = pending else {
+        .map_err(log_internal)?
+    else {
         return Err(ApiError::validation(
             "Start enrollment first, then confirm with a code from your app.",
         ));
@@ -210,12 +209,7 @@ async fn disable(
     }
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    diesel::delete(user_mfa::table.find(user.id))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
-    diesel::delete(user_recovery_codes::table.filter(user_recovery_codes::user_id.eq(user.id)))
-        .execute(&mut connection)
+    discard_enrollment(&mut connection, user.id)
         .await
         .map_err(log_internal)?;
 
@@ -247,9 +241,14 @@ async fn verify_challenge(
             ApiError::unauthorized("That sign-in attempt has expired. Sign in again.")
         })?;
 
-    let accepted = code_matches(&mut connection, peeked.user_id, &body.code)
-        .await
-        .map_err(log_internal)?;
+    let accepted = code_matches(
+        &mut connection,
+        &state.secret_key,
+        peeked.user_id,
+        &body.code,
+    )
+    .await
+    .map_err(log_internal)?;
     if !accepted {
         user_token::record_failure(&mut connection, peeked.id)
             .await
@@ -280,10 +279,11 @@ async fn verify_challenge(
 /// True when the code is a valid TOTP or an unused recovery code.
 async fn code_matches(
     connection: &mut AsyncPgConnection,
+    key: &SecretKey,
     user_id: Uuid,
     submitted: &str,
 ) -> Result<bool, diesel::result::Error> {
-    if let Some(secret) = confirmed_secret(connection, user_id).await?
+    if let Some(secret) = confirmed_secret(connection, key, user_id).await?
         && totp::verify(&secret, submitted, unix_now())
     {
         return Ok(true);
@@ -316,15 +316,84 @@ async fn code_matches(
 /// The user's confirmed TOTP secret, if two-factor auth is active.
 pub(crate) async fn confirmed_secret(
     connection: &mut AsyncPgConnection,
+    key: &SecretKey,
     user_id: Uuid,
 ) -> Result<Option<String>, diesel::result::Error> {
-    user_mfa::table
+    let sealed = user_mfa::table
         .filter(user_mfa::user_id.eq(user_id))
         .filter(user_mfa::confirmed_at.is_not_null())
         .select(user_mfa::totp_secret)
         .first(connection)
         .await
-        .optional()
+        .optional()?;
+
+    open_or_discard(connection, key, user_id, sealed).await
+}
+
+/// The user's unconfirmed TOTP secret, if an enrollment is underway.
+async fn pending_secret(
+    connection: &mut AsyncPgConnection,
+    key: &SecretKey,
+    user_id: Uuid,
+) -> Result<Option<String>, diesel::result::Error> {
+    let sealed = user_mfa::table
+        .filter(user_mfa::user_id.eq(user_id))
+        .filter(user_mfa::confirmed_at.is_null())
+        .select(user_mfa::totp_secret)
+        .first(connection)
+        .await
+        .optional()?;
+
+    open_or_discard(connection, key, user_id, sealed).await
+}
+
+/// Opens a stored seed, discarding an enrollment that can no longer be read.
+///
+/// A seed fails to open when it was written under a different
+/// `ANUBIS_SECRET_KEY`, or when it predates encryption entirely (only possible
+/// in a pre-alpha development database). Neither is recoverable, and refusing
+/// to sign the user in would lock them out of an account whose password still
+/// works. Deleting the enrollment instead drops the account back to
+/// single-factor login and lets the user enroll again from the UI, which is
+/// why no data migration is needed.
+async fn open_or_discard(
+    connection: &mut AsyncPgConnection,
+    key: &SecretKey,
+    user_id: Uuid,
+    sealed: Option<String>,
+) -> Result<Option<String>, diesel::result::Error> {
+    let Some(sealed) = sealed else {
+        return Ok(None);
+    };
+
+    match secret_box::decrypt(key, &sealed) {
+        Ok(secret) => Ok(Some(secret)),
+        Err(error) => {
+            tracing::warn!(
+                error.message = %error,
+                user.id = %user_id,
+                "discarding an unreadable two-factor enrollment for user {{user.id}}; \
+                 the user must set it up again: {{error.message}}",
+            );
+            discard_enrollment(connection, user_id).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Removes a user's TOTP enrollment and every recovery code with it.
+async fn discard_enrollment(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(user_mfa::table.find(user_id))
+        .execute(connection)
+        .await?;
+    diesel::delete(user_recovery_codes::table.filter(user_recovery_codes::user_id.eq(user_id)))
+        .execute(connection)
+        .await?;
+
+    Ok(())
 }
 
 /// Replaces the user's recovery codes, returning the new plaintext set.

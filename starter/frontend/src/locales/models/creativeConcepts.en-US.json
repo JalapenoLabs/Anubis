@@ -1,0 +1,19 @@
+{
+  "creativeConcepts": {
+    "navLink": "Concepts",
+    "title": "Creative concepts",
+    "subtitle": "The parent template: every concept belongs to your team.",
+    "name": "Name",
+    "created": "Created",
+    "empty": "No creative concepts yet. Add the first one below.",
+    "open": "Open",
+    "searchLabel": "Search names",
+    "createTitle": "Add a creative concept",
+    "createAction": "Create concept",
+    "createdMessage": "Created {{name}}.",
+    "deleteAction": "Delete concept",
+    "backToList": "All creative concepts",
+    "notFound": "That creative concept is not available.",
+    "noTeamSelected": "Select a team to see its creative concepts."
+  }
+}

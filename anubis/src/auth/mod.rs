@@ -8,6 +8,7 @@
 //! in the repository's `docs/api.md`.
 
 pub mod password;
+pub mod secret_box;
 pub mod totp;
 
 mod account;

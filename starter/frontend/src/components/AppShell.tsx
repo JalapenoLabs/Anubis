@@ -93,6 +93,12 @@ export function AppShell(props: Props) {
       </NavbarBrand>
       <NavbarContent justify='end'>
         <NavbarItem>
+          <Link to={UrlTree.creativeConcepts} className='opacity-80 hover:opacity-100'>{
+              t('creativeConcepts.navLink')
+            }</Link>
+        </NavbarItem>
+        {/* 🐺 anubis:nav */}
+        <NavbarItem>
           <Link to={UrlTree.members} className='opacity-80 hover:opacity-100'>{
               t('team.members.navLink')
             }</Link>

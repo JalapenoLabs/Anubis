@@ -8,7 +8,13 @@
     "somethingWentWrong": "Something went wrong. Try again.",
     "email": "Email",
     "password": "Password",
-    "signOut": "Sign out"
+    "signOut": "Sign out",
+    "save": "Save",
+    "cancel": "Cancel",
+    "edit": "Edit",
+    "delete": "Delete",
+    "actions": "Actions",
+    "pageOf": "Page {{page}} of {{totalPages}}"
   },
   "auth": {
     "signIn": {

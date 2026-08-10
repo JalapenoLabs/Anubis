@@ -1,21 +1,20 @@
 //! The Anubis starter application server.
 //!
-//! Serves the application's API and, in production, the built SPA assets. Today it
-//! exposes a health endpoint; auth, tenancy, and the API layer arrive with milestones
-//! M1 through M3.
+//! The composition root: it reads configuration, migrates the database, and
+//! mounts the framework's routers alongside the application's own
+//! [`account_router`]. The application itself lives in the library beside this
+//! file, which is what lets the integration tests drive the real routers.
 
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::{db, telemetry};
+use anubis_starter::{APP_MIGRATIONS, ROLES_YML, account_router};
 use axum::Router;
 use axum::routing::get;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
-/// The application's role definitions, embedded at compile time.
-const ROLES_YML: &str = include_str!("../../config/roles.yml");
 
 #[tokio::main]
 async fn main() {
@@ -34,9 +33,13 @@ async fn main() {
         .as_ref()
         .expect("DATABASE_URL is required (e.g. postgres://user:pass@localhost/app_development)");
 
+    // Framework tables first: the application's reference them.
     db::run_pending_migrations(database.url())
         .await
-        .expect("failed to run database migrations");
+        .expect("failed to run framework migrations");
+    db::run_app_migrations(database.url(), APP_MIGRATIONS)
+        .await
+        .expect("failed to run application migrations");
     let pool = db::connect(database.url())
         .await
         .expect("failed to connect to the database");
@@ -62,6 +65,7 @@ async fn main() {
             anubis::api::management::router(pool.clone(), roles.clone()),
         )
         .nest("/api/v1", anubis::api::v1::router(pool.clone()))
+        .nest("/account", account_router(&pool, &roles))
         // Application routes guard with TeamMember / OrganizationMember /
         // CurrentUser through these extensions.
         .layer(anubis::guard::layer(pool, roles));
@@ -85,19 +89,4 @@ async fn main() {
 
 async fn healthz() -> &'static str {
     "ok"
-}
-
-#[cfg(test)]
-mod tests {
-    use anubis::roles::RoleSet;
-
-    use super::ROLES_YML;
-
-    #[test]
-    fn the_embedded_roles_file_is_valid() {
-        let set = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml must be valid");
-        for role in ["default", "editor", "billing", "admin"] {
-            assert!(set.is_defined(role), "baseline role {role:?} must exist");
-        }
-    }
 }

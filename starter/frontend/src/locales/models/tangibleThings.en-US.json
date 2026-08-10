@@ -1,0 +1,14 @@
+{
+  "tangibleThings": {
+    "title": "Tangible things",
+    "subtitle": "The child template: every thing belongs to this concept.",
+    "name": "Name",
+    "description": "Description",
+    "noDescription": "No description",
+    "empty": "No tangible things yet. Add the first one below.",
+    "createTitle": "Add a tangible thing",
+    "createAction": "Add thing",
+    "editTitle": "Edit {{name}}",
+    "descriptionHelp": "Leave it blank to clear the description."
+  }
+}

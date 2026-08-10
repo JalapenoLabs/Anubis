@@ -135,6 +135,9 @@ fn replacements_for(name: &str) -> Replacements {
             format!("{name}-frontend"),
         ),
         ("anubis-starter".to_owned(), name.to_owned()),
+        // The Rust crate name of the backend library, as `main.rs` and the
+        // integration tests import it.
+        ("anubis_starter".to_owned(), name.replace('-', "_")),
         // Outside the monorepo the frontend package resolves from git until
         // it is published to npm.
         (
@@ -197,6 +200,10 @@ mod tests {
         for expected in [
             "backend/Cargo.toml",
             "backend/src/main.rs",
+            "backend/src/schema.rs",
+            // The living templates ship with every stamped app.
+            "backend/src/scaffolding/mod.rs",
+            "backend/migrations/2026-08-11-000001_create_creative_concepts/up.sql",
             "config/roles.yml",
             "compose.yaml",
             "frontend/package.json",
@@ -214,22 +221,24 @@ mod tests {
     #[test]
     fn stamping_leaves_no_starter_tokens_behind() {
         let replacements = replacements_for("acme");
-        for (path, bytes) in embedded::STARTER_FILES {
-            let Ok(text) = std::str::from_utf8(bytes) else {
-                continue;
-            };
-            let stamped = replacements.apply(text);
-            assert!(
-                !stamped.contains("anubis-starter"),
-                "{path} still contains `anubis-starter` after stamping",
-            );
-        }
-        for (path, template) in OVERLAY_FILES {
-            let stamped = replacements.apply(template);
-            assert!(
-                !stamped.contains("anubis-starter"),
-                "overlay {path} still contains `anubis-starter` after stamping",
-            );
+        for token in ["anubis-starter", "anubis_starter"] {
+            for (path, bytes) in embedded::STARTER_FILES {
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                let stamped = replacements.apply(text);
+                assert!(
+                    !stamped.contains(token),
+                    "{path} still contains `{token}` after stamping",
+                );
+            }
+            for (path, template) in OVERLAY_FILES {
+                let stamped = replacements.apply(template);
+                assert!(
+                    !stamped.contains(token),
+                    "overlay {path} still contains `{token}` after stamping",
+                );
+            }
         }
     }
 
@@ -246,7 +255,22 @@ mod tests {
             .find(|(path, _)| *path == "backend/Cargo.toml")
             .expect("the backend overlay exists");
 
-        for dependency in ["axum", "mimalloc", "tokio", "tracing", "tracing-subscriber"] {
+        for dependency in [
+            "axum",
+            "chrono",
+            "diesel",
+            "diesel-async",
+            "diesel_migrations",
+            "http-body-util",
+            "mimalloc",
+            "serde",
+            "serde_json",
+            "tokio",
+            "tower",
+            "tracing",
+            "tracing-subscriber",
+            "uuid",
+        ] {
             let workspace_line = workspace
                 .lines()
                 .find(|line| line.starts_with(&format!("{dependency} = ")))

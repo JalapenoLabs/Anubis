@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
+use crate::auth::secret_box::SecretKey;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, session, user_token};
 use crate::config::{AppConfig, Environment};
@@ -56,6 +57,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         environment: config.environment,
         mailer,
         app_url: config.app_url.clone(),
+        secret_key: config.secret_key.clone(),
     };
 
     Router::new()
@@ -82,6 +84,8 @@ pub(crate) struct AuthState {
     pub(crate) environment: Environment,
     pub(crate) mailer: Mailer,
     pub(crate) app_url: String,
+    /// Seals the secrets auth must read back, today the TOTP seeds.
+    pub(crate) secret_key: SecretKey,
 }
 
 #[derive(Deserialize)]
@@ -201,7 +205,7 @@ async fn login(
     }
 
     // A confirmed second factor turns the session into a challenge.
-    if crate::auth::mfa::confirmed_secret(&mut connection, user.id)
+    if crate::auth::mfa::confirmed_secret(&mut connection, &state.secret_key, user.id)
         .await
         .map_err(log_internal)?
         .is_some()

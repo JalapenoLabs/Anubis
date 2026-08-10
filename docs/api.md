@@ -24,6 +24,8 @@ Every scaffolded list endpoint (web and API) follows one shape:
 }
 ```
 
+The framework implements the convention once: handlers take `anubis::http::ListParams` as a query extractor beside their own filter struct, and answer with `anubis::http::Pagination`. Values that are out of range, or that do not parse at all, fall back to the convention, so a paging bug in a client degrades into a valid page instead of a 400.
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.
@@ -39,6 +41,7 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 - **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor.
 - **Sign-in methods**: password; passwordless emailed 6-digit codes (10-minute life, attempt-limited, enumeration-safe); and passkeys (WebAuthn discoverable credentials, password-manager-first, cross-platform authenticators welcome).
 - **Second factor**: TOTP (authenticator apps) with QR enrollment and single-use recovery codes. When confirmed, password and email-code login answer a 5-minute challenge instead of a session; a passkey is multi-factor by construction and bypasses the challenge. OAuth providers via OpenID Connect remain on the roadmap (M4).
+- **Secrets at rest**: recovery codes hash like every other token. A TOTP seed must be read back to compute the expected code, so it is encrypted instead, with AES-256-GCM under the application key in `ANUBIS_SECRET_KEY` (base64 for exactly 32 bytes, required in production; development and test fall back to a public built-in key and warn at startup). Stored values are versioned and self-describing, `v1:<nonce>:<ciphertext>`, so a future scheme can be added without a migration. A seed that no longer decrypts, because the key rotated, is discarded: the account drops back to single-factor login and the user enrolls again. The same `anubis::auth::secret_box` module covers any later secret that needs recoverable storage.
 - **Account management routes**: profile (names, time zone, locale), avatar upload/serve/delete, signed-in password and email change, session listing and revocation, and password-confirmed account deletion.
 - **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the admin role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; API serializers live in the version module (`TeamV1`) and freeze with it.
 

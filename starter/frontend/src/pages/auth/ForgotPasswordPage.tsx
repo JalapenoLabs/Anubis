@@ -3,7 +3,7 @@
 // Core
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useAnubisApi } from '@jalapenolabs/anubis'
 
 // UI
@@ -11,11 +11,12 @@ import { Button, Input } from '@heroui/react'
 import { AuthLayout } from '../../components/AuthLayout'
 
 // Misc
-import { UrlTree } from '../../urls'
+import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
 
 export function ForgotPasswordPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const [ searchParams ] = useSearchParams()
   const [ email, setEmail ] = useState('')
   const [ isSubmitting, setIsSubmitting ] = useState(false)
   const [ sentMessage, setSentMessage ] = useState<string | null>(null)
@@ -76,7 +77,10 @@ export function ForgotPasswordPage() {
         </form>
     }
     <div className='level-right mt-4 text-sm'>
-      <Link to={UrlTree.signIn} className='text-primary'>{
+      <Link
+        to={getUrlWithDestination(UrlTree.signIn, searchParams.get(DESTINATION_PARAM))}
+        className='text-primary'
+      >{
           t('auth.forgotPassword.backToSignIn')
         }</Link>
     </div>
