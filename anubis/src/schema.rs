@@ -41,7 +41,64 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Top-level tenants. Every team belongs to exactly one organization.
+    organizations (id) {
+        id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Working tenants. All domain resources chain ownership back to a team.
+    teams (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Joins users to organizations, carrying org-level role keys.
+    organization_memberships (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        user_id -> Uuid,
+        roles -> Array<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Joins users to teams, carrying team-level role keys. `user_id` is
+    /// null for invited people who have not claimed the membership yet.
+    team_memberships (id) {
+        id -> Uuid,
+        team_id -> Uuid,
+        user_id -> Nullable<Uuid>,
+        roles -> Array<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_tokens -> users (user_id));
+diesel::joinable!(teams -> organizations (organization_id));
+diesel::joinable!(organization_memberships -> organizations (organization_id));
+diesel::joinable!(organization_memberships -> users (user_id));
+diesel::joinable!(team_memberships -> teams (team_id));
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
+diesel::allow_tables_to_appear_in_same_query!(
+    organizations,
+    teams,
+    organization_memberships,
+    team_memberships,
+    users,
+);

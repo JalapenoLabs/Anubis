@@ -28,7 +28,7 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel::result::DatabaseErrorKind;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -122,13 +122,23 @@ async fn register(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let created: User = diesel::insert_into(users::table)
-        .values(NewUser {
-            email: &credentials.email,
-            password_hash: &password_hash,
+    // One transaction creates the user and their personal organization, so a
+    // half-bootstrapped account can never exist.
+    let created: User = connection
+        .transaction(async |transaction| {
+            let user: User = diesel::insert_into(users::table)
+                .values(NewUser {
+                    email: &credentials.email,
+                    password_hash: &password_hash,
+                })
+                .returning(User::as_returning())
+                .get_result(transaction)
+                .await?;
+
+            crate::tenancy::create_personal_organization(transaction, &user).await?;
+
+            Ok::<User, diesel::result::Error>(user)
         })
-        .returning(User::as_returning())
-        .get_result(&mut connection)
         .await
         .map_err(|error| match error {
             diesel::result::Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _details) => {
