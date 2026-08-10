@@ -9,6 +9,7 @@
 //! surface grows milestone by milestone; the roadmap lives in the repository's
 //! `docs/architecture.md`.
 
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;

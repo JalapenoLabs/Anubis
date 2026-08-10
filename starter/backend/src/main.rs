@@ -55,6 +55,11 @@ async fn main() {
             "/tenancy",
             anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
         )
+        .nest(
+            "/developers",
+            anubis::api::management::router(pool.clone(), roles.clone()),
+        )
+        .nest("/api/v1", anubis::api::v1::router(pool.clone()))
         // Application routes guard with TeamMember / OrganizationMember /
         // CurrentUser through these extensions.
         .layer(anubis::guard::layer(pool, roles));

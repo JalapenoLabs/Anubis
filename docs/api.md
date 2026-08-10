@@ -24,7 +24,7 @@ The SPA consumes the same public API it documents, so the API can never lag the 
 ## Authentication
 
 - **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor. Optional TOTP 2FA and OAuth providers via OpenID Connect are on the roadmap.
-- **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens are provisioned in a "Developers" section of the app UI.
+- **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the admin role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; API serializers live in the version module (`TeamV1`) and freeze with it.
 
 Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.
 

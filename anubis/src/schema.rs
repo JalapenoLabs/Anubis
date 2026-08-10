@@ -104,7 +104,33 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Per-team API credentials ("Developers" section). Tokens live in
+    /// `platform_tokens`; this row is the named application.
+    platform_applications (id) {
+        id -> Uuid,
+        team_id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Bearer tokens for platform applications. Rows hold a hash of the
+    /// token, never the token.
+    platform_tokens (id) {
+        id -> Uuid,
+        platform_application_id -> Uuid,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
+diesel::joinable!(platform_applications -> teams (team_id));
+diesel::joinable!(platform_tokens -> platform_applications (platform_application_id));
 diesel::joinable!(invitations -> organizations (organization_id));
 diesel::joinable!(invitations -> teams (team_id));
 diesel::joinable!(user_tokens -> users (user_id));
@@ -123,3 +149,4 @@ diesel::allow_tables_to_appear_in_same_query!(
     invitations,
     users,
 );
+diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);
