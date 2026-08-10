@@ -68,6 +68,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .route("/password-reset/request", post(request_password_reset))
         .route("/password-reset/confirm", post(confirm_password_reset))
         .merge(crate::auth::account::router())
+        .merge(crate::auth::email_code::router())
         .merge(crate::auth::mfa::router())
         .with_state(state)
         // CurrentUser resolves its pool from request extensions.

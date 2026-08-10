@@ -25,6 +25,8 @@ pub(crate) enum TokenPurpose {
     EmailChange,
     /// A pending second factor between password success and session issuance.
     MfaChallenge,
+    /// A passwordless sign-in code delivered by email.
+    EmailSignIn,
 }
 
 impl TokenPurpose {
@@ -35,6 +37,7 @@ impl TokenPurpose {
             Self::PasswordReset => "password_reset",
             Self::EmailChange => "email_change",
             Self::MfaChallenge => "mfa_challenge",
+            Self::EmailSignIn => "email_sign_in",
         }
     }
 
@@ -48,6 +51,7 @@ impl TokenPurpose {
             Self::PasswordReset => Duration::minutes(30),
             Self::EmailChange => Duration::hours(1),
             Self::MfaChallenge => Duration::minutes(5),
+            Self::EmailSignIn => Duration::minutes(10),
         }
     }
 }
@@ -112,10 +116,7 @@ pub(crate) async fn issue_with_payload(
 pub(crate) struct PeekedToken {
     pub id: Uuid,
     pub user_id: Uuid,
-    #[expect(
-        dead_code,
-        reason = "read by the email sign-in code flow, landing next"
-    )]
+    #[expect(dead_code, reason = "read by the passkey flow, landing next")]
     pub payload: Option<String>,
 }
 
@@ -179,6 +180,88 @@ pub(crate) async fn delete_by_id(
         .await?;
 
     Ok(())
+}
+
+/// Issues a 6-digit code for a user, replacing any outstanding one.
+///
+/// Short codes are guessable, so they are looked up by user (not by code),
+/// attempt-limited, and short-lived per the purpose's lifetime.
+pub(crate) async fn issue_short_code(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+    purpose: TokenPurpose,
+) -> Result<String, diesel::result::Error> {
+    diesel::delete(
+        user_tokens::table
+            .filter(user_tokens::user_id.eq(user_id))
+            .filter(user_tokens::purpose.eq(purpose.as_str())),
+    )
+    .execute(connection)
+    .await?;
+
+    let code = generate_short_code();
+    let token_hash = token::hash(&code);
+
+    diesel::insert_into(user_tokens::table)
+        .values(NewUserToken {
+            user_id,
+            purpose: purpose.as_str(),
+            token_hash: &token_hash,
+            expires_at: Utc::now() + purpose.ttl(),
+            payload: None,
+        })
+        .execute(connection)
+        .await?;
+
+    Ok(code)
+}
+
+/// Verifies a user's short code: deletes it on success, counts failures.
+///
+/// Returns `true` only for a live, attempt-eligible, matching code.
+pub(crate) async fn verify_short_code(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+    purpose: TokenPurpose,
+    submitted: &str,
+) -> Result<bool, diesel::result::Error> {
+    let row: Option<(Uuid, String)> = user_tokens::table
+        .filter(user_tokens::user_id.eq(user_id))
+        .filter(user_tokens::purpose.eq(purpose.as_str()))
+        .filter(user_tokens::expires_at.gt(Utc::now()))
+        .filter(user_tokens::attempts.lt(MAX_TOKEN_ATTEMPTS))
+        .select((user_tokens::id, user_tokens::token_hash))
+        .first(connection)
+        .await
+        .optional()?;
+
+    let Some((token_id, stored_hash)) = row else {
+        return Ok(false);
+    };
+
+    if token::hash(submitted.trim()) == stored_hash {
+        delete_by_id(connection, token_id).await?;
+        Ok(true)
+    } else {
+        record_failure(connection, token_id).await?;
+        Ok(false)
+    }
+}
+
+/// A uniformly random 6-digit code, rejection-sampled to avoid modulo bias.
+fn generate_short_code() -> String {
+    // Largest multiple of 1_000_000 that fits in u32; values above it would
+    // bias the low buckets.
+    const REJECTION_THRESHOLD: u32 = 4_294_000_000;
+
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::fill(&mut bytes).expect("the OS random source must be available");
+        let value = u32::from_be_bytes(bytes);
+        if value < REJECTION_THRESHOLD {
+            return format!("{:06}", value % 1_000_000);
+        }
+    }
 }
 
 /// Consumes a raw token, returning the user it belonged to and its payload.

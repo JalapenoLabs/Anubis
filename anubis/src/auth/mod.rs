@@ -12,6 +12,7 @@ pub mod totp;
 
 mod account;
 mod avatar;
+mod email_code;
 mod extract;
 mod mfa;
 mod model;
