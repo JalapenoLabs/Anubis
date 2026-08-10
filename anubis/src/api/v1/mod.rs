@@ -19,6 +19,9 @@ use axum::http::request::Parts;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Extension, Json};
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::{Modify, OpenApi};
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::api::platform::{self, PlatformApplication};
 use crate::db::DbPool;
@@ -29,11 +32,74 @@ use crate::tenancy::Team;
 pub use serializers::TeamV1;
 
 /// Returns the v1 API routes for an application to mount at `/api/v1`.
+///
+/// Alongside the endpoints, serves the OpenAPI 3.1 document at
+/// `/openapi.json` and human-readable docs at `/docs`.
 pub fn router(pool: DbPool) -> Router {
+    let document = openapi();
     Router::new()
         .route("/team", get(show_team))
+        .route(
+            "/openapi.json",
+            get({
+                let document = document.clone();
+                async move || Json(document)
+            }),
+        )
+        .merge(Scalar::with_url("/docs", document))
         // ApiCaller resolves its pool from request extensions.
         .layer(Extension(pool))
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Anubis API",
+        version = "1",
+        description = "The versioned public REST API. Authenticate with a \
+                       platform application bearer token from the Developers \
+                       section.",
+    ),
+    paths(show_team),
+    components(schemas(serializers::TeamV1, serializers::TeamEnvelopeV1, serializers::ErrorV1)),
+    modifiers(&BearerTokenSecurity),
+)]
+struct ApiDoc;
+
+struct BearerTokenSecurity;
+
+impl Modify for BearerTokenSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(
+            "bearer_token",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+        );
+    }
+}
+
+/// The OpenAPI 3.1 document for v1 of the framework API.
+///
+/// Applications with scaffolded endpoints merge their own paths into this
+/// document; the scaffolder maintains that wiring.
+#[must_use]
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    ApiDoc::openapi()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openapi;
+
+    #[test]
+    fn the_document_describes_the_team_endpoint_and_bearer_auth() {
+        let rendered = serde_json::to_string(&openapi()).expect("document must serialize");
+
+        assert!(rendered.contains("\"openapi\":\"3.1"), "got: {rendered}");
+        assert!(rendered.contains("/api/v1/team"), "got: {rendered}");
+        assert!(rendered.contains("bearer_token"), "got: {rendered}");
+        assert!(rendered.contains("TeamEnvelopeV1"), "got: {rendered}");
+    }
 }
 
 /// The authenticated API caller: a platform application acting as its team.
@@ -96,7 +162,17 @@ fn invalid_token() -> ApiError {
     ApiError::unauthorized("Provide a valid bearer token.")
 }
 
-/// `GET /api/v1/team`: the team the caller's token belongs to.
+/// The team the caller's token belongs to.
+#[utoipa::path(
+    get,
+    path = "/api/v1/team",
+    tag = "teams",
+    responses(
+        (status = 200, description = "The caller's team", body = serializers::TeamEnvelopeV1),
+        (status = 401, description = "Missing or invalid bearer token", body = serializers::ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn show_team(caller: ApiCaller) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(serializers::TeamEnvelopeV1 {
         team: TeamV1::from(&caller.team),

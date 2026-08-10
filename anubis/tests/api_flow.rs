@@ -357,4 +357,40 @@ async fn platform_tokens_authenticate_the_v1_api() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "deleted app tokens die");
+
+    // ------------------------------------------------------------------
+    // The OpenAPI document and docs page are served unauthenticated.
+    // ------------------------------------------------------------------
+    let (status, _headers, body) = send(
+        &router,
+        TestRequest {
+            method: "GET",
+            path: "/api/v1/openapi.json",
+            body: None,
+            session_cookie: None,
+            bearer: None,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["openapi"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("3.1")),
+        "body: {body}"
+    );
+    assert!(body["paths"].get("/api/v1/team").is_some(), "body: {body}");
+
+    let (status, _headers, _body) = send(
+        &router,
+        TestRequest {
+            method: "GET",
+            path: "/api/v1/docs",
+            body: None,
+            session_cookie: None,
+            bearer: None,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

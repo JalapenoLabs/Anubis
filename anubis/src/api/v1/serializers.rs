@@ -6,12 +6,13 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::tenancy::Team;
 
 /// A team, as serialized by API v1.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TeamV1 {
     /// Primary key.
     pub id: Uuid,
@@ -34,7 +35,16 @@ impl From<&Team> for TeamV1 {
     }
 }
 
-#[derive(Serialize)]
+/// Envelope for a single team.
+#[derive(Serialize, ToSchema)]
 pub(crate) struct TeamEnvelopeV1 {
     pub team: TeamV1,
+}
+
+/// The error shape every v1 endpoint answers with.
+#[derive(Serialize, ToSchema)]
+#[schema(as = ErrorV1)]
+pub(crate) struct ErrorV1 {
+    /// A user-safe description of what went wrong.
+    pub message: String,
 }

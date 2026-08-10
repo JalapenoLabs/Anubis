@@ -25,6 +25,12 @@ enum Command {
         #[command(subcommand)]
         command: RolesCommand,
     },
+    /// Export the framework's OpenAPI 3.1 document as JSON.
+    Openapi {
+        /// Write to this path instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -59,6 +65,33 @@ fn main() -> ExitCode {
 
     match command {
         Command::Roles { command } => run_roles(command),
+        Command::Openapi { out } => run_openapi(out.as_deref()),
+    }
+}
+
+fn run_openapi(out: Option<&std::path::Path>) -> ExitCode {
+    let document = anubis::api::v1::openapi();
+    let rendered = match serde_json::to_string_pretty(&document) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("error: failed to serialize the OpenAPI document: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match out {
+        None => {
+            println!("{rendered}");
+            ExitCode::SUCCESS
+        }
+        Some(path) => {
+            if let Err(error) = std::fs::write(path, rendered) {
+                eprintln!("error: failed to write {}: {error}", path.display());
+                return ExitCode::FAILURE;
+            }
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
     }
 }
 

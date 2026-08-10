@@ -38,6 +38,8 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
