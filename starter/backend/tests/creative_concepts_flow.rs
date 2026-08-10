@@ -43,7 +43,11 @@ async fn the_creative_concept_slice_serves_full_crud() {
         &router,
         "POST",
         &collection_path,
-        Some(&json!({ "name": "Lighthouse", "description": "Casts the beam" })),
+        Some(&json!({
+            "name": "Lighthouse",
+            "description": "Casts the beam",
+            // 🐺 anubis:test-create
+        })),
         Some(&owner_cookie),
     )
     .await;
@@ -57,6 +61,7 @@ async fn the_creative_concept_slice_serves_full_crud() {
         body["creative_concept"]["description"],
         json!("Casts the beam")
     );
+    // 🐺 anubis:test-created
 
     // A blank name never reaches the database.
     let (status, _body) = send(
@@ -187,7 +192,11 @@ async fn the_creative_concept_slice_serves_full_crud() {
         &router,
         "PATCH",
         &member_path,
-        Some(&json!({ "name": "First-order lighthouse", "description": "  " })),
+        Some(&json!({
+            "name": "First-order lighthouse",
+            "description": "  ",
+            // 🐺 anubis:test-update
+        })),
         Some(&owner_cookie),
     )
     .await;
@@ -201,6 +210,7 @@ async fn the_creative_concept_slice_serves_full_crud() {
         body["creative_concept"]["updated_at"], body["creative_concept"]["created_at"],
         "the set_updated_at trigger must fire",
     );
+    // 🐺 anubis:test-updated
 
     // Destroy, and the record is gone for good.
     let (status, _body) = send(&router, "DELETE", &member_path, None, Some(&owner_cookie)).await;

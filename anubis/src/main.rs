@@ -66,6 +66,14 @@ enum ScaffoldCommand {
         /// Fields as `name:type`, e.g. `name:text_field`.
         fields: Vec<String>,
     },
+    /// Add one field to an existing model, propagated through its migration,
+    /// schema, model, handlers, test, API module, form, table, and locale file.
+    Field {
+        /// The model name, e.g. `Project`.
+        model: String,
+        /// The field as `name:type`, e.g. `priority:text_field`.
+        field: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +126,9 @@ fn main() -> ExitCode {
                     fields,
                 },
         } => cli::scaffold::model(&model, &ownership, &fields),
+        Command::Scaffold {
+            command: ScaffoldCommand::Field { model, field },
+        } => cli::scaffold::field(&model, &field),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),

@@ -17,6 +17,7 @@
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 
+use super::extract::closing_brace;
 use super::inflect::Names;
 
 /// An ordered set of find-and-replace pairs, applied longest-first.
@@ -106,8 +107,16 @@ impl Replacements {
 ///
 /// The anchor line's leading whitespace prefixes every inserted line, so the
 /// insertion matches the surrounding block. Inserting a block that is already
-/// present returns the content unchanged, which keeps scaffold commands
-/// idempotent. The rest of the file is preserved byte-for-byte.
+/// present in that same block returns the content unchanged, which keeps
+/// scaffold commands idempotent. The rest of the file is preserved
+/// byte-for-byte.
+///
+/// "That same block" is the run of lines directly above the anchor indented at
+/// least as far as the anchor itself, which is the list the anchor closes. The
+/// test has to be that narrow: a record struct and the insertable struct
+/// beside it declare the same column with the same doc comment, and a
+/// whole-file test would read the first as proof the second was already
+/// written.
 ///
 /// # Examples
 /// ```
@@ -153,7 +162,7 @@ pub fn insert_above_anchor(
         }
     }
 
-    if content.contains(&block) {
+    if enclosing_list(&content[..line_start], indentation.len()).contains(&block) {
         return Ok(content.to_owned());
     }
 
@@ -162,6 +171,115 @@ pub fn insert_above_anchor(
     updated.push_str(&block);
     updated.push_str(&content[line_start..]);
     Ok(updated)
+}
+
+/// The tail of `preceding` that belongs to the same list as the anchor.
+///
+/// Lines are taken from the end while they are indented at least as far as the
+/// anchor; the first line indented less closes the list, and so does a blank
+/// line unless the anchor sits at the left margin.
+fn enclosing_list(preceding: &str, indentation: usize) -> &str {
+    let mut start = preceding.len();
+    for line in preceding.split_inclusive('\n').rev() {
+        let leading = line
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .count();
+        if leading < indentation || (line.trim().is_empty() && indentation > 0) {
+            break;
+        }
+        start -= line.len();
+    }
+    &preceding[start..]
+}
+
+/// Adds `entries` to the end of the JSON object `key` names.
+///
+/// JSON carries no comments, so a locale file cannot hold a magic anchor. Its
+/// structure supplies the insertion point instead: a model's locale file is
+/// one object per model, holding one string per key, and new strings join the
+/// end of that object. Everything outside the insertion is preserved
+/// byte-for-byte, and an entry whose key is already present is skipped, so
+/// re-running a scaffold changes nothing.
+///
+/// Returns `None` when `key` names no object, which is the caller's cue to
+/// report the file it read.
+///
+/// # Examples
+/// ```
+/// use anubis::scaffold::insert_json_entries;
+///
+/// let locale = "{\n  \"projects\": {\n    \"title\": \"Projects\"\n  }\n}\n";
+/// let updated = insert_json_entries(
+///     locale,
+///     "projects",
+///     &[("priority".to_owned(), "Priority".to_owned())],
+/// )
+/// .unwrap();
+/// assert!(updated.contains("\"title\": \"Projects\",\n    \"priority\": \"Priority\"\n"));
+/// ```
+#[must_use]
+pub fn insert_json_entries(
+    source: &str,
+    key: &str,
+    entries: &[(String, String)],
+) -> Option<String> {
+    let opening = format!("\"{key}\": {{");
+    let object_start = source.find(&opening)?;
+    let object_end = object_start + closing_brace(&source[object_start..])?;
+
+    // The last entry loses its "last" status, so it gains a comma, and the new
+    // entries adopt its indentation.
+    let (last_line_start, last_line_end) = last_entry_line(&source[object_start..object_end])?;
+    let last_line_start = object_start + last_line_start;
+    let last_line_end = object_start + last_line_end;
+    let indentation: String = source[last_line_start..]
+        .chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .collect();
+
+    let mut added = String::new();
+    for (name, value) in entries {
+        if source[object_start..object_end].contains(&format!("\"{name}\":")) {
+            continue;
+        }
+        added.push_str(",\n");
+        added.push_str(&indentation);
+        added.push_str(&json_string(name));
+        added.push_str(": ");
+        added.push_str(&json_string(value));
+    }
+    if added.is_empty() {
+        return Some(source.to_owned());
+    }
+
+    let mut updated = String::with_capacity(source.len() + added.len());
+    updated.push_str(&source[..last_line_end]);
+    updated.push_str(&added);
+    updated.push_str(&source[last_line_end..]);
+    Some(updated)
+}
+
+/// The byte range of the last entry line inside an object body, trailing
+/// whitespace excluded, so an insertion lands right after the last value.
+fn last_entry_line(object: &str) -> Option<(usize, usize)> {
+    let body_start = object.find('{')? + 1;
+    let mut found = None;
+    let mut offset = body_start;
+    for line in object[body_start..].split_inclusive('\n') {
+        let content = line.trim_end();
+        if !content.is_empty() {
+            found = Some((offset, offset + content.len()));
+        }
+        offset += line.len();
+    }
+    found
+}
+
+/// Renders `value` as a JSON string literal.
+fn json_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// A missing magic-anchor comment.
@@ -274,10 +392,82 @@ A Purchase order.";
     }
 
     #[test]
+    fn idempotency_looks_only_at_the_list_the_anchor_closes() {
+        // The record struct already declares the very line the insertable
+        // struct is about to gain, doc comment and all.
+        let source = "\
+struct Ticket {
+    /// Urgency of the ticket.
+    pub urgency: Option<i32>,
+    // 🐺 anubis:record-fields
+}
+
+struct NewTicket {
+    pub name: String,
+    // 🐺 anubis:insert-fields
+}
+";
+        let addition = "/// Urgency of the ticket.\npub urgency: Option<i32>,";
+        let updated = insert_above_anchor(source, "🐺 anubis:insert-fields", addition).unwrap();
+        assert_eq!(
+            updated.matches("pub urgency: Option<i32>,").count(),
+            2,
+            "the second struct must gain the column too:\n{updated}",
+        );
+
+        // Within one list it stays idempotent, wherever in the list it sits.
+        let twice = insert_above_anchor(&updated, "🐺 anubis:insert-fields", addition).unwrap();
+        assert_eq!(twice, updated);
+        let earlier =
+            insert_above_anchor(&twice, "🐺 anubis:insert-fields", "pub name: String,").unwrap();
+        assert_eq!(earlier, twice, "an entry higher up the list still counts");
+    }
+
+    #[test]
     fn missing_anchor_is_an_error() {
         let error =
             insert_above_anchor("no anchors here\n", "🐺 anubis:routes", "x();").unwrap_err();
         assert_eq!(error.anchor(), "🐺 anubis:routes");
+    }
+
+    #[test]
+    fn locale_entries_join_the_end_of_the_model_object() {
+        let locale = "\
+{
+  \"projects\": {
+    \"navLink\": \"Projects\",
+    \"editTitle\": \"Edit {{name}}\"
+  }
+}
+";
+        let entries = [
+            ("priority".to_owned(), "Priority".to_owned()),
+            (
+                "priorityHelp".to_owned(),
+                "Priority of the project.".to_owned(),
+            ),
+        ];
+        let updated = super::insert_json_entries(locale, "projects", &entries).unwrap();
+        assert_eq!(
+            updated,
+            "\
+{
+  \"projects\": {
+    \"navLink\": \"Projects\",
+    \"editTitle\": \"Edit {{name}}\",
+    \"priority\": \"Priority\",
+    \"priorityHelp\": \"Priority of the project.\"
+  }
+}
+",
+        );
+
+        // A second run adds nothing, and an unknown model is reported.
+        assert_eq!(
+            super::insert_json_entries(&updated, "projects", &entries).unwrap(),
+            updated,
+        );
+        assert!(super::insert_json_entries(locale, "goals", &entries).is_none());
     }
 
     #[test]

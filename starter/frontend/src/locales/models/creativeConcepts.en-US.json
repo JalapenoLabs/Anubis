@@ -3,10 +3,6 @@
     "navLink": "Creative Concepts",
     "title": "Creative concepts",
     "subtitle": "The parent template: every creative concept belongs to your team.",
-    "name": "Name",
-    "nameHelp": "Name the creative concept.",
-    "description": "Description",
-    "descriptionHelp": "Leave it blank to clear the description.",
     "noDescription": "No description",
     "created": "Created",
     "empty": "No creative concepts yet. Add the first one below.",
@@ -18,6 +14,12 @@
     "deleteAction": "Delete creative concept",
     "backToList": "All creative concepts",
     "notFound": "That creative concept is not available.",
-    "noTeamSelected": "Select a team to see its creative concepts."
+    "noTeamSelected": "Select a team to see its creative concepts.",
+    "fields": {
+      "name": "Name",
+      "nameHelp": "Name the creative concept.",
+      "description": "Description",
+      "descriptionHelp": "Leave it blank to clear the description."
+    }
   }
 }

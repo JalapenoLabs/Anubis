@@ -10,6 +10,19 @@
 //! `docs/scaffolding.md` documents and that every application file carries.
 //! The comment marker itself is not part of an anchor: the same name matches
 //! `// 🐺 anubis:routes` in Rust and `# 🐺 anubis:models:editor` in YAML.
+//!
+//! The vocabulary comes in two halves. The model anchors sit in files the
+//! whole application shares, and `anubis scaffold model` inserts a model's
+//! lines above them. The field anchors sit in a model's own artifacts, once
+//! per list of columns, and `anubis scaffold field` inserts one field's lines
+//! above them. Every artifact a scaffold stamps inherits the field anchors
+//! from the living template it came from, so a generated model stays
+//! field-scaffoldable forever.
+//!
+//! Two lists carry no anchor, because they repeat inside one file and an
+//! anchor spelling may not: a `diesel::table!` block's columns and a locale
+//! file's strings, which are JSON and cannot hold comments at all. Both are
+//! written structurally instead, inside the block that names the model.
 
 /// `backend/src/lib.rs`: module declarations.
 pub const MODULES: &str = "🐺 anubis:modules";
@@ -58,6 +71,81 @@ pub const CHILD_IMPORTS: &str = "🐺 anubis:child-imports";
 
 /// A show page: the section elements of the models it owns.
 pub const CHILDREN: &str = "🐺 anubis:children";
+
+/// A model's `model.rs`: the record struct's columns.
+pub const RECORD_FIELDS: &str = "🐺 anubis:record-fields";
+
+/// A model's `model.rs`: the insertable struct's columns.
+pub const INSERT_FIELDS: &str = "🐺 anubis:insert-fields";
+
+/// A model's `model.rs`: the changeset struct's columns.
+pub const CHANGESET_FIELDS: &str = "🐺 anubis:changeset-fields";
+
+/// A model's `model.rs`: the changeset's "was anything submitted" test.
+pub const CHANGESET_EMPTY: &str = "🐺 anubis:changeset-empty";
+
+/// A model's `routes.rs`: the create request body's members.
+pub const CREATE_BODY: &str = "🐺 anubis:create-body";
+
+/// A model's `routes.rs`: the update request body's members.
+pub const UPDATE_BODY: &str = "🐺 anubis:update-body";
+
+/// A model's `routes.rs`: the create handler's normalization bindings.
+pub const CREATE_NORMALIZE: &str = "🐺 anubis:create-normalize";
+
+/// A model's `routes.rs`: the insertable struct literal the create handler builds.
+pub const INSERT_VALUES: &str = "🐺 anubis:insert-values";
+
+/// A model's `routes.rs`: the update handler's normalization bindings.
+pub const UPDATE_NORMALIZE: &str = "🐺 anubis:update-normalize";
+
+/// A model's `routes.rs`: the changeset struct literal the update handler builds.
+pub const CHANGESET_VALUES: &str = "🐺 anubis:changeset-values";
+
+/// A model's integration test: the create request's payload.
+pub const TEST_CREATE: &str = "🐺 anubis:test-create";
+
+/// A model's integration test: the assertions on the created record.
+pub const TEST_CREATED: &str = "🐺 anubis:test-created";
+
+/// A model's integration test: the update request's payload.
+pub const TEST_UPDATE: &str = "🐺 anubis:test-update";
+
+/// A model's integration test: the assertions on the updated record.
+pub const TEST_UPDATED: &str = "🐺 anubis:test-updated";
+
+/// A model's route module: the wire type's members.
+pub const WIRE_FIELDS: &str = "🐺 anubis:wire-fields";
+
+/// A model's route module: the create request type's members.
+pub const CREATE_REQUEST: &str = "🐺 anubis:create-request";
+
+/// A model's route module: the update request type's members.
+pub const UPDATE_REQUEST: &str = "🐺 anubis:update-request";
+
+/// A model's form: the field components it imports from the field library.
+pub const FIELD_IMPORTS: &str = "🐺 anubis:field-imports";
+
+/// A model's form: the zod schema's members.
+pub const FORM_SCHEMA: &str = "🐺 anubis:form-schema";
+
+/// A model's form: the form values built from the record being edited.
+pub const FORM_VALUES: &str = "🐺 anubis:form-values";
+
+/// A model's form: the payload the form submits.
+pub const FORM_PAYLOAD: &str = "🐺 anubis:form-payload";
+
+/// A model's form: the field components it renders.
+pub const FORM_FIELDS: &str = "🐺 anubis:form-fields";
+
+/// A table of the model's records: the column headers.
+pub const LIST_COLUMNS: &str = "🐺 anubis:list-columns";
+
+/// A table of the model's records: the cells of one row.
+pub const LIST_CELLS: &str = "🐺 anubis:list-cells";
+
+/// A show page: the record's own attributes.
+pub const SHOW_FIELDS: &str = "🐺 anubis:show-fields";
 
 /// Marks a line that belongs to the living template alone.
 ///

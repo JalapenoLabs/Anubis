@@ -18,7 +18,7 @@
 //! ```
 
 use super::error::ScaffoldError;
-use super::field::Field;
+use super::field::{Artifact, Field, FieldScaffold};
 use super::inflect::Names;
 use super::stamp::Replacements;
 
@@ -275,11 +275,13 @@ impl ModelScaffold {
 
     /// The requested fields the living template does not already carry.
     ///
-    /// These reach the migration and the Diesel schema as nullable columns;
-    /// wiring them through the model and the handlers is still manual, which
-    /// is what [`ModelScaffold::manual_fields_note`] spells out.
+    /// The template supplies `name` and `description`; every other field is
+    /// planned exactly as `anubis scaffold field` would plan it, and reaches
+    /// the same artifacts through the same insertions. That shared plan is
+    /// what makes a field declared at scaffold time and a field added a month
+    /// later land identically.
     #[must_use]
-    pub fn extra_fields(&self) -> Vec<&Field> {
+    pub fn added_fields(&self) -> Vec<FieldScaffold> {
         self.fields
             .iter()
             .filter(|field| {
@@ -287,94 +289,26 @@ impl ModelScaffold {
                     .iter()
                     .any(|(name, _type)| *name == field.name())
             })
+            .map(|field| FieldScaffold::new(self.model.clone(), field.clone()))
             .collect()
     }
 
     /// The `CREATE TABLE` lines for the fields the template does not carry.
-    ///
-    /// Every one of them is nullable whatever its field type says: nothing
-    /// writes these columns until a developer wires them through the model,
-    /// and a `NOT NULL` column with no writer fails every insert.
     #[must_use]
-    pub fn extra_sql_columns(&self) -> Vec<String> {
-        self.extra_fields()
+    pub fn added_sql_columns(&self) -> Vec<String> {
+        self.added_fields()
             .iter()
-            .map(|field| format!("{},", field.sql_column()))
+            .map(|field| format!("{},", field.field().sql_column()))
             .collect()
     }
 
     /// The `diesel::table!` lines for the fields the template does not carry.
-    ///
-    /// Nullable for the same reason as [`ModelScaffold::extra_sql_columns`].
     #[must_use]
-    pub fn extra_schema_columns(&self) -> Vec<String> {
-        self.extra_fields()
+    pub fn added_schema_columns(&self) -> Vec<String> {
+        self.added_fields()
             .iter()
-            .map(|field| field.schema_column_as(true))
+            .map(|field| field.field().schema_column())
             .collect()
-    }
-
-    /// The comment planted at the top of a generated model that carries
-    /// fields the generator could not wire all the way through.
-    ///
-    /// Returns `None` when every requested field comes from the template.
-    #[must_use]
-    pub fn backend_manual_fields_note(&self) -> Option<String> {
-        let extra = self.extra_fields();
-        if extra.is_empty() {
-            return None;
-        }
-
-        let model = self.model.pascal();
-        let names = extra
-            .iter()
-            .map(|field| format!("`{}`", field.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (verb, columns, pronoun) = if extra.len() == 1 {
-            ("lives", "a nullable column", "it")
-        } else {
-            ("live", "nullable columns", "them")
-        };
-        Some(format!(
-            "// TODO(anubis): {names} {verb} in the migration and in\n\
-             // backend/src/schema.rs as {columns}, and nowhere else. Add {pronoun} to\n\
-             // {model}, New{model}, and {model}Changes below, then to the request bodies\n\
-             // and the create and update handlers in routes.rs. `anubis scaffold field`\n\
-             // will automate this.\n",
-        ))
-    }
-
-    /// The comment planted at the top of a generated form whose model carries
-    /// fields the generator could not wire all the way through.
-    ///
-    /// The backend note names the Rust structs; this one names the field
-    /// component each type wants, which is the whole of the frontend's work.
-    /// Returns `None` when every requested field comes from the template.
-    #[must_use]
-    pub fn frontend_manual_fields_note(&self) -> Option<String> {
-        let extra = self.extra_fields();
-        if extra.is_empty() {
-            return None;
-        }
-
-        let routes = format!("{}Routes.ts", self.model.camel());
-        let names = extra
-            .iter()
-            .map(|field| format!("`{}` ({})", field.name(), field.field_type().component()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (verb, pronoun) = if extra.len() == 1 {
-            ("reaches", "it")
-        } else {
-            ("reach", "them")
-        };
-        Some(format!(
-            "// TODO(anubis): {names} {verb} the database and nowhere else.\n\
-             // Add {pronoun} to the schema and the values below, to the wire type and the\n\
-             // request bodies in ../api/routes/{routes}, and render the named component\n\
-             // in this form. `anubis scaffold field` will automate this.\n",
-        ))
     }
 }
 
@@ -485,15 +419,6 @@ impl ModelScaffold {
         })
     }
 
-    /// The generated form component, relative to the application root.
-    ///
-    /// This is where the fields the generator could not wire are reported, so
-    /// the CLI needs to recognize it among the stamped frontend files.
-    #[must_use]
-    pub fn frontend_form_file(&self) -> String {
-        format!("frontend/src/components/{}Form.tsx", self.model.pascal())
-    }
-
     /// The list page component, e.g. `ProjectsPage`.
     fn list_page(&self) -> String {
         format!("{}Page", self.model.pascal_plural())
@@ -503,6 +428,70 @@ impl ModelScaffold {
     fn show_page(&self) -> String {
         format!("{}Page", self.model.pascal())
     }
+}
+
+/// Every artifact a scaffolded model owns, and what each one receives.
+///
+/// The paths are relative to the application root. Both ownership depths are
+/// listed: a team-owned model owns the two pages, a nested model owns the
+/// section component instead, and neither owns the other's files. A caller
+/// applies the entries whose file exists, which is how `anubis scaffold field`
+/// works on either depth without being told which it is looking at.
+///
+/// The model's locale file is not here: it is JSON, so it takes structural
+/// insertion rather than anchors. [`locale_file`] names it.
+///
+/// # Examples
+/// ```
+/// use anubis::scaffold::{Artifact, Names, model_artifacts};
+///
+/// let files = model_artifacts(&Names::parse("Project")?);
+/// assert!(files.contains(&("backend/src/projects/model.rs".to_owned(), Artifact::Model)));
+/// assert!(files.contains(&(
+///     "frontend/src/components/ProjectForm.tsx".to_owned(),
+///     Artifact::Form,
+/// )));
+/// # Ok::<(), anubis::scaffold::ScaffoldError>(())
+/// ```
+#[must_use]
+pub fn model_artifacts(model: &Names) -> Vec<(String, Artifact)> {
+    let module = model.snake_plural();
+    let pascal = model.pascal();
+    let pascal_plural = model.pascal_plural();
+    vec![
+        (format!("backend/src/{module}/model.rs"), Artifact::Model),
+        (format!("backend/src/{module}/routes.rs"), Artifact::Routes),
+        (format!("backend/tests/{module}_flow.rs"), Artifact::Test),
+        (
+            format!("frontend/src/api/routes/{}Routes.ts", model.camel()),
+            Artifact::ApiRoutes,
+        ),
+        (
+            format!("frontend/src/components/{pascal}Form.tsx"),
+            Artifact::Form,
+        ),
+        (
+            format!("frontend/src/pages/{pascal_plural}Page.tsx"),
+            Artifact::Table,
+        ),
+        (
+            format!("frontend/src/components/{pascal_plural}Section.tsx"),
+            Artifact::Table,
+        ),
+        (
+            format!("frontend/src/pages/{pascal}Page.tsx"),
+            Artifact::ShowPage,
+        ),
+    ]
+}
+
+/// The model's locale file, relative to the application root.
+#[must_use]
+pub fn locale_file(model: &Names) -> String {
+    format!(
+        "frontend/src/locales/models/{}.en-US.json",
+        model.camel_plural(),
+    )
 }
 
 /// The page a nested model attaches to, and the two lines it inserts there.
@@ -653,7 +642,7 @@ mod tests {
             scaffold.migration_directory("2026-08-15-101112"),
             "2026-08-15-101112_create_projects"
         );
-        assert!(scaffold.backend_manual_fields_note().is_none());
+        assert!(scaffold.added_fields().is_empty());
     }
 
     #[test]
@@ -698,45 +687,50 @@ mod tests {
     }
 
     #[test]
-    fn extra_fields_are_reported_as_manual_work() {
+    fn added_fields_are_planned_like_a_scaffold_field_run() {
         let scaffold = ModelScaffold::parse(
             "Project",
             "Team",
-            &fields(&["name:text_field", "summary:text_area"]),
+            &fields(&["name:text_field", "summary:text_area", "archived:boolean"]),
         )
         .unwrap();
-        let extra = scaffold.extra_fields();
-        assert_eq!(extra.len(), 1);
-        assert_eq!(extra[0].name(), "summary");
-        assert_eq!(scaffold.extra_sql_columns(), ["summary TEXT,"]);
+
+        let added = scaffold.added_fields();
+        assert_eq!(added.len(), 2, "the template already carries `name`");
+        assert_eq!(added[0].name(), "summary");
         assert_eq!(
-            scaffold.extra_schema_columns(),
-            ["summary -> Nullable<Text>,"]
+            scaffold.added_sql_columns(),
+            ["summary TEXT,", "archived BOOLEAN NOT NULL DEFAULT false,"],
         );
+        assert_eq!(
+            scaffold.added_schema_columns(),
+            ["summary -> Nullable<Text>,", "archived -> Bool,"],
+        );
+        assert!(
+            added[0]
+                .insertions(super::Artifact::Form)
+                .iter()
+                .any(|(_anchor, line)| line.contains("t('projects.fields.summary')")),
+            "an added field is planned against its own model's locale keys",
+        );
+    }
 
-        let frontend = scaffold
-            .frontend_manual_fields_note()
-            .expect("the form is told too");
-        assert!(frontend.contains("`summary` (TextAreaField)"), "{frontend}");
-        assert!(
-            frontend.contains("../api/routes/projectRoutes.ts"),
-            "{frontend}"
-        );
-        assert!(
-            frontend.lines().all(|line| line.starts_with("// ")),
-            "the note must be a comment block: {frontend}",
-        );
-
-        let note = scaffold
-            .backend_manual_fields_note()
-            .expect("a note is planted");
-        assert!(note.contains("`summary`"));
-        assert!(note.contains("a nullable column"), "note: {note}");
-        assert!(note.contains("NewProject"));
-        assert!(note.contains("ProjectChanges"));
-        assert!(
-            note.lines().all(|line| line.starts_with("// ")),
-            "the note must be a Rust comment block: {note}",
+    #[test]
+    fn a_models_artifacts_are_named_from_its_own_names() {
+        let model = super::Names::parse("Project").unwrap();
+        let files = super::model_artifacts(&model)
+            .into_iter()
+            .map(|(path, _artifact)| path)
+            .collect::<Vec<_>>();
+        assert!(files.contains(&"backend/src/projects/routes.rs".to_owned()));
+        assert!(files.contains(&"backend/tests/projects_flow.rs".to_owned()));
+        assert!(files.contains(&"frontend/src/api/routes/projectRoutes.ts".to_owned()));
+        assert!(files.contains(&"frontend/src/pages/ProjectsPage.tsx".to_owned()));
+        assert!(files.contains(&"frontend/src/pages/ProjectPage.tsx".to_owned()));
+        assert!(files.contains(&"frontend/src/components/ProjectsSection.tsx".to_owned()));
+        assert_eq!(
+            super::locale_file(&model),
+            "frontend/src/locales/models/projects.en-US.json",
         );
     }
 
@@ -783,10 +777,6 @@ mod tests {
             "import projectsEnUS from './locales/models/projects.en-US.json'",
         );
         assert_eq!(scaffold.locale_spread(), "...projectsEnUS,");
-        assert_eq!(
-            scaffold.frontend_form_file(),
-            "frontend/src/components/ProjectForm.tsx",
-        );
         assert!(scaffold.child_attachment().is_none());
         assert!(
             scaffold

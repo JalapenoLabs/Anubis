@@ -1,7 +1,7 @@
-//! `anubis scaffold model`: generate a model's backend slice from the
-//! application's own living templates.
+//! `anubis scaffold model` and `anubis scaffold field`: generate a model's
+//! full-stack slice, and grow it a column at a time.
 //!
-//! The templates are application code, not framework assets: this command
+//! The templates are application code, not framework assets: `scaffold model`
 //! reads `backend/src/scaffolding/`, the migration that created the template's
 //! table, the template's integration test, and the template model's pages
 //! straight out of the application it is run in, rewrites every template name
@@ -9,6 +9,11 @@
 //! files (`lib.rs`, `schema.rs`, `config/roles.yml`, `urls.ts`, `App.tsx`,
 //! `AppShell.tsx`, `i18n.ts`) receive their lines above magic anchors, which is
 //! idempotent, so re-running a scaffold never duplicates an insertion.
+//!
+//! `scaffold field` writes a migration and then edits the model's own
+//! artifacts through the per-field anchors they inherited from the template.
+//! Both commands share one set of insertions, so a field declared in a
+//! `scaffold model` run and a field added a month later land identically.
 //!
 //! Everything is planned before anything is written: a missing template, a
 //! missing anchor, or a module that already exists stops the command with the
@@ -18,8 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anubis::scaffold::{
-    ModelScaffold, ModelTemplate, Replacements, anchor, insert_above_anchor, line_containing,
-    table_block,
+    Artifact, Field, FieldScaffold, LOCALE_FIELDS, ModelScaffold, ModelTemplate, Names,
+    Replacements, anchor, insert_above_anchor, insert_json_entries, line_containing, locale_file,
+    model_artifacts, table_block,
 };
 
 /// The grants a scaffolded model receives, one per role-suffixed anchor.
@@ -98,7 +104,11 @@ fn plan(root: &Path, scaffold: &ModelScaffold) -> Result<Plan, String> {
     let mut created = stamp_module(root, scaffold, template, &replacements)?;
     created.push(stamp_test(root, scaffold, template, &replacements)?);
     created.extend(stamp_migration(root, scaffold, template, &replacements)?);
-    created.extend(stamp_frontend(root, scaffold, template, &replacements)?);
+    created.extend(stamp_frontend(root, template, &replacements)?);
+    // The stamped files carry the template's per-field anchors, so the fields
+    // beyond the template's own shape are wired exactly as `scaffold field`
+    // would wire them into a model generated last month.
+    wire_fields(&mut created, scaffold.model(), &scaffold.added_fields())?;
 
     let schema = update_schema(root, scaffold, template, &replacements)?;
     let library = update_lib(root, scaffold)?;
@@ -130,7 +140,6 @@ fn stamp_module(
     let entries = std::fs::read_dir(root.join(&source))
         .map_err(|error| format!("failed to read {}: {error}", display(&source)))?;
 
-    let note = scaffold.backend_manual_fields_note();
     let mut files = Vec::new();
     for entry in entries {
         let path = entry
@@ -144,14 +153,7 @@ fn stamp_module(
             .and_then(|name| name.to_str())
             .ok_or_else(|| format!("{} has an unreadable name", path.display()))?;
 
-        let mut contents = replacements.apply(&read(&path)?);
-        if name == "model.rs"
-            && let Some(note) = note.as_deref()
-        {
-            contents = plant_note(&contents, note).ok_or_else(|| {
-                format!("{} imports nothing to plant a note above", display(&source))
-            })?;
-        }
+        let contents = replacements.apply(&read(&path)?);
         files.push((destination.join(name), contents));
     }
 
@@ -161,19 +163,6 @@ fn stamp_module(
     // Directory order is arbitrary; the report is not.
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
-}
-
-/// Plants the manual-work note above a stamped file's first import.
-///
-/// Rust and TypeScript both put their imports at the top under the file's own
-/// header, which is exactly where a developer looks first.
-fn plant_note(contents: &str, note: &str) -> Option<String> {
-    let first_import = contents
-        .lines()
-        .find(|line| line.starts_with("use ") || line.starts_with("import "))?;
-    // The whole import line is the needle, so nothing else in the file can
-    // match it, and the note lands with a blank line under it.
-    insert_above_anchor(contents, first_import, &format!("{note}\n")).ok()
 }
 
 /// Stamps the template's integration test into the application's test suite.
@@ -211,15 +200,14 @@ fn stamp_migration(
         PathBuf::from("backend/migrations").join(scaffold.migration_directory(&version));
 
     let mut up = replacements.apply(&read(&source.join("up.sql"))?);
-    let extra = scaffold.extra_sql_columns();
-    if !extra.is_empty() {
-        let block = format!(
-            "-- Added by `anubis scaffold model`. Nullable until each column is wired\n\
-             -- through the model and its handlers.\n{}\n",
-            extra.join("\n"),
-        );
-        up = insert_above_anchor(&up, "created_at TIMESTAMPTZ", &block)
-            .map_err(|error| format!("{}: {error}", source.join("up.sql").display()))?;
+    let added = scaffold.added_sql_columns();
+    if !added.is_empty() {
+        up = insert_above_anchor(
+            &up,
+            "created_at TIMESTAMPTZ",
+            &format!("{}\n", added.join("\n")),
+        )
+        .map_err(|error| format!("{}: {error}", source.join("up.sql").display()))?;
     }
     let down = replacements.apply(&read(&source.join("down.sql"))?);
 
@@ -238,13 +226,9 @@ fn stamp_migration(
 /// child, which belongs to no other model.
 fn stamp_frontend(
     root: &Path,
-    scaffold: &ModelScaffold,
     template: ModelTemplate,
     replacements: &Replacements,
 ) -> Result<Vec<(PathBuf, String)>, String> {
-    let note = scaffold.frontend_manual_fields_note();
-    let form = scaffold.frontend_form_file();
-
     let mut files = Vec::new();
     for source in template.frontend_files() {
         let destination = replacements.apply(source);
@@ -255,14 +239,7 @@ fn stamp_frontend(
         }
 
         let stamped = replacements.apply(&read(&root.join(source))?);
-        let mut contents = drop_template_only(&stamped);
-        if destination == form
-            && let Some(note) = note.as_deref()
-        {
-            contents = plant_note(&contents, note)
-                .ok_or_else(|| format!("{destination} imports nothing to plant a note above"))?;
-        }
-        files.push((PathBuf::from(destination), contents));
+        files.push((PathBuf::from(destination), drop_template_only(&stamped)));
     }
 
     Ok(files)
@@ -432,9 +409,9 @@ fn update_schema(
         )
     })?;
     let mut block = replacements.apply(&block);
-    let extra = scaffold.extra_schema_columns();
-    if !extra.is_empty() {
-        block = insert_above_anchor(&block, "created_at ->", &format!("{}\n", extra.join("\n")))
+    let added = scaffold.added_schema_columns();
+    if !added.is_empty() {
+        block = insert_above_anchor(&block, "created_at ->", &format!("{}\n", added.join("\n")))
             .map_err(|error| format!("{}: {error}", display(&relative)))?;
     }
 
@@ -557,24 +534,287 @@ fn report(scaffold: &ModelScaffold, plan: &Plan) {
          `description` (optional text) columns."
     );
 
-    let extra = scaffold.extra_fields();
-    if !extra.is_empty() {
-        let names = extra
+    let added = scaffold.added_fields();
+    if !added.is_empty() {
+        let names = added
             .iter()
-            .map(|field| field.name())
+            .map(|field| format!("{} ({})", field.name(), field.field().field_type().name()))
             .collect::<Vec<_>>()
             .join(", ");
-        println!();
         println!(
-            "note: the migration and schema.rs carry these fields as nullable columns and \
-             nothing else does: {names}. The generated model.rs and form component each \
-             open with a TODO naming every place that still needs them."
+            "Wired end to end alongside them: {names}. Added columns are nullable, or \
+             non-null with a database default, so a later migration never strands \
+             existing rows."
         );
     }
 
     println!();
     println!("Next steps:");
     println!("  review the generated module, then boot the app to apply the migration");
+    println!("  cargo test");
+}
+
+/// Runs `anubis scaffold field <Model> <field:type>`.
+pub(crate) fn field(model: &str, argument: &str) -> ExitCode {
+    let names = match Names::parse(model) {
+        Ok(names) => names,
+        Err(error) => return fail(&error.to_string()),
+    };
+    let parsed = match Field::parse(argument) {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(error.message()),
+    };
+    let scaffold = FieldScaffold::new(names.clone(), parsed);
+
+    let root = match app_root() {
+        Ok(root) => root,
+        Err(reason) => return fail(&reason),
+    };
+
+    let plan = match plan_field(&root, &names, &scaffold) {
+        Ok(plan) => plan,
+        Err(reason) => return fail(&reason),
+    };
+    if let Err(reason) = plan.plan.apply(&root) {
+        return fail(&reason);
+    }
+
+    report_field(&names, &scaffold, &plan);
+    ExitCode::SUCCESS
+}
+
+/// One planned `scaffold field` run: what it writes, and what it could not find.
+struct FieldPlan {
+    plan: Plan,
+    /// Artifacts the model does not have, named so nothing is skipped quietly.
+    absent: Vec<String>,
+}
+
+/// Plans the migration, the schema column, and every artifact insertion.
+fn plan_field(root: &Path, names: &Names, scaffold: &FieldScaffold) -> Result<FieldPlan, String> {
+    let module = names.snake_plural();
+    let table = names.snake_plural();
+    if !root
+        .join(format!("backend/src/{module}/model.rs"))
+        .is_file()
+    {
+        return Err(format!(
+            "no model named `{}` in this application: backend/src/{module}/model.rs does not \
+             exist. Generate the model first with `anubis scaffold model {} Team`.",
+            names.pascal(),
+            names.pascal(),
+        ));
+    }
+
+    let schema = update_schema_column(root, &table, scaffold)?;
+    let created = migration_for_field(root, &table, scaffold)?;
+
+    let fields = std::slice::from_ref(scaffold);
+    let mut updated = vec![schema];
+    let mut absent = Vec::new();
+    for (relative, artifact) in model_artifacts(names) {
+        let path = root.join(&relative);
+        if !path.is_file() {
+            absent.push(relative);
+            continue;
+        }
+        let contents = insert_field(&relative, &read(&path)?, artifact, fields)?;
+        updated.push((PathBuf::from(relative), contents));
+    }
+
+    let locale = locale_file(names);
+    if root.join(&locale).is_file() {
+        let contents = insert_locale(&locale, &read(&root.join(&locale))?, names, fields)?;
+        updated.push((PathBuf::from(locale), contents));
+    } else {
+        absent.push(locale);
+    }
+
+    Ok(FieldPlan {
+        plan: Plan { created, updated },
+        absent,
+    })
+}
+
+/// Adds the column to the model's own `diesel::table!` block.
+///
+/// The block carries no anchor, because one spelling may appear only once per
+/// file and `schema.rs` holds a block per model. Its structure is the
+/// insertion point instead: the column joins the others, above the timestamps
+/// the database maintains, matching the block's indentation.
+fn update_schema_column(
+    root: &Path,
+    table: &str,
+    scaffold: &FieldScaffold,
+) -> Result<(PathBuf, String), String> {
+    let relative = PathBuf::from("backend/src/schema.rs");
+    let schema = read(&root.join(&relative))?;
+
+    let block = table_block(&schema, table).ok_or_else(|| {
+        format!(
+            "{} declares no `{table}` table, so there is no column list to add to",
+            display(&relative),
+        )
+    })?;
+    let declaration = format!("{} ->", scaffold.name());
+    if block
+        .lines()
+        .any(|line| line.trim_start().starts_with(&declaration))
+    {
+        return Err(format!(
+            "`{table}` already has a `{}` column; scaffolding never redefines a field",
+            scaffold.name(),
+        ));
+    }
+
+    let updated_block =
+        insert_above_anchor(&block, "created_at ->", &scaffold.field().schema_column()).map_err(
+            |_error| {
+                format!(
+                    "the `{table}` block in {} has no `created_at` column to insert above",
+                    display(&relative),
+                )
+            },
+        )?;
+    Ok((relative, schema.replace(&block, &updated_block)))
+}
+
+/// Writes the `ALTER TABLE` migration that adds the column, and drops it again.
+fn migration_for_field(
+    root: &Path,
+    table: &str,
+    scaffold: &FieldScaffold,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let migrations = root.join("backend/migrations");
+    let version = migration_version(&migrations, chrono::Utc::now())?;
+    let destination = PathBuf::from("backend/migrations")
+        .join(format!("{version}_add_{}_to_{table}", scaffold.name()));
+
+    Ok(vec![
+        (
+            destination.join("up.sql"),
+            format!("{}\n", scaffold.add_column(table)),
+        ),
+        (
+            destination.join("down.sql"),
+            format!("{}\n", scaffold.drop_column(table)),
+        ),
+    ])
+}
+
+/// Applies every field's insertions to the artifacts among `files`.
+///
+/// `scaffold model` calls this on the files it has just stamped, which is what
+/// makes an extra field on a new model identical to a field added later.
+fn wire_fields(
+    files: &mut [(PathBuf, String)],
+    model: &Names,
+    fields: &[FieldScaffold],
+) -> Result<(), String> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let artifacts = model_artifacts(model);
+    let locale = locale_file(model);
+    for (path, contents) in files {
+        let relative = display(path);
+        if relative == locale {
+            *contents = insert_locale(&relative, contents, model, fields)?;
+            continue;
+        }
+        if let Some((_path, artifact)) = artifacts
+            .iter()
+            .find(|(candidate, _artifact)| *candidate == relative)
+        {
+            *contents = insert_field(&relative, contents, *artifact, fields)?;
+        }
+    }
+    Ok(())
+}
+
+/// Inserts every field's lines above the anchors one artifact carries.
+fn insert_field(
+    relative: &str,
+    contents: &str,
+    artifact: Artifact,
+    fields: &[FieldScaffold],
+) -> Result<String, String> {
+    let mut updated = contents.to_owned();
+    for field in fields {
+        for (anchor, lines) in field.insertions(artifact) {
+            updated = insert_above_anchor(&updated, anchor, &lines)
+                .map_err(|_error| missing_anchor(relative, anchor))?;
+        }
+    }
+    Ok(updated)
+}
+
+/// Adds every field's label and help text to the model's locale file.
+fn insert_locale(
+    relative: &str,
+    contents: &str,
+    model: &Names,
+    fields: &[FieldScaffold],
+) -> Result<String, String> {
+    let entries = fields
+        .iter()
+        .flat_map(FieldScaffold::locale_entries)
+        .collect::<Vec<_>>();
+    insert_json_entries(contents, LOCALE_FIELDS, &entries).ok_or_else(|| {
+        format!(
+            "{relative} holds no `{LOCALE_FIELDS}` object under `{}` to add the field's strings to",
+            model.camel_plural(),
+        )
+    })
+}
+
+/// The message a file that lost an anchor comment earns.
+fn missing_anchor(relative: &str, anchor: &str) -> String {
+    format!(
+        "{relative} no longer carries the anchor `{anchor}`. Scaffolding inserts a field's \
+         lines above it, so restore the anchor comment and run this again.",
+    )
+}
+
+/// Prints what one `scaffold field` run changed.
+fn report_field(names: &Names, scaffold: &FieldScaffold, plan: &FieldPlan) {
+    let field_type = scaffold.field().field_type();
+    println!(
+        "added {} ({}) to {}",
+        scaffold.name(),
+        field_type.name(),
+        names.pascal(),
+    );
+
+    println!();
+    println!("created:");
+    for (path, _contents) in &plan.plan.created {
+        println!("  {}", display(path));
+    }
+    println!("updated:");
+    for (path, _contents) in &plan.plan.updated {
+        println!("  {}", display(path));
+    }
+    if !plan.absent.is_empty() {
+        println!("not found, so not updated:");
+        for relative in &plan.absent {
+            println!("  {relative}");
+        }
+    }
+
+    println!();
+    if field_type.is_nullable() {
+        println!("The column is nullable, so the rows the table already holds stay valid.");
+    } else {
+        println!(
+            "The column is NOT NULL with a database default, so the rows the table \
+             already holds stay valid."
+        );
+    }
+    println!();
+    println!("Next steps:");
+    println!("  boot the app to apply the migration");
     println!("  cargo test");
 }
 
@@ -625,7 +865,9 @@ fn fail(reason: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_version, plant_note};
+    use anubis::scaffold::{Artifact, Field, FieldScaffold, Names};
+
+    use super::{insert_field, migration_version, missing_anchor};
 
     #[test]
     fn a_version_steps_past_the_second_an_existing_migration_claims() {
@@ -649,13 +891,83 @@ mod tests {
     }
 
     #[test]
-    fn a_note_lands_above_the_first_import() {
-        let model = "//! The `Project` model.\n\nuse anubis::tenancy::TeamMembership;\n";
-        let planted = plant_note(model, "// TODO(anubis): wire `summary`.\n").unwrap();
+    fn a_file_that_lost_an_anchor_is_named_with_it() {
+        let scaffold = FieldScaffold::new(
+            Names::parse("Project").unwrap(),
+            Field::parse("priority:text_field").unwrap(),
+        );
+        let customized = "pub struct Project {\n    pub id: Uuid,\n}\n";
+        let error = insert_field(
+            "backend/src/projects/model.rs",
+            customized,
+            Artifact::Model,
+            std::slice::from_ref(&scaffold),
+        )
+        .unwrap_err();
+        assert!(error.contains("backend/src/projects/model.rs"), "{error}");
+        assert!(error.contains("🐺 anubis:record-fields"), "{error}");
+        assert!(error.contains("restore the anchor"), "{error}");
+
         assert_eq!(
-            planted,
-            "//! The `Project` model.\n\n// TODO(anubis): wire `summary`.\n\n\
-             use anubis::tenancy::TeamMembership;\n",
+            missing_anchor("a.rs", "🐺 anubis:x"),
+            "a.rs no longer carries the anchor `🐺 anubis:x`. Scaffolding inserts a field's \
+             lines above it, so restore the anchor comment and run this again.",
+        );
+    }
+
+    #[test]
+    fn an_artifact_gains_every_line_the_field_owes_it() {
+        let scaffold = FieldScaffold::new(
+            Names::parse("Project").unwrap(),
+            Field::parse("priority:text_field").unwrap(),
+        );
+        let model = "\
+pub struct Project {
+    pub name: String,
+    // 🐺 anubis:record-fields
+}
+
+pub struct NewProject<'a> {
+    pub name: &'a str,
+    // 🐺 anubis:insert-fields
+}
+
+pub struct ProjectChanges {
+    pub name: Option<String>,
+    // 🐺 anubis:changeset-fields
+}
+
+impl ProjectChanges {
+    pub fn is_empty(&self) -> bool {
+        // 🐺 anubis:changeset-empty
+        true
+    }
+}
+";
+        let updated = insert_field(
+            "backend/src/projects/model.rs",
+            model,
+            Artifact::Model,
+            std::slice::from_ref(&scaffold),
+        )
+        .unwrap();
+        assert!(updated.contains("    pub priority: Option<String>,\n"));
+        assert!(updated.contains("    pub priority: Option<&'a str>,\n"));
+        assert!(updated.contains("    pub priority: Option<Option<String>>,\n"));
+        assert!(
+            updated.contains("        if self.priority.is_some() {\n            return false;")
+        );
+
+        // Running the same insertion twice changes nothing.
+        assert_eq!(
+            insert_field(
+                "backend/src/projects/model.rs",
+                &updated,
+                Artifact::Model,
+                std::slice::from_ref(&scaffold),
+            )
+            .unwrap(),
+            updated,
         );
     }
 }

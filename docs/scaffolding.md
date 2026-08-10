@@ -6,7 +6,7 @@ Scaffolding is the crown jewel of Anubis, a 1:1 match of Bullet Train's Super Sc
 
 Templates are real, functional, compiling code, not a DSL. The generator transforms template files into your model's names and namespaces, and the output is standard Rust and standard React that you own and edit freely.
 
-Generated files contain magic anchor comments (`// 🐺 anubis:has-many`, `{/* 🐺 anubis:nav */}`) that later scaffold commands use as insertion targets. Do not delete them. This is exactly Bullet Train's magic-comment mechanism, and it is what makes `scaffold field` able to keep editing files you have customized.
+Generated files contain magic anchor comments (`// 🐺 anubis:record-fields`, `{/* 🐺 anubis:nav */}`) that later scaffold commands use as insertion targets. Do not delete them. This is exactly Bullet Train's magic-comment mechanism, and it is what makes `scaffold field` able to keep editing files you have customized.
 
 The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot.
 
@@ -25,6 +25,10 @@ Template files are written so that name-for-name transformation is enough: every
 ### Anchor vocabulary
 
 Anchors are `🐺 anubis:<name>` inside the host language's comment syntax. `insert_above_anchor` finds the first occurrence only, so an anchor spelling appears at most once per file.
+
+The vocabulary comes in two halves. **Model anchors** sit in files the whole application shares, and `scaffold model` inserts a model's lines above them. **Field anchors** sit in a model's own artifacts, one per list of columns, and `scaffold field` inserts one field's lines above them. Every artifact a scaffold stamps is a copy of a template that already carries the field anchors, so a generated model is field-scaffoldable forever, and so is the model generated from it a year from now.
+
+#### Model anchors
 
 | Anchor | File | Insertion point |
 |---|---|---|
@@ -45,6 +49,42 @@ Anchors are `🐺 anubis:<name>` inside the host language's comment syntax. `ins
 | `// 🐺 anubis:child-imports` | every show page | imports of child section components |
 | `{/* 🐺 anubis:children */}` | every show page | child section elements |
 
+#### Field anchors
+
+Each one closes a list of columns. A model's artifacts carry them wherever a field has to appear, which is what makes `scaffold field` a text insertion rather than a rewrite.
+
+| Anchor | File | Insertion point |
+|---|---|---|
+| `// 🐺 anubis:record-fields` | `backend/src/<models>/model.rs` | the record struct's columns |
+| `// 🐺 anubis:insert-fields` | `backend/src/<models>/model.rs` | the insertable struct's columns |
+| `// 🐺 anubis:changeset-fields` | `backend/src/<models>/model.rs` | the changeset struct's columns |
+| `// 🐺 anubis:changeset-empty` | `backend/src/<models>/model.rs` | `<Model>Changes::is_empty` |
+| `// 🐺 anubis:create-body` | `backend/src/<models>/routes.rs` | the create request body |
+| `// 🐺 anubis:update-body` | `backend/src/<models>/routes.rs` | the update request body |
+| `// 🐺 anubis:create-normalize` | `backend/src/<models>/routes.rs` | the create handler's bindings |
+| `// 🐺 anubis:insert-values` | `backend/src/<models>/routes.rs` | the insertable struct literal |
+| `// 🐺 anubis:update-normalize` | `backend/src/<models>/routes.rs` | the update handler's bindings |
+| `// 🐺 anubis:changeset-values` | `backend/src/<models>/routes.rs` | the changeset struct literal |
+| `// 🐺 anubis:test-create` | `backend/tests/<models>_flow.rs` | the create request's payload |
+| `// 🐺 anubis:test-created` | `backend/tests/<models>_flow.rs` | the assertions on the created record |
+| `// 🐺 anubis:test-update` | `backend/tests/<models>_flow.rs` | the update request's payload |
+| `// 🐺 anubis:test-updated` | `backend/tests/<models>_flow.rs` | the assertions on the updated record |
+| `// 🐺 anubis:wire-fields` | `frontend/src/api/routes/<model>Routes.ts` | the wire type |
+| `// 🐺 anubis:create-request` | `frontend/src/api/routes/<model>Routes.ts` | the create request type |
+| `// 🐺 anubis:update-request` | `frontend/src/api/routes/<model>Routes.ts` | the update request type |
+| `// 🐺 anubis:field-imports` | `frontend/src/components/<Model>Form.tsx` | the field components imported |
+| `// 🐺 anubis:form-schema` | `frontend/src/components/<Model>Form.tsx` | the zod object |
+| `// 🐺 anubis:form-values` | `frontend/src/components/<Model>Form.tsx` | `toFormValues` |
+| `// 🐺 anubis:form-payload` | `frontend/src/components/<Model>Form.tsx` | the submitted payload |
+| `{/* 🐺 anubis:form-fields */}` | `frontend/src/components/<Model>Form.tsx` | the field components rendered |
+| `{/* 🐺 anubis:list-columns */}` | a list page or a section component | the table's column headers |
+| `{/* 🐺 anubis:list-cells */}` | a list page or a section component | one row's cells |
+| `{/* 🐺 anubis:show-fields */}` | `frontend/src/pages/<Model>Page.tsx` | the record's attribute list |
+
+Two lists carry no anchor, because they repeat inside one file and an anchor spelling may not. A `diesel::table!` block's columns are found structurally, by the block that names the model's table, and the column joins them above `created_at`. A locale file is JSON and cannot hold a comment at all: the strings are merged into the model's own object, described below.
+
+The form's four anchors follow from one rule. The template builds its values in a single `toFormValues` function and its payload in a single object, so the initial values, the reset when the edited record changes, the reset after a create, and both write calls all read one list. A field is added to the form in four places rather than seven.
+
 Each `roles.yml` anchor names its role: grants differ per role, and one insertion point can only be found once. `default` gets `read` and `editor` gets `manage`; `billing` and `admin` inherit and need no entries. A role added by hand carries its own anchor.
 
 `anubis:routes` appears in two files, `backend/src/lib.rs` and `frontend/src/App.tsx`, spelled in each one's comment syntax. The rule is one spelling per file, not one per repository.
@@ -52,6 +92,18 @@ Each `roles.yml` anchor names its role: grants differ per role, and one insertio
 The two show-page anchors are what make a scaffolded page a host for later scaffolds: `scaffold model Goal Project,Team` inserts `import { GoalsSection } ...` and `<GoalsSection projectId={projectId} />` into `ProjectPage.tsx`, which `scaffold model Project Team` wrote. A nested model whose parent has no page is refused by name rather than generated half-wired.
 
 `account_router` mounts one router per statement rather than one long method chain, so an inserted line is already `rustfmt`-clean.
+
+#### The contract: do not delete an anchor
+
+Anchors are the price of a framework that keeps editing code you own, exactly as in Bullet Train. Customize a generated file freely, but leave its anchors where they are. A command that cannot find one names the file and the anchor and stops before writing anything:
+
+```
+error: frontend/src/components/ProjectForm.tsx no longer carries the anchor
+`🐺 anubis:form-fields`. Scaffolding inserts a field's lines above it, so
+restore the anchor comment and run this again.
+```
+
+Insertion is idempotent within the list an anchor closes, so a line already present is never duplicated. The test is deliberately that narrow: a record struct and the insertable struct beside it declare the same column with the same doc comment, and a whole-file test would read the first as proof the second was already written.
 
 ### The template-only marker
 
@@ -72,6 +124,8 @@ Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts
 The app's own endpoints get a ky client in `frontend/src/api/index.ts` and one route module per model in `frontend/src/api/routes/`. Wire types keep snake_case field names, because those names are the contract.
 
 JSON carries no comments, so each scaffolded model gets its own locale file at `frontend/src/locales/models/<models>.<locale>.json`, and `i18n.ts` carries the anchors that import and merge them. The base application strings stay in `locales/en-US.json`.
+
+A field's own strings live in a `fields` object inside the model's object, and a scaffolder merges them there structurally: it finds that object, appends the new keys after the last one, and leaves every other byte of the file alone. Keys are `camelCase` (`dueDate`, `dueDateHelp`) even though the column and the form control keep the wire's `snake_case` name, so a generated form reads `label={t('tickets.fields.dueDate')}`. The nesting is not decoration: a column may be called anything, and a model with a `title` or an `open` column would otherwise overwrite the page title and the "Open" link its own locale file already declares.
 
 Forms are field components from `@jalapenolabs/anubis`, one per model attribute, bound to react-hook-form through `control` and `name`. The page passes translated strings down (`label={t('tangibleThings.name')}`, `help={t('tangibleThings.nameHelp')}`), which is why the locale keys the scaffolder emits are named after the props.
 
@@ -97,16 +151,27 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 
-`anubis new`, `anubis routes`, `anubis doctor`, and `anubis scaffold model` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, `anubis scaffold model`, and `anubis scaffold field` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
-The generator accepts the types the living templates prove. Each row knows its column type, its Diesel schema type, its Rust type, and whether the column is nullable; later issues extend the table rather than the code around it, and an unsupported type is refused by name with the supported list.
+The generator accepts the types the living templates prove. Each row knows its column, its Diesel schema type, its Rust type, its wire type, and its React control; a later issue extends the table rather than the code around it, and an unsupported type is refused by name with the supported list.
 
-| Field type | Column | Schema type | Rust type | Nullable |
-|---|---|---|---|---|
-| `text_field` | `TEXT` | `Text` | `String` | no |
-| `text_area` | `TEXT` | `Text` | `Option<String>` | yes |
+| Field type | Column | Schema type | Rust type | Wire type | Component |
+|---|---|---|---|---|---|
+| `text_field` | `TEXT` | `Text` | `Option<String>` | `string \| null` | `TextField` |
+| `text_area` | `TEXT` | `Text` | `Option<String>` | `string \| null` | `TextAreaField` |
+| `number_field` | `INTEGER` | `Int4` | `Option<i32>` | `number \| null` | `NumberField` |
+| `boolean` | `BOOLEAN NOT NULL DEFAULT false` | `Bool` | `bool` | `boolean` | `BooleanField` |
+| `date_field` | `DATE` | `Date` | `Option<chrono::NaiveDate>` | `string \| null` | `DateField` |
+
+#### Nullable, or defaulted
+
+Every column a scaffolder adds is safe to add to a table that already holds rows: it is nullable, or it is `NOT NULL` with a database default. `boolean` is the only defaulted type today, which is why it is the only one that is not an `Option`. The rule lives in the field-type table rather than in the generator, so `scaffold field` on a live table and `scaffold model` on an empty one produce the same column, the same Rust type, and the same form control.
+
+The living template's own `name` column is required, and `description` optional, because that is the shape the template proves. Naming either in a field list is the identity case; naming one with the other's type is refused.
+
+Text columns are trimmed on write, and a blank value clears them, which is what a form submits when a user empties a field. Numbers and dates are stored as submitted. A boolean absent from a create request stores `false`.
 
 ## `anubis scaffold model`: one command, both ends
 
@@ -140,15 +205,57 @@ Every artifact is a transformation of the application's own files: the migration
 
 The run is planned before anything is written, so a missing template, a missing anchor, or an existing module stops the command with the application untouched. Anchor insertions are idempotent, and a model whose module already exists is refused rather than overwritten. Generated Rust is formatted with `rustfmt` when it is on `PATH`: transformation cannot preserve line widths, since a shorter model name lets a wrapped statement fit again, and the formatter settles it.
 
-### Fields today, and the honest gap
+### Fields
 
-Every scaffolded model carries the template's own columns: `name` (required text) and `description` (optional text), wired end to end through the model, the handlers, and the test. Naming either in the field list is the identity case; naming one with the other type is refused.
+Every scaffolded model carries the template's own columns, `name` and `description`, wired end to end. Every other field in the command is planned exactly as `anubis scaffold field` would plan it and inserted into the artifacts the run has just stamped, so this:
 
-Any other field reaches the migration and `schema.rs` as a nullable column, and nothing else. Nullable is deliberate: nothing writes the column yet, and a `NOT NULL` column with no writer would fail every insert. Two `TODO(anubis)` comments say so where the work is: the generated `model.rs` names each field and every backend place it still needs (the record, insert, and changeset structs, the request bodies, the create and update handlers), and the generated form component names each field with the field component its type wants, the wire type and request bodies in its route module, and the form itself. The command repeats the summary at the end of its output. `anubis scaffold field` closes this gap by adding the per-field anchors those files need.
+```
+anubis scaffold model Ticket Team urgency:number_field
+```
 
-Per-field anchors are that issue's design, not this one's. A form's fields are a list of sibling components with nothing between them, and the same is true of a table's columns and a wire type's members, so the insertion points `scaffold field` needs are settled together with the propagation rules it follows. Adding them here would freeze half a design against an unwritten one.
+and this:
+
+```
+anubis scaffold model Ticket Team
+anubis scaffold field Ticket urgency:number_field
+```
+
+leave the application in the same state, apart from a second migration. One set of insertions serves both commands, which is why a field declared on day one and a field added in month six read identically.
 
 Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`. On the frontend the generator pre-wraps the one construct a long model name can push past the 120-column lint limit, the link factory.
+
+## `anubis scaffold field`: one column, everywhere
+
+```
+anubis scaffold field Project priority:text_field
+anubis scaffold field Ticket due_date:date_field
+```
+
+One field per run, on a model an earlier scaffold generated. The command finds the model by its own names, from the application root, and refuses by name when it is not there:
+
+```
+error: no model named `Ghost` in this application: backend/src/ghosts/model.rs
+does not exist. Generate the model first with `anubis scaffold model Ghost Team`.
+```
+
+One run produces:
+
+- a timestamped migration adding the column, with the `ALTER TABLE ... DROP COLUMN` that takes it back
+- the column in the model's `diesel::table!` block in `backend/src/schema.rs`, above the timestamps
+- the column in the record, insertable, and changeset structs, and in the changeset's emptiness test
+- the column in both request bodies, both handlers' normalizations, and both struct literals in `routes.rs`
+- the column in the model's integration test, asserted through the create and the update
+- the wire type and both request types in the model's ky route module
+- the zod schema, the form values, the payload, the field component and its import in the model's form
+- a column and a cell in the model's table, on its list page or in its section component
+- an attribute row on the model's show page, if it has one
+- the label and the help text in the model's locale file
+
+Artifacts a model does not have are named in the report rather than skipped quietly: a nested model has a section component and no pages, and a developer may have deleted a file the scaffold wrote. The whole run is planned before it writes, so a missing anchor, a column that already exists, or a model that does not, stops the command with the application untouched.
+
+### The generated test grows with the model
+
+A generated model arrives with a narrative test, and a field added later joins it: the create request sends a value, the assertions check it, the update request sends a different value, and the assertions check that too. Four anchors in the test template carry it, and the samples come from the field type, so a number is `3` then `5` and a date is `2026-01-31` then `2026-02-28`. A column that reaches the database but not the test would be a column nothing proves.
 
 ## The field component library
 
@@ -219,10 +326,12 @@ All scaffolders share one pure engine, `anubis::scaffold`:
 
 - **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangibleThings`, `tangible_things`, `TANGIBLE_THING`, `tangible-thing`, `Tangible Things`, `tangible thing`, ...). Pluralization covers standard English rules plus a table of common irregulars.
 - **Replacements**: ordered find-and-replace over paths and file bodies, longest pattern first so `tangible_things` wins over `tangible_thing`. `Replacements::between(template, target)` maps every variant pair at once, and sets compose, which is how a nested model rewrites its own name and its parent's in one pass.
-- **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent so re-running a scaffold never duplicates lines. The `anubis::scaffold::anchor` module names every anchor the framework recognizes.
+- **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent within the list that anchor closes, so re-running a scaffold never duplicates lines. The `anubis::scaffold::anchor` module names every anchor the framework recognizes.
+- **Structural insertion**: `insert_json_entries` merges strings into a locale file's own object, because JSON cannot hold an anchor comment.
 - **Extraction**: `table_block` and `line_containing` read declarations back out of an application's own files, so a generated table inherits the template's shape instead of a shape hard-coded in the framework.
-- **Field types**: `FieldType` and `Field` map a `name:type` argument to a column, a schema type, and a Rust type.
-- **Planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
+- **Field types**: `FieldType` and `Field` map a `name:type` argument to a column, a schema type, a Rust type, a wire type, and a React control.
+- **Field planning**: `FieldScaffold` turns one field plus a model's names into every line it contributes, keyed by the `Artifact` that receives it. Both scaffolders read the same table, which is what keeps their output identical.
+- **Model planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
 
@@ -259,6 +368,8 @@ Still to come:
 - Per-model frontend tests. The starter runs Vitest and the scaffolder's own frontend output is covered by `tsc`, ESLint, the production build, and the integration test that scaffolds two models and reads the result. Playwright end-to-end tests wait on Playwright itself, which the starter does not have.
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
+
+Still deferred for `scaffold field`: one field per run (run it twice for two), and no `/api/v1` handlers to update, for the same reason `scaffold model` writes none.
 
 ## Locked conventions the generator stamps
 

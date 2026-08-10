@@ -31,6 +31,7 @@ pub struct CreativeConcept {
     pub name: String,
     /// Optional long-form detail.
     pub description: Option<String>,
+    // 🐺 anubis:record-fields
     /// When the creative concept was created.
     pub created_at: DateTime<Utc>,
     /// When the creative concept was last updated, kept by the database trigger.
@@ -47,6 +48,7 @@ pub struct NewCreativeConcept<'a> {
     pub name: &'a str,
     /// Optional long-form detail.
     pub description: Option<&'a str>,
+    // 🐺 anubis:insert-fields
 }
 
 /// The updatable shape; `None` leaves a column untouched.
@@ -66,6 +68,27 @@ pub struct CreativeConceptChanges {
     pub name: Option<String>,
     /// New description, or `Some(None)` to clear it.
     pub description: Option<Option<String>>,
+    // 🐺 anubis:changeset-fields
+}
+
+impl CreativeConceptChanges {
+    /// Whether the request submitted no change at all.
+    ///
+    /// Diesel refuses an empty changeset, so the handler answers with the
+    /// record untouched instead. One `if` per column keeps the anchor below in
+    /// statement position, which is what lets `anubis scaffold field` extend
+    /// the test with a new column.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        if self.name.is_some() {
+            return false;
+        }
+        if self.description.is_some() {
+            return false;
+        }
+        // 🐺 anubis:changeset-empty
+        true
+    }
 }
 
 impl CreativeConcept {

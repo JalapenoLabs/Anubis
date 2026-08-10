@@ -15,6 +15,7 @@ export type CreativeConcept = {
   team_id: string
   name: string
   description: string | null
+  // 🐺 anubis:wire-fields
   created_at: string
   updated_at: string
 }
@@ -51,6 +52,7 @@ export function getCreativeConcept(creativeConceptId: string) {
 type CreateCreativeConceptRequest = {
   name: string
   description?: string
+  // 🐺 anubis:create-request
 }
 
 export function createCreativeConcept(teamId: string, body: CreateCreativeConceptRequest) {
@@ -63,6 +65,7 @@ type UpdateCreativeConceptRequest = {
   name?: string
   /** A blank description clears the column. */
   description?: string
+  // 🐺 anubis:update-request
 }
 
 export function updateCreativeConcept(

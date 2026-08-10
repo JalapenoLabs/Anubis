@@ -62,7 +62,11 @@ async fn the_tangible_thing_slice_serves_full_crud() {
         &router,
         "POST",
         &collection_path,
-        Some(&json!({ "name": "Fresnel lens", "description": "Casts the beam" })),
+        Some(&json!({
+            "name": "Fresnel lens",
+            "description": "Casts the beam",
+            // 🐺 anubis:test-create
+        })),
         Some(&owner_cookie),
     )
     .await;
@@ -75,6 +79,7 @@ async fn the_tangible_thing_slice_serves_full_crud() {
         body["tangible_thing"]["creative_concept_id"],
         json!(creative_concept_id)
     );
+    // 🐺 anubis:test-created
 
     // A blank name never reaches the database.
     let (status, _body) = send(
@@ -167,7 +172,11 @@ async fn the_tangible_thing_slice_serves_full_crud() {
         &router,
         "PATCH",
         &member_path,
-        Some(&json!({ "name": "First-order lens", "description": "  " })),
+        Some(&json!({
+            "name": "First-order lens",
+            "description": "  ",
+            // 🐺 anubis:test-update
+        })),
         Some(&owner_cookie),
     )
     .await;
@@ -178,6 +187,7 @@ async fn the_tangible_thing_slice_serves_full_crud() {
         body["tangible_thing"]["updated_at"], body["tangible_thing"]["created_at"],
         "the set_updated_at trigger must fire",
     );
+    // 🐺 anubis:test-updated
 
     // A parent from another team is refused by the valid_* scoping method.
     let outsider_team = bootstrapped_team(&router, &outsider_cookie).await;

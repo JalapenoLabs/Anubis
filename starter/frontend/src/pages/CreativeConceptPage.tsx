@@ -94,9 +94,17 @@ export function CreativeConceptPage() {
           : null
         }
       </div>
-      <p className='opacity-70'>{
-          record?.description ?? t('creativeConcepts.noDescription')
-        }</p>
+      <dl className='level-left mt-4 items-start gap-8'>
+        <div>
+          <dt className='text-sm opacity-60'>{
+              t('creativeConcepts.fields.description')
+            }</dt>
+          <dd>{
+              record?.description ?? t('creativeConcepts.noDescription')
+            }</dd>
+        </div>
+        {/* 🐺 anubis:show-fields */}
+      </dl>
     </div>
     { record && mayUpdate
       ? <Card className='relaxed p-2'>

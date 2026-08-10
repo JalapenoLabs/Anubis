@@ -114,11 +114,12 @@ export function CreativeConceptsPage() {
         >
           <TableHeader>
             <TableColumn>{
-                t('creativeConcepts.name')
+                t('creativeConcepts.fields.name')
               }</TableColumn>
             <TableColumn>{
-                t('creativeConcepts.description')
+                t('creativeConcepts.fields.description')
               }</TableColumn>
+            {/* 🐺 anubis:list-columns */}
             <TableColumn>{
                 t('creativeConcepts.created')
               }</TableColumn>
@@ -146,6 +147,7 @@ export function CreativeConceptsPage() {
                         creativeConcept.description ?? t('creativeConcepts.noDescription')
                       }</span>
                   </TableCell>
+                  {/* 🐺 anubis:list-cells */}
                   <TableCell>{
                       new Date(creativeConcept.created_at).toLocaleDateString()
                     }</TableCell>

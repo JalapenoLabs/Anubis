@@ -83,11 +83,12 @@ export function TangibleThingsSection(props: Props) {
         >
           <TableHeader>
             <TableColumn>{
-                t('tangibleThings.name')
+                t('tangibleThings.fields.name')
               }</TableColumn>
             <TableColumn>{
-                t('tangibleThings.description')
+                t('tangibleThings.fields.description')
               }</TableColumn>
+            {/* 🐺 anubis:list-columns */}
             <TableColumn>{
                 t('common.actions')
               }</TableColumn>
@@ -112,6 +113,7 @@ export function TangibleThingsSection(props: Props) {
                         tangibleThing.description ?? t('tangibleThings.noDescription')
                       }</span>
                   </TableCell>
+                  {/* 🐺 anubis:list-cells */}
                   <TableCell>
                     <div className='level-left gap-2'>
                       { mayWrite

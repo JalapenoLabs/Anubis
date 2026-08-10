@@ -15,6 +15,7 @@ export type TangibleThing = {
   creative_concept_id: string
   name: string
   description: string | null
+  // 🐺 anubis:wire-fields
   created_at: string
   updated_at: string
 }
@@ -50,6 +51,7 @@ type TangibleThingResponse = {
 type CreateTangibleThingRequest = {
   name: string
   description?: string
+  // 🐺 anubis:create-request
 }
 
 export function createTangibleThing(
@@ -67,6 +69,7 @@ type UpdateTangibleThingRequest = {
   description?: string
   /** Moves the thing to another concept of the same team. */
   creative_concept_id?: string
+  // 🐺 anubis:update-request
 }
 
 export function updateTangibleThing(

@@ -1,12 +1,12 @@
-//! `anubis scaffold model` against a real copy of the starter application.
+//! `anubis scaffold` against a real copy of the starter application.
 //!
 //! The scaffolder's inputs are files the application owns, so the only honest
 //! test is to run the real binary in a real application tree: the starter is
-//! copied to a scratch directory, two models are scaffolded into it (one owned
-//! by a team, one owned through the first), and the result is inspected as
-//! text. Compiling the copy is left to the workspace's own `cargo test`, which
-//! builds the starter after a scaffold during development, and to the frontend
-//! toolchain, which typechecks and lints it.
+//! copied to a scratch directory, models and fields are scaffolded into it,
+//! and the result is inspected as text. Compiling the copy is left to the
+//! workspace's own `cargo test`, which builds the starter after a scaffold
+//! during development, and to the frontend toolchain, which typechecks and
+//! lints it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -193,12 +193,10 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
 
     // The generated form renders the field components, one per attribute.
     let form = read(&app.join("frontend/src/components/ProjectForm.tsx"));
-    assert!(
-        form.contains("import { TextAreaField, TextField }"),
-        "{form}"
-    );
-    assert!(form.contains("label={t('projects.name')}"));
-    assert!(form.contains("help={t('projects.descriptionHelp')}"));
+    assert!(form.contains("} from '@jalapenolabs/anubis'"), "{form}");
+    assert!(form.contains("  TextAreaField,\n  TextField,\n"));
+    assert!(form.contains("label={t('projects.fields.name')}"));
+    assert!(form.contains("help={t('projects.fields.descriptionHelp')}"));
 
     // The nested model attaches to the page the parent's own scaffold wrote,
     // and the template's own child is not carried along with it.
@@ -303,10 +301,10 @@ fn arguments_and_locations_are_rejected_with_a_reason() {
         stderr(&orphan),
     );
 
-    let unsupported = scaffold(&app, &["Task", "Team", "due:date_field"]);
+    let unsupported = scaffold(&app, &["Task", "Team", "shade:color_picker"]);
     assert!(!unsupported.status.success());
     assert!(
-        stderr(&unsupported).contains("text_field, text_area"),
+        stderr(&unsupported).contains("text_field, text_area, number_field, boolean, date_field"),
         "the supported types must be listed: {}",
         stderr(&unsupported),
     );
@@ -330,10 +328,249 @@ fn arguments_and_locations_are_rejected_with_a_reason() {
     std::fs::remove_dir_all(&app).expect("scratch directories are removable");
 }
 
+/// A field added to a model that already exists reaches every artifact, and
+/// the artifacts a scaffolded model carries are the ones that receive it.
+#[test]
+fn a_field_added_later_reaches_every_artifact() {
+    let app = copy_starter("field");
+
+    let output = scaffold(&app, &["Project", "Team", "name:text_field"]);
+    assert!(
+        output.status.success(),
+        "scaffolding Project failed: {}",
+        stderr(&output),
+    );
+
+    let output = scaffold_field(&app, &["Project", "priority:text_field"]);
+    assert!(
+        output.status.success(),
+        "scaffolding the field failed: {}",
+        stderr(&output),
+    );
+
+    // A timestamped migration adds the column, and gives it back.
+    let added = migration(&app, "_add_priority_to_projects");
+    assert_eq!(
+        read(&added.join("up.sql")).trim(),
+        "ALTER TABLE projects ADD COLUMN priority TEXT;",
+    );
+    assert_eq!(
+        read(&added.join("down.sql")).trim(),
+        "ALTER TABLE projects DROP COLUMN priority;",
+    );
+
+    // The column joins the model's own table block, above the timestamps the
+    // database maintains, and no other model's block moves.
+    let schema = read(&app.join("backend/src/schema.rs"));
+    assert!(
+        schema.contains("        priority -> Nullable<Text>,\n        created_at -> Timestamptz,"),
+        "{schema}",
+    );
+    assert_eq!(schema.matches("priority ->").count(), 1);
+
+    // The backend: record, insertable, changeset, the emptiness test, both
+    // request bodies, both normalizations, and both struct literals.
+    let model = read(&app.join("backend/src/projects/model.rs"));
+    assert!(model.contains("pub priority: Option<String>,"), "{model}");
+    assert!(model.contains("pub priority: Option<&'a str>,"));
+    assert!(model.contains("pub priority: Option<Option<String>>,"));
+    assert!(model.contains("if self.priority.is_some() {"));
+
+    let routes = read(&app.join("backend/src/projects/routes.rs"));
+    assert_eq!(
+        routes.matches("priority: Option<String>,").count(),
+        2,
+        "both request bodies carry the field: {routes}",
+    );
+    assert!(routes.contains("let priority = optional_text(body.priority.as_deref());"));
+    assert!(routes.contains(".map(str::trim)"), "{routes}");
+    assert_eq!(
+        routes.matches("        priority,\n").count(),
+        2,
+        "the insertable and the changeset both take the value: {routes}",
+    );
+
+    // The generated test asserts the column through the create and the update.
+    let test = read(&app.join("backend/tests/projects_flow.rs"));
+    assert!(test.contains("\"priority\": \"Alpha\","), "{test}");
+    assert!(test.contains("assert_eq!(body[\"project\"][\"priority\"], json!(\"Alpha\"));"));
+    assert!(test.contains("\"priority\": \"Beta\","));
+    assert!(test.contains("assert_eq!(body[\"project\"][\"priority\"], json!(\"Beta\"));"));
+
+    // The frontend: wire type, both request types, the form, and the table.
+    let api = read(&app.join("frontend/src/api/routes/projectRoutes.ts"));
+    assert!(api.contains("  priority: string | null\n"), "{api}");
+    assert_eq!(api.matches("priority?: string").count(), 2);
+
+    let form = read(&app.join("frontend/src/components/ProjectForm.tsx"));
+    assert!(form.contains("priority: z.string(),"), "{form}");
+    assert!(form.contains("priority: editing?.priority ?? '',"));
+    assert!(form.contains("priority: data.priority.trim(),"));
+    assert!(form.contains("name='priority'"));
+    assert!(form.contains("label={t('projects.fields.priority')}"));
+
+    let list = read(&app.join("frontend/src/pages/ProjectsPage.tsx"));
+    assert!(list.contains("t('projects.fields.priority')"), "{list}");
+    assert!(list.contains("project.priority"));
+
+    let show = read(&app.join("frontend/src/pages/ProjectPage.tsx"));
+    assert!(show.contains("record?.priority"), "{show}");
+
+    let locale = read(&app.join("frontend/src/locales/models/projects.en-US.json"));
+    assert!(locale.contains("\"priority\": \"Priority\""), "{locale}");
+    assert!(locale.contains("\"priorityHelp\": \"Priority of the project.\""));
+    serde_json::from_str::<serde_json::Value>(&locale).expect("the locale file stays valid JSON");
+
+    // The same field twice refuses, and says why.
+    let again = scaffold_field(&app, &["Project", "priority:text_field"]);
+    assert!(!again.status.success(), "a repeated field must refuse");
+    assert!(
+        stderr(&again).contains("already has a `priority` column"),
+        "unexpected error: {}",
+        stderr(&again),
+    );
+
+    // A model that was never scaffolded is named, with the file looked for.
+    let missing = scaffold_field(&app, &["Ghost", "note:text_field"]);
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing).contains("backend/src/ghosts/model.rs"),
+        "unexpected error: {}",
+        stderr(&missing),
+    );
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
+/// A file a developer customized past its anchor is named, and nothing is
+/// written: this is the contract that makes anchors worth keeping.
+#[test]
+fn a_deleted_anchor_stops_the_run_and_names_itself() {
+    let app = copy_starter("anchors");
+
+    let output = scaffold(&app, &["Project", "Team", "name:text_field"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let form = app.join("frontend/src/components/ProjectForm.tsx");
+    let customized = read(&form).replace("    {/* 🐺 anubis:form-fields */}\n", "");
+    std::fs::write(&form, &customized).expect("the copied form is writable");
+
+    let output = scaffold_field(&app, &["Project", "priority:text_field"]);
+    assert!(!output.status.success(), "a missing anchor must refuse");
+    let message = stderr(&output);
+    assert!(
+        message.contains("frontend/src/components/ProjectForm.tsx"),
+        "the message must name the file: {message}",
+    );
+    assert!(
+        message.contains("🐺 anubis:form-fields"),
+        "the message must name the anchor: {message}",
+    );
+    assert!(message.contains("restore the anchor"), "{message}");
+
+    // The run is planned before it writes, so nothing landed anywhere.
+    assert!(
+        !read(&app.join("backend/src/schema.rs")).contains("priority ->"),
+        "a refused run must not touch the schema",
+    );
+    assert!(
+        !read(&app.join("backend/src/projects/model.rs")).contains("priority"),
+        "a refused run must not touch the model",
+    );
+    assert!(
+        std::fs::read_dir(app.join("backend/migrations"))
+            .expect("the migrations directory is readable")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("priority")),
+        "a refused run must not write a migration",
+    );
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
+/// Every field type reaches the artifacts a `scaffold model` run stamps, with
+/// no leftover manual work, which is the gap this generator closed.
+#[test]
+fn every_field_type_is_wired_by_scaffold_model() {
+    let app = copy_starter("field-types");
+
+    let output = scaffold(
+        &app,
+        &[
+            "Ticket",
+            "Team",
+            "urgency:number_field",
+            "archived:boolean",
+            "due_date:date_field",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "scaffolding Ticket failed: {}",
+        stderr(&output),
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("TODO"),
+        "the run must promise no manual work",
+    );
+
+    // A boolean is the one type that is NOT NULL, because it has a default.
+    let up = read(&migration(&app, "_create_tickets").join("up.sql"));
+    assert!(up.contains("urgency INTEGER,"), "{up}");
+    assert!(up.contains("archived BOOLEAN NOT NULL DEFAULT false,"));
+    assert!(up.contains("due_date DATE,"));
+
+    let model = read(&app.join("backend/src/tickets/model.rs"));
+    assert!(model.contains("pub urgency: Option<i32>,"), "{model}");
+    assert!(model.contains("pub archived: bool,"));
+    assert!(model.contains("pub due_date: Option<chrono::NaiveDate>,"));
+    assert!(model.contains("pub archived: Option<bool>,"));
+
+    let routes = read(&app.join("backend/src/tickets/routes.rs"));
+    assert!(
+        routes.contains("archived: body.archived.unwrap_or(false),"),
+        "{routes}",
+    );
+    assert!(routes.contains("let urgency = body.urgency.map(Some);"));
+
+    let form = read(&app.join("frontend/src/components/TicketForm.tsx"));
+    assert!(form.contains("NumberField,"), "{form}");
+    assert!(form.contains("BooleanField,"));
+    assert!(form.contains("DateField,"));
+    assert!(form.contains("urgency: z.number().nullable(),"));
+    assert!(form.contains("archived: z.boolean(),"));
+    assert!(form.contains("due_date: z.string().nullable(),"));
+    assert!(!form.contains("TODO"), "no manual work is left behind");
+
+    let api = read(&app.join("frontend/src/api/routes/ticketRoutes.ts"));
+    assert!(api.contains("  urgency: number | null\n"), "{api}");
+    assert!(api.contains("  archived: boolean\n"));
+    assert!(api.contains("archived?: boolean"));
+
+    let locale = read(&app.join("frontend/src/locales/models/tickets.en-US.json"));
+    assert!(locale.contains("\"dueDate\": \"Due date\""), "{locale}");
+    // A column may share a name with the model's own strings, which is why
+    // field strings live in their own object.
+    assert_eq!(locale.matches("\"title\":").count(), 1);
+    serde_json::from_str::<serde_json::Value>(&locale).expect("the locale file stays valid JSON");
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
 /// Runs `anubis scaffold model` inside `app`.
 fn scaffold(app: &Path, arguments: &[&str]) -> Output {
     Command::new(ANUBIS)
         .args(["scaffold", "model"])
+        .args(arguments)
+        .current_dir(app)
+        .output()
+        .expect("the anubis binary runs")
+}
+
+/// Runs `anubis scaffold field` inside `app`.
+fn scaffold_field(app: &Path, arguments: &[&str]) -> Output {
+    Command::new(ANUBIS)
+        .args(["scaffold", "field"])
         .args(arguments)
         .current_dir(app)
         .output()

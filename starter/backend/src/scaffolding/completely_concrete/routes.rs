@@ -66,6 +66,7 @@ struct CreateTangibleThingBody {
     name: String,
     /// Blank or absent stores no description.
     description: Option<String>,
+    // 🐺 anubis:create-body
 }
 
 #[derive(Deserialize)]
@@ -76,6 +77,7 @@ struct UpdateTangibleThingBody {
     description: Option<String>,
     /// Moves the tangible thing to another creative concept of the same team.
     creative_concept_id: Option<Uuid>,
+    // 🐺 anubis:update-body
 }
 
 #[derive(Serialize)]
@@ -168,6 +170,7 @@ async fn create(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    // 🐺 anubis:create-normalize
 
     let tangible_thing: TangibleThing = diesel::insert_into(tangible_things::table)
         .values(NewTangibleThing {
@@ -176,6 +179,7 @@ async fn create(
             creative_concept_id: creative_concept.id,
             name,
             description,
+            // 🐺 anubis:insert-values
         })
         .returning(TangibleThing::as_returning())
         .get_result(&mut connection)
@@ -218,14 +222,8 @@ async fn update(
     };
     // A blank description clears the column, which is what the form submits
     // when the user empties the field.
-    let description = body.description.as_deref().map(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
-    });
+    let description = optional_text(body.description.as_deref());
+    // 🐺 anubis:update-normalize
 
     // A submitted parent is only ever accepted from the same team's records.
     let creative_concept_id = match body.creative_concept_id {
@@ -244,18 +242,19 @@ async fn update(
         _unchanged => None,
     };
 
-    if name.is_none() && description.is_none() && creative_concept_id.is_none() {
-        // Nothing was submitted; Diesel rejects an empty changeset.
+    let changes = TangibleThingChanges {
+        name,
+        description,
+        creative_concept_id,
+        // 🐺 anubis:changeset-values
+    };
+    if changes.is_empty() {
         return Ok(Json(TangibleThingBody { tangible_thing }));
     }
 
     let tangible_thing: TangibleThing =
         diesel::update(tangible_things::table.filter(tangible_things::id.eq(tangible_thing.id)))
-            .set(TangibleThingChanges {
-                name,
-                description,
-                creative_concept_id,
-            })
+            .set(changes)
             .returning(TangibleThing::as_returning())
             .get_result(&mut connection)
             .await
@@ -315,6 +314,26 @@ fn require(roles: &RoleSet, membership: &TeamMembership, action: Action) -> Resu
             "You do not have permission to do that.",
         ))
     }
+}
+
+/// Normalizes a submitted text value into a changeset column.
+///
+/// Absent leaves the column alone, blank clears it, and anything else stores
+/// it trimmed. Every nullable text column an `anubis scaffold field` run adds
+/// is normalized through here, so the rule is written once.
+#[expect(
+    clippy::option_option,
+    reason = "Diesel's changeset shape for a nullable column"
+)]
+fn optional_text(submitted: Option<&str>) -> Option<Option<String>> {
+    submitted.map(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
 }
 
 /// Builds a contains-pattern for `ILIKE`, escaping the wildcards so a search

@@ -50,7 +50,10 @@ pub fn table_block(schema: &str, table: &str) -> Option<String> {
 }
 
 /// The offset of the brace closing the first `{` in `source`.
-fn closing_brace(source: &str) -> Option<usize> {
+///
+/// Shared with [`insert_json_entries`](super::insert_json_entries), which
+/// finds a locale file's model object the same way.
+pub(super) fn closing_brace(source: &str) -> Option<usize> {
     let mut depth = 0_usize;
     for (offset, character) in source.char_indices() {
         match character {

@@ -29,6 +29,7 @@ pub struct TangibleThing {
     pub name: String,
     /// Optional long-form detail.
     pub description: Option<String>,
+    // 🐺 anubis:record-fields
     /// When the tangible thing was created.
     pub created_at: DateTime<Utc>,
     /// When the tangible thing was last updated, kept by the database trigger.
@@ -45,6 +46,7 @@ pub struct NewTangibleThing<'a> {
     pub name: &'a str,
     /// Optional long-form detail.
     pub description: Option<&'a str>,
+    // 🐺 anubis:insert-fields
 }
 
 /// The updatable shape; `None` leaves a column untouched.
@@ -67,6 +69,30 @@ pub struct TangibleThingChanges {
     /// A different parent creative concept, already checked against
     /// [`TangibleThing::valid_creative_concepts`].
     pub creative_concept_id: Option<Uuid>,
+    // 🐺 anubis:changeset-fields
+}
+
+impl TangibleThingChanges {
+    /// Whether the request submitted no change at all.
+    ///
+    /// Diesel refuses an empty changeset, so the handler answers with the
+    /// record untouched instead. One `if` per column keeps the anchor below in
+    /// statement position, which is what lets `anubis scaffold field` extend
+    /// the test with a new column.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        if self.name.is_some() {
+            return false;
+        }
+        if self.description.is_some() {
+            return false;
+        }
+        if self.creative_concept_id.is_some() {
+            return false;
+        }
+        // 🐺 anubis:changeset-empty
+        true
+    }
 }
 
 impl TangibleThing {
