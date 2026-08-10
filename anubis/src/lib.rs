@@ -9,6 +9,9 @@
 //! surface grows milestone by milestone; the roadmap lives in the repository's
 //! `docs/architecture.md`.
 
+pub mod config;
+pub mod telemetry;
+
 /// The version of the Anubis framework, matching the crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

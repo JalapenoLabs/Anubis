@@ -4,6 +4,8 @@
 //! exposes a health endpoint; auth, tenancy, and the API layer arrive with milestones
 //! M1 through M3.
 
+use anubis::config::AppConfig;
+use anubis::telemetry;
 use axum::Router;
 use axum::routing::get;
 use mimalloc::MiMalloc;
@@ -11,23 +13,21 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Address the development server binds to until server config lands with M1.
-const BIND_ADDRESS: &str = "127.0.0.1:3000";
-
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let config = AppConfig::from_env().expect("invalid environment configuration");
+    telemetry::init(&config).expect("failed to install the tracing subscriber");
 
     let app = Router::new().route("/healthz", get(healthz));
 
-    let listener = tokio::net::TcpListener::bind(BIND_ADDRESS)
+    let address = config.server.socket_addr();
+    let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("failed to bind the server address");
 
     tracing::info!(
-        server.address = BIND_ADDRESS,
+        server.address = %address,
+        app.environment = %config.environment,
         framework.version = anubis::VERSION,
         "server listening on {{server.address}}",
     );
