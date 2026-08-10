@@ -52,7 +52,7 @@ Bullet Train's most-cited long-term cost is merging upstream starter changes aft
 The API contract flows in one direction, from Rust to TypeScript:
 
 1. Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document.
-2. Codegen turns that document into TypeScript types and ky route functions (one file per resource, matching the Jalapeno Labs frontend API routing conventions).
+2. `anubis client generate-ts` turns that document into TypeScript types and ky route functions in house style.
 3. Application code consumes those functions through SWR hooks.
 
 Scaffolding a model or field regenerates the contract; anything the frontend must update surfaces as a TypeScript compile error.

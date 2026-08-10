@@ -14,12 +14,9 @@ Every Anubis application ships a versioned, documented, public REST API from day
 
 ## Documentation and client generation
 
-Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document served at a stable path. That document drives:
+Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document served at `/api/v1/openapi.json`, with human-readable Scalar docs at `/api/v1/docs`. `anubis openapi` exports the document for tooling.
 
-1. Human-readable API docs for the application's developers menu.
-2. The generated TypeScript client: types plus ky route functions per resource, consumed through SWR hooks in the SPA.
-
-The SPA consumes the same public API it documents, so the API can never lag the UI.
+`anubis client generate-ts` renders the document as the generated TypeScript client (`createAnubisV1`): exported wire types plus one ky function per operation, authenticated with a platform bearer token. Output is deterministic and house-style, and CI regenerates it and fails on drift, so the client can never lag the API. Types keep wire field names (snake_case) because they are the contract itself.
 
 ## Authentication
 

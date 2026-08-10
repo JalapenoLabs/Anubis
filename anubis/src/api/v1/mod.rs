@@ -87,6 +87,17 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     ApiDoc::openapi()
 }
 
+/// Renders the generated TypeScript client for this document.
+///
+/// # Panics
+/// Panics if the OpenAPI document fails to serialize, which would be a bug in
+/// the document itself.
+#[must_use]
+pub fn typescript_client() -> String {
+    let document = serde_json::to_value(openapi()).expect("the OpenAPI document must serialize");
+    crate::api::typescript::render(&document)
+}
+
 #[cfg(test)]
 mod tests {
     use super::openapi;

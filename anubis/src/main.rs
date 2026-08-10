@@ -31,6 +31,21 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Generate clients from the OpenAPI document.
+    Client {
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClientCommand {
+    /// Generate the TypeScript client for the public API.
+    GenerateTs {
+        /// Path the generated module is written to.
+        #[arg(long, default_value = "frontend/src/api/v1.generated.ts")]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +81,16 @@ fn main() -> ExitCode {
     match command {
         Command::Roles { command } => run_roles(command),
         Command::Openapi { out } => run_openapi(out.as_deref()),
+        Command::Client {
+            command: ClientCommand::GenerateTs { out },
+        } => {
+            if let Err(error) = std::fs::write(&out, anubis::api::v1::typescript_client()) {
+                eprintln!("error: failed to write {}: {error}", out.display());
+                return ExitCode::FAILURE;
+            }
+            println!("wrote {}", out.display());
+            ExitCode::SUCCESS
+        }
     }
 }
 

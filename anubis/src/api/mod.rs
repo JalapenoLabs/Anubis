@@ -10,6 +10,7 @@ pub mod management;
 pub mod v1;
 
 mod platform;
+pub(crate) mod typescript;
 
 #[doc(inline)]
 pub use platform::PlatformApplication;

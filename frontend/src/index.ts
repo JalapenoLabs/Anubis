@@ -13,11 +13,13 @@ export type {
   UserEnvelope,
 } from './api/types'
 export type { AnubisApi } from './api/createAnubisApi'
+export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
 
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'
+export { createAnubisV1 } from './api/v1.generated'
 export { getApiErrorMessage } from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
 export { useCurrentUser } from './react/useCurrentUser'

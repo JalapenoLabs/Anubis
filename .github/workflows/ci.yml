@@ -52,6 +52,13 @@ jobs:
             --out starter/frontend/src/roles.generated.ts
           git diff --exit-code starter/frontend/src/roles.generated.ts
 
+      # The generated TypeScript client must match the OpenAPI document.
+      - name: Client drift check
+        run: |
+          cargo run --quiet --bin anubis -- client generate-ts \
+            --out frontend/src/api/v1.generated.ts
+          git diff --exit-code frontend/src/api/v1.generated.ts
+
   frontend:
     name: Frontend
     runs-on: [self-hosted, fedora, earthly, docker]
