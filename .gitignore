@@ -5,6 +5,7 @@ target/
 node_modules/
 dist/
 coverage/
+.vite/
 
 # Yarn (zero-install artifacts are not committed)
 .yarn/*
