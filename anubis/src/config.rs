@@ -14,6 +14,7 @@
 //! | `HOST` | `127.0.0.1` | IP address the server binds to |
 //! | `PORT` | `3000` | TCP port the server binds to |
 //! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
+//! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
 //!
 //! The set grows milestone by milestone.
 
@@ -32,6 +33,9 @@ const PORT_VAR: &str = "PORT";
 
 /// Postgres connection URL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
+
+/// Public base URL of the application, used when building email links.
+const APP_URL_VAR: &str = "APP_URL";
 
 /// Loopback keeps development servers off the network unless opted in.
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -131,6 +135,12 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// Postgres connection settings, when `DATABASE_URL` is set.
     pub database: Option<DatabaseConfig>,
+    /// Public base URL of the application, without a trailing slash.
+    ///
+    /// Used when building links in outgoing email. Defaults to the bind
+    /// address, which is right for development and must be set explicitly in
+    /// production.
+    pub app_url: String,
 }
 
 impl AppConfig {
@@ -187,10 +197,22 @@ impl AppConfig {
             Some(url) => Some(DatabaseConfig { url }),
         };
 
+        let app_url = match lookup(APP_URL_VAR) {
+            None => format!("http://{host}:{port}"),
+            Some(url) => {
+                let trimmed = url.trim().trim_end_matches('/');
+                if trimmed.is_empty() || !trimmed.starts_with("http") {
+                    return Err(Error::invalid(APP_URL_VAR, url, "an http(s) base URL"));
+                }
+                trimmed.to_owned()
+            }
+        };
+
         Ok(Self {
             environment,
             server: ServerConfig { host, port },
             database,
+            app_url,
         })
     }
 }
@@ -319,6 +341,20 @@ mod tests {
         let error = AppConfig::from_lookup(lookup).expect_err("unknown environments are rejected");
 
         assert_eq!(error.variable(), "ANUBIS_ENV");
+    }
+
+    #[test]
+    fn app_url_defaults_to_the_bind_address_and_trims_trailing_slashes() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(defaulted.app_url, "http://127.0.0.1:3000");
+
+        let lookup = lookup_from(&[("APP_URL", "https://app.example.com/")]);
+        let explicit = AppConfig::from_lookup(lookup).expect("a URL is fine");
+        assert_eq!(explicit.app_url, "https://app.example.com");
+
+        let lookup = lookup_from(&[("APP_URL", "not-a-url")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("junk URLs are rejected");
+        assert_eq!(error.variable(), "APP_URL");
     }
 
     #[test]

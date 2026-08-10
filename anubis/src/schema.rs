@@ -13,6 +13,20 @@ diesel::table! {
         password_hash -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        email_verified_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Single-use tokens for email verification and password reset.
+    /// Rows hold a hash of the token, never the token.
+    user_tokens (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        purpose -> Text,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
     }
 }
 
@@ -28,4 +42,6 @@ diesel::table! {
 }
 
 diesel::joinable!(sessions -> users (user_id));
+diesel::joinable!(user_tokens -> users (user_id));
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
+diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);

@@ -1,12 +1,22 @@
-//! Registration, login, logout, and current-user endpoints.
+//! Registration, login, sessions, email verification, and password reset.
 //!
 //! [`router`] returns the routes an application mounts (conventionally under
-//! `/auth`): `POST /register` creates an account, `POST /login` verifies
-//! credentials, `POST /logout` ends the session, and `GET /me` returns the
-//! signed-in user. Registration and login both establish a session cookie.
-//! Login responds identically, in both message and timing, whether the email
-//! is unknown or the password is wrong, so responses do not leak which emails
-//! are registered.
+//! `/auth`):
+//!
+//! | Route | Effect |
+//! |---|---|
+//! | `POST /register` | Create an account, send a verification email, sign in |
+//! | `POST /login` | Verify credentials, sign in |
+//! | `POST /logout` | Revoke the session server-side |
+//! | `GET /me` | Return the signed-in user |
+//! | `POST /verify-email/request` | Re-send the verification email |
+//! | `POST /verify-email/confirm` | Confirm the emailed verification token |
+//! | `POST /password-reset/request` | Email a reset link (never reveals account existence) |
+//! | `POST /password-reset/confirm` | Set a new password, revoking every session |
+//!
+//! Login and password-reset requests respond identically whether or not the
+//! email is registered, in both message and timing, so responses do not leak
+//! which emails exist.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,6 +25,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use chrono::Utc;
 use diesel::prelude::*;
 use diesel::result::DatabaseErrorKind;
 use diesel_async::RunQueryDsl;
@@ -23,10 +34,12 @@ use uuid::Uuid;
 
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
-use crate::auth::{password, session};
-use crate::config::Environment;
+use crate::auth::user_token::TokenPurpose;
+use crate::auth::{password, session, user_token};
+use crate::config::{AppConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
+use crate::mail::{Email, Mailer};
 use crate::schema::users;
 
 /// Upper bound from RFC 3696; anything longer cannot be a deliverable address.
@@ -34,17 +47,24 @@ const MAX_EMAIL_CHARS: usize = 320;
 
 /// Returns the authentication routes for an application to mount.
 ///
-/// The environment decides whether session cookies are `Secure`; pass the
-/// application's configured environment.
-pub fn router(pool: DbPool, environment: Environment) -> Router {
+/// The mailer delivers verification and reset email; the config supplies the
+/// environment (whether session cookies are `Secure`) and the public base URL
+/// embedded in email links.
+pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/me", get(me))
+        .route("/verify-email/request", post(request_email_verification))
+        .route("/verify-email/confirm", post(confirm_email_verification))
+        .route("/password-reset/request", post(request_password_reset))
+        .route("/password-reset/confirm", post(confirm_password_reset))
         .with_state(AuthState {
             pool: pool.clone(),
-            environment,
+            environment: config.environment,
+            mailer,
+            app_url: config.app_url.clone(),
         })
         // CurrentUser resolves its pool from request extensions.
         .layer(Extension(pool))
@@ -54,6 +74,8 @@ pub fn router(pool: DbPool, environment: Environment) -> Router {
 struct AuthState {
     pool: DbPool,
     environment: Environment,
+    mailer: Mailer,
+    app_url: String,
 }
 
 #[derive(Deserialize)]
@@ -62,9 +84,30 @@ struct CredentialsBody {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct EmailOnlyBody {
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct ResetBody {
+    token: String,
+    password: String,
+}
+
 #[derive(Serialize)]
 struct UserBody {
     user: UserResponse,
+}
+
+#[derive(Serialize)]
+struct MessageBody {
+    message: &'static str,
 }
 
 async fn register(
@@ -93,6 +136,8 @@ async fn register(
             }
             other => log_internal(other),
         })?;
+
+    send_verification_email(&state, &mut connection, &created).await;
 
     let jar = signed_in_jar(&state, &mut connection, created.id).await?;
     let body = UserBody {
@@ -162,6 +207,186 @@ async fn me(CurrentUser(user): CurrentUser) -> Json<UserBody> {
     })
 }
 
+async fn request_email_verification(
+    State(state): State<AuthState>,
+    CurrentUser(user): CurrentUser,
+) -> Result<impl IntoResponse, ApiError> {
+    if user.email_verified_at.is_some() {
+        return Ok((
+            StatusCode::OK,
+            Json(MessageBody {
+                message: "Your email address is already verified.",
+            }),
+        ));
+    }
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    send_verification_email(&state, &mut connection, &user).await;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(MessageBody {
+            message: "Check your inbox for a verification link.",
+        }),
+    ))
+}
+
+async fn confirm_email_verification(
+    State(state): State<AuthState>,
+    Json(body): Json<TokenBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    let user_id = user_token::consume(
+        &mut connection,
+        &body.token,
+        TokenPurpose::EmailVerification,
+    )
+    .await
+    .map_err(log_internal)?
+    .ok_or_else(expired_link)?;
+
+    let user: User = diesel::update(users::table.find(user_id))
+        .set((
+            users::email_verified_at.eq(Utc::now()),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .returning(User::as_returning())
+        .get_result(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(Json(UserBody {
+        user: UserResponse::from(&user),
+    }))
+}
+
+async fn request_password_reset(
+    State(state): State<AuthState>,
+    Json(body): Json<EmailOnlyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let email = body.email.trim().to_lowercase();
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    let user: Option<User> = users::table
+        .filter(users::email.eq(&email))
+        .select(User::as_select())
+        .first(&mut connection)
+        .await
+        .optional()
+        .map_err(log_internal)?;
+
+    if let Some(user) = user {
+        let token = user_token::issue(&mut connection, user.id, TokenPurpose::PasswordReset)
+            .await
+            .map_err(log_internal)?;
+        let link = format!("{}/reset-password?token={token}", state.app_url);
+        deliver(
+            &state.mailer,
+            Email {
+                to: user.email.clone(),
+                subject: "Reset your password".to_owned(),
+                text_body: format!(
+                    "Someone requested a password reset for this account.\n\n\
+                     Set a new password within 30 minutes: {link}\n\n\
+                     If this wasn't you, ignore this email; your password is unchanged.",
+                ),
+            },
+        )
+        .await;
+    }
+
+    // The unknown-email path answers identically so responses cannot be used
+    // to probe which addresses are registered.
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(MessageBody {
+            message: "If that email is registered, a reset link is on its way.",
+        }),
+    ))
+}
+
+async fn confirm_password_reset(
+    State(state): State<AuthState>,
+    Json(body): Json<ResetBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_password(&body.password)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    let user_id = user_token::consume(&mut connection, &body.token, TokenPurpose::PasswordReset)
+        .await
+        .map_err(log_internal)?
+        .ok_or_else(expired_link)?;
+
+    let password_hash = password::hash(body.password).await.map_err(log_internal)?;
+
+    diesel::update(users::table.find(user_id))
+        .set((
+            users::password_hash.eq(&password_hash),
+            users::updated_at.eq(Utc::now()),
+        ))
+        .execute(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    // A reset proves the old credentials may be compromised; no session
+    // created under them survives.
+    session::delete_all_for_user(&mut connection, user_id)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(Json(MessageBody {
+        message: "Your password has been reset. Sign in with your new password.",
+    }))
+}
+
+/// Issues a verification token and emails its link. Failures log; they never
+/// fail the surrounding request, since the account itself is fine and the
+/// user can re-request from the UI.
+async fn send_verification_email(
+    state: &AuthState,
+    connection: &mut diesel_async::AsyncPgConnection,
+    user: &User,
+) {
+    let token = match user_token::issue(connection, user.id, TokenPurpose::EmailVerification).await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(
+                error.message = %error,
+                "failed to issue a verification token: {{error.message}}",
+            );
+            return;
+        }
+    };
+
+    let link = format!("{}/verify-email?token={token}", state.app_url);
+    deliver(
+        &state.mailer,
+        Email {
+            to: user.email.clone(),
+            subject: "Verify your email address".to_owned(),
+            text_body: format!(
+                "Welcome! Confirm this email address within 3 days: {link}\n\n\
+                 If you didn't create this account, ignore this email.",
+            ),
+        },
+    )
+    .await;
+}
+
+/// Sends an email, logging failures instead of failing the request.
+async fn deliver(mailer: &Mailer, email: Email) {
+    if let Err(error) = mailer.send(email).await {
+        tracing::error!(
+            error.message = %error,
+            "failed to deliver email: {{error.message}}",
+        );
+    }
+}
+
 /// Creates a session for `user_id` and returns a jar carrying its cookie.
 async fn signed_in_jar(
     state: &AuthState,
@@ -218,7 +443,17 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
         return Err(ApiError::validation("Enter a valid email address."));
     }
 
-    let password_chars = body.password.chars().count();
+    validate_password(&body.password)?;
+
+    Ok(ValidCredentials {
+        email,
+        password: body.password,
+    })
+}
+
+/// Enforces the password length policy shared by registration and reset.
+fn validate_password(candidate: &str) -> Result<(), ApiError> {
+    let password_chars = candidate.chars().count();
     if password_chars < password::MIN_PASSWORD_CHARS {
         return Err(ApiError::validation(format!(
             "Passwords must be at least {} characters.",
@@ -231,15 +466,15 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
             password::MAX_PASSWORD_CHARS
         )));
     }
-
-    Ok(ValidCredentials {
-        email,
-        password: body.password,
-    })
+    Ok(())
 }
 
 fn invalid_credentials() -> ApiError {
     ApiError::unauthorized("Invalid email or password.")
+}
+
+fn expired_link() -> ApiError {
+    ApiError::validation("That link is invalid or has expired. Request a new one.")
 }
 
 fn log_internal(error: impl std::fmt::Display) -> ApiError {

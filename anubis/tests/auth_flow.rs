@@ -67,6 +67,10 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear end-to-end narrative; splitting it would re-register users per step"
+)]
 async fn register_login_and_session_round_trip() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping auth_flow test: DATABASE_URL is not set");
@@ -80,7 +84,13 @@ async fn register_login_and_session_round_trip() {
         .await
         .expect("database must be reachable");
 
-    let router = anubis::auth::router(pool, anubis::config::Environment::Test);
+    let config = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        _ => None,
+    })
+    .expect("test config must parse");
+    let (mailer, outbox) = anubis::mail::Mailer::test();
+    let router = anubis::auth::router(pool, mailer, &config);
     let email = format!("it-{}@example.com", uuid::Uuid::new_v4());
     let password = "correct horse battery staple";
     let credentials = json!({ "email": email, "password": password });
@@ -158,4 +168,120 @@ async fn register_login_and_session_round_trip() {
     let broken = json!({ "email": "not-an-email", "password": password });
     let (status, _headers, _body) = send(&router, "POST", "/register", Some(&broken), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ------------------------------------------------------------------
+    // Email verification: registration already sent a link to the outbox.
+    // ------------------------------------------------------------------
+    let (_status, _headers, body) = send(&router, "GET", "/me", None, Some(&login_cookie)).await;
+    assert_eq!(body["user"]["email_verified"], json!(false), "body: {body}");
+
+    let verification_email = outbox
+        .emails()
+        .into_iter()
+        .find(|sent| sent.to == email && sent.subject.contains("Verify"))
+        .expect("registration must send a verification email");
+    let verify_token = extract_token(&verification_email.text_body);
+
+    let confirm = json!({ "token": verify_token });
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/verify-email/confirm",
+        Some(&confirm),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["user"]["email_verified"], json!(true), "body: {body}");
+
+    // Tokens are single-use.
+    let (status, _headers, _body) = send(
+        &router,
+        "POST",
+        "/verify-email/confirm",
+        Some(&confirm),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ------------------------------------------------------------------
+    // Password reset: request, confirm, and verify session revocation.
+    // ------------------------------------------------------------------
+    let request = json!({ "email": email });
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/password-reset/request",
+        Some(&request),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let known_message = body["message"].clone();
+
+    // Unknown emails get the same answer, so responses cannot probe accounts.
+    let unknown_request = json!({ "email": "nobody@example.com" });
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/password-reset/request",
+        Some(&unknown_request),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["message"], known_message);
+    let mail_to_stranger = outbox
+        .emails()
+        .into_iter()
+        .find(|sent| sent.to == "nobody@example.com");
+    assert!(
+        mail_to_stranger.is_none(),
+        "unknown emails must not be mailed"
+    );
+
+    let reset_email = outbox
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|sent| sent.to == email && sent.subject.contains("Reset"))
+        .expect("the reset email must be in the outbox");
+    let reset_token = extract_token(&reset_email.text_body);
+
+    let new_password = "an entirely new passphrase";
+    let confirm_reset = json!({ "token": reset_token, "password": new_password });
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/password-reset/confirm",
+        Some(&confirm_reset),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Every session died with the reset.
+    let (status, _headers, _body) = send(&router, "GET", "/me", None, Some(&login_cookie)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The old password is gone; the new one works.
+    let old_login = json!({ "email": email, "password": password });
+    let (status, _headers, _body) = send(&router, "POST", "/login", Some(&old_login), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let new_login = json!({ "email": email, "password": new_password });
+    let (status, _headers, body) = send(&router, "POST", "/login", Some(&new_login), None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// Pulls the `token=` value out of an emailed action link.
+fn extract_token(email_body: &str) -> String {
+    let (_before, rest) = email_body
+        .split_once("token=")
+        .expect("the email must contain an action link");
+    rest.split_whitespace()
+        .next()
+        .expect("the token must end at whitespace")
+        .to_owned()
 }

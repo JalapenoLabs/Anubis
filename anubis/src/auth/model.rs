@@ -27,6 +27,8 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     /// When the account was last updated.
     pub updated_at: DateTime<Utc>,
+    /// When the user confirmed control of their email address, if ever.
+    pub email_verified_at: Option<DateTime<Utc>>,
 }
 
 impl fmt::Debug for User {
@@ -37,6 +39,7 @@ impl fmt::Debug for User {
             .field("password_hash", &"...")
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
+            .field("email_verified_at", &self.email_verified_at)
             .finish()
     }
 }
@@ -56,6 +59,8 @@ pub struct UserResponse {
     pub id: Uuid,
     /// Normalized email address.
     pub email: String,
+    /// Whether the user has confirmed control of their email address.
+    pub email_verified: bool,
     /// When the account was created.
     pub created_at: DateTime<Utc>,
 }
@@ -65,6 +70,7 @@ impl From<&User> for UserResponse {
         Self {
             id: user.id,
             email: user.email.clone(),
+            email_verified: user.email_verified_at.is_some(),
             created_at: user.created_at,
         }
     }
@@ -84,6 +90,7 @@ mod tests {
             password_hash: "$argon2id$super-secret-hash".to_owned(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            email_verified_at: None,
         }
     }
 

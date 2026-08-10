@@ -6,15 +6,13 @@
 //! without guessing 256 bits. Expiry is enforced server-side on every lookup;
 //! expired rows for a user are swept when that user signs in again.
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::model::User;
+use crate::auth::token;
 use crate::schema::{sessions, users};
 
 /// Name of the session cookie set at registration and login.
@@ -22,9 +20,6 @@ pub const SESSION_COOKIE: &str = "anubis_session";
 
 /// How long a session lives. Fixed expiry; sliding renewal can come later.
 pub const SESSION_TTL_DAYS: i64 = 30;
-
-/// Random bytes per token; 32 bytes = 256 bits of entropy.
-const TOKEN_BYTES: usize = 32;
 
 #[derive(Insertable)]
 #[diesel(table_name = sessions)]
@@ -50,8 +45,8 @@ pub(crate) async fn create(
     .execute(connection)
     .await?;
 
-    let token = generate_token();
-    let token_hash = hash_token(&token);
+    let token = token::generate();
+    let token_hash = token::hash(&token);
 
     diesel::insert_into(sessions::table)
         .values(NewSession {
@@ -70,7 +65,7 @@ pub(crate) async fn find_user(
     connection: &mut AsyncPgConnection,
     token: &str,
 ) -> Result<Option<User>, diesel::result::Error> {
-    let token_hash = hash_token(token);
+    let token_hash = token::hash(token);
 
     sessions::table
         .inner_join(users::table)
@@ -87,7 +82,7 @@ pub(crate) async fn delete(
     connection: &mut AsyncPgConnection,
     token: &str,
 ) -> Result<(), diesel::result::Error> {
-    let token_hash = hash_token(token);
+    let token_hash = token::hash(token);
 
     diesel::delete(sessions::table.filter(sessions::token_hash.eq(&token_hash)))
         .execute(connection)
@@ -96,37 +91,17 @@ pub(crate) async fn delete(
     Ok(())
 }
 
-fn generate_token() -> String {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    getrandom::fill(&mut bytes).expect("the OS random source must be available");
-    URL_SAFE_NO_PAD.encode(bytes)
-}
+/// Deletes every session a user has, signing out all of their browsers.
+///
+/// Called after a password reset so a stolen session cannot outlive the
+/// credentials it was created with.
+pub(crate) async fn delete_all_for_user(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(sessions::table.filter(sessions::user_id.eq(user_id)))
+        .execute(connection)
+        .await?;
 
-fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    URL_SAFE_NO_PAD.encode(digest)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{generate_token, hash_token};
-
-    #[test]
-    fn tokens_are_long_random_and_unique() {
-        let first = generate_token();
-        let second = generate_token();
-
-        assert_ne!(first, second);
-        // 32 bytes of base64url without padding is 43 characters.
-        assert_eq!(first.len(), 43);
-    }
-
-    #[test]
-    fn hashes_are_stable_and_do_not_reveal_the_token() {
-        let token = generate_token();
-
-        assert_eq!(hash_token(&token), hash_token(&token));
-        assert_ne!(hash_token(&token), token);
-        assert!(!hash_token(&token).contains(&token));
-    }
+    Ok(())
 }

@@ -30,9 +30,13 @@ async fn main() {
         .await
         .expect("failed to connect to the database");
 
+    // The log mailer prints emails (and their action links) to the console.
+    // Swap in a transport backend for production delivery.
+    let mailer = anubis::mail::Mailer::log();
+
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .nest("/auth", anubis::auth::router(pool, config.environment));
+        .nest("/auth", anubis::auth::router(pool, mailer, &config));
 
     let address = config.server.socket_addr();
     let listener = tokio::net::TcpListener::bind(address)
