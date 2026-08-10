@@ -44,6 +44,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The generated TypeScript permissions module must match roles.yml.
+      - name: Roles drift check
+        run: |
+          cargo run --quiet --bin anubis -- roles generate-ts \
+            --file starter/config/roles.yml \
+            --out starter/frontend/src/roles.generated.ts
+          git diff --exit-code starter/frontend/src/roles.generated.ts
+
   frontend:
     name: Frontend
     runs-on: [self-hosted, fedora, earthly, docker]

@@ -5,6 +5,7 @@
 //! M1 through M3.
 
 use anubis::config::AppConfig;
+use anubis::roles::RoleSet;
 use anubis::{db, telemetry};
 use axum::Router;
 use axum::routing::get;
@@ -13,10 +14,20 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// The application's role definitions, embedded at compile time.
+const ROLES_YML: &str = include_str!("../../config/roles.yml");
+
 #[tokio::main]
 async fn main() {
     let config = AppConfig::from_env().expect("invalid environment configuration");
     telemetry::init(&config).expect("failed to install the tracing subscriber");
+
+    // Validated at boot so a bad roles.yml edit can never reach traffic.
+    let roles = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml is invalid");
+    tracing::info!(
+        roles.count = roles.role_keys().count(),
+        "role definitions loaded: {{roles.count}} roles",
+    );
 
     let database = config
         .database
@@ -57,4 +68,19 @@ async fn main() {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+#[cfg(test)]
+mod tests {
+    use anubis::roles::RoleSet;
+
+    use super::ROLES_YML;
+
+    #[test]
+    fn the_embedded_roles_file_is_valid() {
+        let set = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml must be valid");
+        for role in ["default", "editor", "billing", "admin"] {
+            assert!(set.is_defined(role), "baseline role {role:?} must exist");
+        }
+    }
 }

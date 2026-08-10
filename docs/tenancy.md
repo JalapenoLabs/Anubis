@@ -33,14 +33,14 @@ Selectable associations are scoped through generated `valid_*` methods on the mo
 
 ## Roles and permissions
 
-Roles are declared once, in `config/roles.yml`, with role inheritance (`admin` includes `editor` and `billing`) and per-resource grants, modeled on `bullet_train-roles`.
+Roles are declared once, in `config/roles.yml`, with role inheritance (`admin` includes `editor` and `billing`) and per-model action grants (`read`, `create`, `update`, `destroy`, or `manage` as shorthand for all four), modeled on `bullet_train-roles`. The starter ships the baseline vocabulary: `default`, `editor`, `billing`, and `admin`.
 
-The `anubis` CLI compiles that single file into two artifacts:
+One definition drives both sides of the stack:
 
-1. A Rust permissions module the backend uses to authorize every web and API request.
-2. A generated TypeScript permissions module the SPA uses to hide or disable controls the current member cannot use.
+1. The backend embeds the file at compile time (`include_str!`) and resolves it at boot through `anubis::roles::RoleSet`, which rejects unknown includes, inheritance cycles, and unknown actions before the server takes traffic. Authorization asks `RoleSet::can(held_roles, action, model)`.
+2. `anubis roles generate-ts` emits the TypeScript permissions module (`roles.generated.ts`) the SPA uses to hide or disable controls the current member cannot use. Output is deterministic, and CI regenerates it and fails on drift.
 
-One definition, enforced on the backend, reflected in the UI. Both artifacts are regenerated whenever `roles.yml` changes, and drift is a compile error.
+`anubis roles check` validates the file standalone.
 
 ## Billing
 

@@ -14,6 +14,7 @@ pub mod config;
 pub mod db;
 pub mod http;
 pub mod mail;
+pub mod roles;
 pub mod schema;
 pub mod telemetry;
 pub mod tenancy;
