@@ -18,14 +18,14 @@ jobs:
           POSTGRES_PASSWORD: anubis
           POSTGRES_DB: anubis_test
         ports:
-          - 55432:5432
+          # Ephemeral host port: concurrent runs (and stale containers) on a
+          # shared self-hosted runner can never collide on a fixed port.
+          - 5432
         options: >-
           --health-cmd "pg_isready -U anubis"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      DATABASE_URL: postgres://anubis:anubis@localhost:55432/anubis_test
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +42,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        env:
+          DATABASE_URL: postgres://anubis:anubis@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_test
         run: cargo test --workspace
 
       # The generated TypeScript permissions module must match roles.yml.
