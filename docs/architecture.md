@@ -1,0 +1,72 @@
+# Architecture
+
+Anubis is a Rust-first SaaS framework modeled on Bullet Train's developer experience: teams-first multi-tenancy, roles and permissions, an auto-generated versioned REST API, and a Super Scaffolding style code generator. The stack is a Rust backend with a React SPA frontend.
+
+Everything Bullet Train does at runtime through Rails reflection, Anubis does at codegen time. After a scaffold runs, `cargo check` and `tsc` prove the whole stack links end to end. That compile-time guarantee is the core advantage of this stack.
+
+## Backend
+
+| Concern | Choice | Notes |
+|---|---|---|
+| Language | Rust (pinned toolchain) | World-class, idiomatic Rust throughout |
+| Async runtime | tokio | The entire backend is async |
+| Web framework | Axum | Maintained by the tokio team; sits on hyper + tower |
+| Middleware | tower / tower-http | Sessions, auth guards, tracing, CORS, compression |
+| ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
+| Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
+| Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
+| Background jobs | Postgres-backed queue | Job enqueue commits in the same transaction as the domain write that caused it |
+| Passwords | argon2id | |
+| OAuth / SSO | OpenID Connect (`openidconnect` crate) | Providers added via `anubis scaffold oauth <provider>` |
+| Observability | tracing | Structured events with named properties |
+| Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
+
+## Frontend
+
+| Concern | Choice |
+|---|---|
+| Framework | React SPA (client-side rendered), Vite + SWC, TypeScript |
+| UI components | HeroUI + Jalapeno Labs UI Kit |
+| Styling | TailwindCSS, themed via the Jalapeno Labs Brand package |
+| State | Redux Toolkit |
+| Routing | React Router with a central `UrlTree` |
+| Data fetching | ky + SWR |
+| Forms | react-hook-form + zod resolvers |
+| i18n | i18next, per-model locale files emitted by the scaffolder |
+| Unit tests | Vitest |
+| E2E tests | Playwright |
+
+## Packaging
+
+One Rust crate, one npm package, one monorepo.
+
+- `anubis/` is a single Cargo package. It is both the framework library and the `anubis` CLI binary (`cargo install anubis` provides the CLI). Optional functionality (billing, webhooks) lives behind additive cargo features, all enabled by default.
+- `frontend/` is a single npm package (`@jalapenolabs/anubis`). It ships the app shell (nav, breadcrumbs, team switcher, settings pages), the field component library, the auth pages, and the generated-client runtime. Tree shaking keeps consuming apps lean.
+- `starter/` is the template that `anubis new <name>` stamps out. It is deliberately thin: config, composition, and the application's own domain code. Framework behavior lives in the crate and the npm package so upgrades are version bumps, not template merges. The starter doubles as the host app that keeps the scaffolding templates compiling in CI.
+- `docs/` holds one document per decision category.
+
+Bullet Train's most-cited long-term cost is merging upstream starter changes after customization. Anubis avoids that cost structurally by keeping the starter thin and shipping everything else as versioned dependencies.
+
+## The contract pipeline
+
+The API contract flows in one direction, from Rust to TypeScript:
+
+1. Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document.
+2. Codegen turns that document into TypeScript types and ky route functions (one file per resource, matching the Jalapeno Labs frontend API routing conventions).
+3. Application code consumes those functions through SWR hooks.
+
+Scaffolding a model or field regenerates the contract; anything the frontend must update surfaces as a TypeScript compile error.
+
+## Deployment
+
+A production deployment is one static Rust binary (serving the API and the built SPA assets), PostgreSQL, and optionally Redis. Docker images are small and versions are pinned everywhere.
+
+## Roadmap
+
+The scaffolder stamps out patterns, so the patterns are hand-built and stabilized first, then automated.
+
+- **M1 Foundation**: monorepo layout, `anubis` crate skeleton, config, errors, tracing, auth (register, login, sessions, email verification, password reset), React shell with auth pages. A new app boots to a logged-in dashboard.
+- **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
+- **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
+- **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling.
