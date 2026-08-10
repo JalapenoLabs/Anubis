@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod guard;
 pub mod http;
 pub mod mail;
 pub mod roles;

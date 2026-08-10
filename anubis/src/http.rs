@@ -45,6 +45,18 @@ impl ApiError {
         }
     }
 
+    /// A `404 Not Found` that does not reveal whether the resource exists.
+    ///
+    /// Tenancy guards answer non-members with this, so probing ids leaks
+    /// nothing: absent and forbidden look identical.
+    #[must_use]
+    pub fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: "Not found.".to_owned(),
+        }
+    }
+
     /// A `409 Conflict` for requests that collide with existing state.
     #[must_use]
     pub fn conflict(message: impl Into<String>) -> Self {

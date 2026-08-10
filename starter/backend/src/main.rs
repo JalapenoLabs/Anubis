@@ -53,8 +53,11 @@ async fn main() {
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool, mailer, roles, &config),
-        );
+            anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+        )
+        // Application routes guard with TeamMember / OrganizationMember /
+        // CurrentUser through these extensions.
+        .layer(anubis::guard::layer(pool, roles));
 
     let address = config.server.socket_addr();
     let listener = tokio::net::TcpListener::bind(address)

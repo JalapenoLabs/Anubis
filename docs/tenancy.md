@@ -29,6 +29,8 @@ anubis scaffold model Goal Project,Team description:text_field
 
 The chain drives everything: authorization scoping, nested routes, breadcrumbs, and the parent's show-view table. Tenant isolation is enforced by walking the chain, never by trusting a client-supplied id.
 
+Enforcement is extractor-based. A handler that takes `anubis::guard::TeamMember` (or `OrganizationMember`) gets, before its body runs: authentication (401), the route's `{team_id}` resolved against the caller's membership (404 for non-members, byte-identical to a nonexistent id, so probing reveals nothing), and permission checks via `member.require(Action::Update, "Project")` against the compiled role set (403). Routers provide the needed request extensions with `anubis::guard::layer(pool, roles)`. Scaffolded models resolve their parent chain to the owning team and ride the same primitives.
+
 Selectable associations are scoped through generated `valid_*` methods on the model (for example `valid_leads` returning `team.memberships().current_and_invited()`). These methods populate select fields and enforce the tenancy boundary on write, so a form can never smuggle in another tenant's record.
 
 ## Roles and permissions
