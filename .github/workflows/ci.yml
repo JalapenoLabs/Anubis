@@ -9,7 +9,7 @@ on:
 jobs:
   rust:
     name: Rust
-    runs-on: [self-hosted, fedora, earthly, docker]
+    runs-on: [self-hosted, rocky9, earthly, docker]
     services:
       postgres:
         image: postgres:17.6
@@ -61,7 +61,7 @@ jobs:
 
   frontend:
     name: Frontend
-    runs-on: [self-hosted, fedora, earthly, docker]
+    runs-on: [self-hosted, rocky9, earthly, docker]
     steps:
       - uses: actions/checkout@v4
 
