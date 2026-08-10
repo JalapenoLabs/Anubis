@@ -47,6 +47,12 @@ Frontend:
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
 
+## Locked conventions the generator stamps
+
+- **List endpoints** follow the page/limit, sort, and filter conventions in [api.md](api.md); the scaffolder maintains each model's sortable and filterable whitelists.
+- **Scoping methods** (`valid_*`): for every association field, the scaffolder generates an inherent method on the model, `valid_<association>(connection, team) -> QueryResult<Vec<_>>`, stubbed with a `todo!`-style prompt for the developer to fill. The same method populates the select options endpoint and validates submitted ids on create and update, so a form can never smuggle in another tenant's record. One definition, both duties.
+- **Timestamps**: `created_at`/`updated_at` come from the database. `updated_at` is maintained by the shared `set_updated_at()` trigger, attached to every generated table; application code never sets either.
+
 ## Workflow
 
 Domain modeling comes first and scaffolding makes it cheap, so follow Bullet Train's method: write the scaffold commands in a scratch file, review them with people before running them, run them, commit the generated code in its own commit, then polish the UX. Tearing down and re-scaffolding is cheap; live with a wrong domain model is not.

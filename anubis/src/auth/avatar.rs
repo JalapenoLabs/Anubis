@@ -20,7 +20,6 @@ use axum::routing::get;
 use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use image::Limits;
@@ -111,7 +110,6 @@ async fn upload_avatar(
             user_avatars::image.eq(&optimized),
             user_avatars::content_type.eq("image/jpeg"),
             user_avatars::etag.eq(&etag),
-            user_avatars::updated_at.eq(Utc::now()),
         ))
         .execute(&mut connection)
         .await

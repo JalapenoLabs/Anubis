@@ -8,6 +8,22 @@ Every Anubis application ships a versioned, documented, public REST API from day
 - Web (account) handlers and API handlers are separate but share the same permission checks and the same serializers.
 - Request validation is the API-first source of truth: the accepted-fields definition lives in the current API version and the account handlers reuse it. Bumping the API version freezes the old definition automatically, which is what makes versioning safe.
 
+## List endpoint conventions
+
+Every scaffolded list endpoint (web and API) follows one shape:
+
+- **Pagination is page/limit**, not cursor: `?page=2&limit=25`. `page` is 1-based and defaults to 1; `limit` defaults to 25 and caps at 100. Out-of-range values clamp rather than error.
+- **Sorting**: `?sort=name` ascending, `?sort=-created_at` descending. Sortable fields are a per-model whitelist maintained by the scaffolder; unknown fields fall back to the default sort (`created_at` descending).
+- **Filtering**: explicit per-field query params (`?status=active`), whitelisted per model by the scaffolder. No generic filter DSL.
+- **Response envelope**: the plural resource key plus a `pagination` object:
+
+```json
+{
+  "projects": [ ... ],
+  "pagination": { "page": 2, "limit": 25, "total_items": 61, "total_pages": 3 }
+}
+```
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.

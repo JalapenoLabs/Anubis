@@ -289,10 +289,7 @@ async fn confirm_email_verification(
     .ok_or_else(expired_link)?;
 
     let user: User = diesel::update(users::table.find(user_id))
-        .set((
-            users::email_verified_at.eq(Utc::now()),
-            users::updated_at.eq(Utc::now()),
-        ))
+        .set((users::email_verified_at.eq(Utc::now()),))
         .returning(User::as_returning())
         .get_result(&mut connection)
         .await
@@ -366,10 +363,7 @@ async fn confirm_password_reset(
     let password_hash = password::hash(body.password).await.map_err(log_internal)?;
 
     diesel::update(users::table.find(user_id))
-        .set((
-            users::password_hash.eq(&password_hash),
-            users::updated_at.eq(Utc::now()),
-        ))
+        .set((users::password_hash.eq(&password_hash),))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;
