@@ -1,0 +1,7 @@
+{
+  "app": {
+    "title": "Anubis",
+    "tagline": "Your application starts here.",
+    "frameworkVersion": "Framework version {{version}}"
+  }
+}

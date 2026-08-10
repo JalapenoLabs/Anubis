@@ -1,2 +1,15 @@
-target
-target/**
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Yarn (zero-install artifacts are not committed)
+.yarn/*
+.pnp.*
+
+# Environment
+.env
+.env.local

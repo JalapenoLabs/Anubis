@@ -1,0 +1,42 @@
+{
+  "name": "anubis-starter-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The Anubis starter application frontend, stamped out by `anubis new`.",
+  "license": "MIT",
+  "author": "Jalapeno Labs",
+  "type": "module",
+  "engines": {
+    "node": ">=20",
+    "yarn": ">=4"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "clean": "rimraf dist coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@jalapenolabs/anubis": "workspace:^",
+    "i18next": "^24.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-i18next": "^15.4.0"
+  },
+  "devDependencies": {
+    "@jalapenolabs/cli": "https://github.com/jalapenolabs/cli.git",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react-swc": "^3.7.0",
+    "eslint": "^9.0.0",
+    "jiti": "^2.4.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
+  },
+  "packageManager": "yarn@4.17.0"
+}

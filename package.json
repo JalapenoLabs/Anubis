@@ -1,0 +1,26 @@
+{
+  "name": "anubis-monorepo",
+  "private": true,
+  "description": "Monorepo root for the Anubis framework.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JalapenoLabs/Anubis.git"
+  },
+  "workspaces": [
+    "frontend",
+    "starter/frontend"
+  ],
+  "engines": {
+    "node": ">=20",
+    "yarn": ">=4"
+  },
+  "scripts": {
+    "build": "yarn workspaces foreach -A --topological run build",
+    "typecheck": "yarn workspaces foreach -A run typecheck",
+    "lint": "yarn workspaces foreach -A run lint",
+    "lint:fix": "yarn workspaces foreach -A run lint:fix",
+    "test": "yarn workspaces foreach -A run test"
+  },
+  "packageManager": "yarn@4.17.0"
+}
