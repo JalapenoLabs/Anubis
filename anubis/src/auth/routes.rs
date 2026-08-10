@@ -68,6 +68,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .route("/password-reset/request", post(request_password_reset))
         .route("/password-reset/confirm", post(confirm_password_reset))
         .merge(crate::auth::account::router())
+        .merge(crate::auth::mfa::router())
         .with_state(state)
         // CurrentUser resolves its pool from request extensions.
         .layer(Extension(pool))
@@ -159,10 +160,17 @@ async fn register(
     Ok((jar, (StatusCode::CREATED, Json(body))))
 }
 
+#[derive(Serialize)]
+struct MfaChallengeBody {
+    mfa_required: bool,
+    /// Present with `POST /mfa/verify` alongside a TOTP or recovery code.
+    mfa_token: String,
+}
+
 async fn login(
     State(state): State<AuthState>,
     Json(body): Json<CredentialsBody>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let credentials = validate_credentials(body)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -190,11 +198,30 @@ async fn login(
         return Err(invalid_credentials());
     }
 
+    // A confirmed second factor turns the session into a challenge.
+    if crate::auth::mfa::confirmed_secret(&mut connection, user.id)
+        .await
+        .map_err(log_internal)?
+        .is_some()
+    {
+        let mfa_token = user_token::issue(&mut connection, user.id, TokenPurpose::MfaChallenge)
+            .await
+            .map_err(log_internal)?;
+        return Ok((
+            StatusCode::OK,
+            Json(MfaChallengeBody {
+                mfa_required: true,
+                mfa_token,
+            }),
+        )
+            .into_response());
+    }
+
     let jar = signed_in_jar(&state, &mut connection, user.id).await?;
     let body = UserBody {
         user: UserResponse::from(&user),
     };
-    Ok((jar, (StatusCode::OK, Json(body))))
+    Ok((jar, (StatusCode::OK, Json(body))).into_response())
 }
 
 async fn logout(
@@ -402,7 +429,7 @@ async fn deliver(mailer: &Mailer, email: Email) {
 }
 
 /// Creates a session for `user_id` and returns a jar carrying its cookie.
-async fn signed_in_jar(
+pub(crate) async fn signed_in_jar(
     state: &AuthState,
     connection: &mut diesel_async::AsyncPgConnection,
     user_id: Uuid,

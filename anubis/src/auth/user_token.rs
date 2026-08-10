@@ -23,6 +23,8 @@ pub(crate) enum TokenPurpose {
     PasswordReset,
     /// Authorizes swapping to the new email carried in the payload.
     EmailChange,
+    /// A pending second factor between password success and session issuance.
+    MfaChallenge,
 }
 
 impl TokenPurpose {
@@ -32,6 +34,7 @@ impl TokenPurpose {
             Self::EmailVerification => "email_verification",
             Self::PasswordReset => "password_reset",
             Self::EmailChange => "email_change",
+            Self::MfaChallenge => "mfa_challenge",
         }
     }
 
@@ -44,9 +47,13 @@ impl TokenPurpose {
             Self::EmailVerification => Duration::days(3),
             Self::PasswordReset => Duration::minutes(30),
             Self::EmailChange => Duration::hours(1),
+            Self::MfaChallenge => Duration::minutes(5),
         }
     }
 }
+
+/// Failed attempts allowed against one attempt-limited token.
+pub(crate) const MAX_TOKEN_ATTEMPTS: i32 = 5;
 
 #[derive(Insertable)]
 #[diesel(table_name = user_tokens)]
@@ -99,6 +106,79 @@ pub(crate) async fn issue_with_payload(
         .await?;
 
     Ok(raw_token)
+}
+
+/// A live token row observed without consuming it.
+pub(crate) struct PeekedToken {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    #[expect(
+        dead_code,
+        reason = "read by the email sign-in code flow, landing next"
+    )]
+    pub payload: Option<String>,
+}
+
+/// Looks a token up without consuming it, for attempt-limited flows.
+///
+/// The caller verifies a guessable secret against the peeked row, then either
+/// deletes the token on success ([`delete_by_id`]) or records the failure
+/// ([`record_failure`]), which destroys the token once attempts run out.
+pub(crate) async fn peek(
+    connection: &mut AsyncPgConnection,
+    raw_token: &str,
+    purpose: TokenPurpose,
+) -> Result<Option<PeekedToken>, diesel::result::Error> {
+    let token_hash = token::hash(raw_token);
+
+    let row: Option<(Uuid, Uuid, Option<String>)> = user_tokens::table
+        .filter(user_tokens::token_hash.eq(&token_hash))
+        .filter(user_tokens::purpose.eq(purpose.as_str()))
+        .filter(user_tokens::expires_at.gt(Utc::now()))
+        .filter(user_tokens::attempts.lt(MAX_TOKEN_ATTEMPTS))
+        .select((user_tokens::id, user_tokens::user_id, user_tokens::payload))
+        .first(connection)
+        .await
+        .optional()?;
+
+    Ok(row.map(|(id, user_id, payload)| PeekedToken {
+        id,
+        user_id,
+        payload,
+    }))
+}
+
+/// Records a failed attempt; the token dies when attempts run out.
+pub(crate) async fn record_failure(
+    connection: &mut AsyncPgConnection,
+    token_id: Uuid,
+) -> Result<(), diesel::result::Error> {
+    diesel::update(user_tokens::table.find(token_id))
+        .set(user_tokens::attempts.eq(user_tokens::attempts + 1))
+        .execute(connection)
+        .await?;
+
+    diesel::delete(
+        user_tokens::table
+            .find(token_id)
+            .filter(user_tokens::attempts.ge(MAX_TOKEN_ATTEMPTS)),
+    )
+    .execute(connection)
+    .await?;
+
+    Ok(())
+}
+
+/// Deletes a token by id after its flow succeeds.
+pub(crate) async fn delete_by_id(
+    connection: &mut AsyncPgConnection,
+    token_id: Uuid,
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(user_tokens::table.find(token_id))
+        .execute(connection)
+        .await?;
+
+    Ok(())
 }
 
 /// Consumes a raw token, returning the user it belonged to and its payload.

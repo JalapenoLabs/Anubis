@@ -146,8 +146,31 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// TOTP enrollment, one per user. Only confirmed rows gate login.
+    user_mfa (user_id) {
+        user_id -> Uuid,
+        totp_secret -> Text,
+        confirmed_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Single-use MFA recovery codes. Rows hold a hash of the code.
+    user_recovery_codes (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        code_hash -> Text,
+        used_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
+diesel::joinable!(user_mfa -> users (user_id));
+diesel::joinable!(user_recovery_codes -> users (user_id));
 diesel::joinable!(platform_applications -> teams (team_id));
 diesel::joinable!(platform_tokens -> platform_applications (platform_application_id));
 diesel::joinable!(invitations -> organizations (organization_id));

@@ -8,10 +8,12 @@
 //! in the repository's `docs/api.md`.
 
 pub mod password;
+pub mod totp;
 
 mod account;
 mod avatar;
 mod extract;
+mod mfa;
 mod model;
 mod routes;
 mod session;

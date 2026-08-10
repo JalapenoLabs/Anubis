@@ -21,19 +21,23 @@ axum-extra = { version = "0.12", features = ["cookie"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+data-encoding = "2"
 # The libpq-linked "postgres" feature stays off; connections go through
 # diesel-async's pure-Rust tokio-postgres backend so builds need no native libs.
 diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid"] }
 diesel-async = { version = "0.9", features = ["postgres", "deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2.3"
 getrandom = "0.4"
+hmac = "0.12"
 http-body-util = "0.1"
 # Decoders limited to formats browsers actually upload.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 mimalloc = "0.1"
+qrcode = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
+sha1 = "0.10"
 sha2 = "0.11"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
