@@ -3,6 +3,7 @@ CREATE TABLE creative_concepts (
     -- The ownership chain: every application record reaches a team.
     team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
+    description TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

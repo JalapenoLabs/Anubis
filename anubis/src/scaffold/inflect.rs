@@ -159,6 +159,21 @@ impl Names {
         }
         sentence
     }
+
+    /// The singular spaced lowercase form, e.g. `tangible thing`.
+    ///
+    /// This is the form prose uses mid-sentence, as in `Name the tangible
+    /// thing.`, so templates can write natural messages that still transform.
+    #[must_use]
+    pub fn lower(&self) -> String {
+        self.words.join(" ")
+    }
+
+    /// The plural spaced lowercase form, e.g. `tangible things`.
+    #[must_use]
+    pub fn lower_plural(&self) -> String {
+        self.plural_words.join(" ")
+    }
 }
 
 /// Splits `chunk` on lowercase-to-uppercase boundaries into lowercase words.
@@ -288,6 +303,12 @@ impl NameError {
             backtrace: Backtrace::capture(),
         }
     }
+
+    /// The reason the name was rejected.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Debug for NameError {
@@ -342,6 +363,8 @@ mod tests {
         assert_eq!(names.title(), "Creative Concept");
         assert_eq!(names.title_plural(), "Creative Concepts");
         assert_eq!(names.human(), "Creative concept");
+        assert_eq!(names.lower(), "creative concept");
+        assert_eq!(names.lower_plural(), "creative concepts");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The `CreativeConcept` slice: the parent template, owned by a team.
+//! The `CreativeConcept` slice: model, routes, and permissions key.
 
 mod model;
 mod routes;

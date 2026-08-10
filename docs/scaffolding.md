@@ -12,9 +12,13 @@ The template models mirror Bullet Train's naming for the same reason Bullet Trai
 
 ## The template host app
 
-The templates are ordinary application code in `starter/`, exercised by `starter/backend/tests/scaffolding_flow.rs` against a real Postgres. `CreativeConcept` belongs to a Team and carries a `name`; `TangibleThing` belongs to a `CreativeConcept` and carries a `name` and a nullable `description`. Between them they cover every artifact one `scaffold model` run produces, which is what makes them a specification rather than a demo.
+The templates are ordinary application code in `starter/`. `CreativeConcept` belongs to a Team; `TangibleThing` belongs to a `CreativeConcept`. Both carry a required `name` and a nullable `description`, so the two ownership depths differ only in ownership. Between them they cover every artifact one `scaffold model` run produces, which is what makes them a specification rather than a demo.
 
-The starter backend is a library plus a thin binary. `main.rs` is the composition root; the application itself (models, routes, schema, migrations, role constants) lives in `lib.rs` and its modules, so integration tests drive the real routers.
+Each depth has its own narrative test, `starter/backend/tests/creative_concepts_flow.rs` and `starter/backend/tests/tangible_things_flow.rs`, running against a real Postgres. They are templates too: one scaffold stamps the matching narrative for the generated model, so a new model arrives with the same proof its template carries. The plumbing they share (booting the router, registering an account, inviting a teammate) lives in `starter/backend/tests/support/mod.rs`, which is application code the scaffolder never rewrites.
+
+The starter backend is a library plus a thin binary. `main.rs` is the composition root; the application itself (models, routes, schema, migrations, role constants) lives in `lib.rs` and its modules, so integration tests drive the real routers. Model modules are public, because an application's library is what its binary and its tests build on.
+
+Template files are written so that name-for-name transformation is enough: every local identifier and every sentence uses the model's own vocabulary (`CreativeConceptState`, `creative_concept_id`, "Name the creative concept."), never an abbreviation. An abbreviation would survive the transform and land in generated code as a name from another model.
 
 ### Anchor vocabulary
 
@@ -65,7 +69,7 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | Command | Purpose |
 |---|---|
 | `anubis new <name>` | Stamp a new application from the starter template |
-| `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold |
+| `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold (backend today) |
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
 | `anubis scaffold join <JoinModel> <a_id{class=A}> <b_id{class=B}>` | Join model for has-many-through |
 | `anubis scaffold oauth <provider>` | Add an OAuth login provider (the one-line Google Auth moment) |
@@ -74,17 +78,122 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 
-`anubis new`, `anubis routes`, and `anubis doctor` are implemented; the `scaffold` family and `eject` are the rest of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, and the backend half of `anubis scaffold model` are implemented; the frontend half of `scaffold model`, the rest of the `scaffold` family, and `eject` are the remainder of M4 and M5.
 
-Field types map to the field component library: `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
+Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
+
+The generator accepts the types the living templates prove. Each row knows its column type, its Diesel schema type, its Rust type, and whether the column is nullable; later issues extend the table rather than the code around it, and an unsupported type is refused by name with the supported list.
+
+| Field type | Column | Schema type | Rust type | Nullable |
+|---|---|---|---|---|
+| `text_field` | `TEXT` | `Text` | `String` | no |
+| `text_area` | `TEXT` | `Text` | `Option<String>` | yes |
+
+## `anubis scaffold model`: the backend slice
+
+```
+anubis scaffold model Project Team name:text_field
+anubis scaffold model Goal Project,Team name:text_field description:text_area
+```
+
+The command runs inside an application, which is a directory holding `backend/`, `frontend/`, and `config/roles.yml`; the search walks up from the working directory, so it works from anywhere inside one, and inside this repository it finds `starter/`. Anywhere else it stops and says so.
+
+The ownership chain ends in `Team`, because every application record reaches a team. `Team` selects the team-owned template and `<Parent>,Team` the nested one. Deeper chains are refused with a pointer at the roadmap rather than generated half-right.
+
+One run produces:
+
+- a timestamped migration (`up.sql` and `down.sql`) with the table, its ownership index, and the shared `set_updated_at()` trigger
+- a `diesel::table!` block in `backend/src/schema.rs`, plus the `joinable!` and `allow_tables_to_appear_in_same_query!` declarations for a nested model
+- the model's module (`mod.rs`, `model.rs`, `routes.rs`) under `backend/src/<models>/`, carrying the ownership chain, the list conventions, the `valid_*` scoping methods, and account CRUD handlers
+- the module declaration and router mount in `backend/src/lib.rs`
+- `read` and `manage` grants in `config/roles.yml`, and a regenerated `frontend/src/roles.generated.ts`
+- the model's own integration test in `backend/tests/<models>_flow.rs`
+
+Every artifact is a transformation of the application's own files: the migration comes from the migration that created the template's table, the schema block from the template's `table!` block, the module from the template module, the test from the template's narrative. Improving a template improves every later scaffold.
+
+The run is planned before anything is written, so a missing template, a missing anchor, or an existing module stops the command with the application untouched. Anchor insertions are idempotent, and a model whose module already exists is refused rather than overwritten. Generated Rust is formatted with `rustfmt` when it is on `PATH`: transformation cannot preserve line widths, since a shorter model name lets a wrapped statement fit again, and the formatter settles it.
+
+### Fields today, and the honest gap
+
+Every scaffolded model carries the template's own columns: `name` (required text) and `description` (optional text), wired end to end through the model, the handlers, and the test. Naming either in the field list is the identity case; naming one with the other type is refused.
+
+Any other field reaches the migration and `schema.rs` as a nullable column, and nothing else. Nullable is deliberate: nothing writes the column yet, and a `NOT NULL` column with no writer would fail every insert. The generated `model.rs` opens with a `TODO(anubis)` comment naming each field and every place it still needs (the record, insert, and changeset structs, the request bodies, the create and update handlers), and the command says the same at the end of its output. `anubis scaffold field` closes this gap by adding the per-field anchors those files need.
+
+Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`.
+
+## The field component library
+
+Bullet Train's field partials are its forms backbone. Ours are React components in `@jalapenolabs/anubis`, one per scaffolder field type, exported by name from the package root. A generated form is one component per model attribute with nothing in between.
+
+### One wrapper, one contract
+
+Every field composes `FieldWrapper`, which owns the label, the required marker, the control, and one line of help or error text. Fields render their label through the wrapper rather than through the control's own label prop, so a text input, a switch, and a radio group line up on the same grid; controls take `aria-label` for their accessible name. The error message replaces the help text while a field is invalid.
+
+| Wrapper prop | Meaning |
+|---|---|
+| `htmlFor` | The control id the label points at |
+| `label` | The label text, already translated |
+| `isRequired` | Renders the required marker |
+| `help` | Hint text, shown while the field is valid |
+| `error` | Message shown in place of the help text |
+| `className` | Extra classes on the wrapper, not the control |
+
+Every field accepts `AnubisFieldProps`: `control` and `name` for react-hook-form, then `label`, `help`, `placeholder`, `error`, `isRequired`, `isDisabled`, `isReadOnly`, `autoFocus`, `id`, and `className`. `isReadOnly` is the `{readonly}` modifier. Choice fields add `options: FieldOption[]`.
+
+The prop names mirror the locale keys the scaffolder emits, so a generated form reads `label={t('tangibleThings.name')}` and `help={t('tangibleThings.nameHelp')}` straight from the model's locale file.
+
+### react-hook-form and i18n
+
+Each field binds itself with `useController` through the shared `useFieldState` hook, so a form passes `control` and `name` and nothing else. The hook resolves the display state in one place: an explicit `error` prop wins over the resolver's message, and a field with a message is invalid. Applications that add their own field types call `useFieldState` and `FieldWrapper` to inherit the same behavior.
+
+The library never imports i18next. The application owns translation and passes `t(...)` results down as plain strings. Resolver messages surface automatically, and a form that needs a translated message passes `error` instead.
+
+### What ships today
+
+| Field type | Component | Control |
+|---|---|---|
+| `text_field` | `TextField` | HeroUI Input |
+| `text_area` | `TextAreaField` | HeroUI Textarea |
+| `number_field` | `NumberField` | HeroUI Input, holding a `number` or `null` |
+| `email_field` | `EmailField` | HeroUI Input, email keyboard and autofill |
+| `password_field` | `PasswordField` | HeroUI Input, masked |
+| `phone_field` | `PhoneField` | HeroUI Input, dial keyboard |
+| `boolean` | `BooleanField` | HeroUI Switch |
+| `buttons` | `ButtonsField` | HeroUI ButtonGroup as a segmented single choice |
+| `options` | `OptionsField` | HeroUI Select, or RadioGroup with `variant='radio'` |
+| `super_select` | `SuperSelectField` | HeroUI Autocomplete, single or multiple with chips |
+| `date_field` | `DateField` | HeroUI Input, storing `YYYY-MM-DD` verbatim |
+| `date_and_time_field` | `DateAndTimeField` | HeroUI Input, storing UTC and editing local |
+| `color_picker` | `ColorPickerField` | HeroUI Input plus a native color swatch |
+
+A boolean is a switch, not a checkbox: a boolean column is a setting that is on or off, and a switch says so at a glance. Checkboxes stay with selection lists, where "include this one" is the meaning.
+
+Dates carry no timezone, so `DateField` stores the calendar date exactly as typed. Timestamps do, so `DateAndTimeField` converts in both directions and the question is answered once, in the field, instead of in every generated form.
+
+### Deferred
+
+These field types have no component yet, and each waits on something specific:
+
+- `emoji_field`, `rich_text`, `code_editor`: each needs a heavy editor dependency (Emoji Mart, a rich text editor, Monaco). They belong behind a lazy import so applications that never scaffold one never ship one.
+- `file_field`, `image`: these need the upload endpoint and storage decision first. A picker with nowhere to put the bytes is not a field.
+- `address_field`: needs the country and region dataset, and dependent-select behavior, which is the same shape `phone_field` wants for country codes.
+- `phone_field` international formatting: the field ships as a telephone input today and stores the number as typed. Country selection and E.164 normalization arrive with the country dataset.
+- `super_select` async options: options are passed in today. Fetching them from the select options endpoint as the user types changes nothing about the contract.
+
+### Styling
+
+The package ships TypeScript source, so a consuming application's Tailwind build must scan it. Add `@source '../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';` to the application stylesheet next to the HeroUI globs. The fields also use the vertical rhythm helpers (`compact`, `relaxed`) and the HeroUI theme scale, both of which the starter stylesheet defines.
 
 ## The stamping engine
 
 All scaffolders share one pure engine, `anubis::scaffold`:
 
-- **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangible_things`, `tangible-thing`, `Tangible Things`, ...). Pluralization covers standard English rules plus a table of common irregulars.
-- **Replacements**: ordered find-and-replace over paths and file bodies, longest pattern first so `tangible_things` wins over `tangible_thing`. `Replacements::between(template, target)` maps every variant pair at once.
-- **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent so re-running a scaffold never duplicates lines.
+- **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangible_things`, `tangible-thing`, `Tangible Things`, `tangible thing`, ...). Pluralization covers standard English rules plus a table of common irregulars.
+- **Replacements**: ordered find-and-replace over paths and file bodies, longest pattern first so `tangible_things` wins over `tangible_thing`. `Replacements::between(template, target)` maps every variant pair at once, and sets compose, which is how a nested model rewrites its own name and its parent's in one pass.
+- **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent so re-running a scaffold never duplicates lines. The `anubis::scaffold::anchor` module names every anchor the framework recognizes.
+- **Extraction**: `table_block` and `line_containing` read declarations back out of an application's own files, so a generated table inherits the template's shape instead of a shape hard-coded in the framework.
+- **Field types**: `FieldType` and `Field` map a `name:type` argument to a column, a schema type, and a Rust type.
+- **Planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and inserted lines.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
 
@@ -98,14 +207,17 @@ The starter tree is embedded into the `anubis` binary at build time, so stamping
 
 ## What one `scaffold model` produces
 
-Backend:
+Backend, implemented today:
 
 - Diesel migration and `schema.rs` update
-- Model struct with the ownership chain, validations, and stubbed `valid_*` scoping methods
-- Entry in `roles.yml` permission grants
-- Account CRUD handlers and `/api/v1` handlers (separate, like Bullet Train's account vs api controllers)
+- Model struct with the ownership chain, validations, and `valid_*` scoping methods
+- Entry in `roles.yml` permission grants, and the regenerated frontend permissions module
+- Account CRUD handlers, routes wired into the router, and the model's integration test
+
+Backend, still to come:
+
+- `/api/v1` handlers (separate, like Bullet Train's account vs api controllers), once [the ownership question](#deferred-apiv1-for-application-models) is settled
 - Serializer registered with utoipa (OpenAPI 3.1), shared by the API and outgoing webhooks
-- Routes wired into the router, integration tests
 
 Frontend:
 
@@ -120,7 +232,7 @@ Frontend:
 ## Locked conventions the generator stamps
 
 - **List endpoints** follow the page/limit, sort, and filter conventions in [api.md](api.md); the scaffolder maintains each model's sortable and filterable whitelists. `anubis::http::ListParams` and `anubis::http::Pagination` implement the convention once, so every generated endpoint pages and sorts identically.
-- **Scoping methods** (`valid_*`): for every association field, the scaffolder generates an inherent method on the model, `valid_<association>(connection, team) -> QueryResult<Vec<_>>`, stubbed with a `todo!`-style prompt for the developer to fill. The same method populates the select options endpoint and validates submitted ids on create and update, so a form can never smuggle in another tenant's record. One definition, both duties.
+- **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method on the model, `valid_<associations>(connection, team_id) -> QueryResult<Vec<_>>`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on create and update, so a form can never smuggle in another tenant's record. One definition, both duties.
 - **Timestamps**: `created_at`/`updated_at` come from the database. `updated_at` is maintained by the shared `set_updated_at()` trigger, attached to every generated table; application code never sets either.
 
 ## Workflow

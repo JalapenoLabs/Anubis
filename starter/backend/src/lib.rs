@@ -4,7 +4,7 @@
 //! Keeping the application itself in a library is what lets `tests/` drive the
 //! real routers, so the living templates in [`scaffolding`] stay honest.
 
-mod scaffolding;
+pub mod scaffolding;
 mod schema;
 // 🐺 anubis:modules
 

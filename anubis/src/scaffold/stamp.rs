@@ -73,6 +73,8 @@ impl Replacements {
             (template.title(), target.title()),
             (template.title_plural(), target.title_plural()),
             (template.human(), target.human()),
+            (template.lower(), target.lower()),
+            (template.lower_plural(), target.lower_plural()),
         ])
     }
 
@@ -84,6 +86,17 @@ impl Replacements {
             output = output.replace(from, to);
         }
         output
+    }
+
+    /// Consumes the set, yielding its `(from, to)` pairs.
+    ///
+    /// Scaffolders combine several sets, one per name being rewritten: a
+    /// nested model transforms both its own template name and its parent's.
+    /// Feed the concatenated pairs back through [`Replacements::new`] so the
+    /// merged set is ordered longest-first again.
+    #[must_use]
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        self.pairs
     }
 }
 

@@ -1,9 +1,9 @@
 //! Account (session-authenticated) CRUD for `TangibleThing`.
 //!
 //! Every route resolves the ownership chain before it touches a record: the
-//! collection routes through their parent concept, the member routes through
-//! the thing's own parent. A record the caller cannot reach answers `404`,
-//! identically to one that does not exist.
+//! collection routes through their parent creative concept, the member routes
+//! through the tangible thing's own parent. A record the caller cannot reach
+//! answers `404`, identically to one that does not exist.
 //!
 //! | Method | Path |
 //! |---|---|
@@ -40,7 +40,7 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
             "/tangible-things/{tangible_thing_id}",
             get(show).patch(update).delete(destroy),
         )
-        .with_state(ThingState {
+        .with_state(TangibleThingState {
             pool: pool.clone(),
             roles: roles.clone(),
         })
@@ -49,61 +49,62 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
 }
 
 #[derive(Clone)]
-struct ThingState {
+struct TangibleThingState {
     pool: DbPool,
     roles: RoleSet,
 }
 
 /// The list endpoint's filters, whitelisted per model by the scaffolder.
 #[derive(Debug, Deserialize)]
-struct ThingFilters {
+struct TangibleThingFilters {
     /// Case-insensitive substring match on the name.
     name: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CreateThingBody {
+struct CreateTangibleThingBody {
     name: String,
     /// Blank or absent stores no description.
     description: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct UpdateThingBody {
+struct UpdateTangibleThingBody {
     name: Option<String>,
     /// Blank clears the description, absent leaves it alone, which is exactly
     /// how the form behaves.
     description: Option<String>,
-    /// Moves the thing to another concept of the same team.
+    /// Moves the tangible thing to another creative concept of the same team.
     creative_concept_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
-struct ThingBody {
+struct TangibleThingBody {
     tangible_thing: TangibleThing,
 }
 
 #[derive(Serialize)]
-struct ThingsBody {
+struct TangibleThingsBody {
     tangible_things: Vec<TangibleThing>,
     pagination: Pagination,
 }
 
 async fn list(
-    State(state): State<ThingState>,
+    State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
-    Path(concept_id): Path<Uuid>,
+    Path(creative_concept_id): Path<Uuid>,
     Query(params): Query<ListParams>,
-    Query(filters): Query<ThingFilters>,
+    Query(filters): Query<TangibleThingFilters>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (concept, membership) = load_parent(&mut connection, user.id, concept_id).await?;
+    let (creative_concept, membership) =
+        load_parent(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Read)?;
 
     let pattern = like_pattern(filters.name.as_deref());
 
     let mut counted = tangible_things::table
-        .filter(tangible_things::creative_concept_id.eq(concept.id))
+        .filter(tangible_things::creative_concept_id.eq(creative_concept.id))
         .into_boxed();
     if let Some(pattern) = pattern.clone() {
         counted = counted.filter(tangible_things::name.ilike(pattern));
@@ -115,7 +116,7 @@ async fn list(
         .map_err(log_internal)?;
 
     let mut page = tangible_things::table
-        .filter(tangible_things::creative_concept_id.eq(concept.id))
+        .filter(tangible_things::creative_concept_id.eq(creative_concept.id))
         .into_boxed();
     if let Some(pattern) = pattern {
         page = page.filter(tangible_things::name.ilike(pattern));
@@ -141,20 +142,21 @@ async fn list(
         .await
         .map_err(log_internal)?;
 
-    Ok(Json(ThingsBody {
+    Ok(Json(TangibleThingsBody {
         tangible_things: records,
         pagination: Pagination::new(&params, total_items),
     }))
 }
 
 async fn create(
-    State(state): State<ThingState>,
+    State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
-    Path(concept_id): Path<Uuid>,
-    Json(body): Json<CreateThingBody>,
+    Path(creative_concept_id): Path<Uuid>,
+    Json(body): Json<CreateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (concept, membership) = load_parent(&mut connection, user.id, concept_id).await?;
+    let (creative_concept, membership) =
+        load_parent(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Create)?;
 
     let name = body.name.trim();
@@ -171,7 +173,7 @@ async fn create(
         .values(NewTangibleThing {
             // The parent comes from the route, already checked against the
             // caller's membership.
-            creative_concept_id: concept.id,
+            creative_concept_id: creative_concept.id,
             name,
             description,
         })
@@ -180,29 +182,34 @@ async fn create(
         .await
         .map_err(log_internal)?;
 
-    Ok((StatusCode::CREATED, Json(ThingBody { tangible_thing })))
+    Ok((
+        StatusCode::CREATED,
+        Json(TangibleThingBody { tangible_thing }),
+    ))
 }
 
 async fn show(
-    State(state): State<ThingState>,
+    State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
-    Path(thing_id): Path<Uuid>,
+    Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _concept, membership) = load(&mut connection, user.id, thing_id).await?;
+    let (tangible_thing, _creative_concept, membership) =
+        load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Read)?;
 
-    Ok(Json(ThingBody { tangible_thing }))
+    Ok(Json(TangibleThingBody { tangible_thing }))
 }
 
 async fn update(
-    State(state): State<ThingState>,
+    State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
-    Path(thing_id): Path<Uuid>,
-    Json(body): Json<UpdateThingBody>,
+    Path(tangible_thing_id): Path<Uuid>,
+    Json(body): Json<UpdateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, concept, membership) = load(&mut connection, user.id, thing_id).await?;
+    let (tangible_thing, creative_concept, membership) =
+        load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
     let name = match body.name.as_deref().map(str::trim) {
@@ -220,12 +227,13 @@ async fn update(
         }
     });
 
-    // A submitted parent is only ever accepted from the same team's concepts.
+    // A submitted parent is only ever accepted from the same team's records.
     let creative_concept_id = match body.creative_concept_id {
-        Some(requested) if requested != concept.id => {
-            let valid = TangibleThing::valid_creative_concepts(&mut connection, concept.team_id)
-                .await
-                .map_err(log_internal)?;
+        Some(requested) if requested != creative_concept.id => {
+            let valid =
+                TangibleThing::valid_creative_concepts(&mut connection, creative_concept.team_id)
+                    .await
+                    .map_err(log_internal)?;
             if !valid.iter().any(|candidate| candidate.id == requested) {
                 return Err(ApiError::validation(
                     "That creative concept is not available to this team.",
@@ -238,7 +246,7 @@ async fn update(
 
     if name.is_none() && description.is_none() && creative_concept_id.is_none() {
         // Nothing was submitted; Diesel rejects an empty changeset.
-        return Ok(Json(ThingBody { tangible_thing }));
+        return Ok(Json(TangibleThingBody { tangible_thing }));
     }
 
     let tangible_thing: TangibleThing =
@@ -253,16 +261,17 @@ async fn update(
             .await
             .map_err(log_internal)?;
 
-    Ok(Json(ThingBody { tangible_thing }))
+    Ok(Json(TangibleThingBody { tangible_thing }))
 }
 
 async fn destroy(
-    State(state): State<ThingState>,
+    State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
-    Path(thing_id): Path<Uuid>,
+    Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _concept, membership) = load(&mut connection, user.id, thing_id).await?;
+    let (tangible_thing, _creative_concept, membership) =
+        load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
     diesel::delete(tangible_things::table.filter(tangible_things::id.eq(tangible_thing.id)))
@@ -273,25 +282,25 @@ async fn destroy(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Loads the parent concept, answering `404` when it is absent or out of reach.
+/// Loads the parent creative concept, answering `404` when it is unreachable.
 async fn load_parent(
     connection: &mut AsyncPgConnection,
     user_id: Uuid,
-    concept_id: Uuid,
+    creative_concept_id: Uuid,
 ) -> Result<(CreativeConcept, TeamMembership), ApiError> {
-    CreativeConcept::load_for_member(connection, user_id, concept_id)
+    CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
 }
 
-/// Loads the thing, answering `404` when it is absent or out of reach.
+/// Loads the tangible thing, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
     user_id: Uuid,
-    thing_id: Uuid,
+    tangible_thing_id: Uuid,
 ) -> Result<(TangibleThing, CreativeConcept, TeamMembership), ApiError> {
-    TangibleThing::load_for_member(connection, user_id, thing_id)
+    TangibleThing::load_for_member(connection, user_id, tangible_thing_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)

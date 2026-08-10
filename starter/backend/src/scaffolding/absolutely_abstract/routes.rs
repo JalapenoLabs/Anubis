@@ -39,7 +39,7 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
             "/creative-concepts/{creative_concept_id}",
             get(show).patch(update).delete(destroy),
         )
-        .with_state(ConceptState {
+        .with_state(CreativeConceptState {
             pool: pool.clone(),
             roles: roles.clone(),
         })
@@ -49,44 +49,49 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
 }
 
 #[derive(Clone)]
-struct ConceptState {
+struct CreativeConceptState {
     pool: DbPool,
     roles: RoleSet,
 }
 
 /// The list endpoint's filters, whitelisted per model by the scaffolder.
 #[derive(Debug, Deserialize)]
-struct ConceptFilters {
+struct CreativeConceptFilters {
     /// Case-insensitive substring match on the name.
     name: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CreateConceptBody {
+struct CreateCreativeConceptBody {
     name: String,
+    /// Blank or absent stores no description.
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct UpdateConceptBody {
+struct UpdateCreativeConceptBody {
     name: Option<String>,
+    /// Blank clears the description, absent leaves it alone, which is exactly
+    /// how the form behaves.
+    description: Option<String>,
 }
 
 #[derive(Serialize)]
-struct ConceptBody {
+struct CreativeConceptBody {
     creative_concept: CreativeConcept,
 }
 
 #[derive(Serialize)]
-struct ConceptsBody {
+struct CreativeConceptsBody {
     creative_concepts: Vec<CreativeConcept>,
     pagination: Pagination,
 }
 
 async fn list(
-    State(state): State<ConceptState>,
+    State(state): State<CreativeConceptState>,
     member: TeamMember,
     Query(params): Query<ListParams>,
-    Query(filters): Query<ConceptFilters>,
+    Query(filters): Query<CreativeConceptFilters>,
 ) -> Result<impl IntoResponse, ApiError> {
     member.require(Action::Read, MODEL)?;
 
@@ -132,16 +137,16 @@ async fn list(
         .await
         .map_err(log_internal)?;
 
-    Ok(Json(ConceptsBody {
+    Ok(Json(CreativeConceptsBody {
         creative_concepts: records,
         pagination: Pagination::new(&params, total_items),
     }))
 }
 
 async fn create(
-    State(state): State<ConceptState>,
+    State(state): State<CreativeConceptState>,
     member: TeamMember,
-    Json(body): Json<CreateConceptBody>,
+    Json(body): Json<CreateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     member.require(Action::Create, MODEL)?;
 
@@ -149,6 +154,11 @@ async fn create(
     if name.is_empty() {
         return Err(ApiError::validation("Name the creative concept."));
     }
+    let description = body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let creative_concept: CreativeConcept = diesel::insert_into(creative_concepts::table)
@@ -156,65 +166,83 @@ async fn create(
             // The team comes from the route, never from the body.
             team_id: member.team.id,
             name,
+            description,
         })
         .returning(CreativeConcept::as_returning())
         .get_result(&mut connection)
         .await
         .map_err(log_internal)?;
 
-    Ok((StatusCode::CREATED, Json(ConceptBody { creative_concept })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreativeConceptBody { creative_concept }),
+    ))
 }
 
 async fn show(
-    State(state): State<ConceptState>,
+    State(state): State<CreativeConceptState>,
     CurrentUser(user): CurrentUser,
-    Path(concept_id): Path<Uuid>,
+    Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) = load(&mut connection, user.id, concept_id).await?;
+    let (creative_concept, membership) =
+        load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Read)?;
 
-    Ok(Json(ConceptBody { creative_concept }))
+    Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
 async fn update(
-    State(state): State<ConceptState>,
+    State(state): State<CreativeConceptState>,
     CurrentUser(user): CurrentUser,
-    Path(concept_id): Path<Uuid>,
-    Json(body): Json<UpdateConceptBody>,
+    Path(creative_concept_id): Path<Uuid>,
+    Json(body): Json<UpdateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) = load(&mut connection, user.id, concept_id).await?;
+    let (creative_concept, membership) =
+        load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
     let name = match body.name.as_deref().map(str::trim) {
         Some("") => return Err(ApiError::validation("Name the creative concept.")),
-        other => other,
+        other => other.map(str::to_owned),
     };
-    if name.is_none() {
+    // A blank description clears the column, which is what the form submits
+    // when the user empties the field.
+    let description = body.description.as_deref().map(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    });
+
+    if name.is_none() && description.is_none() {
         // Nothing was submitted; Diesel rejects an empty changeset.
-        return Ok(Json(ConceptBody { creative_concept }));
+        return Ok(Json(CreativeConceptBody { creative_concept }));
     }
 
     let creative_concept: CreativeConcept = diesel::update(
         creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)),
     )
-    .set(CreativeConceptChanges { name })
+    .set(CreativeConceptChanges { name, description })
     .returning(CreativeConcept::as_returning())
     .get_result(&mut connection)
     .await
     .map_err(log_internal)?;
 
-    Ok(Json(ConceptBody { creative_concept }))
+    Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
 async fn destroy(
-    State(state): State<ConceptState>,
+    State(state): State<CreativeConceptState>,
     CurrentUser(user): CurrentUser,
-    Path(concept_id): Path<Uuid>,
+    Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) = load(&mut connection, user.id, concept_id).await?;
+    let (creative_concept, membership) =
+        load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
     diesel::delete(creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)))
@@ -225,13 +253,13 @@ async fn destroy(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Loads the concept, answering `404` when it is absent or out of reach.
+/// Loads the creative concept, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
     user_id: Uuid,
-    concept_id: Uuid,
+    creative_concept_id: Uuid,
 ) -> Result<(CreativeConcept, TeamMembership), ApiError> {
-    CreativeConcept::load_for_member(connection, user_id, concept_id)
+    CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)

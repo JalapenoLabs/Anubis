@@ -16,22 +16,22 @@ pub const MODEL: &str = "TangibleThing";
 /// Fields the list endpoint accepts in `?sort=`.
 pub const SORTABLE: [&str; 3] = ["name", "created_at", "updated_at"];
 
-/// A tangible thing: the child template, belonging to a creative concept.
+/// A tangible thing, owned through its creative concept.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = tangible_things)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct TangibleThing {
     /// Primary key.
     pub id: Uuid,
-    /// The parent concept; the ownership chain continues through it.
+    /// The parent creative concept; the ownership chain continues through it.
     pub creative_concept_id: Uuid,
     /// Display name.
     pub name: String,
     /// Optional long-form detail.
     pub description: Option<String>,
-    /// When the thing was created.
+    /// When the tangible thing was created.
     pub created_at: DateTime<Utc>,
-    /// When the thing was last updated, maintained by the database trigger.
+    /// When the tangible thing was last updated, kept by the database trigger.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -39,7 +39,7 @@ pub struct TangibleThing {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = tangible_things)]
 pub struct NewTangibleThing<'a> {
-    /// The parent concept, taken from the route and already tenancy-checked.
+    /// The parent creative concept, taken from the route and tenancy-checked.
     pub creative_concept_id: Uuid,
     /// Display name.
     pub name: &'a str,
@@ -64,13 +64,13 @@ pub struct TangibleThingChanges {
     pub name: Option<String>,
     /// New description, or `Some(None)` to clear it.
     pub description: Option<Option<String>>,
-    /// A different parent concept, already checked against
+    /// A different parent creative concept, already checked against
     /// [`TangibleThing::valid_creative_concepts`].
     pub creative_concept_id: Option<Uuid>,
 }
 
 impl TangibleThing {
-    /// The creative concepts this thing may belong to.
+    /// The creative concepts this tangible thing may belong to.
     ///
     /// One definition, two duties, exactly as `docs/scaffolding.md` requires:
     /// it populates the parent select field and validates a submitted
@@ -91,11 +91,12 @@ impl TangibleThing {
             .await
     }
 
-    /// Loads one thing the user may see, walking the chain to its team.
+    /// Loads one tangible thing the user may see, walking the chain to its team.
     ///
-    /// Returns the thing, its parent concept, and the caller's membership in
-    /// the owning team, or `None` when the thing does not exist *or* the
-    /// caller is not a member of that team. Handlers answer both with `404`.
+    /// Returns the tangible thing, its parent creative concept, and the
+    /// caller's membership in the owning team, or `None` when the record does
+    /// not exist *or* the caller is not a member of that team. Handlers answer
+    /// both with `404`.
     ///
     /// The application's two tables join in one query; the membership is a
     /// second lookup, because application and framework tables cannot share a
@@ -106,20 +107,21 @@ impl TangibleThing {
     pub async fn load_for_member(
         connection: &mut AsyncPgConnection,
         user_id: Uuid,
-        thing_id: Uuid,
+        tangible_thing_id: Uuid,
     ) -> QueryResult<Option<(Self, CreativeConcept, TeamMembership)>> {
         let found: Option<(Self, CreativeConcept)> = tangible_things::table
             .inner_join(creative_concepts::table)
-            .filter(tangible_things::id.eq(thing_id))
+            .filter(tangible_things::id.eq(tangible_thing_id))
             .select((Self::as_select(), CreativeConcept::as_select()))
             .first(connection)
             .await
             .optional()?;
-        let Some((thing, concept)) = found else {
+        let Some((tangible_thing, creative_concept)) = found else {
             return Ok(None);
         };
 
-        let membership = TeamMembership::for_user(connection, user_id, concept.team_id).await?;
-        Ok(membership.map(|membership| (thing, concept, membership)))
+        let membership =
+            TeamMembership::for_user(connection, user_id, creative_concept.team_id).await?;
+        Ok(membership.map(|membership| (tangible_thing, creative_concept, membership)))
     }
 }

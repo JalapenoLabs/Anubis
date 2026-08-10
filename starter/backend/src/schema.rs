@@ -13,19 +13,19 @@
 //! schema that any application can own without patching the framework.
 
 diesel::table! {
-    /// The parent living template: a team-owned record.
+    /// One creative concept, owned by a team.
     creative_concepts (id) {
         id -> Uuid,
         team_id -> Uuid,
         name -> Text,
+        description -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
 }
 
 diesel::table! {
-    /// The child living template: belongs to a creative concept, which is how
-    /// it reaches its owning team.
+    /// One tangible thing, owned through its creative concept.
     tangible_things (id) {
         id -> Uuid,
         creative_concept_id -> Uuid,

@@ -18,7 +18,7 @@ pub const MODEL: &str = "CreativeConcept";
 /// by a column the model does not mean to expose.
 pub const SORTABLE: [&str; 3] = ["name", "created_at", "updated_at"];
 
-/// A creative concept: the parent template, owned by a team.
+/// A creative concept, owned by a team.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = creative_concepts)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -29,9 +29,11 @@ pub struct CreativeConcept {
     pub team_id: Uuid,
     /// Display name.
     pub name: String,
-    /// When the concept was created.
+    /// Optional long-form detail.
+    pub description: Option<String>,
+    /// When the creative concept was created.
     pub created_at: DateTime<Utc>,
-    /// When the concept was last updated, maintained by the database trigger.
+    /// When the creative concept was last updated, kept by the database trigger.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -43,23 +45,36 @@ pub struct NewCreativeConcept<'a> {
     pub team_id: Uuid,
     /// Display name.
     pub name: &'a str,
+    /// Optional long-form detail.
+    pub description: Option<&'a str>,
 }
 
 /// The updatable shape; `None` leaves a column untouched.
+///
+/// `description` is doubly optional because the column is nullable: the outer
+/// `None` means "unchanged" and `Some(None)` clears it. The fields are owned
+/// rather than borrowed because that nesting reads as `&Option<&str>` inside
+/// Diesel's generated changeset, which is a shape clippy rightly dislikes.
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = creative_concepts)]
-pub struct CreativeConceptChanges<'a> {
+#[expect(
+    clippy::option_option,
+    reason = "Diesel's changeset shape for a nullable column"
+)]
+pub struct CreativeConceptChanges {
     /// New display name.
-    pub name: Option<&'a str>,
+    pub name: Option<String>,
+    /// New description, or `Some(None)` to clear it.
+    pub description: Option<Option<String>>,
 }
 
 impl CreativeConcept {
-    /// Loads one concept the user may see, walking the chain to its team.
+    /// Loads one creative concept the user may see, walking the chain to its team.
     ///
-    /// Returns the concept together with the caller's membership in the owning
-    /// team, or `None` when the concept does not exist *or* the caller is not
-    /// a member of its team. Handlers answer both with `404`, so probing ids
-    /// reveals nothing about other tenants.
+    /// Returns the creative concept together with the caller's membership in
+    /// the owning team, or `None` when the record does not exist *or* the
+    /// caller is not a member of its team. Handlers answer both with `404`, so
+    /// probing ids reveals nothing about other tenants.
     ///
     /// The membership lookup is a second query rather than a join: Rust's
     /// orphan rules stop an application crate from declaring its tables and
@@ -70,19 +85,20 @@ impl CreativeConcept {
     pub async fn load_for_member(
         connection: &mut AsyncPgConnection,
         user_id: Uuid,
-        concept_id: Uuid,
+        creative_concept_id: Uuid,
     ) -> QueryResult<Option<(Self, TeamMembership)>> {
-        let concept: Option<Self> = creative_concepts::table
-            .filter(creative_concepts::id.eq(concept_id))
+        let creative_concept: Option<Self> = creative_concepts::table
+            .filter(creative_concepts::id.eq(creative_concept_id))
             .select(Self::as_select())
             .first(connection)
             .await
             .optional()?;
-        let Some(concept) = concept else {
+        let Some(creative_concept) = creative_concept else {
             return Ok(None);
         };
 
-        let membership = TeamMembership::for_user(connection, user_id, concept.team_id).await?;
-        Ok(membership.map(|membership| (concept, membership)))
+        let membership =
+            TeamMembership::for_user(connection, user_id, creative_concept.team_id).await?;
+        Ok(membership.map(|membership| (creative_concept, membership)))
     }
 }

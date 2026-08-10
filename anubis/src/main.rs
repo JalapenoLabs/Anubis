@@ -1,9 +1,9 @@
 //! The `anubis` command line interface.
 //!
 //! The CLI is the front door to the framework: stamping new applications,
-//! scaffolding models and fields, and compiling `roles.yml`. Scaffolding
-//! subcommands land with milestone M4 (see the repository's
-//! `docs/scaffolding.md` for the planned surface).
+//! scaffolding models and fields, and compiling `roles.yml`. `scaffold model`
+//! generates a model's backend slice today; the rest of the `scaffold` family
+//! lands with milestone M4 (see the repository's `docs/scaffolding.md`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +27,11 @@ enum Command {
         /// The application name: lowercase letters, digits, and hyphens.
         name: String,
     },
+    /// Generate application code from the living templates.
+    Scaffold {
+        #[command(subcommand)]
+        command: ScaffoldCommand,
+    },
     /// Verify toolchain, database, and config health.
     Doctor,
     /// Print the framework route table.
@@ -46,6 +51,20 @@ enum Command {
     Client {
         #[command(subcommand)]
         command: ClientCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScaffoldCommand {
+    /// Generate a model's backend slice: migration, schema, model, routes,
+    /// permissions, and an integration test.
+    Model {
+        /// The model name, e.g. `Project`.
+        model: String,
+        /// The ownership chain ending in `Team`, e.g. `Team` or `Project,Team`.
+        ownership: String,
+        /// Fields as `name:type`, e.g. `name:text_field`.
+        fields: Vec<String>,
     },
 }
 
@@ -84,13 +103,21 @@ fn main() -> ExitCode {
     let Some(command) = cli.command else {
         println!("Anubis {}", anubis::VERSION);
         println!("Run `anubis --help` for available commands.");
-        println!("Scaffolding commands arrive with milestone M4.");
+        println!("Scaffold a model with `anubis scaffold model <Model> <ParentChain>`.");
         println!("Roadmap: https://github.com/JalapenoLabs/Anubis/milestones");
         return ExitCode::SUCCESS;
     };
 
     match command {
         Command::New { name } => cli::new::run(&name),
+        Command::Scaffold {
+            command:
+                ScaffoldCommand::Model {
+                    model,
+                    ownership,
+                    fields,
+                },
+        } => cli::scaffold::model(&model, &ownership, &fields),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),
