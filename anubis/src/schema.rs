@@ -14,6 +14,10 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         email_verified_at -> Nullable<Timestamptz>,
+        first_name -> Nullable<Text>,
+        last_name -> Nullable<Text>,
+        time_zone -> Text,
+        locale -> Text,
     }
 }
 
@@ -27,6 +31,8 @@ diesel::table! {
         token_hash -> Text,
         created_at -> Timestamptz,
         expires_at -> Timestamptz,
+        payload -> Nullable<Text>,
+        attempts -> Int4,
     }
 }
 

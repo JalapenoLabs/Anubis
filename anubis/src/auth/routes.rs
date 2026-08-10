@@ -51,6 +51,13 @@ const MAX_EMAIL_CHARS: usize = 320;
 /// environment (whether session cookies are `Secure`) and the public base URL
 /// embedded in email links.
 pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
+    let state = AuthState {
+        pool: pool.clone(),
+        environment: config.environment,
+        mailer,
+        app_url: config.app_url.clone(),
+    };
+
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
@@ -60,22 +67,18 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .route("/verify-email/confirm", post(confirm_email_verification))
         .route("/password-reset/request", post(request_password_reset))
         .route("/password-reset/confirm", post(confirm_password_reset))
-        .with_state(AuthState {
-            pool: pool.clone(),
-            environment: config.environment,
-            mailer,
-            app_url: config.app_url.clone(),
-        })
+        .merge(crate::auth::account::router())
+        .with_state(state)
         // CurrentUser resolves its pool from request extensions.
         .layer(Extension(pool))
 }
 
 #[derive(Clone)]
-struct AuthState {
-    pool: DbPool,
-    environment: Environment,
-    mailer: Mailer,
-    app_url: String,
+pub(crate) struct AuthState {
+    pub(crate) pool: DbPool,
+    pub(crate) environment: Environment,
+    pub(crate) mailer: Mailer,
+    pub(crate) app_url: String,
 }
 
 #[derive(Deserialize)]
@@ -247,7 +250,7 @@ async fn confirm_email_verification(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let user_id = user_token::consume(
+    let (user_id, _payload) = user_token::consume(
         &mut connection,
         &body.token,
         TokenPurpose::EmailVerification,
@@ -325,10 +328,11 @@ async fn confirm_password_reset(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let user_id = user_token::consume(&mut connection, &body.token, TokenPurpose::PasswordReset)
-        .await
-        .map_err(log_internal)?
-        .ok_or_else(expired_link)?;
+    let (user_id, _payload) =
+        user_token::consume(&mut connection, &body.token, TokenPurpose::PasswordReset)
+            .await
+            .map_err(log_internal)?
+            .ok_or_else(expired_link)?;
 
     let password_hash = password::hash(body.password).await.map_err(log_internal)?;
 
@@ -437,7 +441,18 @@ impl std::fmt::Debug for ValidCredentials {
 /// Email normalization (trim + lowercase) happens here so registration and
 /// login always agree on the stored form.
 fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiError> {
-    let email = body.email.trim().to_lowercase();
+    let email = validate_email(&body.email)?;
+    validate_password(&body.password)?;
+
+    Ok(ValidCredentials {
+        email,
+        password: body.password,
+    })
+}
+
+/// Normalizes (trim + lowercase) and structurally validates an email address.
+pub(crate) fn validate_email(raw: &str) -> Result<String, ApiError> {
+    let email = raw.trim().to_lowercase();
 
     if email.is_empty() || email.chars().count() > MAX_EMAIL_CHARS {
         return Err(ApiError::validation("Enter a valid email address."));
@@ -453,16 +468,11 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
         return Err(ApiError::validation("Enter a valid email address."));
     }
 
-    validate_password(&body.password)?;
-
-    Ok(ValidCredentials {
-        email,
-        password: body.password,
-    })
+    Ok(email)
 }
 
 /// Enforces the password length policy shared by registration and reset.
-fn validate_password(candidate: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_password(candidate: &str) -> Result<(), ApiError> {
     let password_chars = candidate.chars().count();
     if password_chars < password::MIN_PASSWORD_CHARS {
         return Err(ApiError::validation(format!(

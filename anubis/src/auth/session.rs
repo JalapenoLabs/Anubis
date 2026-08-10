@@ -105,3 +105,25 @@ pub(crate) async fn delete_all_for_user(
 
     Ok(())
 }
+
+/// Deletes every session a user has except the one behind `keep_token`.
+///
+/// Called after a signed-in password change: other browsers sign out, the
+/// browser that made the change stays signed in.
+pub(crate) async fn delete_all_except(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+    keep_token: &str,
+) -> Result<(), diesel::result::Error> {
+    let keep_hash = token::hash(keep_token);
+
+    diesel::delete(
+        sessions::table
+            .filter(sessions::user_id.eq(user_id))
+            .filter(sessions::token_hash.ne(&keep_hash)),
+    )
+    .execute(connection)
+    .await?;
+
+    Ok(())
+}

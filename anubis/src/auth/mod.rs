@@ -9,6 +9,7 @@
 
 pub mod password;
 
+mod account;
 mod extract;
 mod model;
 mod routes;
