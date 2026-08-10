@@ -54,6 +54,35 @@
       "fillAllFields": "Fill in every field to continue."
     }
   },
+  "team": {
+    "switcher": {
+      "ariaLabel": "Switch team",
+      "noTeams": "No teams yet"
+    },
+    "members": {
+      "navLink": "Members",
+      "title": "Members of {{team}}",
+      "subtitle": "Everyone with access to this team.",
+      "email": "Email",
+      "rolesHeader": "Roles",
+      "status": "Status",
+      "active": "Active",
+      "pendingInvitation": "Invited",
+      "inviteTitle": "Invite a member",
+      "role": "Role",
+      "inviteAction": "Send invitation",
+      "inviteSent": "Invitation sent to {{email}}.",
+      "noTeamSelected": "Select a team to see its members."
+    },
+    "claim": {
+      "title": "Join your team",
+      "claiming": "Accepting your invitation...",
+      "joinedTeam": "You've joined {{team}} in {{organization}}. Welcome aboard!",
+      "joinedOrganization": "You've joined {{organization}}. Welcome aboard!",
+      "failed": "That invitation is invalid or has expired. Ask for a new one.",
+      "goToDashboard": "Go to the dashboard"
+    }
+  },
   "dashboard": {
     "greeting": "Signed in as {{email}}",
     "welcomeTitle": "Your application starts here",

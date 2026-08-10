@@ -38,7 +38,7 @@ export function ResetPasswordPage() {
       setOutcome(response.message)
     }
     catch (error) {
-      const message = await getApiErrorMessage(error)
+      const message = getApiErrorMessage(error)
       setFormError(message ?? t('common.somethingWentWrong'))
     }
     finally {

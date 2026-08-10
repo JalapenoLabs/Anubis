@@ -8,12 +8,17 @@ import { useCurrentUser } from '@jalapenolabs/anubis'
 
 // UI
 import { Spinner } from '@heroui/react'
+import { ClaimInvitationPage } from './pages/ClaimInvitationPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { MembersPage } from './pages/MembersPage'
 import { ForgotPasswordPage } from './pages/auth/ForgotPasswordPage'
 import { ResetPasswordPage } from './pages/auth/ResetPasswordPage'
 import { SignInPage } from './pages/auth/SignInPage'
 import { SignUpPage } from './pages/auth/SignUpPage'
 import { VerifyEmailPage } from './pages/auth/VerifyEmailPage'
+
+// Misc
+import { TeamProvider } from './context/TeamProvider'
 
 // Misc
 import { UNKNOWN_ROUTE_REDIRECT_TO, UrlTree } from './urls'
@@ -58,13 +63,38 @@ function RequireGuest(props: GateProps) {
   return props.children
 }
 
+/** Signed-in pages get the team context on top of the auth gate. */
+function Workspace(props: GateProps) {
+  return <RequireAuth>
+    <TeamProvider>{
+        props.children
+      }</TeamProvider>
+  </RequireAuth>
+}
+
 export function App() {
   return <Routes>
     <Route
       path={UrlTree.root}
       element={
-        <RequireAuth>
+        <Workspace>
           <DashboardPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.members}
+      element={
+        <Workspace>
+          <MembersPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.claimInvitation}
+      element={
+        <RequireAuth>
+          <ClaimInvitationPage />
         </RequireAuth>
       }
     />

@@ -54,7 +54,7 @@ export function SignUpPage() {
       await refresh()
     }
     catch (error) {
-      const message = await getApiErrorMessage(error)
+      const message = getApiErrorMessage(error)
       setFormError(message ?? t('common.somethingWentWrong'))
     }
   })

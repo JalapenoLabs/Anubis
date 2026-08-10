@@ -8,6 +8,8 @@ export const UrlTree = {
   forgotPassword: '/forgot-password',
   resetPassword: '/reset-password',
   verifyEmail: '/verify-email',
+  members: '/members',
+  claimInvitation: '/claim-invitation',
 } as const
 export type UrlValue = typeof UrlTree[keyof typeof UrlTree]
 

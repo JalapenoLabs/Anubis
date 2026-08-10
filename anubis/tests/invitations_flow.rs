@@ -332,4 +332,80 @@ async fn invitations_are_sent_claimed_and_guarded() {
         .await
         .expect("count must run");
     assert_eq!(pending, 0);
+
+    // ------------------------------------------------------------------
+    // Memberships overview: the teammate sees their personal org plus the
+    // admin's org (through the team membership, with no org-level roles).
+    // ------------------------------------------------------------------
+    let teammate_cookie = {
+        let credentials =
+            json!({ "email": teammate_email, "password": "correct horse battery staple" });
+        let (status, headers, body) =
+            send(&router, "POST", "/auth/login", Some(&credentials), None).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        session_token(&headers)
+    };
+
+    let (status, _headers, body) = send(
+        &router,
+        "GET",
+        "/tenancy/memberships",
+        None,
+        Some(&teammate_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let listed = body["organizations"]
+        .as_array()
+        .expect("organizations must be an array");
+    assert_eq!(listed.len(), 2, "body: {body}");
+    let admin_org = listed
+        .iter()
+        .find(|org| org["id"] == json!(organization_id.to_string()))
+        .expect("the admin's org must be listed");
+    assert_eq!(admin_org["roles"], json!([]), "no org-level roles");
+    assert_eq!(admin_org["teams"][0]["name"], json!("General"));
+    assert_eq!(admin_org["teams"][0]["roles"], json!(["editor"]));
+
+    // ------------------------------------------------------------------
+    // Roster: members and pending invitations; non-members get 404.
+    // ------------------------------------------------------------------
+    let lurker_email = format!("lurker-{run}@example.com");
+    let invite = json!({ "email": lurker_email, "team_id": team_id });
+    let (status, _headers, _body) = send(
+        &router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&invite),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let roster_path = format!("/tenancy/teams/{team_id}/members");
+    let (status, _headers, body) =
+        send(&router, "GET", &roster_path, None, Some(&admin_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let members = body["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3, "admin, teammate, pending: {body}");
+    let pending_member = members
+        .iter()
+        .find(|entry| entry["pending"] == json!(true))
+        .expect("the pending invitation must be listed");
+    assert_eq!(pending_member["email"], json!(lurker_email));
+    assert_eq!(pending_member["roles"], json!(["default"]));
+
+    // The biller holds an org membership but no team membership: 404.
+    let biller_cookie = {
+        let credentials =
+            json!({ "email": biller_email, "password": "correct horse battery staple" });
+        let (_status, headers, _body) =
+            send(&router, "POST", "/auth/login", Some(&credentials), None).await;
+        session_token(&headers)
+    };
+    let (status, _headers, _body) =
+        send(&router, "GET", &roster_path, None, Some(&biller_cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

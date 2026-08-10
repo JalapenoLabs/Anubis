@@ -112,6 +112,7 @@ diesel::joinable!(teams -> organizations (organization_id));
 diesel::joinable!(organization_memberships -> organizations (organization_id));
 diesel::joinable!(organization_memberships -> users (user_id));
 diesel::joinable!(team_memberships -> teams (team_id));
+diesel::joinable!(team_memberships -> users (user_id));
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
 diesel::allow_tables_to_appear_in_same_query!(

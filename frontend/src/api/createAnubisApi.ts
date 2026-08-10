@@ -1,6 +1,15 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Credentials, MessageEnvelope, User, WireUserEnvelope } from './types'
+import type {
+  ClaimedInvitation,
+  Credentials,
+  InviteMemberRequest,
+  MembershipsOverview,
+  MessageEnvelope,
+  TeamRosterMember,
+  User,
+  WireUserEnvelope,
+} from './types'
 
 // Utility
 import ky from 'ky'
@@ -77,6 +86,49 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
       .json<MessageEnvelope>()
   }
 
+  function listMemberships() {
+    return client
+      .get('tenancy/memberships')
+      .json<MembershipsOverview>()
+  }
+
+  async function listTeamMembers(teamId: string): Promise<TeamRosterMember[]> {
+    type WireRosterMember = {
+      membership_id: string
+      email: string | null
+      roles: string[]
+      pending: boolean
+    }
+    const response = await client
+      .get(`tenancy/teams/${teamId}/members`)
+      .json<{ members: WireRosterMember[] }>()
+    return response.members.map((member) => ({
+      membershipId: member.membership_id,
+      email: member.email,
+      roles: member.roles,
+      pending: member.pending,
+    }))
+  }
+
+  function inviteMember(request: InviteMemberRequest) {
+    return client
+      .post('tenancy/invitations', {
+        json: {
+          email: request.email,
+          team_id: request.teamId,
+          organization_id: request.organizationId,
+          roles: request.roles ?? [],
+        },
+      })
+      .json<{ invitation: { id: string, email: string } }>()
+  }
+
+  function claimInvitation(token: string) {
+    return client
+      .post('tenancy/invitations/claim', { json: { token }})
+      .json<ClaimedInvitation>()
+  }
+
   return {
     register,
     login,
@@ -86,6 +138,10 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     confirmEmailVerification,
     requestPasswordReset,
     confirmPasswordReset,
+    listMemberships,
+    listTeamMembers,
+    inviteMember,
+    claimInvitation,
   } as const
 }
 

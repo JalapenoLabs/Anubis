@@ -5,14 +5,18 @@ import type { ReactNode } from 'react'
 
 // Core
 import { useTranslation } from 'react-i18next'
+import { Link } from 'react-router'
 import { useAnubisApi, useCurrentUser } from '@jalapenolabs/anubis'
+import { useTeamContext } from '../context/TeamProvider'
 
 // UI
 import {
   Avatar,
+  Button,
   Dropdown,
   DropdownItem,
   DropdownMenu,
+  DropdownSection,
   DropdownTrigger,
   Navbar,
   NavbarBrand,
@@ -20,16 +24,20 @@ import {
   NavbarItem,
 } from '@heroui/react'
 
+// Misc
+import { UrlTree } from '../urls'
+
 type Props = {
   user: User
   children: ReactNode
 }
 
-/** Signed-in application frame: top navbar with the user menu. */
+/** Signed-in application frame: navbar with team switcher and user menu. */
 export function AppShell(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const { refresh } = useCurrentUser()
+  const { memberships, current, selectTeam } = useTeamContext()
 
   async function onSignOut() {
     try {
@@ -43,12 +51,52 @@ export function AppShell(props: Props) {
 
   return <div className='min-h-screen'>
     <Navbar isBordered maxWidth='xl'>
-      <NavbarBrand>
-        <span className='text-lg font-bold'>{
+      <NavbarBrand className='gap-4'>
+        <Link to={UrlTree.root} className='text-lg font-bold'>{
             t('app.title')
-          }</span>
+          }</Link>
+        <Dropdown placement='bottom-start'>
+          <DropdownTrigger>
+            <Button size='sm' variant='flat'>
+              <span>{
+                  current
+                    ? current.team.name
+                    : t('team.switcher.noTeams')
+                }</span>
+            </Button>
+          </DropdownTrigger>
+          <DropdownMenu
+            aria-label={t('team.switcher.ariaLabel')}
+            selectionMode='single'
+            selectedKeys={current ? [ current.team.id ] : []}
+            onAction={(key) => selectTeam(String(key))}
+          >
+            {
+              memberships.organizations.map((organization) => (
+                <DropdownSection
+                  key={organization.id}
+                  title={organization.name}
+                  showDivider
+                >
+                  {
+                    organization.teams.map((team) => (
+                      <DropdownItem key={team.id}>{
+                          team.name
+                        }</DropdownItem>
+                    ))
+                  }
+                </DropdownSection>
+              ))
+            }
+          </DropdownMenu>
+        </Dropdown>
       </NavbarBrand>
       <NavbarContent justify='end'>
+        <NavbarItem>
+          <Link to={UrlTree.members} className='opacity-80 hover:opacity-100'>{
+              t('team.members.navLink')
+            }</Link>
+        </NavbarItem>
         <NavbarItem>
           <Dropdown placement='bottom-end'>
             <DropdownTrigger>
