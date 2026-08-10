@@ -25,6 +25,7 @@ import {
   createTangibleThing,
   updateTangibleThing,
 } from '../api/routes/tangibleThingRoutes'
+// 🐺 anubis:form-imports
 
 const tangibleThingSchema = z.object({
   name: z.string().trim().min(1),
@@ -63,6 +64,7 @@ type Props = {
 /** Creates a tangible thing, or edits the one passed in `editing`. */
 export function TangibleThingForm(props: Props) {
   const { t } = useTranslation()
+  // 🐺 anubis:form-hooks
 
   const form = useForm<TangibleThingFormValues>({
     resolver,

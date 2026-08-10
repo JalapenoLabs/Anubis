@@ -12,6 +12,14 @@
 //! Every file here is a complete vertical slice of what one scaffold produces:
 //! migration, schema, model with its `valid_*` scoping methods, account
 //! handlers, permissions, routes, and tests.
+//!
+//! [`incidentally_linked::IncidentalLinkage`] is the third template, the join
+//! model `anubis scaffold join` transforms. A join links two team-owned models,
+//! so it needs a second one beside the parent: [`merely_peripheral::PeripheralNotion`]
+//! is that model, reduced to what a join's far side needs, because a real
+//! application's far side always comes from its own `scaffold model` run.
 
 pub mod absolutely_abstract;
 pub mod completely_concrete;
+pub mod incidentally_linked;
+pub mod merely_peripheral;

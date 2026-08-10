@@ -60,6 +60,12 @@ pub const PAGE_IMPORTS: &str = "🐺 anubis:page-imports";
 /// `frontend/src/components/AppShell.tsx`: navigation entries.
 pub const NAV: &str = "🐺 anubis:nav";
 
+/// The sign-in page: the url helpers a provider button calls.
+pub const OAUTH_IMPORTS: &str = "🐺 anubis:oauth-imports";
+
+/// The sign-in page: one button per OAuth provider.
+pub const OAUTH_PROVIDERS: &str = "🐺 anubis:oauth-providers";
+
 /// `frontend/src/i18n.ts`: per-model locale imports.
 pub const LOCALE_IMPORTS: &str = "🐺 anubis:locale-imports";
 
@@ -102,6 +108,21 @@ pub const UPDATE_NORMALIZE: &str = "🐺 anubis:update-normalize";
 /// A model's `routes.rs`: the changeset struct literal the update handler builds.
 pub const CHANGESET_VALUES: &str = "🐺 anubis:changeset-values";
 
+/// A model's `routes.rs`: the association reconciliations the create handler runs.
+pub const CREATE_ASSOCIATIONS: &str = "🐺 anubis:create-associations";
+
+/// A model's `routes.rs`: the association reconciliations the update handler runs.
+pub const UPDATE_ASSOCIATIONS: &str = "🐺 anubis:update-associations";
+
+/// A model's `routes.rs`: the view struct's association members.
+pub const VIEW_FIELDS: &str = "🐺 anubis:view-fields";
+
+/// A model's `routes.rs`: the association loads a page of records needs.
+pub const VIEW_LOAD: &str = "🐺 anubis:view-load";
+
+/// A model's `routes.rs`: the view struct literal one record is built into.
+pub const VIEW_VALUES: &str = "🐺 anubis:view-values";
+
 /// A model's integration test: the create request's payload.
 pub const TEST_CREATE: &str = "🐺 anubis:test-create";
 
@@ -125,6 +146,12 @@ pub const UPDATE_REQUEST: &str = "🐺 anubis:update-request";
 
 /// A model's form: the field components it imports from the field library.
 pub const FIELD_IMPORTS: &str = "🐺 anubis:field-imports";
+
+/// A model's form: the application modules a field's control reads from.
+pub const FORM_IMPORTS: &str = "🐺 anubis:form-imports";
+
+/// A model's form: the hooks a field's control needs, such as its options.
+pub const FORM_HOOKS: &str = "🐺 anubis:form-hooks";
 
 /// A model's form: the zod schema's members.
 pub const FORM_SCHEMA: &str = "🐺 anubis:form-schema";

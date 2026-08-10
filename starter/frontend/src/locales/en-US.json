@@ -28,6 +28,16 @@
       "goToSignUp": "Create an account",
       "forgotPassword": "Forgot your password?"
     },
+    "oauth": {
+      "errors": {
+        "unavailable": "That sign-in provider is not available right now. Use your email and password.",
+        "denied": "The sign-in was cancelled. Nothing has changed.",
+        "expired": "That sign-in took too long. Start again.",
+        "emailUnavailable": "That provider shared no email address, so there is no account to sign in to.",
+        "emailUnverified": "That provider has not verified your email address, so we cannot sign you in.",
+        "failed": "That sign-in could not be completed. Try again."
+      }
+    },
     "signUp": {
       "title": "Create your account",
       "subtitle": "A minute from now, you're in.",

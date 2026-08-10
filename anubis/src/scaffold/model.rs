@@ -116,13 +116,13 @@ const TEMPLATE_FIELDS: [(&str, &str); 2] = [("name", "text_field"), ("descriptio
 
 /// `rustfmt`'s default `max_width`. Generated statements that would exceed it
 /// are emitted pre-wrapped, so `cargo fmt --check` passes on untouched output.
-const MAX_WIDTH: usize = 100;
+pub(super) const MAX_WIDTH: usize = 100;
 
 /// The `max-len` the frontend's `ESLint` configuration enforces.
 const TS_MAX_WIDTH: usize = 120;
 
 /// The indentation the `account_router` body sits at.
-const ROUTER_INDENT: usize = 4;
+pub(super) const ROUTER_INDENT: usize = 4;
 
 /// One planned `anubis scaffold model <Model> <ParentChain> [field:type ...]`.
 ///
@@ -298,7 +298,8 @@ impl ModelScaffold {
     pub fn added_sql_columns(&self) -> Vec<String> {
         self.added_fields()
             .iter()
-            .map(|field| format!("{},", field.field().sql_column()))
+            .filter_map(|field| field.field().sql_column())
+            .map(|column| format!("{column},"))
             .collect()
     }
 
@@ -307,7 +308,7 @@ impl ModelScaffold {
     pub fn added_schema_columns(&self) -> Vec<String> {
         self.added_fields()
             .iter()
-            .map(|field| field.field().schema_column())
+            .filter_map(|field| field.field().schema_column())
             .collect()
     }
 }
@@ -576,6 +577,17 @@ fn validate_fields(fields: &[Field], parent: Option<&Names>) -> Result<(), Scaff
                 field.name()
             )));
         }
+        // An association reads through a join model, which cannot exist before
+        // the model this run is generating. Bullet Train splits the two
+        // commands for the same reason.
+        if field.association().is_some() {
+            return Err(ScaffoldError::new(format!(
+                "field `{}` is a has-many-through association, and an association needs a join \
+                 model that already exists. Generate this model first, then run \
+                 `anubis scaffold join` and `anubis scaffold field`.",
+                field.name(),
+            )));
+        }
         if foreign_key.as_deref() == Some(field.name()) {
             return Err(ScaffoldError::new(format!(
                 "field `{}` is the ownership chain's own column and is maintained by the \
@@ -586,13 +598,13 @@ fn validate_fields(fields: &[Field], parent: Option<&Names>) -> Result<(), Scaff
         if let Some((_name, expected)) = TEMPLATE_FIELDS
             .iter()
             .find(|(name, _type)| *name == field.name())
-            && field.field_type().name() != *expected
+            && field.type_name() != *expected
         {
             return Err(ScaffoldError::new(format!(
                 "field `{}` comes from the living template as `{expected}` and cannot be \
                  declared as `{}`",
                 field.name(),
-                field.field_type().name(),
+                field.type_name(),
             )));
         }
     }
@@ -600,7 +612,7 @@ fn validate_fields(fields: &[Field], parent: Option<&Names>) -> Result<(), Scaff
 }
 
 /// The name-variant rewrites from a template name to a target name.
-fn name_pairs(template: &str, target: &Names) -> Vec<(String, String)> {
+pub(super) fn name_pairs(template: &str, target: &Names) -> Vec<(String, String)> {
     let template = Names::parse(template).expect("template names are valid");
     Replacements::between(&template, target).into_pairs()
 }
@@ -609,7 +621,7 @@ fn name_pairs(template: &str, target: &Names) -> Vec<(String, String)> {
 ///
 /// Both separators appear: `::` in `use` paths and router mounts, `/` in the
 /// file paths the stamped module is written to.
-fn module_pairs(template: &str, target: &str) -> Vec<(String, String)> {
+pub(super) fn module_pairs(template: &str, target: &str) -> Vec<(String, String)> {
     vec![
         (format!("scaffolding::{template}"), target.to_owned()),
         (format!("scaffolding/{template}"), target.to_owned()),

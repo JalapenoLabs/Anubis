@@ -36,6 +36,10 @@ http-body-util = "0.1"
 # Decoders limited to formats browsers actually upload.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 mimalloc = "0.1"
+# OpenID Connect sign-in. The default feature pair is exactly the policy we
+# want, spelled out here so a future default change cannot pull in native TLS:
+# reqwest as the async HTTP backend, rustls as its TLS stack, no OpenSSL.
+openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 qrcode = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

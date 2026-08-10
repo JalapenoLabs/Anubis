@@ -78,14 +78,60 @@ struct UpdateCreativeConceptBody {
     // 🐺 anubis:update-body
 }
 
+/// The record as the account endpoints serialize it.
+///
+/// `serde(flatten)` keeps the wire shape identical to the record's own columns,
+/// so a model with no associations serializes exactly as its table does. An
+/// association `anubis scaffold field` adds lands its ids here, which is what
+/// lets one form read and write the same shape.
+#[derive(Serialize)]
+struct CreativeConceptView {
+    #[serde(flatten)]
+    creative_concept: CreativeConcept,
+    // 🐺 anubis:view-fields
+}
+
+impl CreativeConceptView {
+    /// Builds the views for a page of records, one query per association.
+    ///
+    /// A model with no associations does no work here, which is why the lints
+    /// below are allowed rather than expected: each one stops applying the
+    /// moment an association is scaffolded onto this model.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_async,
+        unused_variables,
+        reason = "a scaffolded association queries through `connection` and can fail"
+    )]
+    async fn load(
+        connection: &mut AsyncPgConnection,
+        records: Vec<CreativeConcept>,
+    ) -> QueryResult<Vec<Self>> {
+        // 🐺 anubis:view-load
+        Ok(records
+            .into_iter()
+            .map(|record| Self {
+                // 🐺 anubis:view-values
+                creative_concept: record,
+            })
+            .collect())
+    }
+
+    /// Builds the view for one record.
+    async fn one(connection: &mut AsyncPgConnection, record: CreativeConcept) -> QueryResult<Self> {
+        let mut views = Self::load(connection, vec![record]).await?;
+        Ok(views.pop().expect("load yields one view per record"))
+    }
+}
+
 #[derive(Serialize)]
 struct CreativeConceptBody {
-    creative_concept: CreativeConcept,
+    creative_concept: CreativeConceptView,
 }
 
 #[derive(Serialize)]
 struct CreativeConceptsBody {
-    creative_concepts: Vec<CreativeConcept>,
+    creative_concepts: Vec<CreativeConceptView>,
     pagination: Pagination,
 }
 
@@ -138,9 +184,12 @@ async fn list(
         .load(&mut connection)
         .await
         .map_err(log_internal)?;
+    let creative_concepts = CreativeConceptView::load(&mut connection, records)
+        .await
+        .map_err(log_internal)?;
 
     Ok(Json(CreativeConceptsBody {
-        creative_concepts: records,
+        creative_concepts,
         pagination: Pagination::new(&params, total_items),
     }))
 }
@@ -164,7 +213,7 @@ async fn create(
     // 🐺 anubis:create-normalize
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let creative_concept: CreativeConcept = diesel::insert_into(creative_concepts::table)
+    let record: CreativeConcept = diesel::insert_into(creative_concepts::table)
         .values(NewCreativeConcept {
             // The team comes from the route, never from the body.
             team_id: member.team.id,
@@ -176,7 +225,11 @@ async fn create(
         .get_result(&mut connection)
         .await
         .map_err(log_internal)?;
+    // 🐺 anubis:create-associations
 
+    let creative_concept = CreativeConceptView::one(&mut connection, record)
+        .await
+        .map_err(log_internal)?;
     Ok((
         StatusCode::CREATED,
         Json(CreativeConceptBody { creative_concept }),
@@ -189,10 +242,12 @@ async fn show(
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load(&mut connection, user.id, creative_concept_id).await?;
+    let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Read)?;
 
+    let creative_concept = CreativeConceptView::one(&mut connection, record)
+        .await
+        .map_err(log_internal)?;
     Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
@@ -203,8 +258,7 @@ async fn update(
     Json(body): Json<UpdateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load(&mut connection, user.id, creative_concept_id).await?;
+    let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
     let name = match body.name.as_deref().map(str::trim) {
@@ -216,24 +270,33 @@ async fn update(
     let description = optional_text(body.description.as_deref());
     // 🐺 anubis:update-normalize
 
+    // Associations are reconciled before the columns, so a request that only
+    // changes an association still takes effect.
+    // 🐺 anubis:update-associations
+
     let changes = CreativeConceptChanges {
         name,
         description,
         // 🐺 anubis:changeset-values
     };
     if changes.is_empty() {
+        let creative_concept = CreativeConceptView::one(&mut connection, record)
+            .await
+            .map_err(log_internal)?;
         return Ok(Json(CreativeConceptBody { creative_concept }));
     }
 
-    let creative_concept: CreativeConcept = diesel::update(
-        creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)),
-    )
-    .set(changes)
-    .returning(CreativeConcept::as_returning())
-    .get_result(&mut connection)
-    .await
-    .map_err(log_internal)?;
+    let updated: CreativeConcept =
+        diesel::update(creative_concepts::table.filter(creative_concepts::id.eq(record.id)))
+            .set(changes)
+            .returning(CreativeConcept::as_returning())
+            .get_result(&mut connection)
+            .await
+            .map_err(log_internal)?;
 
+    let creative_concept = CreativeConceptView::one(&mut connection, updated)
+        .await
+        .map_err(log_internal)?;
     Ok(Json(CreativeConceptBody { creative_concept }))
 }
 

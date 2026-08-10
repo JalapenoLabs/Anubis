@@ -14,18 +14,22 @@ export type RoleKey =
 export const RoleGrants = {
   admin: {
     CreativeConcept: [ 'read', 'create', 'update', 'destroy' ],
+    PeripheralNotion: [ 'read', 'create', 'update', 'destroy' ],
     TangibleThing: [ 'read', 'create', 'update', 'destroy' ],
   },
   billing: {
     CreativeConcept: [ 'read' ],
+    PeripheralNotion: [ 'read' ],
     TangibleThing: [ 'read' ],
   },
   default: {
     CreativeConcept: [ 'read' ],
+    PeripheralNotion: [ 'read' ],
     TangibleThing: [ 'read' ],
   },
   editor: {
     CreativeConcept: [ 'read', 'create', 'update', 'destroy' ],
+    PeripheralNotion: [ 'read', 'create', 'update', 'destroy' ],
     TangibleThing: [ 'read', 'create', 'update', 'destroy' ],
   },
 } as const satisfies Record<RoleKey, Partial<Record<string, readonly PermissionAction[]>>>

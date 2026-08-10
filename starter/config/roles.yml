@@ -10,6 +10,12 @@
 # and so need no entries of their own. Each anchor names its role, because the
 # grants differ per role and an insertion point can only be found once; a role
 # you add by hand should carry its own anchor.
+#
+# `anubis scaffold join` adds nothing here. A join model is infrastructure, not
+# a resource: reading an association is a read on the model that owns it,
+# changing it is an update on that model, and listing a form's options is a
+# read on the model being offered. One grant per real-world model is what keeps
+# this file legible.
 
 roles:
   # Every team member holds `default`.
@@ -17,6 +23,7 @@ roles:
     models:
       CreativeConcept: [read]
       TangibleThing: [read]
+      PeripheralNotion: [read]
       # 🐺 anubis:models:default
 
   # Can work with the team's domain resources.
@@ -25,6 +32,7 @@ roles:
     models:
       CreativeConcept: [manage]
       TangibleThing: [manage]
+      PeripheralNotion: [manage]
       # 🐺 anubis:models:editor
 
   # Can manage billing and subscriptions.

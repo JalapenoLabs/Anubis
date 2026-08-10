@@ -17,6 +17,15 @@
 //! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //!
+//! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
+//! adds three more, named after the provider:
+//!
+//! | Variable | Default | Meaning |
+//! |---|---|---|
+//! | `GOOGLE_OAUTH_CLIENT_ID` | unset | OAuth client id; setting it and the secret enables the provider |
+//! | `GOOGLE_OAUTH_CLIENT_SECRET` | unset | OAuth client secret |
+//! | `GOOGLE_OAUTH_ISSUER` | `https://accounts.google.com` | Issuer whose discovery document configures the flow |
+//!
 //! The set grows milestone by milestone.
 //!
 //! # The secret key
@@ -30,11 +39,22 @@
 //! [`crate::telemetry::init`] warns whenever that fallback is in use.
 //! Rotating the key makes values sealed under the old one unreadable, so
 //! affected users re-enroll their second factor.
+//!
+//! # OAuth providers
+//!
+//! A provider is enabled by setting both its client id and its client secret;
+//! setting one without the other is a misconfiguration and refuses to start,
+//! because a half-configured provider is a sign-in button that always fails.
+//! The issuer variable overrides the registry's issuer, which is what a
+//! self-hosted or single-tenant deployment needs. Register the redirect URI
+//! `<APP_URL>/auth/oauth/<provider>/callback` with the provider, and add the
+//! button with `anubis scaffold oauth <provider>`.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::secret_box::SecretKey;
 
 /// Selects the runtime environment.
@@ -167,6 +187,10 @@ pub struct AppConfig {
     /// Production requires it. Development and test fall back to the built-in
     /// development key; see the module docs.
     pub secret_key: SecretKey,
+    /// The OpenID Connect providers the environment enabled, in registry order.
+    ///
+    /// Empty unless a provider's client id and secret are both set.
+    pub oauth: Vec<OauthProviderConfig>,
 }
 
 impl AppConfig {
@@ -246,14 +270,68 @@ impl AppConfig {
             None => SecretKey::development(),
         };
 
+        let oauth = oauth_providers(&lookup)?;
+
         Ok(Self {
             environment,
             server: ServerConfig { host, port },
             database,
             app_url,
             secret_key,
+            oauth,
         })
     }
+}
+
+/// Resolves every provider whose credentials the environment carries.
+///
+/// A provider with neither credential is simply not enabled. A provider with
+/// one of the two is a misconfiguration: the button would be rendered and
+/// every click would fail, so startup stops and names the missing variable.
+fn oauth_providers(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<OauthProviderConfig>, Error> {
+    let mut configured = Vec::new();
+
+    for provider in known_providers() {
+        let client_id = non_empty(lookup(provider.client_id_var));
+        let client_secret = non_empty(lookup(provider.client_secret_var));
+
+        let (client_id, client_secret) = match (client_id, client_secret) {
+            (None, None) => continue,
+            (Some(client_id), Some(client_secret)) => (client_id, client_secret),
+            (Some(_client_id), None) => {
+                return Err(Error::missing(
+                    provider.client_secret_var,
+                    "the client secret that goes with the client id",
+                ));
+            }
+            (None, Some(_client_secret)) => {
+                return Err(Error::missing(
+                    provider.client_id_var,
+                    "the client id that goes with the client secret",
+                ));
+            }
+        };
+
+        let issuer = non_empty(lookup(provider.issuer_var));
+        let config = OauthProviderConfig::new(provider, client_id, client_secret, issuer.clone())
+            .map_err(|_error| {
+            Error::invalid(
+                provider.issuer_var,
+                issuer.as_deref().unwrap_or(provider.issuer),
+                "an OpenID Connect issuer: an http(s) URL with no query string or fragment",
+            )
+        })?;
+        configured.push(config);
+    }
+
+    Ok(configured)
+}
+
+/// Treats a variable set to whitespace as unset, the way a `.env` line reads.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn parse_environment(value: &str) -> Option<Environment> {

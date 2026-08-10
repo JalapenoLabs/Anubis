@@ -80,14 +80,60 @@ struct UpdateTangibleThingBody {
     // 🐺 anubis:update-body
 }
 
+/// The record as the account endpoints serialize it.
+///
+/// `serde(flatten)` keeps the wire shape identical to the record's own columns,
+/// so a model with no associations serializes exactly as its table does. An
+/// association `anubis scaffold field` adds lands its ids here, which is what
+/// lets one form read and write the same shape.
+#[derive(Serialize)]
+struct TangibleThingView {
+    #[serde(flatten)]
+    tangible_thing: TangibleThing,
+    // 🐺 anubis:view-fields
+}
+
+impl TangibleThingView {
+    /// Builds the views for a page of records, one query per association.
+    ///
+    /// A model with no associations does no work here, which is why the lints
+    /// below are allowed rather than expected: each one stops applying the
+    /// moment an association is scaffolded onto this model.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_async,
+        unused_variables,
+        reason = "a scaffolded association queries through `connection` and can fail"
+    )]
+    async fn load(
+        connection: &mut AsyncPgConnection,
+        records: Vec<TangibleThing>,
+    ) -> QueryResult<Vec<Self>> {
+        // 🐺 anubis:view-load
+        Ok(records
+            .into_iter()
+            .map(|record| Self {
+                // 🐺 anubis:view-values
+                tangible_thing: record,
+            })
+            .collect())
+    }
+
+    /// Builds the view for one record.
+    async fn one(connection: &mut AsyncPgConnection, record: TangibleThing) -> QueryResult<Self> {
+        let mut views = Self::load(connection, vec![record]).await?;
+        Ok(views.pop().expect("load yields one view per record"))
+    }
+}
+
 #[derive(Serialize)]
 struct TangibleThingBody {
-    tangible_thing: TangibleThing,
+    tangible_thing: TangibleThingView,
 }
 
 #[derive(Serialize)]
 struct TangibleThingsBody {
-    tangible_things: Vec<TangibleThing>,
+    tangible_things: Vec<TangibleThingView>,
     pagination: Pagination,
 }
 
@@ -143,9 +189,12 @@ async fn list(
         .load(&mut connection)
         .await
         .map_err(log_internal)?;
+    let tangible_things = TangibleThingView::load(&mut connection, records)
+        .await
+        .map_err(log_internal)?;
 
     Ok(Json(TangibleThingsBody {
-        tangible_things: records,
+        tangible_things,
         pagination: Pagination::new(&params, total_items),
     }))
 }
@@ -172,7 +221,7 @@ async fn create(
         .filter(|value| !value.is_empty());
     // 🐺 anubis:create-normalize
 
-    let tangible_thing: TangibleThing = diesel::insert_into(tangible_things::table)
+    let record: TangibleThing = diesel::insert_into(tangible_things::table)
         .values(NewTangibleThing {
             // The parent comes from the route, already checked against the
             // caller's membership.
@@ -185,7 +234,11 @@ async fn create(
         .get_result(&mut connection)
         .await
         .map_err(log_internal)?;
+    // 🐺 anubis:create-associations
 
+    let tangible_thing = TangibleThingView::one(&mut connection, record)
+        .await
+        .map_err(log_internal)?;
     Ok((
         StatusCode::CREATED,
         Json(TangibleThingBody { tangible_thing }),
@@ -198,10 +251,13 @@ async fn show(
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _creative_concept, membership) =
+    let (record, _creative_concept, membership) =
         load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Read)?;
 
+    let tangible_thing = TangibleThingView::one(&mut connection, record)
+        .await
+        .map_err(log_internal)?;
     Ok(Json(TangibleThingBody { tangible_thing }))
 }
 
@@ -212,7 +268,7 @@ async fn update(
     Json(body): Json<UpdateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, creative_concept, membership) =
+    let (record, creative_concept, membership) =
         load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
@@ -224,6 +280,10 @@ async fn update(
     // when the user empties the field.
     let description = optional_text(body.description.as_deref());
     // 🐺 anubis:update-normalize
+
+    // Associations are reconciled before the columns, so a request that only
+    // changes an association still takes effect.
+    // 🐺 anubis:update-associations
 
     // A submitted parent is only ever accepted from the same team's records.
     let creative_concept_id = match body.creative_concept_id {
@@ -249,17 +309,23 @@ async fn update(
         // 🐺 anubis:changeset-values
     };
     if changes.is_empty() {
+        let tangible_thing = TangibleThingView::one(&mut connection, record)
+            .await
+            .map_err(log_internal)?;
         return Ok(Json(TangibleThingBody { tangible_thing }));
     }
 
-    let tangible_thing: TangibleThing =
-        diesel::update(tangible_things::table.filter(tangible_things::id.eq(tangible_thing.id)))
+    let updated: TangibleThing =
+        diesel::update(tangible_things::table.filter(tangible_things::id.eq(record.id)))
             .set(changes)
             .returning(TangibleThing::as_returning())
             .get_result(&mut connection)
             .await
             .map_err(log_internal)?;
 
+    let tangible_thing = TangibleThingView::one(&mut connection, updated)
+        .await
+        .map_err(log_internal)?;
     Ok(Json(TangibleThingBody { tangible_thing }))
 }
 

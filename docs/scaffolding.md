@@ -8,7 +8,7 @@ Templates are real, functional, compiling code, not a DSL. The generator transfo
 
 Generated files contain magic anchor comments (`// 🐺 anubis:record-fields`, `{/* 🐺 anubis:nav */}`) that later scaffold commands use as insertion targets. Do not delete them. This is exactly Bullet Train's magic-comment mechanism, and it is what makes `scaffold field` able to keep editing files you have customized.
 
-The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot.
+The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot. `scaffolding::incidentally_linked::IncidentalLinkage` is the third, the join model, and `scaffolding::merely_peripheral::PeripheralNotion` is the second team-owned model it links.
 
 ## The template host app
 
@@ -17,6 +17,12 @@ The templates are ordinary application code in `starter/`. `CreativeConcept` bel
 The frontend halves mirror the same split. A team-owned model owns a list page, a show page, a form component, a route module, and a locale file. A nested model owns a form component, a route module, a locale file, and one section component (`TangibleThingsSection`) holding its table and its form, which the parent's show page renders. Reducing a child's whole slice to one element is what lets a later scaffold attach a child to a page an earlier scaffold wrote, by inserting a single line.
 
 Each depth has its own narrative test, `starter/backend/tests/creative_concepts_flow.rs` and `starter/backend/tests/tangible_things_flow.rs`, running against a real Postgres. They are templates too: one scaffold stamps the matching narrative for the generated model, so a new model arrives with the same proof its template carries. The plumbing they share (booting the router, registering an account, inviting a teammate) lives in `starter/backend/tests/support/mod.rs`, which is application code the scaffolder never rewrites.
+
+### The join template
+
+`anubis scaffold join` transforms a third template, and a join links two team-owned models, so the host app carries two more of them. `IncidentalLinkage` is the join itself: the table, the model that owns every rule the association needs, and the endpoints that attach, detach, list through, and offer options. `PeripheralNotion` is the far side, an ordinary team-owned model reduced to the two endpoints the join's narrative needs, because `scaffold join` generates no model of its own: a real application's far side always comes from its own `scaffold model` run. `starter/backend/tests/incidental_linkages_flow.rs` is the narrative a generated join inherits, and `frontend/src/api/routes/incidentalLinkageRoutes.ts` is the whole frontend surface a join owns.
+
+The template's own record shape is deliberately plain. A join carries no name and no description because a link is not a thing a user names; what it carries is its two foreign keys, the pair's uniqueness, and the timestamps every table gets.
 
 The starter backend is a library plus a thin binary. `main.rs` is the composition root; the application itself (models, routes, schema, migrations, role constants) lives in `lib.rs` and its modules, so integration tests drive the real routers. Model modules are public, because an application's library is what its binary and its tests build on.
 
@@ -44,6 +50,8 @@ The vocabulary comes in two halves. **Model anchors** sit in files the whole app
 | `// 🐺 anubis:page-imports` | `frontend/src/App.tsx` | page imports |
 | `{/* 🐺 anubis:routes */}` | `frontend/src/App.tsx` | `<Route>` elements |
 | `{/* 🐺 anubis:nav */}` | `frontend/src/components/AppShell.tsx` | navigation entries |
+| `// 🐺 anubis:oauth-imports` | `frontend/src/pages/auth/SignInPage.tsx` | url helpers a provider button calls |
+| `{/* 🐺 anubis:oauth-providers */}` | `frontend/src/pages/auth/SignInPage.tsx` | one button per OAuth provider |
 | `// 🐺 anubis:locale-imports` | `frontend/src/i18n.ts` | per-model locale imports |
 | `// 🐺 anubis:locales` | `frontend/src/i18n.ts` | per-model locale spreads |
 | `// 🐺 anubis:child-imports` | every show page | imports of child section components |
@@ -65,6 +73,11 @@ Each one closes a list of columns. A model's artifacts carry them wherever a fie
 | `// 🐺 anubis:insert-values` | `backend/src/<models>/routes.rs` | the insertable struct literal |
 | `// 🐺 anubis:update-normalize` | `backend/src/<models>/routes.rs` | the update handler's bindings |
 | `// 🐺 anubis:changeset-values` | `backend/src/<models>/routes.rs` | the changeset struct literal |
+| `// 🐺 anubis:create-associations` | `backend/src/<models>/routes.rs` | the create handler's association reconciliations |
+| `// 🐺 anubis:update-associations` | `backend/src/<models>/routes.rs` | the update handler's association reconciliations |
+| `// 🐺 anubis:view-fields` | `backend/src/<models>/routes.rs` | the view struct's association members |
+| `// 🐺 anubis:view-load` | `backend/src/<models>/routes.rs` | the association loads a page of records needs |
+| `// 🐺 anubis:view-values` | `backend/src/<models>/routes.rs` | the view struct literal one record is built into |
 | `// 🐺 anubis:test-create` | `backend/tests/<models>_flow.rs` | the create request's payload |
 | `// 🐺 anubis:test-created` | `backend/tests/<models>_flow.rs` | the assertions on the created record |
 | `// 🐺 anubis:test-update` | `backend/tests/<models>_flow.rs` | the update request's payload |
@@ -73,6 +86,8 @@ Each one closes a list of columns. A model's artifacts carry them wherever a fie
 | `// 🐺 anubis:create-request` | `frontend/src/api/routes/<model>Routes.ts` | the create request type |
 | `// 🐺 anubis:update-request` | `frontend/src/api/routes/<model>Routes.ts` | the update request type |
 | `// 🐺 anubis:field-imports` | `frontend/src/components/<Model>Form.tsx` | the field components imported |
+| `// 🐺 anubis:form-imports` | `frontend/src/components/<Model>Form.tsx` | the application modules a control reads from |
+| `// 🐺 anubis:form-hooks` | `frontend/src/components/<Model>Form.tsx` | the hooks a control needs, such as its options |
 | `// 🐺 anubis:form-schema` | `frontend/src/components/<Model>Form.tsx` | the zod object |
 | `// 🐺 anubis:form-values` | `frontend/src/components/<Model>Form.tsx` | `toFormValues` |
 | `// 🐺 anubis:form-payload` | `frontend/src/components/<Model>Form.tsx` | the submitted payload |
@@ -144,14 +159,14 @@ A scaffolded model currently generates account handlers only. Extending the fram
 | `anubis new <name>` | Stamp a new application from the starter template |
 | `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold |
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
-| `anubis scaffold join <JoinModel> <a_id{class=A}> <b_id{class=B}>` | Join model for has-many-through |
+| `anubis scaffold join <JoinModel> <a_id{class_name=A}> <b_id{class_name=B}>` | Join model for has-many-through |
 | `anubis scaffold oauth <provider>` | Add an OAuth login provider (the one-line Google Auth moment) |
 | `anubis scaffold webhook <name>` | Incoming webhook endpoint |
 | `anubis routes` | Print the route table |
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 
-`anubis new`, `anubis routes`, `anubis doctor`, `anubis scaffold model`, and `anubis scaffold field` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, and `anubis scaffold oauth` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
@@ -164,6 +179,9 @@ The generator accepts the types the living templates prove. Each row knows its c
 | `number_field` | `INTEGER` | `Int4` | `Option<i32>` | `number \| null` | `NumberField` |
 | `boolean` | `BOOLEAN NOT NULL DEFAULT false` | `Bool` | `bool` | `boolean` | `BooleanField` |
 | `date_field` | `DATE` | `Date` | `Option<chrono::NaiveDate>` | `string \| null` | `DateField` |
+| `super_select{class_name=<Other>}` | none, the join table holds it | none | `Vec<Uuid>` | `string[]` | `SuperSelectField` |
+
+`super_select` is the one type in the table that declares no column, because a has-many-through association's values are rows in a join table. [Association fields](#association-fields-has-many-through) describe it in full.
 
 #### Nullable, or defaulted
 
@@ -257,6 +275,100 @@ Artifacts a model does not have are named in the report rather than skipped quie
 
 A generated model arrives with a narrative test, and a field added later joins it: the create request sends a value, the assertions check it, the update request sends a different value, and the assertions check that too. Four anchors in the test template carry it, and the samples come from the field type, so a number is `3` then `5` and a date is `2026-01-31` then `2026-02-28`. A column that reaches the database but not the test would be a column nothing proves.
 
+## `anubis scaffold join`: the has-many-through half
+
+```
+anubis scaffold join AppliedTag project_id{class_name=Project} tag_id{class_name=Tag}
+```
+
+Bullet Train splits a has-many-through into two commands, and so does Anubis, for the same reason: an association reads through a join model, and a join model links two models that both already exist. The join is generated first, the association field second. A `scaffold field` run that finds no join refuses and prints the `scaffold join` command that would create one, rather than guessing a name for a model the developer has to live with.
+
+Both sides must be **team-owned**, which is what lets one comparison decide whether a pair is tenant-safe. A side owned through a parent is refused by name, with deeper chains pointed at the roadmap. A side that does not exist is refused with the `scaffold model` command that would create it, and a pair that some join already links is refused with that join's name: one join model per pair.
+
+Each side is written `<model>_id{class_name=<Model>}`, exactly as Bullet Train writes it (`class` is accepted as a spelling of `class_name`). The attribute must be the class's own `<model>_id`, because a generated join reaches its sides by that name everywhere; a differently named foreign key is refused with the expected spelling.
+
+One run produces:
+
+- a timestamped migration: the join table with a uuid primary key, both foreign keys with `ON DELETE CASCADE`, an index on the second side, a composite `UNIQUE` on the pair, and the shared `set_updated_at()` trigger
+- the `diesel::table!` block, `joinable!` in both directions, and one `allow_tables_to_appear_in_same_query!` pair per side
+- the join's module (`mod.rs`, `model.rs`, `routes.rs`) under `backend/src/<join_models>/`
+- its module declaration and router mount in `backend/src/lib.rs`
+- its integration test in `backend/tests/<join_models>_flow.rs`
+- the ky route module `frontend/src/api/routes/<joinModel>Routes.ts`, carrying the options hook a form binds to
+
+The composite `UNIQUE` is why attaching twice is a no-op rather than a duplicate, including when two requests race; its index is also the lookup by the owning side, which is the leading column.
+
+### The endpoints a join owns
+
+| Method | Path | Authorizes |
+|---|---|---|
+| GET | `/account/teams/{team_id}/<join-models>/options` | `read` on the target |
+| GET | `/account/<owners>/{owner_id}/<targets>` | `read` on the owner |
+| POST | `/account/<owners>/{owner_id}/<targets>` | `update` on the owner |
+| DELETE | `/account/<owners>/{owner_id}/<targets>/{target_id}` | `update` on the owner |
+
+The options endpoint is keyed by the join rather than by the target, so two associations reaching the same model from different owners never collide on a route. It answers `{ "options": [{ "value": ..., "label": ... }] }`, which is the field library's `FieldOption` exactly, so a generated form passes the response straight to the control.
+
+### Why a join takes no entry in `roles.yml`
+
+A join model is infrastructure, not a resource. Attaching a tag to a project is an update *on the project*; reading which tags are attached is a read on the project; listing the tags a form may offer is a read on the tag. Granting the join its own permissions would ask a developer to keep two grants in step for one user-visible action, and the first time they drift the answer to "who may tag a project" stops being knowable from `roles.yml`. So the join rides the two models it links, and `config/roles.yml` keeps one entry per real-world model.
+
+### The generated test
+
+The join's narrative proves the whole surface against a real Postgres: options scoped to the caller's team, attach, list through, a repeated attach that changes nothing, a second record joining the first, another tenant's owner behind `404`, another tenant's record refused on attach, a read-only member refused on both writes, and detach leaving the records themselves alone.
+
+## Association fields: has-many-through
+
+```
+anubis scaffold field Project tag_ids:super_select{class_name=Tag}
+```
+
+The suffix is `_ids` plural and the name is the target's own, exactly as Rails and Bullet Train spell a `has_many :through` attribute. The field declares no column: its values are rows in the join table, so the run writes no migration and touches no `diesel::table!` block. What it does is wire the association through every artifact the model owns.
+
+Backend:
+
+- both request bodies gain `<other>_ids: Option<Vec<Uuid>>`; absent leaves the set alone, a list replaces it whole
+- the create and update handlers reconcile the set through the join model's `replace_all`, which validates every submitted id against `valid_*` and then, in one transaction, deletes the links that are gone and inserts the ones that are new
+- the model's view struct gains `<other>_ids: Vec<Uuid>`, loaded for a whole page in one query, so list, show, create, and update all serialize the same shape
+
+Frontend:
+
+- the wire type gains `<other>_ids: string[]`, and both request types gain it as optional
+- the form gains a `SuperSelectField` in multiple mode, its options from the join's own options hook, its value read straight from the record it is editing
+- the model's table gains a column counting the links, and its show page an attribute doing the same
+- the model's locale file gains the label and help text, named after the model the association reaches (`tagIds` reads "Tags", not "Tag ids")
+
+The model's narrative test gains the wire shape through the create request and its assertion. Attaching and detaching are proven by the join's own generated test, which is where those endpoints live.
+
+### The view struct
+
+Every scaffolded model's `routes.rs` carries a `<Model>View`, a `serde(flatten)` wrapper around the record. With no associations it serializes exactly as the table does, so it costs nothing; an association adds its ids to it. That is what makes one form able to read and write the same shape, and it is the seed of the serializer the `/api/v1` work will share with webhooks.
+
+### Deferred: `super_select` without `_ids`
+
+`super_select{class_name=<Other>}` on a singular name is a belongs_to association, and it does not fall out of this machinery: it needs a real nullable `<other>_id` column on the model, a foreign key, and a `valid_*` method inserted into a model module that carries no anchor for methods. It is refused by name today, with the plural spelling shown. The ownership-chain parent a nested model carries is a belongs_to already, and `scaffold model` generates it, including its `valid_*` scoping method and its cross-tenant refusal; what is missing is a second, non-owning one.
+
+## `anubis scaffold oauth`: one provider, one command
+
+```
+anubis scaffold oauth google
+```
+
+This is Bullet Train's one-line Google Auth moment, and it is deliberately the thinnest command in the family. Almost all of the feature is framework behavior that arrives with the dependency: the two routes, the authorization-code flow with PKCE, the server-side state and nonce, the ID token verification, the identity linking, and the account bootstrap all live in `anubis::auth::oauth` and are described in [api.md](api.md#oauth-sign-in). What is left to generate is the part an application owns.
+
+One run updates two files:
+
+- `frontend/src/pages/auth/SignInPage.tsx`: the provider's button, above the `oauth-providers` anchor, and the url helper it calls, above the `oauth-imports` anchor
+- `frontend/src/locales/en-US.json`: the button's text, merged into the `auth.oauth` object
+
+and then prints the two steps only a person can take: registering an OAuth client with the provider, using the redirect URI the command spells out, and setting `<PROVIDER>_OAUTH_CLIENT_ID` and `<PROVIDER>_OAUTH_CLIENT_SECRET`. Both insertions are idempotent, so a second provider adds a button and nothing else.
+
+### Why the command owns no configuration file
+
+An application declares its providers by setting their credentials, not by listing them somewhere. A config file naming enabled providers would be a second source of truth that disagrees with the environment the moment a deployment differs from development, and the failure mode of that disagreement (a button that always fails) is exactly what a framework should not ship. So the environment decides: a provider with both credentials set is enabled, a provider with one of the two refuses to start, and a button whose provider is not configured redirects to the sign-in page with `oauth_unavailable` rather than pretending.
+
+The provider registry itself is framework-owned and OpenID Connect only, so an unknown key is refused by name with the known list. `<PROVIDER>_OAUTH_ISSUER` overrides the registry's issuer, which is what a self-hosted identity server, a single-tenant directory, and the framework's own test suite use.
+
 ## The field component library
 
 Bullet Train's field partials are its forms backbone. Ours are React components in `@jalapenolabs/anubis`, one per scaffolder field type, exported by name from the package root. A generated form is one component per model attribute with nothing in between.
@@ -314,7 +426,7 @@ These field types have no component yet, and each waits on something specific:
 - `file_field`, `image`: these need the upload endpoint and storage decision first. A picker with nowhere to put the bytes is not a field.
 - `address_field`: needs the country and region dataset, and dependent-select behavior, which is the same shape `phone_field` wants for country codes.
 - `phone_field` international formatting: the field ships as a telephone input today and stores the number as typed. Country selection and E.164 normalization arrive with the country dataset.
-- `super_select` async options: options are passed in today. Fetching them from the select options endpoint as the user types changes nothing about the contract.
+- `super_select` incremental search: a generated association form fetches the whole option list once, from the join's options endpoint, and filters it in the browser. Fetching a page of options as the user types is what a directory-sized list will need, and it changes nothing about the component's contract.
 
 ### Styling
 
@@ -332,6 +444,8 @@ All scaffolders share one pure engine, `anubis::scaffold`:
 - **Field types**: `FieldType` and `Field` map a `name:type` argument to a column, a schema type, a Rust type, a wire type, and a React control.
 - **Field planning**: `FieldScaffold` turns one field plus a model's names into every line it contributes, keyed by the `Artifact` that receives it. Both scaffolders read the same table, which is what keeps their output identical.
 - **Model planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
+- **Join planning**: `JoinScaffold` does the same for a join, rewriting three model names and three module paths at once so generated code reaches each side through the module that side's own scaffold created.
+- **Provider planning**: `OauthScaffold` turns one provider into the sign-in button it contributes, the string that button renders, and the redirect URI its console needs.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
 
@@ -374,7 +488,7 @@ Still deferred for `scaffold field`: one field per run (run it twice for two), a
 ## Locked conventions the generator stamps
 
 - **List endpoints** follow the page/limit, sort, and filter conventions in [api.md](api.md); the scaffolder maintains each model's sortable and filterable whitelists. `anubis::http::ListParams` and `anubis::http::Pagination` implement the convention once, so every generated endpoint pages and sorts identically.
-- **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method on the model, `valid_<associations>(connection, team_id) -> QueryResult<Vec<_>>`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on create and update, so a form can never smuggle in another tenant's record. One definition, both duties.
+- **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method, `valid_<associations>(connection, team_id) -> QueryResult<Vec<_>>`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on write, so a form can never smuggle in another tenant's record. One definition, both duties. For an ownership-chain parent it lives on the model that points at it; for a has-many-through it lives on the join model, which is the only artifact that knows both sides and is generated once for every association that uses it.
 - **Timestamps**: `created_at`/`updated_at` come from the database. `updated_at` is maintained by the shared `set_updated_at()` trigger, attached to every generated table; application code never sets either.
 
 ## Workflow

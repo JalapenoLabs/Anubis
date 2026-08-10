@@ -1,2 +1,2 @@
 # Extend clippy's default doc-ident whitelist ("..") with terms we write in prose.
-doc-valid-idents = ["SaaS", "OpenAPI", "PostgreSQL", "RustCrypto", "WebAuthn", ".."]
+doc-valid-idents = ["SaaS", "OpenAPI", "OpenID", "PostgreSQL", "RustCrypto", "WebAuthn", ".."]

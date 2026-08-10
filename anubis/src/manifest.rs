@@ -207,6 +207,18 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/auth/passkeys/login/finish",
         area: "auth",
     },
+    // OAuth sign-in over OpenID Connect. Both are browser navigations and
+    // answer with a redirect, to the provider or back to the sign-in page.
+    RouteEntry {
+        method: "GET",
+        path: "/auth/oauth/{provider}/start",
+        area: "auth",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/auth/oauth/{provider}/callback",
+        area: "auth",
+    },
     // Tenancy.
     RouteEntry {
         method: "GET",

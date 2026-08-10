@@ -31,6 +31,18 @@ const TEMPLATE_TOKENS: [&str; 11] = [
     "completely_concrete",
 ];
 
+/// The names the join template adds, which must not survive either.
+const JOIN_TEMPLATE_TOKENS: [&str; 8] = [
+    "IncidentalLinkage",
+    "incidentalLinkage",
+    "incidental_linkage",
+    "PeripheralNotion",
+    "peripheralNotion",
+    "peripheral_notion",
+    "incidentally_linked",
+    "merely_peripheral",
+];
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -557,10 +569,251 @@ fn every_field_type_is_wired_by_scaffold_model() {
     std::fs::remove_dir_all(&app).expect("scratch directories are removable");
 }
 
+/// A join and the association that reads through it, end to end.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one join and its association inspected artifact by artifact"
+)]
+fn a_join_carries_an_association_between_two_team_owned_models() {
+    let app = copy_starter("join");
+
+    for model in ["Project", "Tag"] {
+        let output = scaffold(&app, &[model, "Team", "name:text_field"]);
+        assert!(
+            output.status.success(),
+            "scaffolding {model} failed: {}",
+            stderr(&output),
+        );
+    }
+
+    let output = scaffold_join(
+        &app,
+        &[
+            "AppliedTag",
+            "project_id{class_name=Project}",
+            "tag_id{class_name=Tag}",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "scaffolding the join failed: {}",
+        stderr(&output),
+    );
+
+    for expected in [
+        "backend/src/applied_tags/mod.rs",
+        "backend/src/applied_tags/model.rs",
+        "backend/src/applied_tags/routes.rs",
+        "backend/tests/applied_tags_flow.rs",
+        "frontend/src/api/routes/appliedTagRoutes.ts",
+    ] {
+        assert!(app.join(expected).is_file(), "missing {expected}");
+    }
+    // A join is infrastructure, not a resource: it takes no permissions.
+    let roles = read(&app.join("config/roles.yml"));
+    assert!(!roles.contains("AppliedTag"), "{roles}");
+
+    // The migration carries both cascades, the pair's uniqueness, and the trigger.
+    let up = read(&migration(&app, "_create_applied_tags").join("up.sql"));
+    assert!(
+        up.contains("project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE"),
+        "{up}",
+    );
+    assert!(up.contains("tag_id UUID NOT NULL REFERENCES tags(id) ON DELETE CASCADE"));
+    assert!(up.contains("UNIQUE (project_id, tag_id)"));
+    assert!(up.contains("CREATE TRIGGER set_updated_at BEFORE UPDATE ON applied_tags"));
+
+    // The schema joins both ways, and both pairs may share a query.
+    let schema = read(&app.join("backend/src/schema.rs"));
+    assert!(schema.contains("    applied_tags (id) {"), "{schema}");
+    assert!(schema.contains("diesel::joinable!(applied_tags -> projects (project_id));"));
+    assert!(schema.contains("diesel::joinable!(applied_tags -> tags (tag_id));"));
+    assert!(
+        schema.contains("diesel::allow_tables_to_appear_in_same_query!(projects, applied_tags);")
+    );
+    assert!(schema.contains("diesel::allow_tables_to_appear_in_same_query!(tags, applied_tags);"));
+
+    // The join declares itself, so the field scaffolder can find it by pair.
+    let model = read(&app.join("backend/src/applied_tags/model.rs"));
+    assert!(
+        model.contains("pub const JOIN: [&str; 3] = [\"AppliedTag\", \"Project\", \"Tag\"];"),
+        "{model}",
+    );
+    assert!(model.contains("pub async fn valid_tags("));
+    assert!(model.contains("pub async fn tag_ids_by_project("));
+    for token in TEMPLATE_TOKENS.into_iter().chain(JOIN_TEMPLATE_TOKENS) {
+        assert!(
+            !model.contains(token),
+            "the join model still contains `{token}`"
+        );
+    }
+
+    // The association itself lands on the owning side.
+    let output = scaffold_field(&app, &["Project", "tag_ids:super_select{class_name=Tag}"]);
+    assert!(
+        output.status.success(),
+        "scaffolding the association failed: {}",
+        stderr(&output),
+    );
+    // It declares no column, so it writes no migration and no schema entry.
+    assert!(
+        std::fs::read_dir(app.join("backend/migrations"))
+            .expect("the migrations directory is readable")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("tag_ids")),
+        "an association writes no migration",
+    );
+    assert!(
+        !read(&app.join("backend/src/schema.rs")).contains("tag_ids ->"),
+        "an association adds no column",
+    );
+
+    let routes = read(&app.join("backend/src/projects/routes.rs"));
+    assert_eq!(
+        routes.matches("tag_ids: Option<Vec<Uuid>>,").count(),
+        2,
+        "both request bodies carry the association: {routes}",
+    );
+    assert_eq!(
+        routes
+            .matches("crate::applied_tags::AppliedTag::replace_all(")
+            .count(),
+        2,
+        "create and update both reconcile: {routes}",
+    );
+    assert!(routes.contains("AppliedTag::tag_ids_by_project("));
+    assert!(routes.contains("    tag_ids: Vec<Uuid>,"), "{routes}");
+
+    let api = read(&app.join("frontend/src/api/routes/projectRoutes.ts"));
+    assert!(api.contains("  tag_ids: string[]\n"), "{api}");
+    assert_eq!(api.matches("tag_ids?: string[]").count(), 2);
+
+    let form = read(&app.join("frontend/src/components/ProjectForm.tsx"));
+    assert!(form.contains("SuperSelectField,"), "{form}");
+    assert!(form.contains("import { useAppliedTagOptions } from '../api/routes/appliedTagRoutes'"));
+    assert!(form.contains("const tagOptions = useAppliedTagOptions(props.teamId)"));
+    assert!(form.contains("options={tagOptions}"));
+    assert!(form.contains("tag_ids: editing?.tag_ids ?? [],"));
+
+    let locale = read(&app.join("frontend/src/locales/models/projects.en-US.json"));
+    assert!(locale.contains("\"tagIds\": \"Tags\""), "{locale}");
+    serde_json::from_str::<serde_json::Value>(&locale).expect("the locale file stays valid JSON");
+
+    // The same association twice refuses, and a pair is joined only once.
+    let again = scaffold_field(&app, &["Project", "tag_ids:super_select{class_name=Tag}"]);
+    assert!(
+        !again.status.success(),
+        "a repeated association must refuse"
+    );
+    assert!(
+        stderr(&again).contains("already carries the `tag_ids` association"),
+        "unexpected error: {}",
+        stderr(&again),
+    );
+    let twice = scaffold_join(
+        &app,
+        &[
+            "TaggedProject",
+            "project_id{class_name=Project}",
+            "tag_id{class_name=Tag}",
+        ],
+    );
+    assert!(
+        !twice.status.success(),
+        "a second join for a pair must refuse"
+    );
+    assert!(
+        stderr(&twice).contains("`AppliedTag` already links"),
+        "unexpected error: {}",
+        stderr(&twice),
+    );
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
+/// A join needs two team-owned models, and an association needs a join.
+#[test]
+fn join_and_association_arguments_are_rejected_with_a_reason() {
+    let app = copy_starter("join-rejections");
+
+    let output = scaffold(&app, &["Project", "Team", "name:text_field"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = scaffold(&app, &["Goal", "Project,Team", "name:text_field"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // A side that does not exist names the command that would create it.
+    let missing = scaffold_join(
+        &app,
+        &[
+            "AppliedTag",
+            "project_id{class_name=Project}",
+            "tag_id{class_name=Tag}",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing).contains("anubis scaffold model Tag Team"),
+        "unexpected error: {}",
+        stderr(&missing),
+    );
+
+    // A side owned through a parent is refused, pointing at the roadmap.
+    let nested = scaffold_join(
+        &app,
+        &[
+            "AppliedGoal",
+            "project_id{class_name=Project}",
+            "goal_id{class_name=Goal}",
+        ],
+    );
+    assert!(!nested.status.success());
+    assert!(
+        stderr(&nested).contains("not owned directly by a team"),
+        "unexpected error: {}",
+        stderr(&nested),
+    );
+
+    // An association with no join names the join command that would back it.
+    let unjoined = scaffold_field(&app, &["Project", "goal_ids:super_select{class_name=Goal}"]);
+    assert!(!unjoined.status.success());
+    assert!(
+        stderr(&unjoined)
+            .contains("anubis scaffold join <JoinModel> project_id{class_name=Project}"),
+        "unexpected error: {}",
+        stderr(&unjoined),
+    );
+
+    // And `scaffold model` refuses one outright: the join cannot exist yet.
+    let at_model_time = scaffold(
+        &app,
+        &["Ticket", "Team", "tag_ids:super_select{class_name=Tag}"],
+    );
+    assert!(!at_model_time.status.success());
+    assert!(
+        stderr(&at_model_time).contains("anubis scaffold join"),
+        "unexpected error: {}",
+        stderr(&at_model_time),
+    );
+
+    assert!(!app.join("backend/src/applied_tags").exists());
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
 /// Runs `anubis scaffold model` inside `app`.
 fn scaffold(app: &Path, arguments: &[&str]) -> Output {
     Command::new(ANUBIS)
         .args(["scaffold", "model"])
+        .args(arguments)
+        .current_dir(app)
+        .output()
+        .expect("the anubis binary runs")
+}
+
+/// Runs `anubis scaffold join` inside `app`.
+fn scaffold_join(app: &Path, arguments: &[&str]) -> Output {
+    Command::new(ANUBIS)
+        .args(["scaffold", "join"])
         .args(arguments)
         .current_dir(app)
         .output()

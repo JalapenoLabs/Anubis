@@ -58,6 +58,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         mailer,
         app_url: config.app_url.clone(),
         secret_key: config.secret_key.clone(),
+        oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
     };
 
     Router::new()
@@ -72,6 +73,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .merge(crate::auth::account::router())
         .merge(crate::auth::email_code::router())
         .merge(crate::auth::mfa::router())
+        .merge(crate::auth::oauth::router())
         .merge(crate::auth::passkey::router())
         .with_state(state)
         // CurrentUser resolves its pool from request extensions.
@@ -86,6 +88,8 @@ pub(crate) struct AuthState {
     pub(crate) app_url: String,
     /// Seals the secrets auth must read back, today the TOTP seeds.
     pub(crate) secret_key: SecretKey,
+    /// The configured OpenID Connect providers and their discovery cache.
+    pub(crate) oauth: crate::auth::oauth::Runtime,
 }
 
 #[derive(Deserialize)]

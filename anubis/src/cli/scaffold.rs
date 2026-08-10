@@ -1,5 +1,6 @@
-//! `anubis scaffold model` and `anubis scaffold field`: generate a model's
-//! full-stack slice, and grow it a column at a time.
+//! `anubis scaffold model`, `anubis scaffold field`, and
+//! `anubis scaffold oauth`: generate a model's full-stack slice, grow it a
+//! column at a time, and add a sign-in provider.
 //!
 //! The templates are application code, not framework assets: `scaffold model`
 //! reads `backend/src/scaffolding/`, the migration that created the template's
@@ -23,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anubis::scaffold::{
-    Artifact, Field, FieldScaffold, LOCALE_FIELDS, ModelScaffold, ModelTemplate, Names,
-    Replacements, anchor, insert_above_anchor, insert_json_entries, line_containing, locale_file,
-    model_artifacts, table_block,
+    Artifact, Field, FieldScaffold, JoinScaffold, LOCALE_FIELDS, ModelScaffold, ModelTemplate,
+    Names, OauthScaffold, Replacements, anchor, insert_above_anchor, insert_json_entries,
+    line_containing, locale_file, model_artifacts, table_block,
 };
 
 /// The grants a scaffolded model receives, one per role-suffixed anchor.
@@ -38,6 +39,18 @@ const ROLE_GRANTS: [(&str, &str); 2] = [
 
 /// The Rust edition the framework and every stamped application build on.
 const EDITION: &str = "2024";
+
+/// The page `scaffold oauth` adds a provider button to.
+const SIGN_IN_PAGE: &str = "frontend/src/pages/auth/SignInPage.tsx";
+
+/// The application's own strings, as opposed to a model's locale file.
+const BASE_LOCALE: &str = "frontend/src/locales/en-US.json";
+
+/// The object inside it holding the sign-in providers' button text.
+const LOCALE_OAUTH: &str = "oauth";
+
+/// The url helper every provider button calls, imported once.
+const OAUTH_URL_IMPORT: &str = "getOauthStartUrl,";
 
 /// Runs `anubis scaffold model <Model> <ParentChain> [field:type ...]`.
 pub(crate) fn model(model: &str, ownership: &str, fields: &[String]) -> ExitCode {
@@ -128,8 +141,22 @@ fn stamp_module(
     template: ModelTemplate,
     replacements: &Replacements,
 ) -> Result<Vec<(PathBuf, String)>, String> {
-    let source = PathBuf::from("backend/src/scaffolding").join(template.module());
-    let destination = PathBuf::from("backend/src").join(scaffold.module());
+    stamp_template_module(root, template.module(), &scaffold.module(), replacements)
+}
+
+/// Stamps one template module directory into the application's own tree.
+///
+/// Shared by `scaffold model` and `scaffold join`: both transform a directory
+/// under `backend/src/scaffolding/` into a module named after the target, and
+/// neither ever overwrites one that already exists.
+fn stamp_template_module(
+    root: &Path,
+    template_module: &str,
+    module: &str,
+    replacements: &Replacements,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let source = PathBuf::from("backend/src/scaffolding").join(template_module);
+    let destination = PathBuf::from("backend/src").join(module);
     if root.join(&destination).exists() {
         return Err(format!(
             "{} already exists; scaffolding never overwrites a model",
@@ -229,8 +256,17 @@ fn stamp_frontend(
     template: ModelTemplate,
     replacements: &Replacements,
 ) -> Result<Vec<(PathBuf, String)>, String> {
+    stamp_frontend_files(root, template.frontend_files(), replacements)
+}
+
+/// Stamps a list of template frontend files into the application.
+fn stamp_frontend_files(
+    root: &Path,
+    sources: &[&str],
+    replacements: &Replacements,
+) -> Result<Vec<(PathBuf, String)>, String> {
     let mut files = Vec::new();
-    for source in template.frontend_files() {
+    for source in sources {
         let destination = replacements.apply(source);
         if root.join(&destination).exists() {
             return Err(format!(
@@ -538,7 +574,7 @@ fn report(scaffold: &ModelScaffold, plan: &Plan) {
     if !added.is_empty() {
         let names = added
             .iter()
-            .map(|field| format!("{} ({})", field.name(), field.field().field_type().name()))
+            .map(|field| format!("{} ({})", field.name(), field.field().type_name()))
             .collect::<Vec<_>>()
             .join(", ");
         println!(
@@ -564,12 +600,22 @@ pub(crate) fn field(model: &str, argument: &str) -> ExitCode {
         Ok(parsed) => parsed,
         Err(error) => return fail(error.message()),
     };
-    let scaffold = FieldScaffold::new(names.clone(), parsed);
 
     let root = match app_root() {
         Ok(root) => root,
         Err(reason) => return fail(&reason),
     };
+
+    // An association reads and writes through a join model, and only the
+    // application knows which one links the pair.
+    let parsed = match parsed.association() {
+        None => parsed,
+        Some(association) => match resolve_join(&root, &names, association.target()) {
+            Ok(join) => parsed.through(join),
+            Err(reason) => return fail(&reason),
+        },
+    };
+    let scaffold = FieldScaffold::new(names.clone(), parsed);
 
     let plan = match plan_field(&root, &names, &scaffold) {
         Ok(plan) => plan,
@@ -606,11 +652,18 @@ fn plan_field(root: &Path, names: &Names, scaffold: &FieldScaffold) -> Result<Fi
         ));
     }
 
-    let schema = update_schema_column(root, &table, scaffold)?;
-    let created = migration_for_field(root, &table, scaffold)?;
+    // An association adds no column to this model's table: its values are rows
+    // in the join table, so the run writes no migration and touches no schema.
+    let mut created = Vec::new();
+    let mut updated = Vec::new();
+    if scaffold.field().field_type().is_some() {
+        updated.push(update_schema_column(root, &table, scaffold)?);
+        created = migration_for_field(root, &table, scaffold)?;
+    } else {
+        require_association_absent(root, &module, scaffold)?;
+    }
 
     let fields = std::slice::from_ref(scaffold);
-    let mut updated = vec![schema];
     let mut absent = Vec::new();
     for (relative, artifact) in model_artifacts(names) {
         let path = root.join(&relative);
@@ -667,16 +720,58 @@ fn update_schema_column(
         ));
     }
 
+    let column = scaffold.field().schema_column().ok_or_else(|| {
+        format!(
+            "`{}` adds no column, so it belongs in no table block",
+            scaffold.name(),
+        )
+    })?;
     let updated_block =
-        insert_above_anchor(&block, "created_at ->", &scaffold.field().schema_column()).map_err(
-            |_error| {
-                format!(
-                    "the `{table}` block in {} has no `created_at` column to insert above",
-                    display(&relative),
-                )
-            },
-        )?;
+        insert_above_anchor(&block, "created_at ->", &column).map_err(|_error| {
+            format!(
+                "the `{table}` block in {} has no `created_at` column to insert above",
+                display(&relative),
+            )
+        })?;
     Ok((relative, schema.replace(&block, &updated_block)))
+}
+
+/// The join backing an association, or the command that would create it.
+fn resolve_join(root: &Path, model: &Names, target: &Names) -> Result<Names, String> {
+    match find_join(root, model, target)? {
+        Some(join) => Ok(join),
+        None => Err(format!(
+            "no join model links {} to {}. A has-many-through association reads through one, so \
+             generate it first:\n  anubis scaffold join <JoinModel> {}_id{{class_name={}}} \
+             {}_id{{class_name={}}}",
+            model.pascal(),
+            target.pascal(),
+            model.snake(),
+            model.pascal(),
+            target.snake(),
+            target.pascal(),
+        )),
+    }
+}
+
+/// Refuses an association the model already carries.
+///
+/// An association owns no column, so the schema cannot answer the question the
+/// way it does for a field; the request body the earlier run wrote does.
+fn require_association_absent(
+    root: &Path,
+    module: &str,
+    scaffold: &FieldScaffold,
+) -> Result<(), String> {
+    let relative = format!("backend/src/{module}/routes.rs");
+    let declaration = format!("{}: Option<Vec<Uuid>>,", scaffold.name());
+    if read(&root.join(&relative))?.contains(&declaration) {
+        return Err(format!(
+            "`{module}` already carries the `{}` association; scaffolding never redefines a field",
+            scaffold.name(),
+        ));
+    }
+    Ok(())
 }
 
 /// Writes the `ALTER TABLE` migration that adds the column, and drops it again.
@@ -690,15 +785,19 @@ fn migration_for_field(
     let destination = PathBuf::from("backend/migrations")
         .join(format!("{version}_add_{}_to_{table}", scaffold.name()));
 
+    let (added, dropped) = scaffold
+        .add_column(table)
+        .zip(scaffold.drop_column(table))
+        .ok_or_else(|| {
+            format!(
+                "`{}` adds no column, so it needs no migration",
+                scaffold.name(),
+            )
+        })?;
+
     Ok(vec![
-        (
-            destination.join("up.sql"),
-            format!("{}\n", scaffold.add_column(table)),
-        ),
-        (
-            destination.join("down.sql"),
-            format!("{}\n", scaffold.drop_column(table)),
-        ),
+        (destination.join("up.sql"), format!("{added}\n")),
+        (destination.join("down.sql"), format!("{dropped}\n")),
     ])
 }
 
@@ -779,11 +878,10 @@ fn missing_anchor(relative: &str, anchor: &str) -> String {
 
 /// Prints what one `scaffold field` run changed.
 fn report_field(names: &Names, scaffold: &FieldScaffold, plan: &FieldPlan) {
-    let field_type = scaffold.field().field_type();
     println!(
         "added {} ({}) to {}",
         scaffold.name(),
-        field_type.name(),
+        scaffold.field().type_name(),
         names.pascal(),
     );
 
@@ -804,17 +902,420 @@ fn report_field(names: &Names, scaffold: &FieldScaffold, plan: &FieldPlan) {
     }
 
     println!();
-    if field_type.is_nullable() {
-        println!("The column is nullable, so the rows the table already holds stay valid.");
-    } else {
-        println!(
-            "The column is NOT NULL with a database default, so the rows the table \
-             already holds stay valid."
-        );
+    match scaffold.field().field_type() {
+        Some(field_type) if field_type.is_nullable() => {
+            println!("The column is nullable, so the rows the table already holds stay valid.");
+        }
+        Some(_defaulted) => {
+            println!(
+                "The column is NOT NULL with a database default, so the rows the table \
+                 already holds stay valid."
+            );
+        }
+        None => {
+            println!(
+                "The association adds no column: its values are rows in the join table, which \
+                 already exists, so this run writes no migration."
+            );
+        }
     }
     println!();
     println!("Next steps:");
+    if scaffold.field().field_type().is_some() {
+        println!("  boot the app to apply the migration");
+    }
+    println!("  cargo test");
+}
+
+/// Runs `anubis scaffold oauth <provider>`.
+///
+/// The command is thin on purpose: the flow, the routes, and the identity
+/// linking are framework behavior that arrives with the dependency, so all
+/// that is generated is the part the application owns. What it cannot do for
+/// you, registering the client with the provider, it prints.
+pub(crate) fn oauth(provider: &str) -> ExitCode {
+    let Some(known) = anubis::auth::oauth::find_provider(provider) else {
+        return fail(&unknown_provider(provider));
+    };
+    let scaffold = OauthScaffold::new(known);
+
+    let root = match app_root() {
+        Ok(root) => root,
+        Err(reason) => return fail(&reason),
+    };
+
+    let plan = match plan_oauth(&root, scaffold) {
+        Ok(plan) => plan,
+        Err(reason) => return fail(&reason),
+    };
+    if let Err(reason) = plan.apply(&root) {
+        return fail(&reason);
+    }
+
+    report_oauth(scaffold, &plan);
+    ExitCode::SUCCESS
+}
+
+/// Plans the button and the string one provider adds.
+fn plan_oauth(root: &Path, scaffold: OauthScaffold) -> Result<Plan, String> {
+    // The import is one line whatever the provider, and anchor insertion is
+    // idempotent, so a second provider adds a button and nothing else.
+    let page = update_anchors(
+        root,
+        SIGN_IN_PAGE,
+        &[
+            (anchor::OAUTH_IMPORTS, OAUTH_URL_IMPORT.to_owned()),
+            (anchor::OAUTH_PROVIDERS, scaffold.sign_in_button()),
+        ],
+    )?;
+
+    let relative = PathBuf::from(BASE_LOCALE);
+    let locale = read(&root.join(&relative))?;
+    let updated = insert_json_entries(&locale, LOCALE_OAUTH, &scaffold.locale_entries())
+        .ok_or_else(|| {
+            format!(
+                "{BASE_LOCALE} holds no `{LOCALE_OAUTH}` object under `auth` to add the \
+                 provider's button text to",
+            )
+        })?;
+
+    Ok(Plan {
+        created: Vec::new(),
+        updated: vec![page, (relative, updated)],
+    })
+}
+
+/// The message an unknown provider key earns, with the boundary spelled out.
+fn unknown_provider(provider: &str) -> String {
+    let known = anubis::auth::oauth::known_providers()
+        .iter()
+        .map(|provider| provider.key)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "`{provider}` is not a known sign-in provider. Anubis speaks OpenID Connect, and knows: \
+         {known}. GitHub issues no ID token and publishes no discovery document, so it needs a \
+         plain OAuth 2 path the framework does not have yet.",
+    )
+}
+
+/// Prints what changed, and the two steps only the developer can take.
+fn report_oauth(scaffold: OauthScaffold, plan: &Plan) {
+    let provider = scaffold.provider();
+    println!("added {} sign-in", provider.display_name);
+
+    println!();
+    println!("updated:");
+    for (path, _contents) in &plan.updated {
+        println!("  {}", display(path));
+    }
+
+    // The public origin is what the provider redirects the browser back to,
+    // so the example is only useful with the value this app actually runs on.
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_error| "<APP_URL>".to_owned());
+
+    println!();
+    println!("Next steps:");
+    println!(
+        "  register an OAuth client with {}, with this redirect URI:",
+        provider.display_name,
+    );
+    println!("    {}", scaffold.redirect_uri(&app_url));
+    println!("  set both credentials in the environment:");
+    println!("    {}=...", provider.client_id_var);
+    println!("    {}=...", provider.client_secret_var);
+    println!(
+        "  APP_URL must be the origin the browser sees, since it is the base of that redirect URI"
+    );
+}
+
+/// Runs `anubis scaffold join <JoinModel> <a_id{class_name=A}> <b_id{class_name=B}>`.
+pub(crate) fn join(join: &str, owner: &str, target: &str) -> ExitCode {
+    let scaffold = match JoinScaffold::parse(join, owner, target) {
+        Ok(scaffold) => scaffold,
+        Err(error) => return fail(error.message()),
+    };
+
+    let root = match app_root() {
+        Ok(root) => root,
+        Err(reason) => return fail(&reason),
+    };
+
+    let plan = match plan_join(&root, &scaffold) {
+        Ok(plan) => plan,
+        Err(reason) => return fail(&reason),
+    };
+    if let Err(reason) = plan.apply(&root) {
+        return fail(&reason);
+    }
+
+    report_join(&scaffold, &plan);
+    ExitCode::SUCCESS
+}
+
+/// Plans the whole join, reading the application's own join template.
+fn plan_join(root: &Path, scaffold: &JoinScaffold) -> Result<Plan, String> {
+    require_team_owned(root, scaffold.owner())?;
+    require_team_owned(root, scaffold.target())?;
+    if let Some(existing) = find_join(root, scaffold.owner(), scaffold.target())? {
+        return Err(format!(
+            "`{}` already links {} and {}; one join model per pair of models",
+            existing.pascal(),
+            scaffold.owner().pascal(),
+            scaffold.target().pascal(),
+        ));
+    }
+
+    let template = scaffold.template();
+    let replacements = scaffold.replacements();
+
+    let mut created =
+        stamp_template_module(root, template.module(), &scaffold.module(), &replacements)?;
+    created.push(stamp_join_test(root, scaffold, &replacements)?);
+    created.extend(stamp_join_migration(root, scaffold, &replacements)?);
+    created.extend(stamp_frontend_files(
+        root,
+        template.frontend_files(),
+        &replacements,
+    )?);
+
+    let schema = update_join_schema(root, scaffold, &replacements)?;
+    let library = update_anchors(
+        root,
+        "backend/src/lib.rs",
+        &[
+            (anchor::MODULES, scaffold.module_declaration()),
+            (anchor::ROUTES, scaffold.route_mount()),
+        ],
+    )?;
+
+    Ok(Plan {
+        created,
+        updated: vec![schema, library],
+    })
+}
+
+/// Refuses a side that is not a model this application owns a team-owned slice for.
+///
+/// A join links two models that both reach the same team directly, which is
+/// what lets one comparison decide whether a pair is tenant-safe. A model owned
+/// through a parent is refused by name rather than generated half-scoped.
+fn require_team_owned(root: &Path, names: &Names) -> Result<(), String> {
+    let module = names.snake_plural();
+    let relative = format!("backend/src/{module}/model.rs");
+    if !root.join(&relative).is_file() {
+        return Err(format!(
+            "no model named `{}` in this application: {relative} does not exist. Generate it \
+             first with `anubis scaffold model {} Team`.",
+            names.pascal(),
+            names.pascal(),
+        ));
+    }
+    if !read(&root.join(&relative))?.contains("pub team_id: Uuid,") {
+        return Err(format!(
+            "`{}` is not owned directly by a team. A join links two team-owned models today, so \
+             both sides reach the same team in one step; deeper chains are on the roadmap.",
+            names.pascal(),
+        ));
+    }
+    Ok(())
+}
+
+/// The join model linking `owner` to `target`, if the application has one.
+///
+/// Join models declare themselves with `pub const JOIN`, so the lookup is a
+/// scan of the application's own models rather than a naming convention the
+/// developer has to remember.
+fn find_join(root: &Path, owner: &Names, target: &Names) -> Result<Option<Names>, String> {
+    let source = root.join("backend/src");
+    for module in directory_names(&source)? {
+        let model = source.join(&module).join("model.rs");
+        if !model.is_file() {
+            continue;
+        }
+        let Some([join, declared_owner, declared_target]) = join_declaration(&read(&model)?) else {
+            continue;
+        };
+        if declared_owner == owner.pascal() && declared_target == target.pascal() {
+            return Ok(Some(Names::parse(&join).map_err(|error| {
+                format!(
+                    "{} declares an unparseable join name: {error}",
+                    model.display()
+                )
+            })?));
+        }
+    }
+    Ok(None)
+}
+
+/// The three model names a join model's `JOIN` constant declares.
+fn join_declaration(contents: &str) -> Option<[String; 3]> {
+    const DECLARATION: &str = "pub const JOIN: [&str; 3] = [";
+
+    let start = contents.find(DECLARATION)?;
+    let rest = &contents[start..];
+    let end = rest.find("];")?;
+    let names = rest[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.try_into().ok()
+}
+
+/// Stamps the join template's narrative test into the application's suite.
+fn stamp_join_test(
+    root: &Path,
+    scaffold: &JoinScaffold,
+    replacements: &Replacements,
+) -> Result<(PathBuf, String), String> {
+    let tests = PathBuf::from("backend/tests");
+    let source = tests.join(format!("{}_flow.rs", scaffold.template().table()));
+    let destination = tests.join(format!("{}_flow.rs", scaffold.table()));
+    if root.join(&destination).exists() {
+        return Err(format!(
+            "{} already exists; move it aside to scaffold this join again",
+            display(&destination),
+        ));
+    }
+
+    let contents = replacements.apply(&read(&root.join(&source))?);
+    Ok((destination, contents))
+}
+
+/// Stamps the migration that created the join template's table.
+fn stamp_join_migration(
+    root: &Path,
+    scaffold: &JoinScaffold,
+    replacements: &Replacements,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let migrations = root.join("backend/migrations");
+    let source = template_migration(&migrations, &scaffold.template().table())?;
+    let version = migration_version(&migrations, chrono::Utc::now())?;
+    let destination =
+        PathBuf::from("backend/migrations").join(scaffold.migration_directory(&version));
+
+    Ok(vec![
+        (
+            destination.join("up.sql"),
+            replacements.apply(&read(&source.join("up.sql"))?),
+        ),
+        (
+            destination.join("down.sql"),
+            replacements.apply(&read(&source.join("down.sql"))?),
+        ),
+    ])
+}
+
+/// Adds the join's table, both joins, and both same-query pairs to `schema.rs`.
+fn update_join_schema(
+    root: &Path,
+    scaffold: &JoinScaffold,
+    replacements: &Replacements,
+) -> Result<(PathBuf, String), String> {
+    let relative = PathBuf::from("backend/src/schema.rs");
+    let schema = read(&root.join(&relative))?;
+    let template = scaffold.template();
+
+    let block = table_block(&schema, &template.table()).ok_or_else(|| {
+        format!(
+            "{} declares no `{}` table; the living template's table is what a scaffold transforms",
+            display(&relative),
+            template.table(),
+        )
+    })?;
+    let mut updated = insert_above_anchor(
+        &schema,
+        anchor::TABLES,
+        &format!("{}\n\n", replacements.apply(&block)),
+    )
+    .map_err(|error| format!("{}: {error}", display(&relative)))?;
+
+    // A join declares one `joinable!` per side and one same-query pair per
+    // side; the pair of sides never meets in a query, so it needs neither.
+    let join_table = template.table();
+    for (needle, anchor) in [
+        (
+            format!(
+                "diesel::joinable!({join_table} -> {}",
+                template.owner_table()
+            ),
+            anchor::JOINS,
+        ),
+        (
+            format!(
+                "diesel::joinable!({join_table} -> {}",
+                template.target_table()
+            ),
+            anchor::JOINS,
+        ),
+        (
+            format!(
+                "diesel::allow_tables_to_appear_in_same_query!({}, {join_table}",
+                template.owner_table()
+            ),
+            anchor::SAME_QUERY,
+        ),
+        (
+            format!(
+                "diesel::allow_tables_to_appear_in_same_query!({}, {join_table}",
+                template.target_table()
+            ),
+            anchor::SAME_QUERY,
+        ),
+    ] {
+        let line = line_containing(&schema, &needle).ok_or_else(|| {
+            format!(
+                "{} holds no `{needle}` declaration to transform",
+                display(&relative),
+            )
+        })?;
+        updated = insert_above_anchor(&updated, anchor, &replacements.apply(&line))
+            .map_err(|error| format!("{}: {error}", display(&relative)))?;
+    }
+
+    Ok((relative, updated))
+}
+
+/// Prints what the join generated, and what it deliberately did not.
+fn report_join(scaffold: &JoinScaffold, plan: &Plan) {
+    println!(
+        "scaffolded {} ({} and {})",
+        scaffold.join().pascal(),
+        scaffold.owner().pascal(),
+        scaffold.target().pascal(),
+    );
+
+    println!();
+    println!("created:");
+    for (path, _contents) in &plan.created {
+        println!("  {}", display(path));
+    }
+    println!("updated:");
+    for (path, _contents) in &plan.updated {
+        println!("  {}", display(path));
+    }
+
+    println!();
+    println!(
+        "A join model is infrastructure, not a resource, so it takes no entry in \
+         config/roles.yml: reading the association is a read on {}, changing it is an update \
+         on {}, and listing a form's options is a read on {}.",
+        scaffold.owner().pascal(),
+        scaffold.owner().pascal(),
+        scaffold.target().pascal(),
+    );
+
+    println!();
+    println!("Next steps:");
     println!("  boot the app to apply the migration");
+    println!(
+        "  anubis scaffold field {} {}_ids:super_select{{class_name={}}}",
+        scaffold.owner().pascal(),
+        scaffold.target().snake(),
+        scaffold.target().pascal(),
+    );
     println!("  cargo test");
 }
 

@@ -16,7 +16,13 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
 // Misc
-import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
+import {
+  AUTH_ERROR_PARAM,
+  DESTINATION_PARAM,
+  UrlTree,
+  getUrlWithDestination,
+  // 🐺 anubis:oauth-imports
+} from '../../urls'
 
 const signInSchema = z.object({
   email: z.email(),
@@ -25,6 +31,22 @@ const signInSchema = z.object({
 
 type SignInFormValues = z.infer<typeof signInSchema>
 const resolver = zodResolver(signInSchema)
+
+/**
+ * The codes an OAuth sign-in fails back with, and the string each one renders.
+ *
+ * The codes are the framework's (`anubis::auth::oauth`), so they are wire
+ * values rather than translation keys. A code with no entry here falls back to
+ * the generic message, which is what keeps an unrecognized one off the screen.
+ */
+const oauthErrorKeys: Record<string, string | undefined> = {
+  oauth_unavailable: 'auth.oauth.errors.unavailable',
+  oauth_denied: 'auth.oauth.errors.denied',
+  oauth_expired: 'auth.oauth.errors.expired',
+  oauth_email_unavailable: 'auth.oauth.errors.emailUnavailable',
+  oauth_email_unverified: 'auth.oauth.errors.emailUnverified',
+  oauth_failed: 'auth.oauth.errors.failed',
+}
 
 export function SignInPage() {
   const { t } = useTranslation()
@@ -36,6 +58,9 @@ export function SignInPage() {
   // The page the guard sent the user away from, kept on the links out of here
   // so a detour through sign-up or a password reset does not lose it.
   const destination = searchParams.get(DESTINATION_PARAM)
+
+  // An OAuth flow that failed lands back here carrying its reason.
+  const oauthError = searchParams.get(AUTH_ERROR_PARAM)
 
   const emailRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
@@ -71,6 +96,12 @@ export function SignInPage() {
     title={t('auth.signIn.title')}
     subtitle={t('auth.signIn.subtitle')}
   >
+    { oauthError
+      ? <p className='relaxed text-danger'>{
+          t(oauthErrorKeys[oauthError] ?? 'common.somethingWentWrong')
+        }</p>
+      : null
+    }
     <form onSubmit={onSubmit}>
       <div className='compact'>
         <Input
@@ -129,6 +160,8 @@ export function SignInPage() {
         </div>
       </Tooltip>
     </form>
+    {/* One button per provider, written by `anubis scaffold oauth <provider>`. */}
+    {/* 🐺 anubis:oauth-providers */}
     <div className='level mt-4 text-sm'>
       <Link
         to={getUrlWithDestination(UrlTree.forgotPassword, destination)}

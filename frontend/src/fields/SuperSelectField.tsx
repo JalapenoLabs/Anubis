@@ -26,9 +26,10 @@ type Props<Values extends FieldValues> = AnubisFieldProps<Values> & {
  * The `super_select` scaffolder type: a searchable association picker.
  *
  * This is the field an association lands in, so the options are the records the
- * scaffolder's `valid_*` scoping method returns for the current team. They are
- * passed in today; fetching them from the select-options endpoint as the user
- * types is the next step, and it changes nothing about this contract.
+ * scaffolder's `valid_*` scoping method returns for the current team. A
+ * generated form binds them through the options hook `anubis scaffold join`
+ * writes beside the association's other route functions, so this component
+ * stays a pure control: it renders the list it is given.
  */
 export function SuperSelectField<Values extends FieldValues>(props: Props<Values>) {
   const { fieldId, field, errorMessage, isInvalid } = useFieldState(props)

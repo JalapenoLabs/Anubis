@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import {
   UrlTree,
   getCreativeConceptUrl,
+  getOauthStartUrl,
   getUrlWithDestination,
   sanitizeDestination,
 } from './urls'
@@ -60,6 +61,21 @@ describe('getUrlWithDestination', () => {
 
   it('should drop a destination that leaves the app', () => {
     expect(getUrlWithDestination(UrlTree.signIn, 'https://evil.example')).toBe('/sign-in')
+  })
+})
+
+describe('getOauthStartUrl', () => {
+  it('should point at the backend route for the provider', () => {
+    expect(getOauthStartUrl('google', null)).toBe('/auth/oauth/google/start')
+  })
+
+  it('should carry the encoded destination through the provider round trip', () => {
+    expect(getOauthStartUrl('google', '/creative-concepts?page=2'))
+      .toBe('/auth/oauth/google/start?next=%2Fcreative-concepts%3Fpage%3D2')
+  })
+
+  it('should drop a destination that leaves the app', () => {
+    expect(getOauthStartUrl('google', '//evil.example')).toBe('/auth/oauth/google/start')
   })
 })
 

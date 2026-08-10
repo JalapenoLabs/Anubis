@@ -3,5 +3,5 @@
 mod model;
 mod routes;
 
-pub use model::CreativeConcept;
+pub use model::{CreativeConcept, MODEL};
 pub use routes::router;

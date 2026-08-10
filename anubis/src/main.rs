@@ -66,6 +66,22 @@ enum ScaffoldCommand {
         /// Fields as `name:type`, e.g. `name:text_field`.
         fields: Vec<String>,
     },
+    /// Add an OAuth sign-in provider: the sign-in button, its string, and the
+    /// setup instructions for the provider's console.
+    Oauth {
+        /// The provider key, e.g. `google`.
+        provider: String,
+    },
+    /// Generate the join model two existing team-owned models need before a
+    /// has-many-through association can reach between them.
+    Join {
+        /// The join model name, e.g. `AppliedTag`.
+        model: String,
+        /// The side that owns the association, e.g. `project_id{class_name=Project}`.
+        owner: String,
+        /// The side it reaches, e.g. `tag_id{class_name=Tag}`.
+        target: String,
+    },
     /// Add one field to an existing model, propagated through its migration,
     /// schema, model, handlers, test, API module, form, table, and locale file.
     Field {
@@ -127,8 +143,19 @@ fn main() -> ExitCode {
                 },
         } => cli::scaffold::model(&model, &ownership, &fields),
         Command::Scaffold {
+            command:
+                ScaffoldCommand::Join {
+                    model,
+                    owner,
+                    target,
+                },
+        } => cli::scaffold::join(&model, &owner, &target),
+        Command::Scaffold {
             command: ScaffoldCommand::Field { model, field },
         } => cli::scaffold::field(&model, &field),
+        Command::Scaffold {
+            command: ScaffoldCommand::Oauth { provider },
+        } => cli::scaffold::oauth(&provider),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),

@@ -38,6 +38,14 @@ pub fn account_router(pool: &DbPool, roles: &RoleSet) -> Router {
         pool.clone(),
         roles.clone(),
     ));
+    router = router.merge(scaffolding::merely_peripheral::router(
+        pool.clone(),
+        roles.clone(),
+    ));
+    router = router.merge(scaffolding::incidentally_linked::router(
+        pool.clone(),
+        roles.clone(),
+    ));
     // 🐺 anubis:routes
     router
 }
@@ -61,7 +69,7 @@ mod tests {
         let set = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml must be valid");
         let editor = set.grants("editor").expect("editor must be defined");
 
-        for model in ["CreativeConcept", "TangibleThing"] {
+        for model in ["CreativeConcept", "TangibleThing", "PeripheralNotion"] {
             assert!(
                 editor.contains_key(model),
                 "{model} must be granted to editors in config/roles.yml",

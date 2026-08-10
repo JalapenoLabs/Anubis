@@ -21,6 +21,14 @@
 //! maps to an `Option` in Rust and to `T | null` on the wire. The living
 //! template's own `name` column is required, but that is the template's shape
 //! rather than this table's: `text_field` describes a column a scaffold adds.
+//!
+//! ## Associations
+//!
+//! One field type declares no column at all. `<other>_ids:super_select{class_name=<Other>}`
+//! is Bullet Train's has-many-through spelling, and it names an [`Association`]
+//! rather than a [`FieldType`]: the values live in the join table an earlier
+//! `anubis scaffold join` run created, so there is no migration and no schema
+//! column, and every line the field contributes reads through the join model.
 
 use super::anchor;
 use super::error::ScaffoldError;
@@ -225,7 +233,46 @@ pub const LOCALE_FIELDS: &str = "fields";
 /// mistake worth catching before anything is written.
 const RESERVED: [&str; 4] = ["id", "team_id", "created_at", "updated_at"];
 
-/// One `name:type` argument: a column the scaffolded model carries.
+/// The field type that declares an association rather than a column.
+const ASSOCIATION_TYPE: &str = "super_select";
+
+/// The suffix that makes an association plural, as in `tag_ids`.
+const ASSOCIATION_SUFFIX: &str = "_ids";
+
+/// A has-many-through association, backed by a join model.
+///
+/// The target is the model on the other side, as the command's
+/// `{class_name=...}` modifier names it. The join is the model connecting the
+/// two, which only the application knows, so the CLI resolves it and hands it
+/// back through [`Field::through`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Association {
+    target: Names,
+    join: Option<Names>,
+}
+
+impl Association {
+    /// The model on the other side of the join, e.g. `Tag`.
+    #[must_use]
+    pub fn target(&self) -> &Names {
+        &self.target
+    }
+
+    /// The join model backing the association, once the CLI has found it.
+    #[must_use]
+    pub fn join(&self) -> Option<&Names> {
+        self.join.as_ref()
+    }
+}
+
+/// What a field argument declares: a column, or an association through a join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FieldKind {
+    Column(FieldType),
+    Association(Association),
+}
+
+/// One `name:type` argument: a column, or an association, the model carries.
 ///
 /// # Examples
 /// ```
@@ -233,28 +280,35 @@ const RESERVED: [&str; 4] = ["id", "team_id", "created_at", "updated_at"];
 ///
 /// let field = Field::parse("summary:text_area").unwrap();
 /// assert_eq!(field.name(), "summary");
-/// assert_eq!(field.sql_column(), "summary TEXT");
-/// assert_eq!(field.schema_column(), "summary -> Nullable<Text>,");
+/// assert_eq!(field.sql_column().as_deref(), Some("summary TEXT"));
+/// assert_eq!(field.schema_column().as_deref(), Some("summary -> Nullable<Text>,"));
 ///
 /// let flag = Field::parse("archived:boolean").unwrap();
-/// assert_eq!(flag.sql_column(), "archived BOOLEAN NOT NULL DEFAULT false");
-/// assert_eq!(flag.schema_column(), "archived -> Bool,");
+/// assert_eq!(flag.sql_column().as_deref(), Some("archived BOOLEAN NOT NULL DEFAULT false"));
+/// assert_eq!(flag.schema_column().as_deref(), Some("archived -> Bool,"));
+///
+/// let tags = Field::parse("tag_ids:super_select{class_name=Tag}").unwrap();
+/// assert_eq!(tags.association().map(|through| through.target().pascal()), Some("Tag".to_owned()));
+/// assert!(tags.sql_column().is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     name: String,
-    field_type: FieldType,
+    kind: FieldKind,
 }
 
 impl Field {
-    /// Parses one `name:type` command line argument.
+    /// Parses one `name:type` command line argument, modifiers included.
     ///
     /// # Errors
     /// Returns an error when the argument is not `name:type`, when the name is
     /// not a `snake_case` column name, when the name is one the scaffolder
-    /// already owns, or when the type is not in [`FIELD_TYPES`].
+    /// already owns, when a modifier list is malformed, or when the type is
+    /// neither `super_select` nor a member of [`FIELD_TYPES`].
     pub fn parse(argument: &str) -> Result<Self, ScaffoldError> {
-        let Some((name, type_name)) = argument.split_once(':') else {
+        let (declaration, modifiers) = split_modifiers(argument)?;
+
+        let Some((name, type_name)) = declaration.split_once(':') else {
             return Err(ScaffoldError::new(format!(
                 "field `{argument}` must be written as `name:type`, for example `name:text_field`"
             )));
@@ -262,8 +316,19 @@ impl Field {
 
         let name = name.trim();
         validate_name(name)?;
+        let type_name = type_name.trim();
 
-        let Some(field_type) = FieldType::lookup(type_name.trim()) else {
+        if type_name == ASSOCIATION_TYPE {
+            return parse_association(name, &modifiers);
+        }
+        if let Some((key, _value)) = modifiers.first() {
+            return Err(ScaffoldError::new(format!(
+                "modifier `{key}` is not understood on `{type_name}`; modifiers land on \
+                 `super_select` today, as `{ASSOCIATION_TYPE}{{class_name=<Other>}}`"
+            )));
+        }
+
+        let Some(field_type) = FieldType::lookup(type_name) else {
             return Err(ScaffoldError::new(format!(
                 "field type `{type_name}` is not supported yet; supported types are {}",
                 supported_types(),
@@ -272,44 +337,169 @@ impl Field {
 
         Ok(Self {
             name: name.to_owned(),
-            field_type,
+            kind: FieldKind::Column(field_type),
         })
     }
 
-    /// The column name.
+    /// Names the join model backing this field's association.
+    ///
+    /// Only the application knows which join connects two models, so the CLI
+    /// finds it and completes the field before anything is planned.
+    #[must_use]
+    pub fn through(mut self, join: Names) -> Self {
+        if let FieldKind::Association(association) = &mut self.kind {
+            association.join = Some(join);
+        }
+        self
+    }
+
+    /// The column name, or the association's `<other>_ids` attribute.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// The field's type.
+    /// The column's type, or `None` when the field is an association.
     #[must_use]
-    pub fn field_type(&self) -> FieldType {
-        self.field_type
+    pub fn field_type(&self) -> Option<FieldType> {
+        match &self.kind {
+            FieldKind::Column(field_type) => Some(*field_type),
+            FieldKind::Association(_through) => None,
+        }
+    }
+
+    /// The association this field declares, if it declares one.
+    #[must_use]
+    pub fn association(&self) -> Option<&Association> {
+        match &self.kind {
+            FieldKind::Column(_field_type) => None,
+            FieldKind::Association(association) => Some(association),
+        }
+    }
+
+    /// The type name as the command line spells it.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match &self.kind {
+            FieldKind::Column(field_type) => field_type.name,
+            FieldKind::Association(_through) => ASSOCIATION_TYPE,
+        }
     }
 
     /// The column definition for a `CREATE TABLE` statement, without a comma.
+    ///
+    /// `None` for an association: its values live in the join table.
     #[must_use]
-    pub fn sql_column(&self) -> String {
-        match self.field_type.default_sql {
-            None => format!("{} {}", self.name, self.field_type.sql_type),
-            Some(default) => format!(
+    pub fn sql_column(&self) -> Option<String> {
+        let field_type = self.field_type()?;
+        match field_type.default_sql {
+            None => Some(format!("{} {}", self.name, field_type.sql_type)),
+            Some(default) => Some(format!(
                 "{} {} NOT NULL DEFAULT {default}",
-                self.name, self.field_type.sql_type,
-            ),
+                self.name, field_type.sql_type,
+            )),
         }
     }
 
     /// The column line for a `diesel::table!` block, comma included.
+    ///
+    /// `None` for an association, which adds no column to this model's table.
     #[must_use]
-    pub fn schema_column(&self) -> String {
-        let schema_type = self.field_type.schema_type;
-        if self.field_type.is_nullable() {
-            format!("{} -> Nullable<{schema_type}>,", self.name)
+    pub fn schema_column(&self) -> Option<String> {
+        let field_type = self.field_type()?;
+        let schema_type = field_type.schema_type;
+        if field_type.is_nullable() {
+            Some(format!("{} -> Nullable<{schema_type}>,", self.name))
         } else {
-            format!("{} -> {schema_type},", self.name)
+            Some(format!("{} -> {schema_type},", self.name))
         }
     }
+}
+
+/// A field argument split into its `name:type` half and its modifiers.
+type Declaration<'argument> = (&'argument str, Vec<(String, String)>);
+
+/// Splits a trailing `{key=value,...}` modifier list off a field argument.
+///
+/// Bullet Train also allows the whole list to be quoted, so a modifier value
+/// may contain a comma; the quotes are stripped and the rest reads the same.
+fn split_modifiers(argument: &str) -> Result<Declaration<'_>, ScaffoldError> {
+    let Some(open) = argument.find('{') else {
+        return Ok((argument, Vec::new()));
+    };
+    let Some(close) = argument.rfind('}').filter(|close| *close > open) else {
+        return Err(ScaffoldError::new(format!(
+            "field `{argument}` opens a modifier list with `{{` and never closes it"
+        )));
+    };
+
+    let mut modifiers = Vec::new();
+    for entry in argument[open + 1..close]
+        .trim()
+        .trim_matches('"')
+        .split(',')
+    {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(ScaffoldError::new(format!(
+                "modifier `{entry}` must be written as `key=value`"
+            )));
+        };
+        modifiers.push((key.trim().to_owned(), value.trim().to_owned()));
+    }
+
+    Ok((&argument[..open], modifiers))
+}
+
+/// Builds the association a `super_select{class_name=...}` argument names.
+fn parse_association(name: &str, modifiers: &[(String, String)]) -> Result<Field, ScaffoldError> {
+    let mut target = None;
+    for (key, value) in modifiers {
+        match key.as_str() {
+            "class_name" => target = Some(value.as_str()),
+            _other => {
+                return Err(ScaffoldError::new(format!(
+                    "modifier `{key}` is not understood on `{ASSOCIATION_TYPE}` yet; `class_name` \
+                     is the only one, and `source` is on the roadmap"
+                )));
+            }
+        }
+    }
+
+    let Some(target) = target else {
+        return Err(ScaffoldError::new(format!(
+            "`{ASSOCIATION_TYPE}` needs the model it selects from: write \
+             `<other>{ASSOCIATION_SUFFIX}:{ASSOCIATION_TYPE}{{class_name=<Other>}}`"
+        )));
+    };
+    let target = Names::parse(target)?;
+
+    let Some(base) = name.strip_suffix(ASSOCIATION_SUFFIX) else {
+        return Err(ScaffoldError::new(format!(
+            "field `{name}` names a single `{}`, which is a belongs_to association and is not \
+             generated yet. A has-many-through association carries the plural suffix: \
+             `{}{ASSOCIATION_SUFFIX}:{ASSOCIATION_TYPE}{{class_name={}}}`",
+            target.pascal(),
+            target.snake(),
+            target.pascal(),
+        )));
+    };
+    if base != target.snake() {
+        return Err(ScaffoldError::new(format!(
+            "field `{name}` does not match `class_name={}`; a has-many-through association is \
+             named after the model it reaches, so write `{}{ASSOCIATION_SUFFIX}`",
+            target.pascal(),
+            target.snake(),
+        )));
+    }
+
+    Ok(Field {
+        name: name.to_owned(),
+        kind: FieldKind::Association(Association { target, join: None }),
+    })
 }
 
 /// The supported type names, rendered for an error message.
@@ -387,8 +577,8 @@ pub enum Artifact {
 /// );
 /// assert_eq!(scaffold.label(), "Priority");
 /// assert_eq!(
-///     scaffold.add_column("projects"),
-///     "ALTER TABLE projects ADD COLUMN priority TEXT;",
+///     scaffold.add_column("projects").as_deref(),
+///     Some("ALTER TABLE projects ADD COLUMN priority TEXT;"),
 /// );
 ///
 /// let insertions = scaffold.insertions(Artifact::Model);
@@ -419,11 +609,23 @@ impl FieldScaffold {
     /// which is a bug in the framework rather than in an application.
     #[must_use]
     pub fn new(model: Names, field: Field) -> Self {
-        // A column name is a name like any other, so the same inflector that
+        // A field name is a name like any other, so the same inflector that
         // turns `TangibleThing` into prose turns `due_date` into "Due date".
         let words = Names::parse(field.name()).expect("a parsed field name is a parseable name");
-        let label = words.human();
-        let help = format!("{label} of the {}.", model.lower());
+        // An association is labelled after the model it reaches, because
+        // "Tag ids" is the column's name and "Tags" is the field's meaning.
+        let (label, help) = match field.association() {
+            None => {
+                let label = words.human();
+                let help = format!("{label} of the {}.", model.lower());
+                (label, help)
+            }
+            Some(association) => {
+                let label = upper_first(&association.target().lower_plural());
+                let help = format!("{label} linked to this {}.", model.lower());
+                (label, help)
+            }
+        };
         let locale_name = words.camel();
         let locale_key = format!("{}.{LOCALE_FIELDS}.{locale_name}", model.camel_plural());
         Self {
@@ -455,18 +657,32 @@ impl FieldScaffold {
     }
 
     /// The `ALTER TABLE` statement that adds the column.
+    ///
+    /// `None` for an association: the join table already holds its values, so
+    /// the run writes no migration at all.
     #[must_use]
-    pub fn add_column(&self, table: &str) -> String {
-        format!(
-            "ALTER TABLE {table} ADD COLUMN {};",
-            self.field.sql_column()
-        )
+    pub fn add_column(&self, table: &str) -> Option<String> {
+        let column = self.field.sql_column()?;
+        Some(format!("ALTER TABLE {table} ADD COLUMN {column};"))
     }
 
     /// The `ALTER TABLE` statement that removes the column again.
     #[must_use]
-    pub fn drop_column(&self, table: &str) -> String {
-        format!("ALTER TABLE {table} DROP COLUMN {};", self.name())
+    pub fn drop_column(&self, table: &str) -> Option<String> {
+        self.field.field_type()?;
+        Some(format!("ALTER TABLE {table} DROP COLUMN {};", self.name()))
+    }
+
+    /// The column's type, on the paths only a column field reaches.
+    ///
+    /// # Panics
+    /// Panics when called for an association, which is a bug in the generator
+    /// rather than in an application: [`insertions`](Self::insertions) routes
+    /// associations to their own methods before any of these run.
+    fn column_type(&self) -> FieldType {
+        self.field
+            .field_type()
+            .expect("only a column field reaches this path")
     }
 
     /// The field's strings, as they sit inside the model's [`LOCALE_FIELDS`]
@@ -489,6 +705,9 @@ impl FieldScaffold {
     /// matters for readability: each anchor is independent.
     #[must_use]
     pub fn insertions(&self, artifact: Artifact) -> Vec<(&'static str, String)> {
+        if let Some(association) = self.field.association() {
+            return self.association_insertions(artifact, association);
+        }
         match artifact {
             Artifact::Model => self.model_insertions(),
             Artifact::Routes => self.routes_insertions(),
@@ -500,10 +719,167 @@ impl FieldScaffold {
         }
     }
 
+    /// Every `(anchor, lines)` pair an association contributes to `artifact`.
+    ///
+    /// An association owns no column, so `model.rs` receives nothing: the ids
+    /// live in the join table, and every line here reads or writes them
+    /// through the join model an earlier `anubis scaffold join` run generated.
+    ///
+    /// # Panics
+    /// Panics when the association has no join, which is a bug in the CLI: it
+    /// resolves the join out of the application before planning anything.
+    fn association_insertions(
+        &self,
+        artifact: Artifact,
+        association: &Association,
+    ) -> Vec<(&'static str, String)> {
+        let join = association
+            .join()
+            .expect("the CLI resolves an association's join before planning");
+        let target = association.target();
+        let name = self.name();
+        let record = self.model.snake();
+
+        match artifact {
+            // The ids are the join table's rows, not this model's columns.
+            Artifact::Model => Vec::new(),
+            Artifact::Routes => self.association_routes(join, target),
+            // The narrative proves the wire shape; the join's own generated
+            // test is where attaching and detaching are proven.
+            Artifact::Test => vec![
+                (anchor::TEST_CREATE, format!("\"{name}\": [],")),
+                (
+                    anchor::TEST_CREATED,
+                    format!("assert_eq!(body[\"{record}\"][\"{name}\"], json!([]));"),
+                ),
+            ],
+            Artifact::ApiRoutes => vec![
+                (anchor::WIRE_FIELDS, format!("{name}: string[]")),
+                (anchor::CREATE_REQUEST, format!("{name}?: string[]")),
+                (
+                    anchor::UPDATE_REQUEST,
+                    format!("/** Replaces the whole set. */\n{name}?: string[]"),
+                ),
+            ],
+            Artifact::Form => self.association_form(join, target),
+            // A table shows how many are linked; the records themselves are a
+            // click away on the model's own page.
+            Artifact::Table => vec![
+                (
+                    anchor::LIST_COLUMNS,
+                    format!(
+                        "<TableColumn>{{\n    t('{key}')\n  }}</TableColumn>",
+                        key = self.locale_key,
+                    ),
+                ),
+                (
+                    anchor::LIST_CELLS,
+                    format!(
+                        "<TableCell>{{\n    {}.{name}.length\n  }}</TableCell>",
+                        self.model.camel(),
+                    ),
+                ),
+            ],
+            Artifact::ShowPage => vec![(
+                anchor::SHOW_FIELDS,
+                format!(
+                    "<div>\n  <dt className='text-sm opacity-60'>{{\n      t('{key}')\n    \
+                     }}</dt>\n  <dd>{{\n      record?.{name}.length ?? 0\n    }}</dd>\n</div>",
+                    key = self.locale_key,
+                ),
+            )],
+        }
+    }
+
+    /// The request bodies, the reconciliations, and the serialized ids.
+    fn association_routes(&self, join: &Names, target: &Names) -> Vec<(&'static str, String)> {
+        let name = self.name();
+        let module = join.snake_plural();
+        let join_type = join.pascal();
+        let loader = format!("{}_ids_by_{}", target.snake(), self.model.snake());
+
+        // The record and its team are both in scope wherever this lands: a
+        // team-owned model carries `team_id`, and a join links two of them.
+        let reconcile = format!(
+            "if let Some(requested) = body.{name}.as_deref() {{\n    \
+             crate::{module}::{join_type}::replace_all(\n        &mut connection,\n        \
+             record.id,\n        record.team_id,\n        requested,\n    )\n    .await?;\n}}",
+        );
+
+        vec![
+            (
+                anchor::CREATE_BODY,
+                format!("/// {}\n{name}: Option<Vec<Uuid>>,", self.help),
+            ),
+            (
+                anchor::UPDATE_BODY,
+                format!(
+                    "/// {} Absent leaves the set alone; a list replaces it whole.\n\
+                     {name}: Option<Vec<Uuid>>,",
+                    self.help,
+                ),
+            ),
+            (anchor::CREATE_ASSOCIATIONS, reconcile.clone()),
+            (anchor::UPDATE_ASSOCIATIONS, reconcile),
+            (
+                anchor::VIEW_FIELDS,
+                format!("/// {}\n{name}: Vec<Uuid>,", self.help),
+            ),
+            (
+                anchor::VIEW_LOAD,
+                format!(
+                    "let {name} = crate::{module}::{join_type}::{loader}(\n    connection,\n    \
+                     &records.iter().map(|record| record.id).collect::<Vec<_>>(),\n)\n.await?;",
+                ),
+            ),
+            (
+                anchor::VIEW_VALUES,
+                format!("{name}: {name}.get(&record.id).cloned().unwrap_or_default(),"),
+            ),
+        ]
+    }
+
+    /// The import, the options hook, the schema, the value, and the control.
+    fn association_form(&self, join: &Names, target: &Names) -> Vec<(&'static str, String)> {
+        let name = self.name();
+        let key = &self.locale_key;
+        let options = format!("{}Options", target.camel());
+        let hook = format!("use{}Options", join.pascal());
+
+        vec![
+            (anchor::FIELD_IMPORTS, "SuperSelectField,".to_owned()),
+            (
+                anchor::FORM_IMPORTS,
+                format!(
+                    "import {{ {hook} }} from '../api/routes/{}Routes'",
+                    join.camel(),
+                ),
+            ),
+            (
+                anchor::FORM_HOOKS,
+                format!("const {options} = {hook}(props.teamId)"),
+            ),
+            (anchor::FORM_SCHEMA, format!("{name}: z.array(z.string()),")),
+            (
+                anchor::FORM_VALUES,
+                format!("{name}: editing?.{name} ?? [],"),
+            ),
+            (anchor::FORM_PAYLOAD, format!("{name}: data.{name},")),
+            (
+                anchor::FORM_FIELDS,
+                format!(
+                    "<SuperSelectField\n  control={{form.control}}\n  name='{name}'\n  \
+                     label={{t('{key}')}}\n  help={{t('{key}Help')}}\n  isMultiple\n  \
+                     options={{{options}}}\n/>",
+                ),
+            ),
+        ]
+    }
+
     /// The record, insertable, and changeset structs, plus the empty test.
     fn model_insertions(&self) -> Vec<(&'static str, String)> {
         let name = self.name();
-        let field_type = self.field.field_type();
+        let field_type = self.column_type();
         vec![
             (
                 anchor::RECORD_FIELDS,
@@ -535,7 +911,7 @@ impl FieldScaffold {
     /// The request bodies, the normalizations, and the two struct literals.
     fn routes_insertions(&self) -> Vec<(&'static str, String)> {
         let name = self.name();
-        let field_type = self.field.field_type();
+        let field_type = self.column_type();
         // A request body is optional whatever the column is: absent means
         // "unchanged" on update, and "leave it at its default" on create.
         let submitted = format!("Option<{}>", field_type.bare_type);
@@ -610,7 +986,7 @@ impl FieldScaffold {
     /// The wire type and the two request types.
     fn api_routes_insertions(&self) -> Vec<(&'static str, String)> {
         let name = self.name();
-        let field_type = self.field.field_type();
+        let field_type = self.column_type();
         // A request member is optional and, for a nullable column, explicitly
         // nullable: sending null is how a form clears a value it cannot blank.
         let submitted = if field_type.is_nullable() && field_type.shape != Shape::Text {
@@ -641,7 +1017,7 @@ impl FieldScaffold {
     /// The import, the schema, the values, the payload, and the control.
     fn form_insertions(&self) -> Vec<(&'static str, String)> {
         let name = self.name();
-        let field_type = self.field.field_type();
+        let field_type = self.column_type();
         let key = &self.locale_key;
 
         let (schema, empty, payload) = match field_type.shape {
@@ -699,7 +1075,7 @@ impl FieldScaffold {
     /// One attribute of the record, as a show page renders it.
     fn show_row(&self) -> String {
         let key = &self.locale_key;
-        let value = match self.field.field_type().shape {
+        let value = match self.column_type().shape {
             Shape::Boolean => format!("record?.{} ? t('common.yes') : t('common.no')", self.name()),
             Shape::Text | Shape::Scalar => format!("record?.{}", self.name()),
         };
@@ -712,7 +1088,7 @@ impl FieldScaffold {
     /// The expression a table cell renders for one record.
     fn cell_value(&self) -> String {
         let record = self.model.camel();
-        match self.field.field_type().shape {
+        match self.column_type().shape {
             Shape::Boolean => format!(
                 "{record}.{} ? t('common.yes') : t('common.no')",
                 self.name()
@@ -726,7 +1102,7 @@ impl FieldScaffold {
     /// They differ so that the update half of the narrative proves the column
     /// actually changed rather than merely survived.
     fn samples(&self) -> (&'static str, &'static str) {
-        match self.field.field_type().name {
+        match self.column_type().name {
             "number_field" => ("3", "5"),
             "boolean" => ("true", "false"),
             "date_field" => ("\"2026-01-31\"", "\"2026-02-28\""),
@@ -738,6 +1114,15 @@ impl FieldScaffold {
     fn lower_label(&self) -> String {
         self.label.to_lowercase()
     }
+}
+
+/// Uppercases the first character of a phrase so it can start a sentence.
+fn upper_first(phrase: &str) -> String {
+    let mut raised = phrase.to_owned();
+    if let Some(first) = raised.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    raised
 }
 
 /// Lowercases the first character of a sentence so it can be prefixed.
@@ -799,10 +1184,10 @@ mod tests {
 
         let field = Field::parse("archived:boolean").expect("a valid argument");
         assert_eq!(
-            field.sql_column(),
-            "archived BOOLEAN NOT NULL DEFAULT false"
+            field.sql_column().as_deref(),
+            Some("archived BOOLEAN NOT NULL DEFAULT false"),
         );
-        assert_eq!(field.schema_column(), "archived -> Bool,");
+        assert_eq!(field.schema_column().as_deref(), Some("archived -> Bool,"));
     }
 
     #[test]
@@ -821,9 +1206,12 @@ mod tests {
     fn parses_a_field_argument() {
         let field = Field::parse("summary:text_area").expect("valid argument");
         assert_eq!(field.name(), "summary");
-        assert_eq!(field.field_type().name(), "text_area");
-        assert_eq!(field.sql_column(), "summary TEXT");
-        assert_eq!(field.schema_column(), "summary -> Nullable<Text>,");
+        assert_eq!(field.type_name(), "text_area");
+        assert_eq!(field.sql_column().as_deref(), Some("summary TEXT"));
+        assert_eq!(
+            field.schema_column().as_deref(),
+            Some("summary -> Nullable<Text>,"),
+        );
     }
 
     #[test]
@@ -847,12 +1235,12 @@ mod tests {
         let field = scaffold("priority:text_field");
         assert_eq!(field.label(), "Priority");
         assert_eq!(
-            field.add_column("projects"),
-            "ALTER TABLE projects ADD COLUMN priority TEXT;",
+            field.add_column("projects").as_deref(),
+            Some("ALTER TABLE projects ADD COLUMN priority TEXT;"),
         );
         assert_eq!(
-            field.drop_column("projects"),
-            "ALTER TABLE projects DROP COLUMN priority;",
+            field.drop_column("projects").as_deref(),
+            Some("ALTER TABLE projects DROP COLUMN priority;"),
         );
 
         assert!(
@@ -1019,5 +1407,130 @@ mod tests {
         assert!(
             line(&date, Artifact::Form, "form-fields").contains("t('projects.fields.dueDate')")
         );
+    }
+
+    /// The association a `scaffold join AppliedTag ...` run would back.
+    fn association() -> FieldScaffold {
+        let field = Field::parse("tag_ids:super_select{class_name=Tag}")
+            .expect("a valid association argument")
+            .through(Names::parse("AppliedTag").expect("a valid join name"));
+        FieldScaffold::new(Names::parse("Project").expect("a valid model name"), field)
+    }
+
+    #[test]
+    fn an_association_declares_no_column() {
+        let field = Field::parse("tag_ids:super_select{class_name=Tag}").expect("a valid argument");
+        assert_eq!(field.type_name(), "super_select");
+        assert!(field.field_type().is_none());
+        assert!(field.sql_column().is_none());
+        assert!(field.schema_column().is_none());
+        assert_eq!(
+            field.association().map(|through| through.target().pascal()),
+            Some("Tag".to_owned()),
+        );
+
+        let scaffold = association();
+        assert_eq!(
+            scaffold.label(),
+            "Tags",
+            "an association reads as its target"
+        );
+        assert!(scaffold.add_column("projects").is_none());
+        assert!(scaffold.drop_column("projects").is_none());
+        assert!(scaffold.insertions(Artifact::Model).is_empty());
+        assert_eq!(
+            scaffold.locale_entries(),
+            vec![
+                ("tagIds".to_owned(), "Tags".to_owned()),
+                (
+                    "tagIdsHelp".to_owned(),
+                    "Tags linked to this project.".to_owned()
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_association_reads_and_writes_through_its_join() {
+        let scaffold = association();
+
+        assert_eq!(
+            line(&scaffold, Artifact::Routes, "create-body"),
+            "/// Tags linked to this project.\ntag_ids: Option<Vec<Uuid>>,",
+        );
+        assert!(
+            line(&scaffold, Artifact::Routes, "create-associations")
+                .contains("crate::applied_tags::AppliedTag::replace_all(")
+        );
+        assert!(
+            line(&scaffold, Artifact::Routes, "update-associations").contains("record.team_id,")
+        );
+        assert!(
+            line(&scaffold, Artifact::Routes, "view-load")
+                .contains("AppliedTag::tag_ids_by_project(")
+        );
+        assert_eq!(
+            line(&scaffold, Artifact::Routes, "view-values"),
+            "tag_ids: tag_ids.get(&record.id).cloned().unwrap_or_default(),",
+        );
+
+        assert_eq!(
+            line(&scaffold, Artifact::ApiRoutes, "wire-fields"),
+            "tag_ids: string[]",
+        );
+        assert_eq!(
+            line(&scaffold, Artifact::Form, "form-imports"),
+            "import { useAppliedTagOptions } from '../api/routes/appliedTagRoutes'",
+        );
+        assert_eq!(
+            line(&scaffold, Artifact::Form, "form-hooks"),
+            "const tagOptions = useAppliedTagOptions(props.teamId)",
+        );
+        assert_eq!(
+            line(&scaffold, Artifact::Form, "form-values"),
+            "tag_ids: editing?.tag_ids ?? [],",
+        );
+        let control = line(&scaffold, Artifact::Form, "form-fields");
+        assert!(control.starts_with("<SuperSelectField\n"), "{control}");
+        assert!(control.contains("isMultiple"));
+        assert!(control.contains("options={tagOptions}"));
+
+        assert!(line(&scaffold, Artifact::Table, "list-cells").contains("project.tag_ids.length"));
+        assert!(
+            line(&scaffold, Artifact::ShowPage, "show-fields")
+                .contains("record?.tag_ids.length ?? 0")
+        );
+    }
+
+    #[test]
+    fn association_arguments_are_validated() {
+        // `class_name` is required, and only it is understood today.
+        Field::parse("tag_ids:super_select").unwrap_err();
+        Field::parse("tag_ids:super_select{source=team.tags}").unwrap_err();
+        // A modifier list has to close, and each entry has to be `key=value`.
+        Field::parse("tag_ids:super_select{class_name=Tag").unwrap_err();
+        Field::parse("tag_ids:super_select{class_name}").unwrap_err();
+        // Modifiers land on `super_select`, not on a column type.
+        Field::parse("priority:text_field{class_name=Tag}").unwrap_err();
+
+        // The plural suffix is what separates has-many-through from belongs_to.
+        let single = Field::parse("tag:super_select{class_name=Tag}").unwrap_err();
+        assert!(
+            single.message().contains("belongs_to"),
+            "the singular form must name what it is: {}",
+            single.message(),
+        );
+        assert!(single.message().contains("tag_ids:super_select"));
+
+        // And the name has to match the class it reaches.
+        let mismatched = Field::parse("label_ids:super_select{class_name=Tag}").unwrap_err();
+        assert!(
+            mismatched.message().contains("tag_ids"),
+            "the message must name the expected spelling: {}",
+            mismatched.message(),
+        );
+
+        // Bullet Train's quoted modifier list reads the same.
+        Field::parse("tag_ids:super_select{\"class_name=Tag\"}").expect("quotes are accepted");
     }
 }

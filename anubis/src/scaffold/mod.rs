@@ -17,9 +17,14 @@
 //! - [`table_block`] and [`line_containing`] read declarations back out of the
 //!   application's own files, which is how a generated table inherits the
 //!   template's shape rather than a shape hard-coded here.
-//! - [`Field`] and [`FieldType`] map a `name:type` argument to a column,
-//!   [`FieldScaffold`] turns one field into every line it contributes to each
-//!   [`Artifact`], and [`ModelScaffold`] plans a whole `scaffold model` run.
+//! - [`Field`] and [`FieldType`] map a `name:type` argument to a column, or to
+//!   an [`Association`] when it names one, [`FieldScaffold`] turns one field
+//!   into every line it contributes to each [`Artifact`], and [`ModelScaffold`]
+//!   plans a whole `scaffold model` run.
+//! - [`JoinScaffold`] plans a `scaffold join` run: the join table, model, and
+//!   endpoints two existing models need before an association can reach them.
+//! - [`OauthScaffold`] plans a `scaffold oauth` run: the sign-in button one
+//!   provider adds, and the string it renders.
 //!
 //! Everything here is pure string-to-string transformation. File discovery,
 //! reading, and writing belong to the CLI, which keeps this engine trivially
@@ -40,7 +45,9 @@ mod error;
 mod extract;
 mod field;
 mod inflect;
+mod join;
 mod model;
+mod oauth;
 mod stamp;
 
 #[doc(inline)]
@@ -48,10 +55,16 @@ pub use error::ScaffoldError;
 #[doc(inline)]
 pub use extract::{line_containing, table_block};
 #[doc(inline)]
-pub use field::{Artifact, FIELD_TYPES, Field, FieldScaffold, FieldType, LOCALE_FIELDS};
+pub use field::{
+    Artifact, Association, FIELD_TYPES, Field, FieldScaffold, FieldType, LOCALE_FIELDS,
+};
 #[doc(inline)]
 pub use inflect::{NameError, Names, pluralize};
 #[doc(inline)]
+pub use join::{JoinScaffold, JoinTemplate};
+#[doc(inline)]
 pub use model::{ChildAttachment, ModelScaffold, ModelTemplate, locale_file, model_artifacts};
+#[doc(inline)]
+pub use oauth::OauthScaffold;
 #[doc(inline)]
 pub use stamp::{AnchorError, Replacements, insert_above_anchor, insert_json_entries};

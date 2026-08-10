@@ -36,10 +36,36 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One peripheral notion, owned by a team.
+    peripheral_notions (id) {
+        id -> Uuid,
+        team_id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// One creative concept linked to one peripheral notion.
+    incidental_linkages (id) {
+        id -> Uuid,
+        creative_concept_id -> Uuid,
+        peripheral_notion_id -> Uuid,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 // 🐺 anubis:tables
 
 diesel::joinable!(tangible_things -> creative_concepts (creative_concept_id));
+diesel::joinable!(incidental_linkages -> creative_concepts (creative_concept_id));
+diesel::joinable!(incidental_linkages -> peripheral_notions (peripheral_notion_id));
 // 🐺 anubis:joins
 
 diesel::allow_tables_to_appear_in_same_query!(creative_concepts, tangible_things);
+diesel::allow_tables_to_appear_in_same_query!(creative_concepts, incidental_linkages);
+diesel::allow_tables_to_appear_in_same_query!(peripheral_notions, incidental_linkages);
 // 🐺 anubis:same-query

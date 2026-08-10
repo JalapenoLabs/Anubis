@@ -3,5 +3,5 @@
 mod model;
 mod routes;
 
-pub use model::TangibleThing;
+pub use model::{MODEL, TangibleThing};
 pub use routes::router;

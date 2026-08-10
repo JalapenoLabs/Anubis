@@ -18,7 +18,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Background jobs | Postgres-backed queue | Job enqueue commits in the same transaction as the domain write that caused it |
 | Passwords | argon2id | |
 | Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
-| OAuth / SSO | OpenID Connect (`openidconnect` crate) | Providers added via `anubis scaffold oauth <provider>` |
+| OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; providers are added via `anubis scaffold oauth <provider>` and two environment variables. See [api.md](api.md#oauth-sign-in) |
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
 

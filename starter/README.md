@@ -22,6 +22,23 @@ on port 3000, so the SPA and API stay same-origin in development. Same-origin
 production serving (the backend shipping the built SPA) is on the roadmap;
 until then the built frontend needs its own static host.
 
+## OAuth sign-in
+
+Add a provider with one command, from this directory:
+
+```sh
+anubis scaffold oauth google
+```
+
+It writes the button on the sign-in page and prints what it cannot do for you:
+register an OAuth client with the provider, using
+`http://localhost:5173/auth/oauth/google/callback` as the redirect URI in
+development, then set `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
+in the backend's environment. `APP_URL` is the base of that redirect URI, so it
+has to be the origin the browser sees, which is why the commands above set it
+to the dev server rather than the backend. Until both credentials are set the
+button lands back on the sign-in page with `oauth_unavailable`.
+
 ## Running pieces individually
 
 ```sh

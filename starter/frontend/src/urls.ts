@@ -28,6 +28,14 @@ export const POST_SIGN_IN_REDIRECT_TO: UrlValue = UrlTree.root
  * is a fresh page load, and router state does not survive that.
  */
 export const DESTINATION_PARAM = 'next'
+/**
+ * Query parameter an OAuth sign-in that failed comes back on.
+ *
+ * The backend redirects to the sign-in page with a machine-readable code
+ * rather than a message, because the browser is the wrong place to explain
+ * another system's failure; the page maps the code to a translated string.
+ */
+export const AUTH_ERROR_PARAM = 'error'
 
 // ///////////////////////////// //
 //         Link factories        //
@@ -75,6 +83,23 @@ export function getUrlWithDestination(url: UrlValue, destination: string | null 
   }
 
   return `${url}?${DESTINATION_PARAM}=${encodeURIComponent(safeDestination)}`
+}
+
+/**
+ * Builds the link that starts an OAuth sign-in with `provider`.
+ *
+ * This is a backend URL, not a router route: the browser leaves the SPA for
+ * the provider's consent screen and comes back through the callback, which
+ * sets the session cookie and redirects to the preserved destination.
+ * `anubis scaffold oauth <provider>` writes the button that calls this.
+ */
+export function getOauthStartUrl(provider: string, destination: string | null | undefined): string {
+  const safeDestination = sanitizeDestination(destination)
+  if (!safeDestination) {
+    return `/auth/oauth/${provider}/start`
+  }
+
+  return `/auth/oauth/${provider}/start?${DESTINATION_PARAM}=${encodeURIComponent(safeDestination)}`
 }
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {
