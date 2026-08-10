@@ -1,0 +1,10 @@
+# Use the classic node_modules layout. PnP is intentionally disabled: it still
+# trips up some React tooling.
+nodeLinker: node-modules
+
+# Yarn Berry blocks git dependencies unless explicitly approved. Until the
+# Anubis frontend package is published to npm, it installs straight from the
+# framework repository, as does the shared Jalapeno Labs CLI.
+approvedGitRepositories:
+  - "https://github.com/jalapenolabs/cli.git"
+  - "https://github.com/JalapenoLabs/Anubis.git"

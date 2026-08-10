@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod cli;
+
 /// The Anubis framework CLI.
 #[derive(Debug, Parser)]
 #[command(name = "anubis", version, about)]
@@ -20,6 +22,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Stamp a new application from the starter template.
+    New {
+        /// The application name: lowercase letters, digits, and hyphens.
+        name: String,
+    },
+    /// Verify toolchain, database, and config health.
+    Doctor,
+    /// Print the framework route table.
+    Routes,
     /// Validate and compile the application's roles.yml.
     Roles {
         #[command(subcommand)]
@@ -79,6 +90,9 @@ fn main() -> ExitCode {
     };
 
     match command {
+        Command::New { name } => cli::new::run(&name),
+        Command::Doctor => cli::doctor::run(),
+        Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),
         Command::Openapi { out } => run_openapi(out.as_deref()),
         Command::Client {

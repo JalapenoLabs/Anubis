@@ -24,7 +24,27 @@ The template models mirror Bullet Train's naming for the same reason Bullet Trai
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 
+`anubis new`, `anubis routes`, and `anubis doctor` are implemented; the `scaffold` family and `eject` are the rest of M4 and M5.
+
 Field types map to the field component library: `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
+
+## The stamping engine
+
+All scaffolders share one pure engine, `anubis::scaffold`:
+
+- **Names**: one model name in, every casing and plural variant out (`TangibleThing`, `tangible_things`, `tangible-thing`, `Tangible Things`, ...). Pluralization covers standard English rules plus a table of common irregulars.
+- **Replacements**: ordered find-and-replace over paths and file bodies, longest pattern first so `tangible_things` wins over `tangible_thing`. `Replacements::between(template, target)` maps every variant pair at once.
+- **Anchor insertion**: `insert_above_anchor` adds generated lines above a magic anchor comment, matching its indentation, and is idempotent so re-running a scaffold never duplicates lines.
+
+The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
+
+## How `anubis new` works
+
+The starter tree is embedded into the `anubis` binary at build time, so stamping is offline and always matches the installed framework version. Stamping rewrites the app name across every path and file, then overlays the files that make the result a standalone repository: a workspace `Cargo.toml` carrying the framework's lint bar, a standalone `backend/Cargo.toml`, a root `package.json`, `.yarnrc.yml`, `.gitignore`, `README.md`, and the toolchain and clippy pins. Until the crate and npm package are published, stamped apps depend on the framework from its git repository (Cargo git dependency; yarn `#workspace=` git protocol). A drift-gate test pins the overlay's dependency versions to the framework workspace.
+
+## Route visibility
+
+`anubis routes` prints the framework's mounted surface from two sources: a curated manifest in `anubis::manifest` (drift-gated by a test that composes the real routers and probes every entry) and the OpenAPI document, which contributes every versioned `/api/v1` operation automatically. Application-defined routes live in the application's router and are not visible to the CLI.
 
 ## What one `scaffold model` produces
 

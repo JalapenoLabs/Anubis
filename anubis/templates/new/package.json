@@ -1,0 +1,25 @@
+{
+  "name": "anubis-starter",
+  "private": true,
+  "description": "The anubis-starter application.",
+  "workspaces": [
+    "frontend"
+  ],
+  "engines": {
+    "node": ">=20",
+    "yarn": ">=4"
+  },
+  "scripts": {
+    "dev": "docker compose -f compose.yaml up -d --wait && concurrently -n api,web -c blue,green \"cross-env DATABASE_URL=postgres://app:app@localhost:54321/app_development APP_URL=http://localhost:5173 cargo run -p anubis-starter\" \"yarn workspace anubis-starter-frontend dev\"",
+    "build": "yarn workspaces foreach -A --topological run build",
+    "typecheck": "yarn workspaces foreach -A run typecheck",
+    "lint": "yarn workspaces foreach -A run lint",
+    "lint:fix": "yarn workspaces foreach -A run lint:fix",
+    "test": "yarn workspaces foreach -A run test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "cross-env": "^7.0.3"
+  },
+  "packageManager": "yarn@4.17.0"
+}

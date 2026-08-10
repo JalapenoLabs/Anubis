@@ -1,0 +1,19 @@
+[package]
+name = "anubis-starter"
+description = "The anubis-starter application server."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[dependencies]
+# Anubis is installed from its repository until the crate is published.
+anubis = { git = "https://github.com/JalapenoLabs/Anubis.git" }
+axum = "0.8"
+mimalloc = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

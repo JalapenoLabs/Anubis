@@ -1,0 +1,16 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+coverage/
+.vite/
+
+# Yarn (zero-install artifacts are not committed)
+.yarn/*
+.pnp.*
+
+# Environment
+.env
+.env.local
