@@ -9,16 +9,15 @@ on:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, fedora, earthly, docker]
     steps:
       - uses: actions/checkout@v4
 
-      # The toolchain version matches rust-toolchain.toml.
+      # The toolchain version matches rust-toolchain.toml. Self-hosted runners
+      # keep the cargo registry and target dir warm, so no cache step is needed.
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -31,7 +30,7 @@ jobs:
 
   frontend:
     name: Frontend
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, fedora, earthly, docker]
     steps:
       - uses: actions/checkout@v4
 
