@@ -5,7 +5,7 @@
 //! M1 through M3.
 
 use anubis::config::AppConfig;
-use anubis::telemetry;
+use anubis::{db, telemetry};
 use axum::Router;
 use axum::routing::get;
 use mimalloc::MiMalloc;
@@ -18,7 +18,21 @@ async fn main() {
     let config = AppConfig::from_env().expect("invalid environment configuration");
     telemetry::init(&config).expect("failed to install the tracing subscriber");
 
-    let app = Router::new().route("/healthz", get(healthz));
+    let database = config
+        .database
+        .as_ref()
+        .expect("DATABASE_URL is required (e.g. postgres://user:pass@localhost/app_development)");
+
+    db::run_pending_migrations(database.url())
+        .await
+        .expect("failed to run database migrations");
+    let pool = db::connect(database.url())
+        .await
+        .expect("failed to connect to the database");
+
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .nest("/auth", anubis::auth::router(pool));
 
     let address = config.server.socket_addr();
     let listener = tokio::net::TcpListener::bind(address)

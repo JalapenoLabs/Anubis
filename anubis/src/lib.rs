@@ -9,7 +9,11 @@
 //! surface grows milestone by milestone; the roadmap lives in the repository's
 //! `docs/architecture.md`.
 
+pub mod auth;
 pub mod config;
+pub mod db;
+pub mod http;
+pub mod schema;
 pub mod telemetry;
 
 /// The version of the Anubis framework, matching the crate version.

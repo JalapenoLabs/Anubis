@@ -13,8 +13,9 @@
 //! | `ANUBIS_ENV` | `development` | One of `development`, `test`, `production` |
 //! | `HOST` | `127.0.0.1` | IP address the server binds to |
 //! | `PORT` | `3000` | TCP port the server binds to |
+//! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
 //!
-//! The set grows milestone by milestone (the database URL arrives with M2).
+//! The set grows milestone by milestone.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -28,6 +29,9 @@ const HOST_VAR: &str = "HOST";
 
 /// TCP port the server binds to.
 const PORT_VAR: &str = "PORT";
+
+/// Postgres connection URL.
+const DATABASE_URL_VAR: &str = "DATABASE_URL";
 
 /// Loopback keeps development servers off the network unless opted in.
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -95,6 +99,29 @@ impl ServerConfig {
     }
 }
 
+/// Postgres connection settings.
+///
+/// The URL embeds credentials, so this type never exposes it through `Debug`
+/// or `Display`; read it deliberately with [`DatabaseConfig::url`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    url: String,
+}
+
+impl DatabaseConfig {
+    /// Returns the Postgres connection URL, credentials included.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("DatabaseConfig(...)")
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -102,6 +129,8 @@ pub struct AppConfig {
     pub environment: Environment,
     /// Where the application server binds.
     pub server: ServerConfig,
+    /// Postgres connection settings, when `DATABASE_URL` is set.
+    pub database: Option<DatabaseConfig>,
 }
 
 impl AppConfig {
@@ -146,9 +175,22 @@ impl AppConfig {
                 .map_err(|_error| Error::invalid(PORT_VAR, value, "a TCP port number"))?,
         };
 
+        let database = match lookup(DATABASE_URL_VAR) {
+            None => None,
+            Some(url) if url.trim().is_empty() => {
+                return Err(Error::invalid(
+                    DATABASE_URL_VAR,
+                    url,
+                    "a non-empty Postgres connection URL",
+                ));
+            }
+            Some(url) => Some(DatabaseConfig { url }),
+        };
+
         Ok(Self {
             environment,
             server: ServerConfig { host, port },
+            database,
         })
     }
 }
@@ -277,6 +319,31 @@ mod tests {
         let error = AppConfig::from_lookup(lookup).expect_err("unknown environments are rejected");
 
         assert_eq!(error.variable(), "ANUBIS_ENV");
+    }
+
+    #[test]
+    fn database_url_is_optional_but_must_be_non_empty() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert!(unset.database.is_none());
+
+        let lookup = lookup_from(&[("DATABASE_URL", "postgres://app:hunter2@localhost/app")]);
+        let set = AppConfig::from_lookup(lookup).expect("a URL is fine");
+        let database = set.database.expect("database config must be present");
+        assert_eq!(database.url(), "postgres://app:hunter2@localhost/app");
+
+        let lookup = lookup_from(&[("DATABASE_URL", "   ")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("blank URLs are rejected");
+        assert_eq!(error.variable(), "DATABASE_URL");
+    }
+
+    #[test]
+    fn database_debug_output_never_leaks_credentials() {
+        let lookup = lookup_from(&[("DATABASE_URL", "postgres://app:hunter2@localhost/app")]);
+        let config = AppConfig::from_lookup(lookup).expect("a URL is fine");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("DatabaseConfig"), "got: {rendered}");
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
     }
 
     #[test]
