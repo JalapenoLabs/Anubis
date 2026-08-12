@@ -15,6 +15,7 @@ pub mod config;
 pub mod db;
 pub mod guard;
 pub mod http;
+pub mod jobs;
 pub mod mail;
 pub mod manifest;
 pub mod roles;

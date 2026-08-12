@@ -23,6 +23,7 @@ Pre-alpha. The architecture is settled and documented in [docs/](docs/); impleme
 - [Tenancy, teams, and organizations](docs/tenancy.md)
 - [Scaffolding](docs/scaffolding.md)
 - [REST API](docs/api.md)
+- [Background jobs](docs/jobs.md)
 
 ## Repository layout
 

@@ -1,6 +1,6 @@
 # CI
 
-CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with the labels `[self-hosted, fedora, earthly, docker]`. The runners persist the cargo registry, target dir, and yarn cache between runs, so workflows carry no cache save/restore steps.
+CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with the labels `[self-hosted, rocky9, earthly, docker]`. The runners persist the cargo registry, target dir, and yarn cache between runs, so workflows carry no cache save/restore steps.
 
 ## Workflow
 
