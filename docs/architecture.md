@@ -15,7 +15,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
 | Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
 | Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
-| Background jobs | Postgres-backed queue | Job enqueue commits in the same transaction as the domain write that caused it |
+| Background jobs | Postgres-backed queue | Enqueue commits in the same transaction as the domain write that caused it. At-least-once, retried on a widening backoff, then dead-lettered. See [jobs.md](jobs.md) |
 | Passwords | argon2id | |
 | Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
 | OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; providers are added via `anubis scaffold oauth <provider>` and two environment variables. See [api.md](api.md#oauth-sign-in) |
@@ -72,4 +72,4 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling.
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling. The job queue ships; see [jobs.md](jobs.md).

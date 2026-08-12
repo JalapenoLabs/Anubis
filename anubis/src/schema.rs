@@ -219,6 +219,38 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Background work waiting to run. See the queue design in `docs/jobs.md`.
+    jobs (id) {
+        id -> Uuid,
+        queue -> Text,
+        kind -> Text,
+        payload -> Jsonb,
+        attempts -> Int4,
+        max_attempts -> Int4,
+        run_at -> Timestamptz,
+        locked_at -> Nullable<Timestamptz>,
+        locked_by -> Nullable<Text>,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Jobs that exhausted their attempts, kept for operators to inspect.
+    dead_jobs (id) {
+        id -> Uuid,
+        queue -> Text,
+        kind -> Text,
+        payload -> Jsonb,
+        attempts -> Int4,
+        last_error -> Nullable<Text>,
+        enqueued_at -> Timestamptz,
+        failed_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
