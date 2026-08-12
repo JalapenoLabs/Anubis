@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
+use crate::auth::secret_box::SecretKey;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, session, user_token};
 use crate::config::{AppConfig, Environment};
@@ -56,6 +57,8 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         environment: config.environment,
         mailer,
         app_url: config.app_url.clone(),
+        secret_key: config.secret_key.clone(),
+        oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
     };
 
     Router::new()
@@ -70,6 +73,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         .merge(crate::auth::account::router())
         .merge(crate::auth::email_code::router())
         .merge(crate::auth::mfa::router())
+        .merge(crate::auth::oauth::router())
         .merge(crate::auth::passkey::router())
         .with_state(state)
         // CurrentUser resolves its pool from request extensions.
@@ -82,6 +86,10 @@ pub(crate) struct AuthState {
     pub(crate) environment: Environment,
     pub(crate) mailer: Mailer,
     pub(crate) app_url: String,
+    /// Seals the secrets auth must read back, today the TOTP seeds.
+    pub(crate) secret_key: SecretKey,
+    /// The configured OpenID Connect providers and their discovery cache.
+    pub(crate) oauth: crate::auth::oauth::Runtime,
 }
 
 #[derive(Deserialize)]
@@ -201,7 +209,7 @@ async fn login(
     }
 
     // A confirmed second factor turns the session into a challenge.
-    if crate::auth::mfa::confirmed_secret(&mut connection, user.id)
+    if crate::auth::mfa::confirmed_secret(&mut connection, &state.secret_key, user.id)
         .await
         .map_err(log_internal)?
         .is_some()
@@ -289,10 +297,7 @@ async fn confirm_email_verification(
     .ok_or_else(expired_link)?;
 
     let user: User = diesel::update(users::table.find(user_id))
-        .set((
-            users::email_verified_at.eq(Utc::now()),
-            users::updated_at.eq(Utc::now()),
-        ))
+        .set((users::email_verified_at.eq(Utc::now()),))
         .returning(User::as_returning())
         .get_result(&mut connection)
         .await
@@ -366,10 +371,7 @@ async fn confirm_password_reset(
     let password_hash = password::hash(body.password).await.map_err(log_internal)?;
 
     diesel::update(users::table.find(user_id))
-        .set((
-            users::password_hash.eq(&password_hash),
-            users::updated_at.eq(Utc::now()),
-        ))
+        .set((users::password_hash.eq(&password_hash),))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;

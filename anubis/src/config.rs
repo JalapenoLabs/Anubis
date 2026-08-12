@@ -15,12 +15,47 @@
 //! | `PORT` | `3000` | TCP port the server binds to |
 //! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
 //! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
+//! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
+//!
+//! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
+//! adds three more, named after the provider:
+//!
+//! | Variable | Default | Meaning |
+//! |---|---|---|
+//! | `GOOGLE_OAUTH_CLIENT_ID` | unset | OAuth client id; setting it and the secret enables the provider |
+//! | `GOOGLE_OAUTH_CLIENT_SECRET` | unset | OAuth client secret |
+//! | `GOOGLE_OAUTH_ISSUER` | `https://accounts.google.com` | Issuer whose discovery document configures the flow |
 //!
 //! The set grows milestone by milestone.
+//!
+//! # The secret key
+//!
+//! `ANUBIS_SECRET_KEY` keys [`crate::auth::secret_box`], which seals secrets
+//! the application has to read back (today, TOTP seeds). Generate one with
+//! `openssl rand -base64 32`, or any source of 32 random bytes rendered as
+//! base64; padding is optional. Production fails to start without it.
+//! Development and test fall back to a fixed, public development key so a
+//! freshly stamped application boots with no configuration, and
+//! [`crate::telemetry::init`] warns whenever that fallback is in use.
+//! Rotating the key makes values sealed under the old one unreadable, so
+//! affected users re-enroll their second factor.
+//!
+//! # OAuth providers
+//!
+//! A provider is enabled by setting both its client id and its client secret;
+//! setting one without the other is a misconfiguration and refuses to start,
+//! because a half-configured provider is a sign-in button that always fails.
+//! The issuer variable overrides the registry's issuer, which is what a
+//! self-hosted or single-tenant deployment needs. Register the redirect URI
+//! `<APP_URL>/auth/oauth/<provider>/callback` with the provider, and add the
+//! button with `anubis scaffold oauth <provider>`.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use crate::auth::oauth::{OauthProviderConfig, known_providers};
+use crate::auth::secret_box::SecretKey;
 
 /// Selects the runtime environment.
 const ENV_VAR: &str = "ANUBIS_ENV";
@@ -36,6 +71,12 @@ const DATABASE_URL_VAR: &str = "DATABASE_URL";
 
 /// Public base URL of the application, used when building email links.
 const APP_URL_VAR: &str = "APP_URL";
+
+/// Base64 key that encrypts recoverable secrets at rest.
+const SECRET_KEY_VAR: &str = "ANUBIS_SECRET_KEY";
+
+/// What a valid `ANUBIS_SECRET_KEY` looks like, quoted back in errors.
+const SECRET_KEY_FORM: &str = "base64 for exactly 32 random bytes, e.g. `openssl rand -base64 32`";
 
 /// Loopback keeps development servers off the network unless opted in.
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -141,6 +182,15 @@ pub struct AppConfig {
     /// address, which is right for development and must be set explicitly in
     /// production.
     pub app_url: String,
+    /// Key that encrypts recoverable secrets at rest, from `ANUBIS_SECRET_KEY`.
+    ///
+    /// Production requires it. Development and test fall back to the built-in
+    /// development key; see the module docs.
+    pub secret_key: SecretKey,
+    /// The OpenID Connect providers the environment enabled, in registry order.
+    ///
+    /// Empty unless a provider's client id and secret are both set.
+    pub oauth: Vec<OauthProviderConfig>,
 }
 
 impl AppConfig {
@@ -167,7 +217,7 @@ impl AppConfig {
         let environment = match lookup(ENV_VAR) {
             None => Environment::default(),
             Some(value) => parse_environment(&value).ok_or_else(|| {
-                Error::invalid(ENV_VAR, value, "one of development, test, production")
+                Error::invalid(ENV_VAR, &value, "one of development, test, production")
             })?,
         };
 
@@ -175,14 +225,14 @@ impl AppConfig {
             None => DEFAULT_HOST,
             Some(value) => value
                 .parse()
-                .map_err(|_error| Error::invalid(HOST_VAR, value, "an IP address"))?,
+                .map_err(|_error| Error::invalid(HOST_VAR, &value, "an IP address"))?,
         };
 
         let port = match lookup(PORT_VAR) {
             None => DEFAULT_PORT,
             Some(value) => value
                 .parse()
-                .map_err(|_error| Error::invalid(PORT_VAR, value, "a TCP port number"))?,
+                .map_err(|_error| Error::invalid(PORT_VAR, &value, "a TCP port number"))?,
         };
 
         let database = match lookup(DATABASE_URL_VAR) {
@@ -190,7 +240,7 @@ impl AppConfig {
             Some(url) if url.trim().is_empty() => {
                 return Err(Error::invalid(
                     DATABASE_URL_VAR,
-                    url,
+                    &url,
                     "a non-empty Postgres connection URL",
                 ));
             }
@@ -202,19 +252,86 @@ impl AppConfig {
             Some(url) => {
                 let trimmed = url.trim().trim_end_matches('/');
                 if trimmed.is_empty() || !trimmed.starts_with("http") {
-                    return Err(Error::invalid(APP_URL_VAR, url, "an http(s) base URL"));
+                    return Err(Error::invalid(APP_URL_VAR, &url, "an http(s) base URL"));
                 }
                 trimmed.to_owned()
             }
         };
+
+        let secret_key = match lookup(SECRET_KEY_VAR) {
+            Some(encoded) => SecretKey::from_base64(&encoded)
+                .map_err(|_error| Error::invalid_secret(SECRET_KEY_VAR, SECRET_KEY_FORM))?,
+            // Live deployments store real secrets, so the key is mandatory
+            // there; anywhere else the public development key keeps a fresh
+            // checkout running with no configuration.
+            None if environment.is_production() => {
+                return Err(Error::missing(SECRET_KEY_VAR, SECRET_KEY_FORM));
+            }
+            None => SecretKey::development(),
+        };
+
+        let oauth = oauth_providers(&lookup)?;
 
         Ok(Self {
             environment,
             server: ServerConfig { host, port },
             database,
             app_url,
+            secret_key,
+            oauth,
         })
     }
+}
+
+/// Resolves every provider whose credentials the environment carries.
+///
+/// A provider with neither credential is simply not enabled. A provider with
+/// one of the two is a misconfiguration: the button would be rendered and
+/// every click would fail, so startup stops and names the missing variable.
+fn oauth_providers(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<OauthProviderConfig>, Error> {
+    let mut configured = Vec::new();
+
+    for provider in known_providers() {
+        let client_id = non_empty(lookup(provider.client_id_var));
+        let client_secret = non_empty(lookup(provider.client_secret_var));
+
+        let (client_id, client_secret) = match (client_id, client_secret) {
+            (None, None) => continue,
+            (Some(client_id), Some(client_secret)) => (client_id, client_secret),
+            (Some(_client_id), None) => {
+                return Err(Error::missing(
+                    provider.client_secret_var,
+                    "the client secret that goes with the client id",
+                ));
+            }
+            (None, Some(_client_secret)) => {
+                return Err(Error::missing(
+                    provider.client_id_var,
+                    "the client id that goes with the client secret",
+                ));
+            }
+        };
+
+        let issuer = non_empty(lookup(provider.issuer_var));
+        let config = OauthProviderConfig::new(provider, client_id, client_secret, issuer.clone())
+            .map_err(|_error| {
+            Error::invalid(
+                provider.issuer_var,
+                issuer.as_deref().unwrap_or(provider.issuer),
+                "an OpenID Connect issuer: an http(s) URL with no query string or fragment",
+            )
+        })?;
+        configured.push(config);
+    }
+
+    Ok(configured)
+}
+
+/// Treats a variable set to whitespace as unset, the way a `.env` line reads.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn parse_environment(value: &str) -> Option<Environment> {
@@ -226,21 +343,46 @@ fn parse_environment(value: &str) -> Option<Environment> {
     }
 }
 
-/// A configuration variable was set to a value that does not parse.
+/// A configuration variable is missing, or set to a value that does not parse.
 #[derive(Debug)]
 pub struct Error {
     variable: &'static str,
-    value: String,
-    expected: &'static str,
+    message: String,
     backtrace: Backtrace,
 }
 
 impl Error {
-    fn invalid(variable: &'static str, value: String, expected: &'static str) -> Self {
+    /// The variable holds a value that does not parse.
+    ///
+    /// The value is quoted back to make the fix obvious, so never use this for
+    /// a variable holding a secret; use [`Error::invalid_secret`] instead.
+    fn invalid(variable: &'static str, value: &str, expected: &'static str) -> Self {
+        Self::new(
+            variable,
+            format!("invalid value for {variable}: expected {expected}, got {value:?}"),
+        )
+    }
+
+    /// The variable holds a value that does not parse and must not be logged.
+    fn invalid_secret(variable: &'static str, expected: &'static str) -> Self {
+        Self::new(
+            variable,
+            format!("invalid value for {variable}: expected {expected}"),
+        )
+    }
+
+    /// The variable is required in this environment but is not set.
+    fn missing(variable: &'static str, expected: &'static str) -> Self {
+        Self::new(
+            variable,
+            format!("{variable} is not set: expected {expected}"),
+        )
+    }
+
+    fn new(variable: &'static str, message: String) -> Self {
         Self {
             variable,
-            value,
-            expected,
+            message,
             backtrace: Backtrace::capture(),
         }
     }
@@ -254,11 +396,7 @@ impl Error {
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid value for {}: expected {}, got {:?}",
-            self.variable, self.expected, self.value
-        )?;
+        f.write_str(&self.message)?;
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
         }
@@ -274,6 +412,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{AppConfig, Environment};
+    use crate::auth::secret_box::SecretKey;
+
+    /// A syntactically valid `ANUBIS_SECRET_KEY`, for tests that need one.
+    const SAMPLE_SECRET_KEY: &str = "bkVLZLd1zHBqxWvKGKp5gRTZKcTf9UvHT5vXbHvWJ0M=";
 
     fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
@@ -298,6 +440,7 @@ mod tests {
             ("ANUBIS_ENV", "production"),
             ("HOST", "0.0.0.0"),
             ("PORT", "8080"),
+            ("ANUBIS_SECRET_KEY", SAMPLE_SECRET_KEY),
         ]);
 
         let config = AppConfig::from_lookup(lookup).expect("valid variables must parse");
@@ -316,7 +459,11 @@ mod tests {
             ("Test", Environment::Test),
             ("PROD", Environment::Production),
         ] {
-            let lookup = lookup_from(&[("ANUBIS_ENV", value)]);
+            // Production insists on a key; every environment accepts one.
+            let lookup = lookup_from(&[
+                ("ANUBIS_ENV", value),
+                ("ANUBIS_SECRET_KEY", SAMPLE_SECRET_KEY),
+            ]);
             let config = AppConfig::from_lookup(lookup).expect("known names must parse");
             assert_eq!(config.environment, expected, "for input {value:?}");
         }
@@ -380,6 +527,55 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(rendered.contains("DatabaseConfig"), "got: {rendered}");
         assert!(!rendered.contains("hunter2"), "got: {rendered}");
+    }
+
+    #[test]
+    fn the_secret_key_falls_back_to_the_development_key_outside_production() {
+        for environment in ["development", "test"] {
+            let lookup = lookup_from(&[("ANUBIS_ENV", environment)]);
+            let config = AppConfig::from_lookup(lookup).expect("no key is fine here");
+            assert!(
+                config.secret_key.is_development(),
+                "for environment {environment}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_refuses_to_start_without_a_secret_key() {
+        let lookup = lookup_from(&[("ANUBIS_ENV", "production")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("production requires a key");
+
+        assert_eq!(error.variable(), "ANUBIS_SECRET_KEY");
+        let rendered = error.to_string();
+        assert!(rendered.contains("is not set"), "got: {rendered}");
+        assert!(rendered.contains("32 random bytes"), "got: {rendered}");
+    }
+
+    #[test]
+    fn a_configured_secret_key_is_used_verbatim() {
+        let encoded = SecretKey::generate().to_base64();
+        let lookup = lookup_from(&[
+            ("ANUBIS_ENV", "production"),
+            ("ANUBIS_SECRET_KEY", &encoded),
+        ]);
+
+        let config = AppConfig::from_lookup(lookup).expect("a valid key must parse");
+
+        assert!(!config.secret_key.is_development());
+        assert_eq!(config.secret_key.to_base64(), encoded);
+    }
+
+    #[test]
+    fn a_malformed_secret_key_is_rejected_without_echoing_it() {
+        let lookup = lookup_from(&[("ANUBIS_SECRET_KEY", "c2hvcnQ=")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("short keys are rejected");
+
+        assert_eq!(error.variable(), "ANUBIS_SECRET_KEY");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("c2hvcnQ"), "got: {rendered}");
     }
 
     #[test]

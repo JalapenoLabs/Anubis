@@ -4,11 +4,14 @@
 //! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
 //! always provides one.
 
+use anubis::schema::{user_mfa, users};
 use axum::Router;
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
 use chrono::Utc;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -107,7 +110,7 @@ async fn totp_gates_login_and_recovery_codes_work() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &config));
+    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &config));
 
     let email = format!("mfa-{}@example.com", Uuid::new_v4());
     let password = "correct horse battery staple";
@@ -182,6 +185,25 @@ async fn totp_gates_login_and_recovery_codes_work() {
     let (status, _headers, body) = send(&router, "GET", "/auth/mfa", None, Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["totp_enabled"], json!(true));
+
+    // The seed is sealed at rest: the row holds a versioned ciphertext, never
+    // the base32 secret the authenticator app scanned.
+    let mut connection = pool.get().await.expect("connection must be available");
+    let user_id: Uuid = users::table
+        .filter(users::email.eq(&email))
+        .select(users::id)
+        .first(&mut connection)
+        .await
+        .expect("the user must exist");
+    let stored: String = user_mfa::table
+        .find(user_id)
+        .select(user_mfa::totp_secret)
+        .first(&mut connection)
+        .await
+        .expect("the enrollment must exist");
+    drop(connection);
+    assert!(stored.starts_with("v1:"), "got: {stored}");
+    assert!(!stored.contains(&secret), "the seed must never be at rest");
 
     // ------------------------------------------------------------------
     // Login now answers with a challenge instead of a session.

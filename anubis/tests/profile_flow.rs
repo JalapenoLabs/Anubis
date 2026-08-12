@@ -8,10 +8,15 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
+use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+use anubis::schema::users;
 
 async fn send(
     router: &Router,
@@ -103,7 +108,7 @@ async fn profile_credentials_sessions_and_deletion() {
     })
     .expect("test config must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &config));
+    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &config));
 
     let run = Uuid::new_v4();
     let email = format!("profile-{run}@example.com");
@@ -146,6 +151,21 @@ async fn profile_credentials_sessions_and_deletion() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["user"]["first_name"], json!("Alex"), "unchanged");
     assert_eq!(body["user"]["last_name"], Value::Null, "cleared");
+
+    // updated_at is trigger-maintained: updates advance it without any
+    // application code setting it.
+    let mut connection = pool.get().await.expect("connection must be available");
+    let (created_at, updated_at): (DateTime<Utc>, DateTime<Utc>) = users::table
+        .filter(users::email.eq(&email))
+        .select((users::created_at, users::updated_at))
+        .first(&mut connection)
+        .await
+        .expect("the user must exist");
+    drop(connection);
+    assert!(
+        updated_at > created_at,
+        "the trigger must advance updated_at"
+    );
 
     // ------------------------------------------------------------------
     // Password change: wrong current rejected; other sessions die.

@@ -84,7 +84,6 @@ async fn update_profile(
             users::last_name.eq(last_name),
             users::time_zone.eq(time_zone),
             users::locale.eq(locale),
-            users::updated_at.eq(Utc::now()),
         ))
         .returning(User::as_returning())
         .get_result(&mut connection)
@@ -155,10 +154,7 @@ async fn change_password(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     diesel::update(users::table.find(user.id))
-        .set((
-            users::password_hash.eq(&password_hash),
-            users::updated_at.eq(Utc::now()),
-        ))
+        .set((users::password_hash.eq(&password_hash),))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;
@@ -263,7 +259,6 @@ async fn confirm_email_change(
         .set((
             users::email.eq(&new_email),
             users::email_verified_at.eq(Utc::now()),
-            users::updated_at.eq(Utc::now()),
         ))
         .returning(User::as_returning())
         .get_result(&mut connection)

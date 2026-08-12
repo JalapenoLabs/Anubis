@@ -1,14 +1,16 @@
 //! The `anubis` command line interface.
 //!
 //! The CLI is the front door to the framework: stamping new applications,
-//! scaffolding models and fields, and compiling `roles.yml`. Scaffolding
-//! subcommands land with milestone M4 (see the repository's
-//! `docs/scaffolding.md` for the planned surface).
+//! scaffolding models and fields, and compiling `roles.yml`. `scaffold model`
+//! generates a model's backend slice today; the rest of the `scaffold` family
+//! lands with milestone M4 (see the repository's `docs/scaffolding.md`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+mod cli;
 
 /// The Anubis framework CLI.
 #[derive(Debug, Parser)]
@@ -20,6 +22,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Stamp a new application from the starter template.
+    New {
+        /// The application name: lowercase letters, digits, and hyphens.
+        name: String,
+    },
+    /// Generate application code from the living templates.
+    Scaffold {
+        #[command(subcommand)]
+        command: ScaffoldCommand,
+    },
+    /// Verify toolchain, database, and config health.
+    Doctor,
+    /// Print the framework route table.
+    Routes,
     /// Validate and compile the application's roles.yml.
     Roles {
         #[command(subcommand)]
@@ -35,6 +51,44 @@ enum Command {
     Client {
         #[command(subcommand)]
         command: ClientCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScaffoldCommand {
+    /// Generate a model's backend slice: migration, schema, model, routes,
+    /// permissions, and an integration test.
+    Model {
+        /// The model name, e.g. `Project`.
+        model: String,
+        /// The ownership chain ending in `Team`, e.g. `Team` or `Project,Team`.
+        ownership: String,
+        /// Fields as `name:type`, e.g. `name:text_field`.
+        fields: Vec<String>,
+    },
+    /// Add an OAuth sign-in provider: the sign-in button, its string, and the
+    /// setup instructions for the provider's console.
+    Oauth {
+        /// The provider key, e.g. `google`.
+        provider: String,
+    },
+    /// Generate the join model two existing team-owned models need before a
+    /// has-many-through association can reach between them.
+    Join {
+        /// The join model name, e.g. `AppliedTag`.
+        model: String,
+        /// The side that owns the association, e.g. `project_id{class_name=Project}`.
+        owner: String,
+        /// The side it reaches, e.g. `tag_id{class_name=Tag}`.
+        target: String,
+    },
+    /// Add one field to an existing model, propagated through its migration,
+    /// schema, model, handlers, test, API module, form, table, and locale file.
+    Field {
+        /// The model name, e.g. `Project`.
+        model: String,
+        /// The field as `name:type`, e.g. `priority:text_field`.
+        field: String,
     },
 }
 
@@ -73,12 +127,37 @@ fn main() -> ExitCode {
     let Some(command) = cli.command else {
         println!("Anubis {}", anubis::VERSION);
         println!("Run `anubis --help` for available commands.");
-        println!("Scaffolding commands arrive with milestone M4.");
+        println!("Scaffold a model with `anubis scaffold model <Model> <ParentChain>`.");
         println!("Roadmap: https://github.com/JalapenoLabs/Anubis/milestones");
         return ExitCode::SUCCESS;
     };
 
     match command {
+        Command::New { name } => cli::new::run(&name),
+        Command::Scaffold {
+            command:
+                ScaffoldCommand::Model {
+                    model,
+                    ownership,
+                    fields,
+                },
+        } => cli::scaffold::model(&model, &ownership, &fields),
+        Command::Scaffold {
+            command:
+                ScaffoldCommand::Join {
+                    model,
+                    owner,
+                    target,
+                },
+        } => cli::scaffold::join(&model, &owner, &target),
+        Command::Scaffold {
+            command: ScaffoldCommand::Field { model, field },
+        } => cli::scaffold::field(&model, &field),
+        Command::Scaffold {
+            command: ScaffoldCommand::Oauth { provider },
+        } => cli::scaffold::oauth(&provider),
+        Command::Doctor => cli::doctor::run(),
+        Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),
         Command::Openapi { out } => run_openapi(out.as_deref()),
         Command::Client {

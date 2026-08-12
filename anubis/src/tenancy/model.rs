@@ -1,7 +1,8 @@
 //! The framework-owned tenancy models.
 
 use chrono::{DateTime, Utc};
-use diesel::prelude::{Insertable, Queryable, Selectable};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -78,6 +79,32 @@ pub struct TeamMembership {
     pub created_at: DateTime<Utc>,
     /// When the membership was last updated.
     pub updated_at: DateTime<Utc>,
+}
+
+impl TeamMembership {
+    /// The user's membership in a team, or `None` when they are not a member.
+    ///
+    /// This is the last link of every scaffolded model's ownership chain:
+    /// resolve the record's `team_id`, then ask this whether the caller
+    /// belongs there. Application tables cannot join framework tables in one
+    /// Diesel query (Rust's orphan rules forbid the cross-crate trait
+    /// implementations), so the chain ends in this indexed lookup.
+    ///
+    /// # Errors
+    /// Returns the underlying Diesel error when the query fails.
+    pub async fn for_user(
+        connection: &mut AsyncPgConnection,
+        user_id: Uuid,
+        team_id: Uuid,
+    ) -> QueryResult<Option<Self>> {
+        team_memberships::table
+            .filter(team_memberships::team_id.eq(team_id))
+            .filter(team_memberships::user_id.eq(user_id))
+            .select(Self::as_select())
+            .first(connection)
+            .await
+            .optional()
+    }
 }
 
 #[derive(Insertable)]

@@ -5,6 +5,10 @@
    keep it local. Tailwind skips whichever glob matches nothing. */
 @source '../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
 @source '../../../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
+/* The field components ship as TypeScript source, so the same pair of globs
+   points Tailwind at the framework package. */
+@source '../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
+@source '../../../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
 @custom-variant dark (&:is(.dark *));
 
 /* Vertical rhythm helpers: put the class on each item needing a gap below it.
@@ -22,6 +26,20 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 1rem;
+}
+
+.level-left {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 1rem;
+}
+
+.level-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   gap: 1rem;
 }
 

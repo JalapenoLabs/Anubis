@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
 
 // UI
@@ -16,7 +16,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
 // Misc
-import { UrlTree } from '../../urls'
+import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
 
 const signUpSchema = z.object({
   email: z.email(),
@@ -30,7 +30,12 @@ export function SignUpPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const { refresh } = useCurrentUser()
+  const [ searchParams ] = useSearchParams()
   const [ formError, setFormError ] = useState<string | null>(null)
+
+  // Registration signs the user straight in, so the destination only has to
+  // survive the hop back to sign-in for people who already have an account.
+  const destination = searchParams.get(DESTINATION_PARAM)
 
   const emailRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
@@ -50,7 +55,8 @@ export function SignUpPage() {
     setFormError(null)
     try {
       await api.register(data)
-      // RequireGuest redirects to the dashboard once the user refreshes in.
+      // RequireGuest redirects to the preserved destination, or to the
+      // dashboard, once the user refreshes in.
       await refresh()
     }
     catch (error) {
@@ -130,7 +136,7 @@ export function SignUpPage() {
             t('auth.signUp.haveAccount')
           }</span>
         {' '}
-        <Link to={UrlTree.signIn} className='text-primary'>{
+        <Link to={getUrlWithDestination(UrlTree.signIn, destination)} className='text-primary'>{
             t('auth.signUp.goToSignIn')
           }</Link>
       </span>

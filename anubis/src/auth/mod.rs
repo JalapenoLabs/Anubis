@@ -3,11 +3,13 @@
 //! Email/password authentication with argon2id hashing and Postgres-backed
 //! cookie sessions. Applications mount [`router`] (conventionally under
 //! `/auth`) for registration, login, logout, and current-user endpoints, and
-//! guard their own handlers with the [`CurrentUser`] extractor. Email
-//! verification and OAuth arrive with later milestone steps; the design lives
-//! in the repository's `docs/api.md`.
+//! guard their own handlers with the [`CurrentUser`] extractor. Sign-in also
+//! covers emailed codes, passkeys, TOTP as a second factor, and OAuth through
+//! OpenID Connect; the design lives in the repository's `docs/api.md`.
 
+pub mod oauth;
 pub mod password;
+pub mod secret_box;
 pub mod totp;
 
 mod account;

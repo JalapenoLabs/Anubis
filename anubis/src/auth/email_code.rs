@@ -148,7 +148,7 @@ async fn verify_code(
     };
 
     // An inbox alone never bypasses a confirmed second factor.
-    if mfa::confirmed_secret(&mut connection, user.id)
+    if mfa::confirmed_secret(&mut connection, &state.secret_key, user.id)
         .await
         .map_err(log_internal)?
         .is_some()

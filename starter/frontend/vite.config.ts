@@ -14,6 +14,7 @@ export default defineConfig({
       // The backend serves the API; the SPA stays same-origin in production.
       '/auth': 'http://127.0.0.1:3000',
       '/tenancy': 'http://127.0.0.1:3000',
+      '/account': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',
     },
   },

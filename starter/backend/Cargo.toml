@@ -12,10 +12,21 @@ repository.workspace = true
 [dependencies]
 anubis = { workspace = true }
 axum = { workspace = true }
+chrono = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_migrations = { workspace = true }
 mimalloc = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

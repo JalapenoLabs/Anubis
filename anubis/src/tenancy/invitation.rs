@@ -182,10 +182,7 @@ pub(crate) async fn claim(
                     .filter(team_memberships::id.eq(membership_id))
                     .filter(team_memberships::user_id.is_null()),
             )
-            .set((
-                team_memberships::user_id.eq(claimant),
-                team_memberships::updated_at.eq(Utc::now()),
-            ))
+            .set((team_memberships::user_id.eq(claimant),))
             .execute(connection)
             .await;
 

@@ -192,11 +192,71 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Links a user account to its subject at an OpenID Connect provider.
+    oauth_identities (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        provider -> Text,
+        subject -> Text,
+        email -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// In-flight authorization-code flows. Rows hold a hash of the state token.
+    oauth_states (id) {
+        id -> Uuid,
+        provider -> Text,
+        token_hash -> Text,
+        nonce -> Text,
+        pkce_verifier -> Text,
+        destination -> Nullable<Text>,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Background work waiting to run. See the queue design in `docs/jobs.md`.
+    jobs (id) {
+        id -> Uuid,
+        queue -> Text,
+        kind -> Text,
+        payload -> Jsonb,
+        attempts -> Int4,
+        max_attempts -> Int4,
+        run_at -> Timestamptz,
+        locked_at -> Nullable<Timestamptz>,
+        locked_by -> Nullable<Text>,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Jobs that exhausted their attempts, kept for operators to inspect.
+    dead_jobs (id) {
+        id -> Uuid,
+        queue -> Text,
+        kind -> Text,
+        payload -> Jsonb,
+        attempts -> Int4,
+        last_error -> Nullable<Text>,
+        enqueued_at -> Timestamptz,
+        failed_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
 diesel::joinable!(user_recovery_codes -> users (user_id));
 diesel::joinable!(user_passkeys -> users (user_id));
+diesel::joinable!(oauth_identities -> users (user_id));
 diesel::joinable!(platform_applications -> teams (team_id));
 diesel::joinable!(platform_tokens -> platform_applications (platform_application_id));
 diesel::joinable!(invitations -> organizations (organization_id));
@@ -208,6 +268,7 @@ diesel::joinable!(organization_memberships -> users (user_id));
 diesel::joinable!(team_memberships -> teams (team_id));
 diesel::joinable!(team_memberships -> users (user_id));
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
+diesel::allow_tables_to_appear_in_same_query!(oauth_identities, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
 diesel::allow_tables_to_appear_in_same_query!(
     organizations,

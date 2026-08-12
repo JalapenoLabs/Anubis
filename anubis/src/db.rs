@@ -6,6 +6,11 @@
 //! actually reach the database; [`run_pending_migrations`] applies the
 //! framework's embedded migrations at boot, so a freshly stamped application
 //! migrates itself on first start.
+//!
+//! Applications own their domain tables, so they embed their own migration
+//! directory and apply it with [`run_app_migrations`] right after the
+//! framework's, which is the order the ownership chain requires: application
+//! tables reference `teams`.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -43,12 +48,43 @@ pub async fn connect(database_url: &str) -> Result<DbPool, Error> {
     Ok(pool)
 }
 
-/// Applies any embedded migrations that have not run yet.
+/// Applies the framework's embedded migrations that have not run yet.
 ///
 /// # Errors
 /// Returns an [`Error`] when the database cannot be reached or a migration
 /// fails to apply.
 pub async fn run_pending_migrations(database_url: &str) -> Result<(), Error> {
+    apply(database_url, MIGRATIONS).await
+}
+
+/// Applies an application's own embedded migrations.
+///
+/// Run this after [`run_pending_migrations`]: application tables reference the
+/// framework's, and the shared `set_updated_at()` trigger function must exist
+/// before a generated migration attaches it.
+///
+/// ```ignore
+/// use diesel_migrations::{EmbeddedMigrations, embed_migrations};
+///
+/// const APP_MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
+///
+/// anubis::db::run_pending_migrations(url).await?;
+/// anubis::db::run_app_migrations(url, APP_MIGRATIONS).await?;
+/// ```
+///
+/// # Errors
+/// Returns an [`Error`] when the database cannot be reached or a migration
+/// fails to apply.
+pub async fn run_app_migrations(
+    database_url: &str,
+    migrations: EmbeddedMigrations,
+) -> Result<(), Error> {
+    apply(database_url, migrations).await
+}
+
+/// Runs a migration set on a blocking thread, which is where Diesel's
+/// migration harness lives.
+async fn apply(database_url: &str, migrations: EmbeddedMigrations) -> Result<(), Error> {
     let url = database_url.to_owned();
 
     let outcome = tokio::task::spawn_blocking(move || {
@@ -57,7 +93,7 @@ pub async fn run_pending_migrations(database_url: &str) -> Result<(), Error> {
         let mut connection = AsyncConnectionWrapper::<AsyncPgConnection>::establish(&url)
             .map_err(|source| Error::new("failed to connect for migrations", source))?;
         connection
-            .run_pending_migrations(MIGRATIONS)
+            .run_pending_migrations(migrations)
             .map_err(|source| Error::from_boxed("failed to apply migrations", source))?;
         Ok(())
     })

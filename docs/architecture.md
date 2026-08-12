@@ -15,9 +15,10 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
 | Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
 | Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
-| Background jobs | Postgres-backed queue | Job enqueue commits in the same transaction as the domain write that caused it |
+| Background jobs | Postgres-backed queue | Enqueue commits in the same transaction as the domain write that caused it. At-least-once, retried on a widening backoff, then dead-lettered. See [jobs.md](jobs.md) |
 | Passwords | argon2id | |
-| OAuth / SSO | OpenID Connect (`openidconnect` crate) | Providers added via `anubis scaffold oauth <provider>` |
+| Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
+| OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; providers are added via `anubis scaffold oauth <provider>` and two environment variables. See [api.md](api.md#oauth-sign-in) |
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
 
@@ -35,6 +36,8 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | i18n | i18next, per-model locale files emitted by the scaffolder |
 | Unit tests | Vitest |
 | E2E tests | Playwright |
+
+Route guards preserve where the user was headed. When the auth guard turns a signed-out visitor away, it sends them to `/sign-in?next=<path>`, and the guest guard returns them to that path the moment a session exists. The destination rides in the query string because the flow that needs it most, an invitation link opened from an email, is a cold page load that router state would not survive. Every destination passes through `sanitizeDestination` in the app's `urls.ts`, which accepts root-relative paths only, so the parameter cannot become an open redirect.
 
 ## Packaging
 
@@ -59,7 +62,7 @@ Scaffolding a model or field regenerates the contract; anything the frontend mus
 
 ## Deployment
 
-A production deployment is one static Rust binary (serving the API and the built SPA assets), PostgreSQL, and optionally Redis. Docker images are small and versions are pinned everywhere.
+The target: a production deployment is one static Rust binary serving the API and the built SPA assets, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere. Serving the SPA from the binary is not implemented yet (tracked in GitHub issues, M5), so today the frontend requires its own static host.
 
 ## Roadmap
 
@@ -69,4 +72,4 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling.
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling. The job queue ships; see [jobs.md](jobs.md).
