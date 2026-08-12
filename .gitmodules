@@ -1,0 +1,4 @@
+[submodule "bullet_train/bullet_train"]
+	path = bullet_train/bullet_train
+	url = https://github.com/bullet-train-co/bullet_train.git
+	branch = main
