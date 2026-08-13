@@ -10,9 +10,15 @@ One command from the repository root:
 yarn dev
 ```
 
-It starts Postgres in Docker (waiting for health), the backend with the right
-environment, and the frontend dev server. The backend applies pending
-migrations at boot; the app is at http://localhost:5173.
+It copies `.env.example` to `.env` when there is none, starts Postgres in
+Docker (waiting for health), then runs the backend and the frontend dev server
+with that environment. The backend applies pending migrations at boot; the app
+is at http://localhost:5173.
+
+`.env` is the one place development configuration lives: the database
+container and the backend both read it, so the credentials are written once.
+It is git-ignored; `.env.example` is the committed template, and it is the
+same file `anubis new` stamps into every application.
 
 Emails (verification, password reset, invitations, sign-in codes) go to the
 backend log in development; the action links and codes are in the log lines.
@@ -31,7 +37,7 @@ yarn workspace anubis-starter-frontend build
 
 DATABASE_URL=postgres://user:password@host/app \
 APP_URL=https://app.example.com \
-ANUBIS_SECRET_KEY="$(openssl rand -base64 32)" \
+ANUBIS_SECRET_KEY="$(anubis secret generate)" \
 ANUBIS_ENV=production \
 SPA_DIR=starter/frontend/dist \
 cargo run --release -p anubis-starter
@@ -68,12 +74,10 @@ button lands back on the sign-in page with `oauth_unavailable`.
 
 ```sh
 # Postgres only
-docker compose -f starter/compose.yaml up -d --wait
+docker compose --env-file .env -f starter/compose.yaml up -d --wait
 
-# Backend (from the repository root)
-DATABASE_URL=postgres://app:app@localhost:54321/app_development \
-APP_URL=http://localhost:5173 \
-cargo run -p anubis-starter
+# Backend, with the environment from .env (from the repository root)
+yarn dotenv -- cargo run -p anubis-starter
 
 # Frontend
 yarn workspace anubis-starter-frontend dev

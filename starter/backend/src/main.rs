@@ -92,6 +92,12 @@ async fn main() {
             "/developers",
             anubis::api::management::router(pool.clone(), roles.clone()),
         )
+        // Outgoing webhook subscriptions and their delivery log, beside the
+        // platform applications above.
+        .nest(
+            "/developers",
+            anubis::webhooks::router(pool.clone(), roles.clone(), &config),
+        )
         // The application owns its v1 surface: the framework's endpoints, the
         // application's own, and the merged document at /openapi.json and
         // /docs, in one call.
@@ -120,9 +126,34 @@ async fn main() {
         None => app,
     };
 
+    // Background jobs run in this process. Registering a job is the whole of
+    // the wiring: it subscribes the worker to that job's queue and captures
+    // whatever the handler needs. Outgoing webhook delivery is the framework's
+    // own job; an application's go on the same builder.
+    let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), &config);
+    let worker = anubis::jobs::Worker::builder(pool.clone())
+        .register(move |job: anubis::webhooks::DeliverWebhook| {
+            let deliverer = deliverer.clone();
+            async move { deliverer.deliver(job).await }
+        })
+        .build();
+
+    let (stop_worker, worker_stops) = tokio::sync::oneshot::channel::<()>();
+    let working = tokio::spawn(worker.run(async move {
+        let _stopped = worker_stops.await;
+    }));
+
     // The framework owns everything from here: the probes, the middleware, the
     // accept loop, and draining in-flight requests on SIGTERM or ctrl-c.
     server::serve(app, pool, &config)
         .await
         .expect("the server terminated unexpectedly");
+
+    // The worker keeps running until the server has drained, because a request
+    // still finishing may yet enqueue work. Then it drains its own in-flight
+    // jobs, so a deploy never kills a job mid-flight.
+    let _listening = stop_worker.send(());
+    working
+        .await
+        .expect("the job worker must shut down cleanly");
 }

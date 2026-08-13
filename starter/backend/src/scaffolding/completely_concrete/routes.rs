@@ -29,7 +29,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -37,6 +37,17 @@ use uuid::Uuid;
 use super::model::{MODEL, NewTangibleThing, SORTABLE, TangibleThing, TangibleThingChanges};
 use crate::scaffolding::absolutely_abstract::CreativeConcept;
 use crate::schema::tangible_things;
+
+/// The event types this model publishes to outgoing webhooks.
+///
+/// `<model>.<action>` in snake case, the model singular, which is the
+/// convention `anubis::webhooks` documents and a team subscribes to by name.
+/// The payload is the same `TangibleThingView` the endpoints below answer
+/// with, so a receiver reading the published OpenAPI document already knows
+/// the shape.
+const CREATED_EVENT: &str = "tangible_thing.created";
+const UPDATED_EVENT: &str = "tangible_thing.updated";
+const DESTROYED_EVENT: &str = "tangible_thing.destroyed";
 
 /// Returns the tangible thing routes, mounted under `/account`.
 pub fn router(pool: DbPool, roles: RoleSet) -> Router {
@@ -278,24 +289,32 @@ async fn insert_record(
         .filter(|value| !value.is_empty());
     // 🐺 anubis:create-normalize
 
-    let record: TangibleThing = diesel::insert_into(tangible_things::table)
-        .values(NewTangibleThing {
-            // The parent comes from the route, already checked against the
-            // caller's membership or the token's team.
-            creative_concept_id: creative_concept.id,
-            name,
-            description,
-            // 🐺 anubis:insert-values
-        })
-        .returning(TangibleThing::as_returning())
-        .get_result(connection)
-        .await
-        .map_err(log_internal)?;
-    // 🐺 anubis:create-associations
+    // The record, its associations, and the event they produce share one
+    // transaction, so a webhook is exactly as durable as the row that caused
+    // it: a rollback sends nothing, and a commit never loses its event. That
+    // is what a queue in Postgres buys, and why emission takes a connection.
+    let team_id = creative_concept.team_id;
+    connection
+        .transaction::<TangibleThingView, ApiError, _>(async |connection| {
+            let record: TangibleThing = diesel::insert_into(tangible_things::table)
+                .values(NewTangibleThing {
+                    // The parent comes from the route, already checked against
+                    // the caller's membership or the token's team.
+                    creative_concept_id: creative_concept.id,
+                    name,
+                    description,
+                    // 🐺 anubis:insert-values
+                })
+                .returning(TangibleThing::as_returning())
+                .get_result(connection)
+                .await?;
+            // 🐺 anubis:create-associations
 
-    TangibleThingView::one(connection, record)
+            let tangible_thing = TangibleThingView::one(connection, record).await?;
+            anubis::webhooks::emit(connection, team_id, CREATED_EVENT, &tangible_thing).await?;
+            Ok(tangible_thing)
+        })
         .await
-        .map_err(log_internal)
 }
 
 /// Applies a submitted change to one tangible thing.
@@ -317,50 +336,78 @@ async fn apply_changes(
     let description = optional_text(body.description.as_deref());
     // 🐺 anubis:update-normalize
 
-    // Associations are reconciled before the columns, so a request that only
-    // changes an association still takes effect.
-    // 🐺 anubis:update-associations
+    let team_id = creative_concept.team_id;
 
-    // A submitted parent is only ever accepted from the same team's records.
-    let creative_concept_id = match body.creative_concept_id {
-        Some(requested) if requested != creative_concept.id => {
-            let valid =
-                TangibleThing::valid_creative_concepts(connection, creative_concept.team_id)
-                    .await
-                    .map_err(log_internal)?;
-            if !valid.iter().any(|candidate| candidate.id == requested) {
-                return Err(ApiError::validation(
-                    "That creative concept is not available to this team.",
-                ));
-            }
-            Some(requested)
-        }
-        _unchanged => None,
-    };
+    connection
+        .transaction::<TangibleThingView, ApiError, _>(async |connection| {
+            // Associations are reconciled before the columns, so a request that
+            // only changes an association still takes effect.
+            // 🐺 anubis:update-associations
 
-    let changes = TangibleThingChanges {
-        name,
-        description,
-        creative_concept_id,
-        // 🐺 anubis:changeset-values
-    };
-    if changes.is_empty() {
-        return TangibleThingView::one(connection, record)
-            .await
-            .map_err(log_internal);
-    }
+            // A submitted parent is only ever accepted from the same team's
+            // records.
+            let creative_concept_id = match body.creative_concept_id {
+                Some(requested) if requested != creative_concept.id => {
+                    let valid = TangibleThing::valid_creative_concepts(connection, team_id).await?;
+                    if !valid.iter().any(|candidate| candidate.id == requested) {
+                        return Err(ApiError::validation(
+                            "That creative concept is not available to this team.",
+                        ));
+                    }
+                    Some(requested)
+                }
+                _unchanged => None,
+            };
 
-    let updated: TangibleThing =
-        diesel::update(tangible_things::table.filter(tangible_things::id.eq(record.id)))
-            .set(changes)
-            .returning(TangibleThing::as_returning())
-            .get_result(connection)
-            .await
-            .map_err(log_internal)?;
+            let changes = TangibleThingChanges {
+                name,
+                description,
+                creative_concept_id,
+                // 🐺 anubis:changeset-values
+            };
+            let tangible_thing = if changes.is_empty() {
+                TangibleThingView::one(connection, record).await?
+            } else {
+                let updated: TangibleThing = diesel::update(
+                    tangible_things::table.filter(tangible_things::id.eq(record.id)),
+                )
+                .set(changes)
+                .returning(TangibleThing::as_returning())
+                .get_result(connection)
+                .await?;
+                TangibleThingView::one(connection, updated).await?
+            };
 
-    TangibleThingView::one(connection, updated)
+            // Emitted even when the change set was empty, because an
+            // association reconciled above is a change the columns cannot see.
+            anubis::webhooks::emit(connection, team_id, UPDATED_EVENT, &tangible_thing).await?;
+            Ok(tangible_thing)
+        })
         .await
-        .map_err(log_internal)
+}
+
+/// Deletes one tangible thing, and tells the team's webhook endpoints.
+///
+/// The record is serialized before it is deleted, so the event carries the
+/// tangible thing as it last stood rather than an id and nothing else.
+async fn delete_record(
+    connection: &mut AsyncPgConnection,
+    record: TangibleThing,
+    creative_concept: &CreativeConcept,
+) -> Result<(), ApiError> {
+    let team_id = creative_concept.team_id;
+    let record_id = record.id;
+
+    connection
+        .transaction::<(), ApiError, _>(async |connection| {
+            let tangible_thing = TangibleThingView::one(connection, record).await?;
+            diesel::delete(tangible_things::table.filter(tangible_things::id.eq(record_id)))
+                .execute(connection)
+                .await?;
+            anubis::webhooks::emit(connection, team_id, DESTROYED_EVENT, &tangible_thing).await?;
+            Ok(())
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -439,15 +486,11 @@ async fn destroy(
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _creative_concept, membership) =
+    let (tangible_thing, creative_concept, membership) =
         load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
-    diesel::delete(tangible_things::table.filter(tangible_things::id.eq(tangible_thing.id)))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
+    delete_record(&mut connection, tangible_thing, &creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -618,14 +661,10 @@ async fn api_destroy(
     caller.require(&state.roles, Action::Destroy, MODEL)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _creative_concept) =
+    let (tangible_thing, creative_concept) =
         load_for_token(&mut connection, &caller, tangible_thing_id).await?;
 
-    diesel::delete(tangible_things::table.filter(tangible_things::id.eq(tangible_thing.id)))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
+    delete_record(&mut connection, tangible_thing, &creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

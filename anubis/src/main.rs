@@ -26,6 +26,9 @@ enum Command {
     New {
         /// The application name: lowercase letters, digits, and hyphens.
         name: String,
+        /// License of the new application: private, or MIT.
+        #[arg(long, value_enum, default_value_t = cli::new::License::Unlicensed)]
+        license: cli::new::License,
     },
     /// Generate application code from the living templates.
     Scaffold {
@@ -52,6 +55,17 @@ enum Command {
         #[command(subcommand)]
         command: ClientCommand,
     },
+    /// Mint the secrets an application's environment needs.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCommand {
+    /// Print a fresh `ANUBIS_SECRET_KEY`.
+    Generate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,7 +154,7 @@ fn main() -> ExitCode {
     };
 
     match command {
-        Command::New { name } => cli::new::run(&name),
+        Command::New { name, license } => cli::new::run(&name, license),
         Command::Scaffold {
             command:
                 ScaffoldCommand::Model {
@@ -170,6 +184,9 @@ fn main() -> ExitCode {
         Command::Client {
             command: ClientCommand::GenerateTs { from, out },
         } => run_generate_ts(from.as_deref(), &out),
+        Command::Secret {
+            command: SecretCommand::Generate,
+        } => cli::secret::generate(),
     }
 }
 

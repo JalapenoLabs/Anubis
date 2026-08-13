@@ -1,0 +1,113 @@
+# Continuous integration for anubis-starter, stamped by `anubis new`.
+#
+# It holds both ends to the same bar: the Rust workspace is formatted, linted,
+# and tested against a real Postgres, the frontend is typechecked, linted,
+# tested, and built, and the two generated files are regenerated and compared,
+# so a roles or API change that was never regenerated fails here instead of in
+# review. This file is yours; relax or extend it freely.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: anubis_starter
+          POSTGRES_PASSWORD: anubis-starter-dev-password
+          POSTGRES_DB: anubis_starter_test
+        ports:
+          # Ephemeral host port: concurrent runs can never collide on a fixed
+          # one. The step below reads the assigned port back.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U anubis_starter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain version matches rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      # GitHub-hosted runners start cold every run, so without a cache every
+      # push rebuilds the framework from source.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        env:
+          DATABASE_URL: postgres://anubis_starter:anubis-starter-dev-password@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_starter_test
+        run: cargo test --workspace
+
+      # The drift checks below run the framework CLI, which is installed from
+      # the framework repository until the crate is published to crates.io.
+      - name: Install the Anubis CLI
+        run: cargo install anubis --git https://github.com/JalapenoLabs/Anubis.git --locked
+
+      # The generated TypeScript permissions module must match roles.yml.
+      - name: Roles drift check
+        run: |
+          anubis roles generate-ts \
+            --file config/roles.yml \
+            --out frontend/src/roles.generated.ts
+          git diff --exit-code frontend/src/roles.generated.ts
+
+      # The generated TypeScript client must match the OpenAPI document this
+      # application merges, so the application binary exports it and the CLI
+      # renders that export.
+      - name: Client drift check
+        run: |
+          exported="$(mktemp)"
+          cargo run --quiet -p anubis-starter -- openapi > "$exported"
+          anubis client generate-ts \
+            --from "$exported" \
+            --out frontend/src/api/v1.generated.ts
+          git diff --exit-code frontend/src/api/v1.generated.ts
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Pin Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.17.0 --activate
+
+      # Immutable installs need a committed yarn.lock: commit yours with the
+      # first commit, alongside Cargo.lock.
+      - name: Install
+        run: yarn install --immutable
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Test
+        run: yarn test
+
+      - name: Build
+        run: yarn build

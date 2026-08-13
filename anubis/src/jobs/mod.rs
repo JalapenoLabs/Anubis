@@ -134,8 +134,35 @@ pub async fn enqueue_in<J: Job>(
     job: &J,
     delay: Duration,
 ) -> Result<Uuid, Error> {
+    insert(connection, job, delay)
+        .await
+        .map_err(|source| Error::new("failed to enqueue the job", source))
+}
+
+/// Enqueues `job`, reporting failure as a query error.
+///
+/// The entry point the framework's own emitters use. They run inside Diesel
+/// transactions whose error type is [`diesel::result::Error`], so an enqueue
+/// that fails there has to join the rollback rather than need converting.
+pub(crate) async fn enqueue_query<J: Job>(
+    connection: &mut AsyncPgConnection,
+    job: &J,
+) -> diesel::QueryResult<Uuid> {
+    insert(connection, job, Duration::ZERO).await
+}
+
+/// Writes one job row, whatever error shape the caller wants around it.
+///
+/// A payload that will not serialize is a
+/// [`SerializationError`](diesel::result::Error::SerializationError), which is
+/// exactly what happened: the value could not be rendered for its column.
+async fn insert<J: Job>(
+    connection: &mut AsyncPgConnection,
+    job: &J,
+    delay: Duration,
+) -> diesel::QueryResult<Uuid> {
     let payload = serde_json::to_value(job)
-        .map_err(|source| Error::new("failed to serialize the job payload", source))?;
+        .map_err(|source| diesel::result::Error::SerializationError(Box::new(source)))?;
 
     // Both conversions only saturate past the year 262143, where the exact
     // instant has stopped meaning anything; a nonsense delay becomes a job
@@ -156,7 +183,6 @@ pub async fn enqueue_in<J: Job>(
         },
     )
     .await
-    .map_err(|source| Error::new("failed to enqueue the job", source))
 }
 
 /// A failure to enqueue a job.

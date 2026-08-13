@@ -38,14 +38,31 @@
 //! # The secret key
 //!
 //! `ANUBIS_SECRET_KEY` keys [`crate::auth::secret_box`], which seals secrets
-//! the application has to read back (today, TOTP seeds). Generate one with
-//! `openssl rand -base64 32`, or any source of 32 random bytes rendered as
-//! base64; padding is optional. Production fails to start without it.
-//! Development and test fall back to a fixed, public development key so a
-//! freshly stamped application boots with no configuration, and
-//! [`crate::telemetry::init`] warns whenever that fallback is in use.
-//! Rotating the key makes values sealed under the old one unreadable, so
-//! affected users re-enroll their second factor.
+//! the application has to read back (today, TOTP seeds). Mint one with
+//! `anubis secret generate`, which prints exactly the value this variable
+//! takes; `openssl rand -base64 32` or any other source of 32 random bytes
+//! rendered as base64 works too, and padding is optional. Production fails to
+//! start without it. Development and test fall back to a fixed, public
+//! development key so a freshly stamped application boots with no
+//! configuration, and [`crate::telemetry::init`] warns whenever that fallback
+//! is in use. `anubis doctor` reports the same two states: a warning when the
+//! variable is unset, and a failure when it is set to something that cannot
+//! be a key.
+//!
+//! ## Rotation
+//!
+//! Rotation is a one-way door: every value sealed under the old key stops
+//! opening. That is the design rather than a limitation, because it makes
+//! stolen ciphertext worthless the moment the key is replaced. Concretely, a
+//! TOTP enrollment whose seed no longer opens is discarded and the user
+//! enrolls a second factor again (see [`crate::auth::mfa`]), and any other
+//! sealed secret has to be reissued the same way. Plan a rotation as user
+//! communication, not just a deploy.
+//!
+//! Rotating without that cost needs a dual-key read path: a second variable
+//! holding the previous key, tried when the current one fails, so values
+//! re-seal under the new key as they are read. That is future work; today
+//! there is one key.
 //!
 //! # Email delivery
 //!

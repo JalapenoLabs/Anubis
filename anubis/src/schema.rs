@@ -251,6 +251,42 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Team-owned outgoing webhook subscriptions. See `docs/webhooks.md`.
+    ///
+    /// `secret` holds the signing secret sealed with
+    /// [`crate::auth::secret_box`], not a hash: signing a body requires the
+    /// secret itself.
+    webhook_endpoints (id) {
+        id -> Uuid,
+        team_id -> Uuid,
+        url -> Text,
+        description -> Nullable<Text>,
+        event_types -> Array<Text>,
+        active -> Bool,
+        secret -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// One event's delivery to one endpoint, with its attempt history.
+    webhook_deliveries (id) {
+        id -> Uuid,
+        webhook_endpoint_id -> Uuid,
+        event_type -> Text,
+        payload -> Jsonb,
+        status -> Text,
+        attempts -> Int4,
+        response_status -> Nullable<Int4>,
+        last_error -> Nullable<Text>,
+        delivered_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
@@ -278,4 +314,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     invitations,
     users,
 );
+diesel::joinable!(webhook_endpoints -> teams (team_id));
+diesel::joinable!(webhook_deliveries -> webhook_endpoints (webhook_endpoint_id));
 diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);
+diesel::allow_tables_to_appear_in_same_query!(webhook_endpoints, webhook_deliveries, teams);

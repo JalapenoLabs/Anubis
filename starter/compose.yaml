@@ -1,17 +1,23 @@
+# The development datastores. Credentials and ports come from `.env`, which
+# `yarn dev` creates from `.env.example` on first run and passes here with
+# `--env-file`; the defaults below keep a bare `docker compose up` working
+# without one. Change a value in `.env` and both this file and the backend
+# follow it.
 services:
   postgres:
+    container_name: anubis-starter-postgres
     image: postgres:17.6
     environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: app_development
+      POSTGRES_USER: ${POSTGRES_USER:-anubis_starter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anubis-starter-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-anubis_starter_development}
     ports:
       # Off the default port so a host Postgres never collides.
-      - "54321:5432"
+      - "${POSTGRES_PORT:-54321}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-anubis_starter}"]
       interval: 2s
       timeout: 5s
       retries: 15
@@ -22,11 +28,12 @@ services:
   # needs none of it, since realtime channels are served in process by
   # default. See docs/realtime.md.
   redis:
+    container_name: anubis-starter-redis
     image: redis:7.4.10-alpine
     profiles: ["realtime"]
     ports:
       # Off the default port so a host Redis never collides.
-      - "63790:6379"
+      - "${REDIS_PORT:-63790}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

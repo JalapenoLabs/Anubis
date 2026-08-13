@@ -24,6 +24,20 @@ export const appClient = ky.create({
   retry: 0,
 })
 
+/**
+ * The client for the Developers section, mounted under `/developers`.
+ *
+ * Platform application credentials and outgoing webhook subscriptions live
+ * here: team-scoped, admin-only, and driven by the same session cookie as the
+ * rest of the app. It is a second instance rather than a path off `appClient`
+ * because the prefix is a different framework-mounted surface, not one of the
+ * application's own models.
+ */
+export const developersClient = ky.create({
+  prefix: '/developers/',
+  retry: 0,
+})
+
 /** The pagination object every list endpoint returns beside its records. */
 export type Pagination = {
   page: number

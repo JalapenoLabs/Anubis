@@ -138,6 +138,14 @@ Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts
 
 The `/api/v1` handlers answer the same questions with a bearer token instead of a session: `ApiCaller` resolves the token to its team, `load_for_team` walks the chain in one comparison, and `ApiCaller::require` authorizes against the same `RoleSet`. [api.md](api.md#application-models) states what a token's roles are and why.
 
+### Outgoing webhooks
+
+Every generated model publishes its lifecycle. `routes.rs` declares three event types (`<model>.created`, `<model>.updated`, `<model>.destroyed`) and the three shared functions emit them: `insert_record`, `apply_changes`, and `delete_record`. Emission lives in the shared half deliberately, so a record written through the browser and one written through a bearer token produce byte-identical events, and a column `scaffold field` adds reaches subscribers with no second declaration.
+
+Each of those functions wraps its write, its association reconciliation, and its emission in one transaction, which is what makes the event exactly as durable as the row: a rollback sends nothing, and a commit never loses its webhook. `anubis::webhooks::emit` takes the connection for that reason.
+
+`scaffold field` needs no new anchor for any of this, because the emission sits inside functions the field anchors already live in, and the payload is the `<Model>View` a field joins anyway. The generated narrative subscribes an endpoint, writes the record, and asserts the delivery rows land with the right event types and payload; it stops there, because a real HTTP delivery would need a listener, and `anubis/tests/webhooks_flow.rs` proves that half against one.
+
 ### The two surfaces of a generated model
 
 Each model's `routes.rs` carries both surfaces and one implementation. Everything above the query is authorization, and that is the only thing the two do differently, so the file holds three shared functions (`list_page`, `insert_record`, `apply_changes`) that both sets of handlers call. They are where the per-field anchors for normalization and struct literals live.
@@ -170,7 +178,7 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 
 | Command | Purpose |
 |---|---|
-| `anubis new <name>` | Stamp a new application from the starter template |
+| `anubis new <name> [--license mit]` | Stamp a new application from the starter template |
 | `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold |
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
 | `anubis scaffold join <JoinModel> <a_id{class_name=A}> <b_id{class_name=B}>` | Join model for has-many-through |
@@ -179,8 +187,9 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 | `anubis routes` | Print the route table |
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
+| `anubis secret generate` | Print a fresh `ANUBIS_SECRET_KEY` |
 
-`anubis new`, `anubis routes`, `anubis doctor`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, and `anubis scaffold oauth` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, `anubis secret generate`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, and `anubis scaffold oauth` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
@@ -356,7 +365,7 @@ The model's narrative test gains the wire shape through the create request and i
 
 ### The view struct
 
-Every scaffolded model's `routes.rs` carries a `<Model>View`, a `serde(flatten)` wrapper around the record. With no associations it serializes exactly as the table does, so it costs nothing; an association adds its ids to it. That is what makes one form able to read and write the same shape, and it is the seed of the serializer the `/api/v1` work will share with webhooks.
+Every scaffolded model's `routes.rs` carries a `<Model>View`, a `serde(flatten)` wrapper around the record. With no associations it serializes exactly as the table does, so it costs nothing; an association adds its ids to it. That is what makes one form able to read and write the same shape, and it is the serializer all three consumers share: the account UI, `/api/v1`, and the payload of every [outgoing webhook](webhooks.md) the model emits.
 
 ### Deferred: `super_select` without `_ids`
 
@@ -465,7 +474,21 @@ The engine does no file I/O; the CLI is its thin filesystem shell. That split ke
 
 ## How `anubis new` works
 
-The starter tree is embedded into the `anubis` binary at build time, so stamping is offline and always matches the installed framework version. Stamping rewrites the app name across every path and file, then overlays the files that make the result a standalone repository: a workspace `Cargo.toml` carrying the framework's lint bar, a standalone `backend/Cargo.toml`, a root `package.json`, `.yarnrc.yml`, `.gitignore`, `README.md`, and the toolchain and clippy pins. Until the crate and npm package are published, stamped apps depend on the framework from its git repository (Cargo git dependency; yarn `#workspace=` git protocol). A drift-gate test pins the overlay's dependency versions to the framework workspace.
+The starter tree is embedded into the `anubis` binary at build time, so stamping is offline and always matches the installed framework version. Stamping rewrites the app name across every path and file, then overlays the files that make the result a standalone repository: a workspace `Cargo.toml` carrying the framework's lint bar, a standalone `backend/Cargo.toml`, a root `package.json`, `.yarnrc.yml`, `.gitignore`, `README.md`, `.env.example`, `.github/workflows/ci.yml`, and the toolchain and clippy pins. Until the crate and npm package are published, stamped apps depend on the framework from its git repository (Cargo git dependency; yarn `#workspace=` git protocol). Drift-gate tests pin the overlay's dependency versions to the framework workspace, the CI template's tool versions to this repository's workflow, and the `.env.example` overlay to the one this repository runs on.
+
+The stamped workflow holds the application to the framework's own bar, on GitHub-hosted runners: see [ci.md](ci.md#ci-for-stamped-applications).
+
+### Development configuration
+
+A stamped app configures development through one file. `.env.example` is committed and holds development values; `yarn dev` copies it to `.env` when there is none, then loads it, and passes it to `docker compose --env-file .env`. The database credentials therefore live in exactly one place: compose interpolates them (with the same values as defaults, so a bare `docker compose up` still works) and the backend reads `DATABASE_URL` from the same file. The database is named after the application, and each stamp mints its own development password, so no two applications ship the same default.
+
+### License
+
+Applications are private by default: `"license": "UNLICENSED"` in `package.json` and no LICENSE file. `anubis new <name> --license mit` writes an MIT LICENSE stamped with the current year and a placeholder for the copyright holder, and sets the manifest field to match.
+
+### Lockfiles
+
+Templates ship no lockfiles, and the application pins by committing `Cargo.lock` and `yarn.lock` with its first commit. Shipping a lockfile in a template pins the app to whatever the framework's own tree resolved on the day it was released, including entries for dependencies the app does not have, and it goes stale between releases in a way nothing checks. What the framework does pin exactly is the layer under the lockfiles: `rust-toolchain.toml`, `packageManager`, and the dependency versions in the stamped manifests, which the drift gate keeps equal to the versions the starter is tested against. Between a stamp and the first install, a caret range can therefore resolve a patch or minor the starter never saw; the stamped CI runs `yarn install --immutable`, so once that first commit exists the app is pinned and any later drift is a deliberate update.
 
 ## Route visibility
 
@@ -480,7 +503,7 @@ Backend, implemented today:
 - Entry in `roles.yml` permission grants, and the regenerated frontend permissions module
 - Account CRUD handlers, routes wired into the router, and the model's integration test
 - `/api/v1` CRUD handlers with utoipa registrations, mounted and merged into the application's OpenAPI document, and proven by the `/api/v1` half of that same test
-- A serializer (`<Model>View`) shared by both surfaces and by the published document, and by outgoing webhooks when they land
+- A serializer (`<Model>View`) shared by both surfaces, by the published document, and by the model's outgoing webhooks
 
 Frontend, implemented today:
 

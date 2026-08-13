@@ -141,6 +141,27 @@ fn retry_after_seconds(retry_after: Duration) -> u64 {
     rounded_up.max(1)
 }
 
+impl From<diesel::result::Error> for ApiError {
+    /// Renders a failed query as a `500`, logging the cause on the way.
+    ///
+    /// This exists so a handler can run its writes inside a Diesel
+    /// transaction, whose error type must be `From<diesel::result::Error>`,
+    /// and still answer with the framework's one error shape. Generated
+    /// handlers do exactly that: the record, its associations, and the
+    /// outgoing webhook it emits all commit together or not at all.
+    ///
+    /// It logs rather than dropping the cause, because
+    /// [`ApiError::internal`]'s body is deliberately generic and the
+    /// response's `x-request-id` is the only thread back to this line.
+    fn from(source: diesel::result::Error) -> Self {
+        tracing::error!(
+            error.message = %source,
+            "a database query failed: {{error.message}}",
+        );
+        Self::internal()
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     message: &'a str,
@@ -379,6 +400,19 @@ mod tests {
         assert_eq!(
             ApiError::unavailable("not ready").status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn a_failed_query_becomes_a_generic_internal_error() {
+        let error = ApiError::from(diesel::result::Error::NotFound);
+
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.message(), ApiError::internal().message());
+        assert!(
+            !error.message().contains("NotFound"),
+            "the cause belongs in the log, not the body: {}",
+            error.message(),
         );
     }
 

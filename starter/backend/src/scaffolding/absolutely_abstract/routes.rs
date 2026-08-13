@@ -32,13 +32,24 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use super::model::{CreativeConcept, CreativeConceptChanges, MODEL, NewCreativeConcept, SORTABLE};
 use crate::schema::creative_concepts;
+
+/// The event types this model publishes to outgoing webhooks.
+///
+/// `<model>.<action>` in snake case, the model singular, which is the
+/// convention `anubis::webhooks` documents and a team subscribes to by name.
+/// The payload is the same `CreativeConceptView` the endpoints below answer
+/// with, so a receiver reading the published OpenAPI document already knows
+/// the shape.
+const CREATED_EVENT: &str = "creative_concept.created";
+const UPDATED_EVENT: &str = "creative_concept.updated";
+const DESTROYED_EVENT: &str = "creative_concept.destroyed";
 
 /// Returns the creative concept routes, mounted under `/account`.
 pub fn router(pool: DbPool, roles: RoleSet) -> Router {
@@ -273,23 +284,31 @@ async fn insert_record(
         .filter(|value| !value.is_empty());
     // 🐺 anubis:create-normalize
 
-    let record: CreativeConcept = diesel::insert_into(creative_concepts::table)
-        .values(NewCreativeConcept {
-            // The team comes from the route or the token, never from the body.
-            team_id,
-            name,
-            description,
-            // 🐺 anubis:insert-values
-        })
-        .returning(CreativeConcept::as_returning())
-        .get_result(connection)
-        .await
-        .map_err(log_internal)?;
-    // 🐺 anubis:create-associations
+    // The record, its associations, and the event they produce share one
+    // transaction, so a webhook is exactly as durable as the row that caused
+    // it: a rollback sends nothing, and a commit never loses its event. That
+    // is what a queue in Postgres buys, and why emission takes a connection.
+    connection
+        .transaction::<CreativeConceptView, ApiError, _>(async |connection| {
+            let record: CreativeConcept = diesel::insert_into(creative_concepts::table)
+                .values(NewCreativeConcept {
+                    // The team comes from the route or the token, never from
+                    // the body.
+                    team_id,
+                    name,
+                    description,
+                    // 🐺 anubis:insert-values
+                })
+                .returning(CreativeConcept::as_returning())
+                .get_result(connection)
+                .await?;
+            // 🐺 anubis:create-associations
 
-    CreativeConceptView::one(connection, record)
+            let creative_concept = CreativeConceptView::one(connection, record).await?;
+            anubis::webhooks::emit(connection, team_id, CREATED_EVENT, &creative_concept).await?;
+            Ok(creative_concept)
+        })
         .await
-        .map_err(log_internal)
 }
 
 /// Applies a submitted change to one creative concept.
@@ -310,32 +329,61 @@ async fn apply_changes(
     let description = optional_text(body.description.as_deref());
     // 🐺 anubis:update-normalize
 
-    // Associations are reconciled before the columns, so a request that only
-    // changes an association still takes effect.
-    // 🐺 anubis:update-associations
+    let team_id = record.team_id;
 
-    let changes = CreativeConceptChanges {
-        name,
-        description,
-        // 🐺 anubis:changeset-values
-    };
-    if changes.is_empty() {
-        return CreativeConceptView::one(connection, record)
-            .await
-            .map_err(log_internal);
-    }
+    connection
+        .transaction::<CreativeConceptView, ApiError, _>(async |connection| {
+            // Associations are reconciled before the columns, so a request that
+            // only changes an association still takes effect.
+            // 🐺 anubis:update-associations
 
-    let updated: CreativeConcept =
-        diesel::update(creative_concepts::table.filter(creative_concepts::id.eq(record.id)))
-            .set(changes)
-            .returning(CreativeConcept::as_returning())
-            .get_result(connection)
-            .await
-            .map_err(log_internal)?;
+            let changes = CreativeConceptChanges {
+                name,
+                description,
+                // 🐺 anubis:changeset-values
+            };
+            let creative_concept = if changes.is_empty() {
+                CreativeConceptView::one(connection, record).await?
+            } else {
+                let updated: CreativeConcept = diesel::update(
+                    creative_concepts::table.filter(creative_concepts::id.eq(record.id)),
+                )
+                .set(changes)
+                .returning(CreativeConcept::as_returning())
+                .get_result(connection)
+                .await?;
+                CreativeConceptView::one(connection, updated).await?
+            };
 
-    CreativeConceptView::one(connection, updated)
+            // Emitted even when the change set was empty, because an
+            // association reconciled above is a change the columns cannot see.
+            anubis::webhooks::emit(connection, team_id, UPDATED_EVENT, &creative_concept).await?;
+            Ok(creative_concept)
+        })
         .await
-        .map_err(log_internal)
+}
+
+/// Deletes one creative concept, and tells the team's webhook endpoints.
+///
+/// The record is serialized before it is deleted, so the event carries the
+/// creative concept as it last stood rather than an id and nothing else.
+async fn delete_record(
+    connection: &mut AsyncPgConnection,
+    record: CreativeConcept,
+) -> Result<(), ApiError> {
+    let team_id = record.team_id;
+    let record_id = record.id;
+
+    connection
+        .transaction::<(), ApiError, _>(async |connection| {
+            let creative_concept = CreativeConceptView::one(connection, record).await?;
+            diesel::delete(creative_concepts::table.filter(creative_concepts::id.eq(record_id)))
+                .execute(connection)
+                .await?;
+            anubis::webhooks::emit(connection, team_id, DESTROYED_EVENT, &creative_concept).await?;
+            Ok(())
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -410,11 +458,7 @@ async fn destroy(
         load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
-    diesel::delete(creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
+    delete_record(&mut connection, creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -573,11 +617,7 @@ async fn api_destroy(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let creative_concept = load_for_token(&mut connection, &caller, creative_concept_id).await?;
 
-    diesel::delete(creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
+    delete_record(&mut connection, creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

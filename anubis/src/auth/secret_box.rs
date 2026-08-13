@@ -44,6 +44,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_PAD_INDIFFERENT, URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Bytes in an AES-256 key.
 const KEY_BYTES: usize = 32;
@@ -98,11 +99,15 @@ impl SecretKey {
     /// to exactly 32 bytes. The error never quotes the input, so it is safe to
     /// log.
     pub fn from_base64(encoded: &str) -> Result<Self, Error> {
-        let decoded = STANDARD_PAD_INDIFFERENT
-            .decode(encoded.trim())
-            .map_err(|_error| Error::new("the key is not valid base64".to_owned()))?;
+        // The decoded buffer holds the raw key, so it is cleared on the way
+        // out rather than left in freed memory.
+        let decoded = Zeroizing::new(
+            STANDARD_PAD_INDIFFERENT
+                .decode(encoded.trim())
+                .map_err(|_error| Error::new("the key is not valid base64".to_owned()))?,
+        );
 
-        let bytes: [u8; KEY_BYTES] = decoded.try_into().map_err(|decoded: Vec<u8>| {
+        let bytes: [u8; KEY_BYTES] = decoded.as_slice().try_into().map_err(|_error| {
             Error::new(format!(
                 "the key must decode to exactly {KEY_BYTES} bytes, got {}",
                 decoded.len()
@@ -143,6 +148,18 @@ impl SecretKey {
 impl Debug for SecretKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("SecretKey(...)")
+    }
+}
+
+impl Drop for SecretKey {
+    /// Clears the key bytes when this copy goes away.
+    ///
+    /// Defense in depth, not a guarantee: the key is `Clone`, and AES-GCM
+    /// keeps its own expanded copy for the length of a call. What this buys is
+    /// that a parsed key does not linger in freed memory for the life of the
+    /// process, which is the window a core dump or a reused page would expose.
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 

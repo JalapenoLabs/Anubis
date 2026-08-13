@@ -12,6 +12,7 @@ import { ClaimInvitationPage } from './pages/ClaimInvitationPage'
 import { CreativeConceptPage } from './pages/CreativeConceptPage'
 import { CreativeConceptsPage } from './pages/CreativeConceptsPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { DevelopersPage } from './pages/developers/DevelopersPage'
 import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
 import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
@@ -111,6 +112,14 @@ export function App() {
       element={
         <Workspace>
           <TeamSettingsPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.teamDevelopers}
+      element={
+        <Workspace>
+          <DevelopersPage />
         </Workspace>
       }
     />

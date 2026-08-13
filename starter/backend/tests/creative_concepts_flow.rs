@@ -287,3 +287,117 @@ async fn the_creative_concept_slice_serves_full_crud() {
     let (status, _body) = send_as_token(&router, "GET", &api_member, None, Some(&token)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Every write publishes its event to the team's webhook endpoints.
+///
+/// The assertions stop at the delivery row, which is where the model's own
+/// responsibility ends: emitting inside the write's transaction, with the same
+/// serialized shape the endpoints answer with. Signing the request and posting
+/// it is the framework's job, driven by a worker no test binary runs, and
+/// `anubis/tests/webhooks_flow.rs` proves that half against a real listener.
+#[tokio::test]
+async fn writing_a_creative_concept_queues_a_webhook_delivery() {
+    let Some((router, _outbox)) = boot().await else {
+        eprintln!("skipping creative_concepts_flow webhook test: DATABASE_URL is not set");
+        return;
+    };
+
+    let run = Uuid::new_v4();
+    let owner_cookie = register(
+        &router,
+        &format!("creative-concept-hooks-{run}@example.com"),
+    )
+    .await;
+    let team_id = bootstrapped_team(&router, &owner_cookie).await;
+
+    // Subscribe to the model's whole lifecycle. The secret is shown once here
+    // and nowhere else, which is what makes signing verifiable at the receiver.
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/developers/teams/{team_id}/webhook-endpoints"),
+        Some(&json!({
+            "url": "https://receiver.example.com/anubis",
+            "description": "Creative concept lifecycle",
+            "event_types": [
+                "creative_concept.created",
+                "creative_concept.updated",
+                "creative_concept.destroyed",
+            ],
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert!(
+        body["secret"]
+            .as_str()
+            .is_some_and(|secret| secret.starts_with("whsec_")),
+        "the signing secret is returned exactly once: {body}",
+    );
+    let endpoint_id = body["webhook_endpoint"]["id"]
+        .as_str()
+        .expect("the response carries the endpoint")
+        .to_owned();
+    let deliveries_path =
+        format!("/developers/teams/{team_id}/webhook-endpoints/{endpoint_id}/deliveries");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/account/teams/{team_id}/creative-concepts"),
+        Some(&json!({ "name": "Signal fire" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let creative_concept_id = body["creative_concept"]["id"]
+        .as_str()
+        .expect("the response carries the record")
+        .to_owned();
+    let member_path = format!("/account/creative-concepts/{creative_concept_id}");
+
+    let (status, _body) = send(
+        &router,
+        "PATCH",
+        &member_path,
+        Some(&json!({ "name": "Signal fire mark II" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _body) = send(&router, "DELETE", &member_path, None, Some(&owner_cookie)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Newest first, so the log reads backwards through the record's life.
+    let (status, body) = send(&router, "GET", &deliveries_path, None, Some(&owner_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let deliveries = body["webhook_deliveries"]
+        .as_array()
+        .expect("the plural key carries the deliveries");
+    let events: Vec<&str> = deliveries
+        .iter()
+        .filter_map(|delivery| delivery["event_type"].as_str())
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "creative_concept.destroyed",
+            "creative_concept.updated",
+            "creative_concept.created",
+        ],
+        "every write publishes its event: {body}",
+    );
+
+    // The payload is the record as the endpoints serialize it, not an id.
+    let created = deliveries.last().expect("the create is the oldest");
+    assert_eq!(created["status"], json!("pending"));
+    assert_eq!(created["attempts"], json!(0));
+    assert_eq!(created["payload"]["id"], json!(creative_concept_id));
+    assert_eq!(created["payload"]["name"], json!("Signal fire"));
+    assert_eq!(
+        deliveries[0]["payload"]["name"],
+        json!("Signal fire mark II"),
+        "the destroy carries the record as it last stood: {body}",
+    );
+}

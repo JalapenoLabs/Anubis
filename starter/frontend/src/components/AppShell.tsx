@@ -29,7 +29,12 @@ import { Breadcrumbs } from './Breadcrumbs'
 import { CreateOrganizationModal } from './tenancy/CreateOrganizationModal'
 
 // Misc
-import { UrlTree, getOrganizationSettingsUrl, getTeamSettingsUrl } from '../urls'
+import {
+  UrlTree,
+  getOrganizationSettingsUrl,
+  getTeamDevelopersUrl,
+  getTeamSettingsUrl,
+} from '../urls'
 
 type Props = {
   user: User
@@ -166,6 +171,17 @@ export function AppShell(props: Props) {
             }</Link>
         </NavbarItem>
         {/* 🐺 anubis:nav */}
+        { current
+          ? <NavbarItem>
+              <Link
+                to={getTeamDevelopersUrl(current.team.id)}
+                className='opacity-80 hover:opacity-100'
+              >{
+                  t('developers.navLink')
+                }</Link>
+            </NavbarItem>
+          : null
+        }
         { current
           ? <NavbarItem>
               <Link

@@ -39,6 +39,7 @@ lettre = { workspace = true }
 openidconnect = { workspace = true }
 qrcode = { workspace = true }
 redis = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
@@ -55,6 +56,7 @@ utoipa = { workspace = true }
 utoipa-scalar = { workspace = true }
 uuid = { workspace = true }
 webauthn-rs = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # Integration tests are their own crates, so the websocket test needs its own

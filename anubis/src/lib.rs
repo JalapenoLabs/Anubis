@@ -27,6 +27,7 @@ pub mod server;
 pub mod spa;
 pub mod telemetry;
 pub mod tenancy;
+pub mod webhooks;
 
 /// The version of the Anubis framework, matching the crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

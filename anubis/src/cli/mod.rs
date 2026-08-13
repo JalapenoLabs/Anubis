@@ -10,3 +10,4 @@ pub(crate) mod doctor;
 pub(crate) mod new;
 pub(crate) mod routes;
 pub(crate) mod scaffold;
+pub(crate) mod secret;

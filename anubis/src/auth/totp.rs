@@ -6,7 +6,7 @@
 //! RFC 4648 as `otpauth://` URIs expect.
 
 use data_encoding::BASE32_NOPAD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 /// Seconds per code, the authenticator-app default.

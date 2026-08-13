@@ -81,10 +81,18 @@ Both tables are ordinary Postgres tables and are meant to be queried:
 - `jobs` is work that still has to happen. `attempts`, `run_at`, and `last_error` say where a struggling job stands.
 - `dead_jobs` is work that will not happen without a person. `failed_at` and `enqueued_at` bracket how long it tried.
 
+## The framework's own jobs
+
+| Job | Queue | What it does |
+|---|---|---|
+| `anubis::webhooks::DeliverWebhook` | `webhooks` | POSTs one signed outgoing webhook delivery, recording the answer on its row |
+
+Registering it is three lines on the worker builder, and the starter's `main.rs` shows them. It runs on its own queue so a customer endpoint that hangs for ten seconds cannot hold up an application's own work. [Outgoing webhooks](webhooks.md) covers the rest.
+
 ## Roadmap
 
 Tracked in GitHub issues under M5:
 
-- Framework jobs of its own: outgoing webhook delivery and SMTP mail send through this queue.
-- Recurring schedules, for maintenance work such as pruning expired sessions and tokens.
+- SMTP mail send through this queue.
+- Recurring schedules, for maintenance work such as pruning expired sessions, tokens, and delivered webhooks.
 - An in-app view of pending and dead jobs, sharing the webhook debugging UI.

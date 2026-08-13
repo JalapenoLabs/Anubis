@@ -34,7 +34,10 @@ diesel_migrations = "2.3"
 # Stream and sink combinators the websocket and Redis pub/sub loops need.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.4"
-hmac = "0.12"
+# HMAC for TOTP codes and outgoing webhook signatures. Pinned to the line that
+# rides `digest` 0.11, the same generation as `sha1` and `sha2` below, so one
+# Mac type covers both hashes.
+hmac = "0.13"
 http-body-util = "0.1"
 # Decoders limited to formats browsers actually upload.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
@@ -65,10 +68,14 @@ redis = { version = "1.5", default-features = false, features = [
   "tokio-comp",
   "tokio-rustls-comp",
 ] }
+# The outgoing webhook delivery client. Defaults link native TLS, so the set is
+# spelled out and matches what `openidconnect` already builds on: rustls, no
+# OpenSSL, and no second copy of the client in the tree.
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
@@ -95,6 +102,9 @@ webauthn-rs = { version = "=0.6.1-dev", features = [
   # Username-less (discoverable) login, the password-manager passkey flow.
   "conditional-ui",
 ] }
+# Clears key material from memory on drop. Already in the tree under aes-gcm;
+# named here because `anubis::auth::secret_box` uses it directly.
+zeroize = "1"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

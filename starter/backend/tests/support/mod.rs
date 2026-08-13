@@ -54,10 +54,16 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
             "/tenancy",
             anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
         )
-        // Where a narrative mints the bearer token its `/api/v1` half uses.
+        // Where a narrative mints the bearer token its `/api/v1` half uses,
+        // and where it subscribes the webhook endpoint whose deliveries prove
+        // the model emits its events.
         .nest(
             "/developers",
             anubis::api::management::router(pool.clone(), roles.clone()),
+        )
+        .nest(
+            "/developers",
+            anubis::webhooks::router(pool.clone(), roles.clone(), &config),
         )
         .nest(
             "/api/v1",

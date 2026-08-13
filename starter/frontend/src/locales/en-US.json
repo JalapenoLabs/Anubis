@@ -298,5 +298,51 @@
     "welcomeBody": "This dashboard is the blank canvas. Scaffold your first model and it will show up in the navigation.",
     "unverifiedBanner": "Confirm your email address to secure your account. Check your inbox for the link.",
     "resendVerification": "Re-send verification email"
+  },
+  "developers": {
+    "navLink": "Developers",
+    "title": "Developers",
+    "subtitle": "Integrations for {{team}}: where this team’s events are sent.",
+    "webhooks": {
+      "title": "Outgoing webhooks",
+      "subtitle": "Subscribe an HTTPS endpoint to event types and we will POST every matching event to it, signed with your endpoint’s secret.",
+      "url": "Endpoint",
+      "events": "Events",
+      "active": "Active",
+      "empty": "No endpoints yet. Subscribe one below.",
+      "viewDeliveries": "Deliveries",
+      "adminOnly": "Only a team admin can subscribe or remove endpoints.",
+      "urlLabel": "Endpoint URL",
+      "urlHelp": "Must be https outside development.",
+      "descriptionLabel": "Description",
+      "eventsLabel": "Event types",
+      "eventsHelp": "One per line, or separated by commas. Each is <model>.created, <model>.updated, or <model>.destroyed.",
+      "subscribeAction": "Subscribe endpoint",
+      "secret": {
+        "title": "Your signing secret",
+        "subtitle": "Copy it now. It is stored encrypted and never shown again; sign every request body with it to verify the delivery came from us.",
+        "copy": "Copy",
+        "copied": "Copied",
+        "acknowledge": "I have saved it"
+      },
+      "deliveries": {
+        "title": "Deliveries",
+        "event": "Event",
+        "status": "Status",
+        "attempts": "Attempts",
+        "response": "Response",
+        "lastError": "Last error",
+        "sentAt": "Queued",
+        "redeliver": "Redeliver",
+        "close": "Close",
+        "empty": "Nothing has been delivered to this endpoint yet.",
+        "statuses": {
+          "pending": "Pending",
+          "delivered": "Delivered",
+          "failed": "Failed",
+          "dead": "Given up"
+        }
+      }
+    }
   }
 }

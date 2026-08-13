@@ -25,6 +25,14 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
 
+### Secrets at rest and key rotation
+
+`ANUBIS_SECRET_KEY` is base64 for exactly 32 random bytes. `anubis secret generate` prints one, and `anubis doctor` warns when the variable is unset (the public development key is in use) and fails when it holds something that cannot be a key.
+
+Rotating the key is a one-way door: every value sealed under the old one stops opening, which is what makes stolen ciphertext worthless the moment the key is replaced. In practice that means TOTP enrollments are discarded and those users enroll a second factor again, and any other sealed secret is reissued. Treat a rotation as user communication, not just a deploy.
+
+Rotating without that cost needs a dual-key read path: a second variable holding the previous key, tried when the current one fails, so values re-seal under the new key as they are read. That is future work; today there is one key.
+
 ## Frontend
 
 | Concern | Choice |
@@ -90,4 +98,4 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)).
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)) and outgoing webhooks (see [webhooks.md](webhooks.md)).

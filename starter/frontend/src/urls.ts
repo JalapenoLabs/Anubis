@@ -14,6 +14,13 @@ export const UrlTree = {
   settingsProfile: '/settings/profile',
   settingsSecurity: '/settings/security',
   teamSettings: '/teams/:teamId/settings',
+  /**
+   * The team's Developers section.
+   *
+   * Not `/developers`: the backend reserves that prefix for the API itself, so
+   * a client route under it would answer JSON on a cold load.
+   */
+  teamDevelopers: '/teams/:teamId/developers',
   organizationSettings: '/organizations/:organizationId/settings',
   claimInvitation: '/claim-invitation',
   creativeConcepts: '/creative-concepts',
@@ -110,6 +117,10 @@ export function getOauthStartUrl(provider: string, destination: string | null | 
 
 export function getTeamSettingsUrl(teamId: string): string {
   return UrlTree.teamSettings.replace(':teamId', teamId)
+}
+
+export function getTeamDevelopersUrl(teamId: string): string {
+  return UrlTree.teamDevelopers.replace(':teamId', teamId)
 }
 
 export function getOrganizationSettingsUrl(organizationId: string): string {

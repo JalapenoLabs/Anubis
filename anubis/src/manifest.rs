@@ -351,6 +351,38 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/developers/teams/{team_id}/platform-applications/{application_id}/rotate-token",
         area: "developers",
     },
+    // Outgoing webhook subscriptions and their delivery log.
+    RouteEntry {
+        method: "GET",
+        path: "/developers/teams/{team_id}/webhook-endpoints",
+        area: "developers",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/developers/teams/{team_id}/webhook-endpoints",
+        area: "developers",
+    },
+    RouteEntry {
+        method: "PATCH",
+        path: "/developers/teams/{team_id}/webhook-endpoints/{endpoint_id}",
+        area: "developers",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/developers/teams/{team_id}/webhook-endpoints/{endpoint_id}",
+        area: "developers",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/developers/teams/{team_id}/webhook-endpoints/{endpoint_id}/deliveries",
+        area: "developers",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/developers/teams/{team_id}/webhook-endpoints/{endpoint_id}/deliveries/\
+                {delivery_id}/redeliver",
+        area: "developers",
+    },
     // API contract endpoints. The versioned operations themselves come from
     // the OpenAPI document and are merged in by the CLI.
     RouteEntry {
@@ -431,6 +463,10 @@ roles:
             .nest(
                 "/developers",
                 crate::api::management::router(pool.clone(), roles.clone()),
+            )
+            .nest(
+                "/developers",
+                crate::webhooks::router(pool.clone(), roles.clone(), &config),
             )
             .nest("/api/v1", crate::api::v1::router(pool.clone()))
             .layer(crate::guard::layer(pool, roles))

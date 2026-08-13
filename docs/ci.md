@@ -29,6 +29,17 @@ Both jobs end with a vulnerability audit: `cargo audit` against RustSec advisori
 
 `cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The runners keep `~/.cargo/bin` between runs, so only the first run on a fresh runner pays the few minutes it takes to compile.
 
+## CI for stamped applications
+
+`anubis new` stamps `.github/workflows/ci.yml` from `anubis/templates/new/github-ci.yml`, so an application arrives with the same bar the framework holds itself to. Two things differ, both because a stamped app is not on the Jalapeno Labs fleet:
+
+- `runs-on: ubuntu-latest`, with `Swatinem/rust-cache` standing in for the warm target dir a self-hosted runner keeps.
+- The drift checks run the `anubis` CLI, installed with `cargo install anubis --git https://github.com/JalapenoLabs/Anubis.git --locked`, because the CLI is a framework binary rather than one of the application's. It becomes `cargo install anubis --version <x>` once the crate is published.
+
+The application's drift checks are the two that belong to it: `frontend/src/roles.generated.ts` from its own `config/roles.yml`, and `frontend/src/api/v1.generated.ts` from the document its binary exports. Its Postgres service is named after the app and takes an ephemeral host port, exactly as the framework's does.
+
+A test pins the template's tool versions to this repository's workflow, so bumping Postgres, Rust, Node, or Yarn here reaches every application stamped afterwards.
+
 ## Version pinning
 
 Every toolchain version is pinned and must stay in sync:
