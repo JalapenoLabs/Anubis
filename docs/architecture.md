@@ -11,12 +11,13 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Language | Rust (pinned toolchain) | World-class, idiomatic Rust throughout |
 | Async runtime | tokio | The entire backend is async |
 | Web framework | Axum | Maintained by the tokio team; sits on hyper + tower |
-| Middleware | tower / tower-http | Sessions, auth guards, tracing, CORS, compression |
+| Middleware | tower / tower-http | Sessions, auth guards, per-client rate limits, tracing, CORS, compression |
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
 | Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
 | Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
 | Background jobs | Postgres-backed queue | Enqueue commits in the same transaction as the domain write that caused it. At-least-once, retried on a widening backoff, then dead-lettered. See [jobs.md](jobs.md) |
 | Passwords | argon2id | |
+| Abuse limits | In-process GCRA, per client and per email recipient | Budgets on the auth endpoints, answering `429` with `Retry-After`. Bounded memory, no Redis, and therefore per instance. See [api.md](api.md#rate-limiting) |
 | Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
 | OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; providers are added via `anubis scaffold oauth <provider>` and two environment variables. See [api.md](api.md#oauth-sign-in) |
 | Outgoing email | SMTP via `lettre` (tokio + rustls, no native TLS) | One `Mailer` service with log, test, and SMTP backends, selected by `SMTP_URL`. See [email.md](email.md) |
@@ -63,7 +64,20 @@ Scaffolding a model or field regenerates the contract; anything the frontend mus
 
 ## Deployment
 
-The target: a production deployment is one static Rust binary serving the API and the built SPA assets, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere. Serving the SPA from the binary is not implemented yet (tracked in GitHub issues, M5), so today the frontend requires its own static host.
+A production deployment is one Rust binary serving the API and the built SPA, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere.
+
+`SPA_DIR` points the binary at the frontend's build output and is the whole switch:
+
+```sh
+yarn workspace anubis-starter-frontend build
+SPA_DIR=starter/frontend/dist cargo run -p anubis-starter
+```
+
+The assets mount as the router's fallback, so the API keeps precedence without a route list: every path a mounted router claims is answered by that router, and everything else resolves to the SPA. Files under `assets/` carry content hashes, so they are served with a one-year `immutable` `Cache-Control`; `index.html`, which names them, is served with `no-cache`, so a deploy is live on the next page load. Any other path serves `index.html` too, which is what makes a cold load of a client-side route work.
+
+Paths under the framework's own prefixes (`/api`, `/auth`, `/developers`, `/tenancy`, `/users`) are the exception: an unmatched path there answers the API's JSON `404` rather than the SPA, because HTML with a `200` turns a routing mistake into a parse error far from its cause. Applications reserve their own prefixes the same way; the starter reserves `/account`.
+
+Leaving `SPA_DIR` unset serves the API alone, which is both the development default (Vite owns the browser there) and a supported production shape for a frontend hosted on a CDN. Production logs a warning when it is unset. When it is set, the directory is validated at startup, so a deploy that shipped without a build fails immediately instead of at the first page load.
 
 ## Roadmap
 

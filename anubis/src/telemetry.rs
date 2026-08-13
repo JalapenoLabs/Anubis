@@ -11,7 +11,7 @@
 //! process. Because it is the first thing with both a live subscriber and the
 //! configuration in hand, [`init`] also announces configuration that is fine
 //! locally and costly in a live deployment: the built-in `ANUBIS_SECRET_KEY`
-//! fallback, and a production deployment with no mail relay.
+//! fallback, and a production deployment with no mail relay or no frontend.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -53,6 +53,18 @@ fn warn_about_risky_defaults(config: &AppConfig) {
             "ANUBIS_SECRET_KEY is unset: secrets at rest are encrypted with the built-in \
              development key, which is public. Set ANUBIS_SECRET_KEY before storing anything \
              real. (environment: {{app.environment}})",
+        );
+    }
+
+    // An API-only deployment is a legitimate shape, so this is a warning: the
+    // frontend may well live behind a CDN. It is still the likeliest reason a
+    // fresh production deploy answers every page with a 404.
+    if config.spa_dir.is_none() && config.environment.is_production() {
+        tracing::warn!(
+            app.environment = %config.environment,
+            "SPA_DIR is unset: this binary serves the API only and no frontend. Point it at the \
+             built frontend (for example SPA_DIR=frontend/dist) unless the SPA is hosted \
+             elsewhere. (environment: {{app.environment}})",
         );
     }
 

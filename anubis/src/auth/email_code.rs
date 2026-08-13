@@ -6,6 +6,10 @@
 //! email + code for a session; codes live ten minutes, die after a handful
 //! of wrong attempts, and are single-use. An account with a confirmed second
 //! factor still gets the MFA challenge: an inbox alone never bypasses TOTP.
+//!
+//! Both routes carry a per-client budget from [`crate::rate_limit`], and the
+//! request route also charges the address it would mail, so rotating client
+//! addresses cannot bomb one inbox.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -22,12 +26,19 @@ use crate::auth::user_token::TokenPurpose;
 use crate::auth::{mfa, user_token};
 use crate::http::ApiError;
 use crate::mail::Email;
+use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
 
-pub(crate) fn router() -> Router<AuthState> {
+pub(crate) fn router(rate_limit: &RateLimiter) -> Router<AuthState> {
     Router::new()
-        .route("/email-code/request", post(request_code))
-        .route("/email-code/verify", post(verify_code))
+        .route(
+            "/email-code/request",
+            post(request_code).layer(rate_limit.layer(Budget::EmailPerClient)),
+        )
+        .route(
+            "/email-code/verify",
+            post(verify_code).layer(rate_limit.layer(Budget::Credentials)),
+        )
 }
 
 #[derive(Deserialize)]
@@ -45,6 +56,11 @@ async fn request_code(
     Json(body): Json<RequestBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let email = validate_email(&body.email)?;
+
+    // Charged before the lookup, so the answer cannot depend on whether the
+    // address belongs to an account, and so an attacker rotating client
+    // addresses still meets one budget per inbox.
+    state.rate_limit.check_recipient(&email)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let user: Option<User> = users::table

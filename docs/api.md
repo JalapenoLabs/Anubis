@@ -48,6 +48,29 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 
 Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.
 
+## Rate limiting
+
+Tokens are attempt-limited individually, but the endpoints that accept them would otherwise take attempts at network speed. The framework gives each client a balance on the endpoints an attacker can drive without credentials, and answers `429 Too Many Requests` with a `Retry-After` header once it is spent. The body is the standard error shape, and its message names only the wait: which budget tripped, and whether the account or address involved exists, stay invisible.
+
+| Endpoint | Budget | Keyed by |
+|---|---|---|
+| `POST /auth/login`, `POST /auth/mfa/verify`, `POST /auth/email-code/verify` | 10 per minute | Client address |
+| `POST /auth/register` | 10 per hour | Client address |
+| `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /auth/verify-email/request` | 20 per hour | Client address |
+| `POST /auth/password-reset/request`, `POST /auth/email-code/request` | 5 per hour | Target email address |
+
+Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on.
+
+The mail endpoints carry two budgets because the two abuses differ. A client hammering the endpoint is caught per address; a campaign rotating addresses to bomb one inbox is caught per recipient, which is why that budget is the tighter of the two. The recipient is charged before the account lookup and only its SHA-256 becomes a key, so no address sits in memory in the clear and the answer never depends on whether the address is registered.
+
+Rate limiting is not an enumeration oracle. Budgets count requests, never outcomes, so the same volume from the same client produces the same `429` whether the accounts involved exist or not. That is a property of counting volume rather than a check anyone has to remember to add.
+
+**Addressing.** By default the client is the socket peer address, which is correct whenever the application terminates connections itself. Behind a proxy, set `TRUSTED_PROXY_HEADER=x-forwarded-for` (or whichever header that proxy appends to). The limiter then reads the **last** entry of that header, the hop the trusted proxy wrote. Everything before it was written by an upstream the application does not control, or by the client, so trusting the first entry would let any caller choose its own key and opt out of the limits. A configured header that is missing or unparsable falls back to the peer address, so a misconfigured proxy makes limits stricter, never looser. Serving the router with `into_make_service_with_connect_info::<SocketAddr>()` is what supplies the peer address; without it the framework logs a warning at the first request and admits everything, since only a composition bug can produce a request with no address.
+
+**Turning it off.** `RATE_LIMIT_DISABLED=true` switches every budget off. It exists for development and for test suites that drive these endpoints hard from one address; deployments leave it unset. The budgets are otherwise identical in every environment, because a limit that differs between development and production is a limit nobody has tested.
+
+**Scope and cost.** State is in-process: two instances behind a load balancer enforce two budgets, so the effective limit multiplies by the instance count. That still bounds an attack at `instances * quota` per period, which is the difference between a bounded attack and an unbounded one. A shared store is the eventual answer, not a prerequisite. Memory is bounded too: the limiter tracks at most 32,768 keys, roughly a hundred bytes each, and prunes when it reaches that, first the keys whose balance is already full and then the least-loaded ones. A client rotating addresses to flood the map evicts its own fresh keys before the keys the limiter is holding back, because those are the heaviest in the map.
+
 ## The identity screens
 
 Every route above has a screen. The starter owns the pages; `@jalapenolabs/anubis` owns the typed client (`createAnubisApi`) and the WebAuthn browser helpers, because both are the same in every application.

@@ -2,8 +2,11 @@
 //!
 //! The composition root: it reads configuration, migrates the database, and
 //! mounts the framework's routers alongside the application's own
-//! [`account_router`]. The application itself lives in the library beside this
-//! file, which is what lets the integration tests drive the real routers.
+//! [`account_router`], with the built frontend behind them all. The
+//! application itself lives in the library beside this file, which is what
+//! lets the integration tests drive the real routers.
+
+use std::net::SocketAddr;
 
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
@@ -70,6 +73,22 @@ async fn main() {
         // CurrentUser through these extensions.
         .layer(anubis::guard::layer(pool, roles));
 
+    // In production the built frontend ships with the binary: every path the
+    // routers above declined resolves to the SPA, so a cold load of a client
+    // route works. `/account` joins the framework's own prefixes as a place
+    // where an unmatched path is a JSON 404 rather than index.html. Unset
+    // SPA_DIR leaves the browser to the Vite dev server, the development
+    // default.
+    let app = match &config.spa_dir {
+        Some(dir) => {
+            let assets = anubis::spa::Assets::new(dir)
+                .expect("SPA_DIR must point at a built frontend (yarn build)")
+                .reserve("/account");
+            app.fallback_service(assets.into_service())
+        }
+        None => app,
+    };
+
     let address = config.server.socket_addr();
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -82,9 +101,15 @@ async fn main() {
         "server listening on {{server.address}}",
     );
 
-    axum::serve(listener, app)
-        .await
-        .expect("server terminated unexpectedly");
+    // Connect info, not just the router: the framework's rate limits charge
+    // each request to the address it arrived from, which only the accept loop
+    // knows. See `anubis::rate_limit`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server terminated unexpectedly");
 }
 
 async fn healthz() -> &'static str {

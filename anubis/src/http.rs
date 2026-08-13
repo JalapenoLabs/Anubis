@@ -3,14 +3,19 @@
 //! [`ApiError`] is the one error shape handlers return: a status code plus a
 //! user-safe JSON body of `{"message": "..."}`. Internal detail never reaches
 //! the response body; log it with `tracing` at the point of failure and return
-//! [`ApiError::internal`].
+//! [`ApiError::internal`]. The body shape holds for every status, including
+//! the `429` that [`ApiError::too_many_requests`] adds a `Retry-After` header
+//! to.
 //!
 //! [`ListParams`] and [`Pagination`] carry the locked list-endpoint
 //! conventions from the repository's `docs/api.md`, so every scaffolded list
 //! endpoint pages, sorts, and answers in exactly one shape.
 
+use std::time::Duration;
+
 use axum::Json;
 use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -19,34 +24,27 @@ use serde::{Deserialize, Serialize};
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// How long the caller should wait, rendered as a `Retry-After` header.
+    retry_after: Option<Duration>,
 }
 
 impl ApiError {
     /// A `400 Bad Request` for input that fails validation.
     #[must_use]
     pub fn validation(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self::new(StatusCode::BAD_REQUEST, message)
     }
 
     /// A `401 Unauthorized` for missing or bad credentials.
     #[must_use]
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
-        }
+        Self::new(StatusCode::UNAUTHORIZED, message)
     }
 
     /// A `403 Forbidden` for authenticated users lacking permission.
     #[must_use]
     pub fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
+        Self::new(StatusCode::FORBIDDEN, message)
     }
 
     /// A `404 Not Found` that does not reveal whether the resource exists.
@@ -55,18 +53,30 @@ impl ApiError {
     /// nothing: absent and forbidden look identical.
     #[must_use]
     pub fn not_found() -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: "Not found.".to_owned(),
-        }
+        Self::new(StatusCode::NOT_FOUND, "Not found.")
     }
 
     /// A `409 Conflict` for requests that collide with existing state.
     #[must_use]
     pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    /// A `429 Too Many Requests` telling the caller how long to wait.
+    ///
+    /// The response carries a `Retry-After` header alongside the usual JSON
+    /// body. The message names the wait and nothing else: which budget a
+    /// caller exhausted, and whether the account or address involved exists,
+    /// stay invisible, so a limit can never become a probe.
+    ///
+    /// See [`crate::rate_limit`] for the budgets that produce this.
+    #[must_use]
+    pub fn too_many_requests(retry_after: Duration) -> Self {
+        let seconds = retry_after_seconds(retry_after);
         Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!("Too many requests. Try again in {seconds} seconds."),
+            retry_after: Some(retry_after),
         }
     }
 
@@ -76,10 +86,10 @@ impl ApiError {
     /// response body never carries internal detail.
     #[must_use]
     pub fn internal() -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "Something went wrong on our side.".to_owned(),
-        }
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side.",
+        )
     }
 
     /// Returns the HTTP status code.
@@ -93,6 +103,29 @@ impl ApiError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Returns how long the caller should wait, when the error says so.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+}
+
+/// Renders a wait as the whole seconds a `Retry-After` header carries.
+///
+/// Rounded up, and never below one: a header of `0` invites an immediate
+/// retry that the limiter would reject again.
+fn retry_after_seconds(retry_after: Duration) -> u64 {
+    let rounded_up = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+    rounded_up.max(1)
 }
 
 #[derive(Serialize)]
@@ -105,7 +138,14 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorBody {
             message: &self.message,
         });
-        (self.status, body).into_response()
+
+        match self.retry_after {
+            None => (self.status, body).into_response(),
+            Some(retry_after) => {
+                let seconds = retry_after_seconds(retry_after);
+                (self.status, [(RETRY_AFTER, seconds.to_string())], body).into_response()
+            }
+        }
     }
 }
 
@@ -230,7 +270,10 @@ impl Pagination {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::extract::Query;
+    use axum::http::header::RETRY_AFTER;
     use axum::http::{StatusCode, Uri};
     use axum::response::IntoResponse;
 
@@ -326,5 +369,35 @@ mod tests {
     fn responses_carry_the_status() {
         let response = ApiError::conflict("taken").into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn rate_limited_responses_carry_a_retry_after_header_in_whole_seconds() {
+        let error = ApiError::too_many_requests(Duration::from_millis(6_200));
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after(), Some(Duration::from_millis(6_200)));
+        assert!(error.message().contains('7'), "got: {}", error.message());
+
+        let response = error.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("7"),
+        );
+    }
+
+    #[test]
+    fn a_sub_second_wait_still_asks_for_one_second() {
+        let response = ApiError::too_many_requests(Duration::from_millis(1)).into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+        );
     }
 }

@@ -17,6 +17,11 @@
 //! Login and password-reset requests respond identically whether or not the
 //! email is registered, in both message and timing, so responses do not leak
 //! which emails exist.
+//!
+//! Every route above that an attacker can drive without credentials carries a
+//! per-client budget from [`crate::rate_limit`], declared beside the route.
+//! The endpoints that send email additionally charge the address they would
+//! mail, because rotating client addresses is how one inbox gets bombed.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -41,6 +46,7 @@ use crate::config::{AppConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::mail::{Email, Mailer};
+use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
 
 /// Upper bound from RFC 3696; anything longer cannot be a deliverable address.
@@ -52,6 +58,7 @@ const MAX_EMAIL_CHARS: usize = 320;
 /// environment (whether session cookies are `Secure`) and the public base URL
 /// embedded in email links.
 pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
+    let rate_limit = RateLimiter::new(&config.rate_limit);
     let state = AuthState {
         pool: pool.clone(),
         environment: config.environment,
@@ -59,20 +66,33 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         app_url: config.app_url.clone(),
         secret_key: config.secret_key.clone(),
         oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
+        rate_limit: rate_limit.clone(),
     };
 
     Router::new()
-        .route("/register", post(register))
-        .route("/login", post(login))
+        .route(
+            "/register",
+            post(register).layer(rate_limit.layer(Budget::Registration)),
+        )
+        .route(
+            "/login",
+            post(login).layer(rate_limit.layer(Budget::Credentials)),
+        )
         .route("/logout", post(logout))
         .route("/me", get(me))
-        .route("/verify-email/request", post(request_email_verification))
+        .route(
+            "/verify-email/request",
+            post(request_email_verification).layer(rate_limit.layer(Budget::EmailPerClient)),
+        )
         .route("/verify-email/confirm", post(confirm_email_verification))
-        .route("/password-reset/request", post(request_password_reset))
+        .route(
+            "/password-reset/request",
+            post(request_password_reset).layer(rate_limit.layer(Budget::EmailPerClient)),
+        )
         .route("/password-reset/confirm", post(confirm_password_reset))
         .merge(crate::auth::account::router())
-        .merge(crate::auth::email_code::router())
-        .merge(crate::auth::mfa::router())
+        .merge(crate::auth::email_code::router(&rate_limit))
+        .merge(crate::auth::mfa::router(&rate_limit))
         .merge(crate::auth::oauth::router())
         .merge(crate::auth::passkey::router())
         .with_state(state)
@@ -90,6 +110,8 @@ pub(crate) struct AuthState {
     pub(crate) secret_key: SecretKey,
     /// The configured OpenID Connect providers and their discovery cache.
     pub(crate) oauth: crate::auth::oauth::Runtime,
+    /// Budgets the handlers charge themselves, keyed by the target address.
+    pub(crate) rate_limit: RateLimiter,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +335,11 @@ async fn request_password_reset(
     Json(body): Json<EmailOnlyBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let email = body.email.trim().to_lowercase();
+
+    // Charged before the lookup, so the answer cannot depend on whether the
+    // address belongs to an account, and so an attacker rotating client
+    // addresses still meets one budget per inbox.
+    state.rate_limit.check_recipient(&email)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 

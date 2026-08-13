@@ -18,9 +18,11 @@ pub mod http;
 pub mod jobs;
 pub mod mail;
 pub mod manifest;
+pub mod rate_limit;
 pub mod roles;
 pub mod scaffold;
 pub mod schema;
+pub mod spa;
 pub mod telemetry;
 pub mod tenancy;
 

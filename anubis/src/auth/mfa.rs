@@ -38,19 +38,25 @@ use crate::auth::secret_box::{self, SecretKey};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{CurrentUser, password, token, totp, user_token};
 use crate::http::ApiError;
+use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::{user_mfa, user_recovery_codes, users};
 
 /// Recovery codes issued at confirmation.
 const RECOVERY_CODE_COUNT: usize = 10;
 
-pub(crate) fn router() -> Router<AuthState> {
+pub(crate) fn router(rate_limit: &RateLimiter) -> Router<AuthState> {
     Router::new()
         .route("/mfa", get(status))
         .route("/mfa/totp/setup", post(setup))
         .route("/mfa/totp/qr.svg", get(qr_svg))
         .route("/mfa/totp/confirm", post(confirm))
         .route("/mfa/totp/disable", post(disable))
-        .route("/mfa/verify", post(verify_challenge))
+        // The only route here an attacker reaches without a session: it takes
+        // a challenge token and a six-digit code.
+        .route(
+            "/mfa/verify",
+            post(verify_challenge).layer(rate_limit.layer(Budget::Credentials)),
+        )
 }
 
 #[derive(Serialize)]

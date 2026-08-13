@@ -18,6 +18,9 @@
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
 //! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
+//! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
+//! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
+//! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
 //! adds three more, named after the provider:
@@ -59,6 +62,36 @@
 //! deploy that sends no email should not be blocked by mail configuration.
 //! See `docs/email.md`.
 //!
+//! # Serving the frontend
+//!
+//! `SPA_DIR` points at the frontend's build output, which is what makes a
+//! production deployment one binary: the same server that answers `/api` hands
+//! the browser the compiled React app. Leaving it unset serves no frontend,
+//! which is the development default, since the Vite dev server owns the
+//! browser there. [`crate::telemetry::init`] warns when a production
+//! deployment leaves it unset. The directory is validated when
+//! [`crate::spa::Assets::new`] opens it, so a deploy that shipped without a
+//! build fails at startup rather than at the first page load.
+//!
+//! # Rate limiting
+//!
+//! The auth endpoints carry per-client budgets by default, so nothing has to
+//! be configured to have them. Two variables tune that:
+//!
+//! `RATE_LIMIT_DISABLED=true` switches the limits off. It exists for
+//! development and for test suites that drive the auth endpoints hard from
+//! one address; a deployment should never set it. The variable is read the
+//! same way in every environment, because a limit that silently differs
+//! between development and production is a limit nobody has tested.
+//!
+//! `TRUSTED_PROXY_HEADER` names the forwarding header that identifies the
+//! client when the application sits behind a proxy, conventionally
+//! `x-forwarded-for`. Leave it unset when the application terminates
+//! connections itself: the socket peer address is then the client, and a
+//! forwarding header would be attacker-supplied. Set it only when a proxy you
+//! control appends to that header, because the limiter reads the last entry,
+//! the one that proxy wrote. See [`crate::rate_limit`] and `docs/api.md`.
+//!
 //! # OAuth providers
 //!
 //! A provider is enabled by setting both its client id and its client secret;
@@ -72,9 +105,13 @@
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+
+use axum::http::HeaderName;
 
 use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::secret_box::SecretKey;
+use crate::rate_limit::RateLimitConfig;
 
 /// Selects the runtime environment.
 const ENV_VAR: &str = "ANUBIS_ENV";
@@ -110,6 +147,21 @@ const MAIL_FROM_VAR: &str = "MAIL_FROM";
 /// What a valid `MAIL_FROM` looks like, quoted back in errors.
 const MAIL_FROM_FORM: &str =
     "an email address with an optional display name, e.g. `Acme <no-reply@acme.com>`";
+
+/// Directory of built frontend assets the server hands the browser.
+const SPA_DIR_VAR: &str = "SPA_DIR";
+
+/// Switches off the per-client budgets on the abuse-prone endpoints.
+const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
+
+/// Names the forwarding header that identifies the client behind a proxy.
+const TRUSTED_PROXY_HEADER_VAR: &str = "TRUSTED_PROXY_HEADER";
+
+/// What a valid `TRUSTED_PROXY_HEADER` looks like, quoted back in errors.
+const HEADER_NAME_FORM: &str = "an HTTP header name, e.g. `x-forwarded-for`";
+
+/// What a valid boolean variable looks like, quoted back in errors.
+const BOOLEAN_FORM: &str = "one of true, false, 1, 0, yes, no";
 
 /// Loopback keeps development servers off the network unless opted in.
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -261,6 +313,15 @@ pub struct AppConfig {
     ///
     /// Empty unless a provider's client id and secret are both set.
     pub oauth: Vec<OauthProviderConfig>,
+    /// Directory of built frontend assets, when `SPA_DIR` is set.
+    ///
+    /// Present means the binary also serves the SPA, absent means it serves
+    /// only the API; see the module docs and [`crate::spa`].
+    pub spa_dir: Option<PathBuf>,
+    /// Whether the abuse limits are on, and how clients are addressed.
+    ///
+    /// On by default; see the module docs and [`crate::rate_limit`].
+    pub rate_limit: RateLimitConfig,
 }
 
 impl AppConfig {
@@ -342,6 +403,10 @@ impl AppConfig {
 
         let smtp = smtp_config(&lookup)?;
         let oauth = oauth_providers(&lookup)?;
+        // Only the path is resolved here; whether it holds a built frontend is
+        // the assets service's question, asked once at startup.
+        let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
+        let rate_limit = rate_limit_config(&lookup)?;
 
         Ok(Self {
             environment,
@@ -351,7 +416,47 @@ impl AppConfig {
             secret_key,
             smtp,
             oauth,
+            spa_dir,
+            rate_limit,
         })
+    }
+}
+
+/// Resolves the abuse limits: whether they run, and how clients are addressed.
+///
+/// A header name that cannot be a header name stops startup rather than
+/// silently reverting to the peer address, because the difference decides who
+/// every request is charged to.
+fn rate_limit_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<RateLimitConfig, Error> {
+    let disabled = match non_empty(lookup(RATE_LIMIT_DISABLED_VAR)) {
+        None => false,
+        Some(value) => parse_bool(&value)
+            .ok_or_else(|| Error::invalid(RATE_LIMIT_DISABLED_VAR, value.trim(), BOOLEAN_FORM))?,
+    };
+
+    let trusted_proxy_header = match non_empty(lookup(TRUSTED_PROXY_HEADER_VAR)) {
+        None => None,
+        Some(value) => {
+            let name = value.trim().to_ascii_lowercase();
+            let parsed = HeaderName::try_from(name).map_err(|_error| {
+                Error::invalid(TRUSTED_PROXY_HEADER_VAR, value.trim(), HEADER_NAME_FORM)
+            })?;
+            Some(parsed)
+        }
+    };
+
+    Ok(RateLimitConfig {
+        disabled,
+        trusted_proxy_header,
+    })
+}
+
+/// Reads the spellings of yes and no that environment variables use.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -510,6 +615,7 @@ impl std::error::Error for Error {}
 mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
 
     use super::{AppConfig, Environment};
     use crate::auth::secret_box::SecretKey;
@@ -759,6 +865,62 @@ mod tests {
         let config = AppConfig::from_lookup(lookup).expect("a missing relay must not block boot");
 
         assert!(config.smtp.is_none());
+    }
+
+    #[test]
+    fn the_spa_directory_is_unset_until_asked_for() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert!(unset.spa_dir.is_none());
+
+        // A variable set to whitespace reads as unset, the way a `.env` line does.
+        let lookup = lookup_from(&[("SPA_DIR", "   ")]);
+        let blank = AppConfig::from_lookup(lookup).expect("blank is fine");
+        assert!(blank.spa_dir.is_none());
+
+        let lookup = lookup_from(&[("SPA_DIR", " frontend/dist ")]);
+        let set = AppConfig::from_lookup(lookup).expect("a path is fine");
+        assert_eq!(set.spa_dir, Some(PathBuf::from("frontend/dist")));
+    }
+
+    #[test]
+    fn rate_limiting_is_on_until_a_deployment_turns_it_off() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert!(!defaulted.rate_limit.disabled);
+        assert!(defaulted.rate_limit.trusted_proxy_header.is_none());
+
+        for value in ["true", "TRUE", "1", "yes"] {
+            let lookup = lookup_from(&[("RATE_LIMIT_DISABLED", value)]);
+            let config = AppConfig::from_lookup(lookup).expect("a boolean must parse");
+            assert!(config.rate_limit.disabled, "for input {value:?}");
+        }
+
+        for value in ["false", "0", "no"] {
+            let lookup = lookup_from(&[("RATE_LIMIT_DISABLED", value)]);
+            let config = AppConfig::from_lookup(lookup).expect("a boolean must parse");
+            assert!(!config.rate_limit.disabled, "for input {value:?}");
+        }
+
+        let lookup = lookup_from(&[("RATE_LIMIT_DISABLED", "maybe")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("junk booleans are rejected");
+        assert_eq!(error.variable(), "RATE_LIMIT_DISABLED");
+    }
+
+    #[test]
+    fn the_trusted_proxy_header_is_normalized_and_validated() {
+        let lookup = lookup_from(&[("TRUSTED_PROXY_HEADER", " X-Forwarded-For ")]);
+        let config = AppConfig::from_lookup(lookup).expect("a header name must parse");
+        assert_eq!(
+            config
+                .rate_limit
+                .trusted_proxy_header
+                .as_ref()
+                .map(axum::http::HeaderName::as_str),
+            Some("x-forwarded-for"),
+        );
+
+        let lookup = lookup_from(&[("TRUSTED_PROXY_HEADER", "not a header")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("junk header names are rejected");
+        assert_eq!(error.variable(), "TRUSTED_PROXY_HEADER");
     }
 
     #[test]

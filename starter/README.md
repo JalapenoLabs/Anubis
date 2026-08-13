@@ -19,9 +19,33 @@ backend log in development; the action links and codes are in the log lines.
 
 The vite dev server proxies `/auth`, `/tenancy`, `/account`, `/users`, and
 `/healthz` to the backend on port 3000, so the SPA and API stay same-origin in
-development. Same-origin
-production serving (the backend shipping the built SPA) is on the roadmap;
-until then the built frontend needs its own static host.
+development, exactly as they are in production.
+
+## Production
+
+One binary serves the API and the frontend. Build the SPA, then point
+`SPA_DIR` at the build output:
+
+```sh
+yarn workspace anubis-starter-frontend build
+
+DATABASE_URL=postgres://user:password@host/app \
+APP_URL=https://app.example.com \
+ANUBIS_SECRET_KEY="$(openssl rand -base64 32)" \
+ANUBIS_ENV=production \
+SPA_DIR=starter/frontend/dist \
+cargo run --release -p anubis-starter
+```
+
+Every path the routers do not claim serves `index.html`, so client-side routes
+survive a cold load; hashed files under `assets/` are served with a one-year
+immutable cache and `index.html` with `no-cache`, so a deploy is live on the
+next page load. An unmatched path under `/api`, `/auth`, `/tenancy`,
+`/developers`, `/users`, or `/account` answers a JSON `404` instead of the
+page.
+
+Leaving `SPA_DIR` unset serves the API alone; production warns at startup when
+it does.
 
 ## OAuth sign-in
 
