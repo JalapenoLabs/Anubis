@@ -51,6 +51,7 @@
   },
   "scripts": {
     "build": "vite build",
+    "prepack": "yarn build",
     "clean": "rimraf dist coverage",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
