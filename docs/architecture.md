@@ -11,7 +11,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Language | Rust (pinned toolchain) | World-class, idiomatic Rust throughout |
 | Async runtime | tokio | The entire backend is async |
 | Web framework | Axum | Maintained by the tokio team; sits on hyper + tower |
-| Middleware | tower / tower-http | Sessions, auth guards, per-client rate limits, tracing, CORS, compression |
+| Middleware | tower / tower-http | Sessions, auth guards, per-client rate limits, request ids, tracing, security headers, opt-in CORS. See [server.md](server.md) |
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
 | Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
 | Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
@@ -65,6 +65,8 @@ Scaffolding a model or field regenerates the contract; anything the frontend mus
 ## Deployment
 
 A production deployment is one Rust binary serving the API and the built SPA, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere.
+
+The binary boots through `anubis::server::serve`, which is where production behavior lives: liveness at `/healthz` and readiness at `/readyz`, a request id on every response, one log event per request, a per-request timeout, security headers, opt-in CORS, and a bounded drain on `SIGTERM`. An application's `main` composes routers and calls it once. See [server.md](server.md).
 
 `SPA_DIR` points the binary at the frontend's build output and is the whole switch:
 

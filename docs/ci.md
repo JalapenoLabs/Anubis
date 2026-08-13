@@ -6,8 +6,14 @@ CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with
 
 `.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `develop`:
 
-- **Rust job**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-- **Frontend job**: `yarn install --immutable`, then typecheck, lint, test, and build across all workspaces.
+- **Rust job**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, the roles and client drift checks, then `cargo audit`.
+- **Frontend job**: `yarn install --immutable`, then typecheck, lint, test, build, and `yarn npm audit`.
+
+## Dependency audit
+
+Both jobs end with a vulnerability audit: `cargo audit` against RustSec advisories, and `yarn npm audit --all --recursive` against npm's. Both run `continue-on-error: true`, so a fresh advisory published overnight reports on every push without blocking unrelated work from merging. Flip both to blocking once the reports are routinely empty and a new advisory is something the team wants to fix before merging.
+
+`cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The runners keep `~/.cargo/bin` between runs, so only the first run on a fresh runner pays the few minutes it takes to compile.
 
 ## Version pinning
 

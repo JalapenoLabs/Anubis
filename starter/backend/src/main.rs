@@ -5,15 +5,17 @@
 //! [`account_router`], with the built frontend behind them all. The
 //! application itself lives in the library beside this file, which is what
 //! lets the integration tests drive the real routers.
-
-use std::net::SocketAddr;
+//!
+//! Everything a production server needs around that router, the probes,
+//! request ids, request logging, timeouts, security headers, and a graceful
+//! shutdown, comes from the one call to [`anubis::server::serve`]. See
+//! `docs/server.md`.
 
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
-use anubis::{db, telemetry};
+use anubis::{db, server, telemetry};
 use anubis_starter::{APP_MIGRATIONS, ROLES_YML, account_router};
 use axum::Router;
-use axum::routing::get;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -52,7 +54,6 @@ async fn main() {
     let mailer = anubis::mail::Mailer::from_config(&config).expect("invalid mail configuration");
 
     let app = Router::new()
-        .route("/healthz", get(healthz))
         // Public profile pictures at /users/{user_id}/avatar.
         .merge(anubis::auth::avatar_router(pool.clone()))
         .nest(
@@ -71,7 +72,7 @@ async fn main() {
         .nest("/account", account_router(&pool, &roles))
         // Application routes guard with TeamMember / OrganizationMember /
         // CurrentUser through these extensions.
-        .layer(anubis::guard::layer(pool, roles));
+        .layer(anubis::guard::layer(pool.clone(), roles));
 
     // In production the built frontend ships with the binary: every path the
     // routers above declined resolves to the SPA, so a cold load of a client
@@ -89,29 +90,9 @@ async fn main() {
         None => app,
     };
 
-    let address = config.server.socket_addr();
-    let listener = tokio::net::TcpListener::bind(address)
+    // The framework owns everything from here: the probes, the middleware, the
+    // accept loop, and draining in-flight requests on SIGTERM or ctrl-c.
+    server::serve(app, pool, &config)
         .await
-        .expect("failed to bind the server address");
-
-    tracing::info!(
-        server.address = %address,
-        app.environment = %config.environment,
-        framework.version = anubis::VERSION,
-        "server listening on {{server.address}}",
-    );
-
-    // Connect info, not just the router: the framework's rate limits charge
-    // each request to the address it arrived from, which only the accept loop
-    // knows. See `anubis::rate_limit`.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .expect("server terminated unexpectedly");
-}
-
-async fn healthz() -> &'static str {
-    "ok"
+        .expect("the server terminated unexpectedly");
 }

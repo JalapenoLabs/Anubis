@@ -26,6 +26,10 @@ Every scaffolded list endpoint (web and API) follows one shape:
 
 The framework implements the convention once: handlers take `anubis::http::ListParams` as a query extractor beside their own filter struct, and answer with `anubis::http::Pagination`. Values that are out of range, or that do not parse at all, fall back to the convention, so a paging bug in a client degrades into a valid page instead of a 400.
 
+## Transport
+
+Every response, on every route, carries an `x-request-id` and the framework's security headers, and every request runs under a timeout. Cross-origin access is off until `CORS_ALLOWED_ORIGINS` names exact origins; the `/api/v1` bearer-token surface is what that exists for, since session cookies stay same-origin. [The server](server.md) covers the whole serve path, the headers, and the liveness and readiness probes.
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.

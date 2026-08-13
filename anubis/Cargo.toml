@@ -56,6 +56,8 @@ webauthn-rs = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
+# `start_paused` lets a test prove the request timeout without spending it.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -3,7 +3,8 @@
 //! Axum routers cannot be introspected after construction, so the framework
 //! keeps this manifest alongside them: one entry per route the framework
 //! mounts, exactly as a starter application composes them (`/auth`,
-//! `/tenancy`, `/developers`, `/api/v1`, and the public avatar route).
+//! `/tenancy`, `/developers`, `/api/v1`, the public avatar route, and the
+//! probes [`crate::server::harden`] adds).
 //!
 //! Drift cannot happen silently: a unit test in this module composes the real
 //! routers and sends a request for every entry, so a route that is renamed,
@@ -41,6 +42,17 @@ pub fn framework_routes() -> &'static [RouteEntry] {
 /// The manifest itself. Update it in the same change as any router edit; the
 /// `every_manifest_entry_is_mounted` test fails the build on mismatch.
 static FRAMEWORK_ROUTES: &[RouteEntry] = &[
+    // Liveness and readiness, mounted by `anubis::server::harden`.
+    RouteEntry {
+        method: "GET",
+        path: "/healthz",
+        area: "server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/readyz",
+        area: "server",
+    },
     // Public profile pictures.
     RouteEntry {
         method: "GET",
@@ -380,6 +392,7 @@ roles:
         let mailer = crate::mail::Mailer::log();
 
         Router::new()
+            .merge(crate::server::health_router(pool.clone()))
             .merge(crate::auth::avatar_router(pool.clone()))
             .nest(
                 "/auth",

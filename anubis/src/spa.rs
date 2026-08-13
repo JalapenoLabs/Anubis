@@ -107,9 +107,9 @@ const REVALIDATE: HeaderValue = HeaderValue::from_static("no-cache");
 /// Requests under these never resolve to `index.html`; see the module docs.
 /// Drift cannot happen silently: a unit test walks
 /// [`crate::manifest::framework_routes`] and fails the build if a mounted
-/// route is not covered here. `/healthz` is deliberately absent, being a
-/// single exact route that always matches and so can never reach the
-/// fallback.
+/// route is not covered here. The probes `/healthz` and `/readyz` are
+/// deliberately absent, being exact routes with nothing nested under them:
+/// they always match their own router and so can never reach the fallback.
 pub const RESERVED_PREFIXES: &[&str] = &["/api", "/auth", "/developers", "/tenancy", "/users"];
 
 /// The built frontend, served as a router fallback.
@@ -327,6 +327,10 @@ mod tests {
 
     use super::{Assets, RESERVED_PREFIXES, cache_control, is_reserved, normalize_prefix};
 
+    /// The framework routes that need no reserved prefix, being exact paths
+    /// with nothing nested under them.
+    const PROBES: &[&str] = &["/healthz", "/readyz"];
+
     fn reserved() -> Vec<String> {
         RESERVED_PREFIXES
             .iter()
@@ -386,7 +390,7 @@ mod tests {
 
         for route in crate::manifest::framework_routes() {
             assert!(
-                is_reserved(route.path, &reserved) || route.path == "/healthz",
+                is_reserved(route.path, &reserved) || PROBES.contains(&route.path),
                 "{} is mounted, so an unmatched sibling of it must answer JSON, \
                  not the SPA: add its prefix to RESERVED_PREFIXES",
                 route.path,

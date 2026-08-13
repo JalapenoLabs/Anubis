@@ -22,7 +22,7 @@ That report covers the framework's identity and history, current MIT/open-source
 
 # Blessed architecture decisions
 
-These are decided and current. Full detail lives in @./docs (architecture.md, tenancy.md, scaffolding.md, api.md).
+These are decided and current. Full detail lives in @./docs (architecture.md, tenancy.md, scaffolding.md, api.md, server.md).
 
 - **Backend**: Rust on tokio, Axum + tower + hyper. World-class idiomatic Rust is the bar.
 - **ORM**: Diesel + diesel-async. Chosen for maximum compile-time typing; no stringly SQL, no runtime query surprises.
@@ -33,6 +33,9 @@ These are decided and current. Full detail lives in @./docs (architecture.md, te
 - **Background jobs**: durable Postgres queue, no Redis in the durability path. Enqueue rides on the caller's connection so it commits with the domain write. At-least-once delivery, quadratic retry backoff, then a `dead_jobs` table an operator reads. Jobs declare their own queue; a worker serves exactly the queues it has handlers for.
 - **Tenancy**: User -> TeamMembership -> Team -> Organization, plus OrganizationMembership for org-level roles. Resources chain ownership to a Team; assignments target TeamMemberships. Personal org + default team auto-created at signup. Billing attaches to the Organization.
 - **Permissions**: single `roles.yml`, compiled to both a Rust authorization module and a TypeScript UI-affordances module.
+- **Serving**: one framework call, `anubis::server::serve`, owns production behavior; `main` only composes routers. It mounts liveness `/healthz` (no I/O) and readiness `/readyz` (database pool, 2s), and layers, outermost first: a server-minted request id returned as `x-request-id`, request tracing, security headers, opt-in CORS, and a 30s per-request timeout answering `503` in the `ApiError` shape. `SIGTERM` and ctrl-c drain in-flight requests for 25s, inside Kubernetes' default grace period. See [server.md](docs/server.md).
+- **Security posture**: `nosniff`, `strict-origin-when-cross-origin`, `X-Frame-Options: DENY`, and a minimal `frame-ancestors 'none'` CSP on every response (a full SPA CSP needs build-time asset hashes and is follow-up work). HSTS in production only, and only over https. CORS is strict same-origin until `CORS_ALLOWED_ORIGINS` names exact origins, validated at config load; credentials are never allowed cross-origin, so the bearer-token `/api/v1` surface is the cross-origin consumer and cookies stay same-origin.
+- **Supply chain**: `cargo audit` and `yarn npm audit` run on every CI push, non-blocking for now; see [ci.md](docs/ci.md) for when they flip blocking.
 - **Secrets at rest**: hashing is the default (passwords, tokens, recovery codes). Secrets the app must read back, such as TOTP seeds, are encrypted with pure-Rust AES-256-GCM (`anubis::auth::secret_box`) under `ANUBIS_SECRET_KEY`: base64 for 32 bytes, required in production, with a public development fallback so `yarn dev` stays zero-config. Stored values are versioned (`v1:<nonce>:<ciphertext>`).
 - **Abuse limits**: `anubis::rate_limit` gives the auth endpoints in-process per-client budgets (GCRA, bounded map, no Redis) and answers `429` with `Retry-After`. The mail endpoints also charge the hashed target address, so rotating client addresses cannot bomb one inbox. Clients are the socket peer address unless `TRUSTED_PROXY_HEADER` names a proxy header, whose last entry wins. `RATE_LIMIT_DISABLED=true` is the development and test escape hatch. Limits are per instance; a shared store is future work.
 - **Roadmap**: M1 Foundation, M2 Tenancy, M3 API layer, M4 Scaffolding, M5 Ecosystem (webhooks, jobs, billing). Patterns are hand-built first, then automated by the scaffolder. GitHub milestones mirror M1-M5.

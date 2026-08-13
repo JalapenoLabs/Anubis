@@ -61,6 +61,22 @@ jobs:
             --out frontend/src/api/v1.generated.ts
           git diff --exit-code frontend/src/api/v1.generated.ts
 
+      # The runner keeps ~/.cargo/bin between runs, so only the first run on a
+      # fresh runner pays the few minutes cargo-audit takes to compile. Failing
+      # to install it must not fail the job while the audit itself is advisory.
+      - name: Install cargo-audit
+        continue-on-error: true
+        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+
+      # RustSec advisories against Cargo.lock. Non-blocking on purpose: a new
+      # advisory published overnight must not stop unrelated work from merging,
+      # and the point today is that every push reports the current exposure.
+      # Flip continue-on-error to false once the report is routinely empty and
+      # a fresh advisory is something the team wants to fix before merging.
+      - name: Audit Rust dependencies
+        continue-on-error: true
+        run: cargo audit
+
   frontend:
     name: Frontend
     runs-on: [self-hosted, rocky9, earthly, docker]
@@ -90,3 +106,10 @@ jobs:
 
       - name: Build
         run: yarn build
+
+      # npm advisories across every workspace and the whole dependency tree.
+      # Non-blocking for the same reason the Rust audit is; flip
+      # continue-on-error to false alongside it.
+      - name: Audit npm dependencies
+        continue-on-error: true
+        run: yarn npm audit --all --recursive

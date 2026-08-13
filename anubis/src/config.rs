@@ -21,6 +21,7 @@
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
+//! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
 //! adds three more, named after the provider:
@@ -92,6 +93,16 @@
 //! control appends to that header, because the limiter reads the last entry,
 //! the one that proxy wrote. See [`crate::rate_limit`] and `docs/api.md`.
 //!
+//! # Cross-origin access
+//!
+//! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
+//! exact origins, such as `https://app.example.com,https://admin.example.com`.
+//! Unset, the default, sends no CORS headers at all, which is what a
+//! same-origin deployment (the SPA served by this binary) wants. Each entry
+//! must be a bare `scheme://host[:port]` with no path, query, credentials, or
+//! wildcard, and is normalized at startup, so a typo fails the boot rather than
+//! the first cross-origin call. See [`crate::server`] and `docs/server.md`.
+//!
 //! # OAuth providers
 //!
 //! A provider is enabled by setting both its client id and its client secret;
@@ -108,10 +119,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use axum::http::HeaderName;
+use url::{Origin, Url};
 
 use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::secret_box::SecretKey;
 use crate::rate_limit::RateLimitConfig;
+use crate::server::CorsConfig;
 
 /// Selects the runtime environment.
 const ENV_VAR: &str = "ANUBIS_ENV";
@@ -156,6 +169,13 @@ const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
 
 /// Names the forwarding header that identifies the client behind a proxy.
 const TRUSTED_PROXY_HEADER_VAR: &str = "TRUSTED_PROXY_HEADER";
+
+/// Lists the origins allowed to call the application from a browser.
+const CORS_ALLOWED_ORIGINS_VAR: &str = "CORS_ALLOWED_ORIGINS";
+
+/// What a valid `CORS_ALLOWED_ORIGINS` entry looks like, quoted back in errors.
+const ORIGIN_FORM: &str =
+    "comma-separated exact origins with no path and no wildcard, e.g. `https://app.example.com`";
 
 /// What a valid `TRUSTED_PROXY_HEADER` looks like, quoted back in errors.
 const HEADER_NAME_FORM: &str = "an HTTP header name, e.g. `x-forwarded-for`";
@@ -322,6 +342,11 @@ pub struct AppConfig {
     ///
     /// On by default; see the module docs and [`crate::rate_limit`].
     pub rate_limit: RateLimitConfig,
+    /// Which origins may call the application from a browser.
+    ///
+    /// Empty by default, which sends no CORS headers at all; see the module
+    /// docs and [`crate::server`].
+    pub cors: CorsConfig,
 }
 
 impl AppConfig {
@@ -407,6 +432,7 @@ impl AppConfig {
         // the assets service's question, asked once at startup.
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
         let rate_limit = rate_limit_config(&lookup)?;
+        let cors = cors_config(&lookup)?;
 
         Ok(Self {
             environment,
@@ -418,6 +444,7 @@ impl AppConfig {
             oauth,
             spa_dir,
             rate_limit,
+            cors,
         })
     }
 }
@@ -449,6 +476,68 @@ fn rate_limit_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<RateLim
         disabled,
         trusted_proxy_header,
     })
+}
+
+/// Resolves which origins may call the application from a browser.
+///
+/// An entry that is not an exact origin stops startup rather than being
+/// dropped: a typo that silently narrows a CORS policy surfaces as a browser
+/// error in someone else's console, days later.
+fn cors_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<CorsConfig, Error> {
+    let Some(raw) = non_empty(lookup(CORS_ALLOWED_ORIGINS_VAR)) else {
+        return Ok(CorsConfig::default());
+    };
+
+    let mut allowed_origins = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let origin = parse_origin(entry)
+            .ok_or_else(|| Error::invalid(CORS_ALLOWED_ORIGINS_VAR, entry, ORIGIN_FORM))?;
+        if !allowed_origins.contains(&origin) {
+            allowed_origins.push(origin);
+        }
+    }
+
+    Ok(CorsConfig { allowed_origins })
+}
+
+/// Renders one entry as the exact origin a browser will send, or `None`.
+///
+/// A browser's `Origin` header is `scheme://host[:port]` and nothing else, so
+/// anything carrying a path, a query, credentials, or a wildcard could never
+/// match one and is a misunderstanding worth failing on. `Origin` serialization
+/// also normalizes the case and drops a default port, which is what makes the
+/// stored value comparable to what arrives.
+fn parse_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    if !matches!(url.path(), "" | "/") {
+        return None;
+    }
+    // A wildcard host parses as a perfectly good domain but can never equal an
+    // `Origin` header. People reach for `https://*.example.com` expecting
+    // subdomain matching, which CORS has no notion of, so this is a mistake
+    // worth naming rather than a rule that silently never matches.
+    if url.host_str().is_some_and(|host| host.contains('*')) {
+        return None;
+    }
+
+    match url.origin() {
+        Origin::Tuple(..) => Some(url.origin().ascii_serialization()),
+        Origin::Opaque(_) => None,
+    }
 }
 
 /// Reads the spellings of yes and no that environment variables use.
@@ -921,6 +1010,64 @@ mod tests {
         let lookup = lookup_from(&[("TRUSTED_PROXY_HEADER", "not a header")]);
         let error = AppConfig::from_lookup(lookup).expect_err("junk header names are rejected");
         assert_eq!(error.variable(), "TRUSTED_PROXY_HEADER");
+    }
+
+    #[test]
+    fn cross_origin_access_is_off_until_origins_are_named() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert!(defaulted.cors.allowed_origins.is_empty());
+
+        let lookup = lookup_from(&[(
+            "CORS_ALLOWED_ORIGINS",
+            " https://app.example.com , https://admin.example.com:8443 , \
+             https://app.example.com ",
+        )]);
+        let config = AppConfig::from_lookup(lookup).expect("origins must parse");
+        assert_eq!(
+            config.cors.allowed_origins,
+            [
+                "https://app.example.com".to_owned(),
+                "https://admin.example.com:8443".to_owned(),
+            ],
+            "entries are normalized, in order, and deduplicated",
+        );
+    }
+
+    #[test]
+    fn an_origin_a_browser_could_never_send_is_rejected() {
+        for value in [
+            "*",
+            "https://*.example.com",
+            "https://app.example.com/dashboard",
+            "https://app.example.com?tenant=acme",
+            "https://user:hunter2@app.example.com",
+            "app.example.com",
+            "ftp://files.example.com",
+        ] {
+            let lookup = lookup_from(&[("CORS_ALLOWED_ORIGINS", value)]);
+            match AppConfig::from_lookup(lookup) {
+                Ok(config) => panic!("{value:?} must be rejected, got {:?}", config.cors),
+                Err(error) => assert_eq!(error.variable(), "CORS_ALLOWED_ORIGINS", "for {value:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_port_and_a_trailing_slash_normalize_away() {
+        let lookup = lookup_from(&[(
+            "CORS_ALLOWED_ORIGINS",
+            "https://app.example.com:443/,HTTP://Local.Example.com:80",
+        )]);
+
+        let config = AppConfig::from_lookup(lookup).expect("origins must parse");
+
+        assert_eq!(
+            config.cors.allowed_origins,
+            [
+                "https://app.example.com".to_owned(),
+                "http://local.example.com".to_owned(),
+            ],
+        );
     }
 
     #[test]

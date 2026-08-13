@@ -83,13 +83,25 @@ impl ApiError {
     /// A `500 Internal Server Error` with a deliberately generic body.
     ///
     /// Log the actual failure with `tracing` before returning this; the
-    /// response body never carries internal detail.
+    /// response body never carries internal detail. The response's
+    /// `x-request-id` header is what ties a user's report to that log line.
     #[must_use]
     pub fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Something went wrong on our side.",
         )
+    }
+
+    /// A `503 Service Unavailable` for work this server cannot do right now.
+    ///
+    /// The honest answer when the server itself ran out of time or a
+    /// dependency is unreachable, both of which a caller may retry. Keep the
+    /// message free of which dependency failed, for the same reason
+    /// [`ApiError::internal`]'s body is generic.
+    #[must_use]
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
     /// Returns the HTTP status code.
@@ -355,6 +367,10 @@ mod tests {
         assert_eq!(
             ApiError::internal().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ApiError::unavailable("not ready").status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
