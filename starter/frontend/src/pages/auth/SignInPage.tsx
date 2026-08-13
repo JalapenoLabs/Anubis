@@ -1,19 +1,18 @@
 // Copyright © 2026 Jalapeno Labs
 
 // Core
-import { useEffect, useRef, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
+import { useCurrentUser } from '@jalapenolabs/anubis'
 
 // UI
-import { Button, Input, Tooltip } from '@heroui/react'
+import { Button } from '@heroui/react'
 import { AuthLayout } from '../../components/AuthLayout'
-
-// Utility
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
+import { PasskeySignInButton } from './PasskeySignInButton'
+import { SignInEmailCodeForm } from './SignInEmailCodeForm'
+import { SignInMfaForm } from './SignInMfaForm'
+import { SignInPasswordForm } from './SignInPasswordForm'
 
 // Misc
 import {
@@ -23,14 +22,6 @@ import {
   getUrlWithDestination,
   // 🐺 anubis:oauth-imports
 } from '../../urls'
-
-const signInSchema = z.object({
-  email: z.email(),
-  password: z.string().min(8),
-})
-
-type SignInFormValues = z.infer<typeof signInSchema>
-const resolver = zodResolver(signInSchema)
 
 /**
  * The codes an OAuth sign-in fails back with, and the string each one renders.
@@ -48,12 +39,24 @@ const oauthErrorKeys: Record<string, string | undefined> = {
   oauth_failed: 'auth.oauth.errors.failed',
 }
 
+/**
+ * Which sign-in step is on screen.
+ *
+ * Every method ends in one of two places: a session, or the second-factor
+ * challenge. Modeling the challenge as a step of this page, rather than as a
+ * route of its own, is what keeps the preserved destination in the URL through
+ * the whole flow.
+ */
+type SignInStep =
+  | { name: 'password' }
+  | { name: 'email-code' }
+  | { name: 'mfa', mfaToken: string }
+
 export function SignInPage() {
   const { t } = useTranslation()
-  const api = useAnubisApi()
   const { refresh } = useCurrentUser()
   const [ searchParams ] = useSearchParams()
-  const [ formError, setFormError ] = useState<string | null>(null)
+  const [ step, setStep ] = useState<SignInStep>({ name: 'password' })
 
   // The page the guard sent the user away from, kept on the links out of here
   // so a detour through sign-up or a password reset does not lose it.
@@ -62,35 +65,28 @@ export function SignInPage() {
   // An OAuth flow that failed lands back here carrying its reason.
   const oauthError = searchParams.get(AUTH_ERROR_PARAM)
 
-  const emailRef = useRef<HTMLInputElement>(null)
-  useEffect(() => {
-    emailRef.current?.focus()
-  }, [])
+  async function onSignedIn() {
+    // RequireGuest redirects to the preserved destination, or to the
+    // dashboard, once the user refreshes in.
+    await refresh()
+  }
 
-  const form = useForm<SignInFormValues>({
-    resolver,
-    mode: 'onChange',
-    defaultValues: {
-      email: '',
-      password: '',
-    },
-  })
+  function onMfaRequired(mfaToken: string) {
+    setStep({ name: 'mfa', mfaToken })
+  }
 
-  const onSubmit = form.handleSubmit(async (data) => {
-    setFormError(null)
-    try {
-      await api.login(data)
-      // RequireGuest redirects to the preserved destination, or to the
-      // dashboard, once the user refreshes in.
-      await refresh()
-    }
-    catch (error) {
-      const message = getApiErrorMessage(error)
-      setFormError(message ?? t('common.somethingWentWrong'))
-    }
-  })
-
-  const isValid = form.formState.isValid
+  if (step.name === 'mfa') {
+    return <AuthLayout
+      title={t('auth.mfa.title')}
+      subtitle={t('auth.mfa.subtitle')}
+    >
+      <SignInMfaForm
+        mfaToken={step.mfaToken}
+        onSignedIn={onSignedIn}
+        onCancel={() => setStep({ name: 'password' })}
+      />
+    </AuthLayout>
+  }
 
   return <AuthLayout
     title={t('auth.signIn.title')}
@@ -102,64 +98,32 @@ export function SignInPage() {
         }</p>
       : null
     }
-    <form onSubmit={onSubmit}>
-      <div className='compact'>
-        <Input
-          ref={emailRef}
-          type='email'
-          label={t('common.email')}
-          className='w-full'
-          isInvalid={Boolean(form.formState.errors.email && form.formState.touchedFields.email)}
-          value={form.watch('email')}
-          onChange={(event) => {
-            form.setValue('email', event.currentTarget.value, {
-              shouldDirty: true,
-              shouldValidate: true,
-              shouldTouch: true,
-            })
-          }}
+    { step.name === 'password'
+      ? <SignInPasswordForm
+          onSignedIn={onSignedIn}
+          onMfaRequired={onMfaRequired}
         />
-      </div>
-      <div className='compact'>
-        <Input
-          type='password'
-          label={t('common.password')}
-          className='w-full'
-          value={form.watch('password')}
-          onChange={(event) => {
-            form.setValue('password', event.currentTarget.value, {
-              shouldDirty: true,
-              shouldValidate: true,
-            })
-          }}
+      : <SignInEmailCodeForm
+          onSignedIn={onSignedIn}
+          onMfaRequired={onMfaRequired}
         />
-      </div>
-      { formError
-        ? <p className='compact text-danger'>{
-            formError
-          }</p>
-        : null
-      }
-      <Tooltip
-        content={t('auth.validation.fillAllFields')}
-        isDisabled={isValid}
-        placement='top'
-      >
-        <div className='relaxed mt-6'>
-          <Button
-            type='submit'
-            color='primary'
-            className='w-full'
-            isDisabled={!isValid || form.formState.isSubmitting}
-            isLoading={form.formState.isSubmitting}
-          >
-            <span>{
-                t('auth.signIn.action')
-              }</span>
-          </Button>
-        </div>
-      </Tooltip>
-    </form>
+    }
+    <Button
+      variant='light'
+      className='mb-2 w-full'
+      onPress={() => setStep(
+        step.name === 'password'
+          ? { name: 'email-code' }
+          : { name: 'password' },
+      )}
+    >
+      <span>{
+          step.name === 'password'
+            ? t('auth.emailCode.switchTo')
+            : t('auth.emailCode.switchBack')
+        }</span>
+    </Button>
+    <PasskeySignInButton onSignedIn={onSignedIn} />
     {/* One button per provider, written by `anubis scaffold oauth <provider>`. */}
     {/* 🐺 anubis:oauth-providers */}
     <div className='level mt-4 text-sm'>

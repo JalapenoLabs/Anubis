@@ -16,6 +16,8 @@
 //! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
 //! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
+//! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
+//! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
 //! adds three more, named after the provider:
@@ -39,6 +41,23 @@
 //! [`crate::telemetry::init`] warns whenever that fallback is in use.
 //! Rotating the key makes values sealed under the old one unreadable, so
 //! affected users re-enroll their second factor.
+//!
+//! # Email delivery
+//!
+//! `SMTP_URL` is the switch: set it and [`crate::mail::Mailer::from_config`]
+//! delivers over SMTP, in every environment. Both forms the relay world uses
+//! are understood: `smtps://host:465` opens TLS immediately, while
+//! `smtp://host:587?tls=required` connects in the clear and upgrades with
+//! STARTTLS. Credentials ride in the URL and must be percent-encoded if they
+//! contain URL syntax. The URL is a secret, so it is never echoed in errors
+//! or logs.
+//!
+//! A relay needs a sender, so `MAIL_FROM` becomes required the moment
+//! `SMTP_URL` is set. Leaving both unset keeps the log mailer, which is the
+//! zero-configuration development default. Production without a relay boots
+//! anyway, with a startup warning from [`crate::telemetry::init`]: a first
+//! deploy that sends no email should not be blocked by mail configuration.
+//! See `docs/email.md`.
 //!
 //! # OAuth providers
 //!
@@ -77,6 +96,20 @@ const SECRET_KEY_VAR: &str = "ANUBIS_SECRET_KEY";
 
 /// What a valid `ANUBIS_SECRET_KEY` looks like, quoted back in errors.
 const SECRET_KEY_FORM: &str = "base64 for exactly 32 random bytes, e.g. `openssl rand -base64 32`";
+
+/// SMTP relay URL, credentials included.
+const SMTP_URL_VAR: &str = "SMTP_URL";
+
+/// What a valid `SMTP_URL` looks like, quoted back in errors.
+const SMTP_URL_FORM: &str =
+    "an smtp:// or smtps:// relay URL, e.g. `smtps://user:password@smtp.example.com:465`";
+
+/// Sender address of outgoing email.
+const MAIL_FROM_VAR: &str = "MAIL_FROM";
+
+/// What a valid `MAIL_FROM` looks like, quoted back in errors.
+const MAIL_FROM_FORM: &str =
+    "an email address with an optional display name, e.g. `Acme <no-reply@acme.com>`";
 
 /// Loopback keeps development servers off the network unless opted in.
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -167,6 +200,38 @@ impl fmt::Debug for DatabaseConfig {
     }
 }
 
+/// SMTP relay settings for outgoing email.
+///
+/// The URL embeds credentials, so this type never exposes it through `Debug`;
+/// read it deliberately with [`SmtpConfig::url`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct SmtpConfig {
+    url: String,
+    from: String,
+}
+
+impl SmtpConfig {
+    /// Returns the relay URL, credentials included.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the sender address every outgoing email carries.
+    #[must_use]
+    pub fn from(&self) -> &str {
+        &self.from
+    }
+}
+
+impl fmt::Debug for SmtpConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -187,6 +252,11 @@ pub struct AppConfig {
     /// Production requires it. Development and test fall back to the built-in
     /// development key; see the module docs.
     pub secret_key: SecretKey,
+    /// SMTP relay settings, when `SMTP_URL` is set.
+    ///
+    /// Present means real delivery, absent means the log mailer; see the
+    /// module docs.
+    pub smtp: Option<SmtpConfig>,
     /// The OpenID Connect providers the environment enabled, in registry order.
     ///
     /// Empty unless a provider's client id and secret are both set.
@@ -270,6 +340,7 @@ impl AppConfig {
             None => SecretKey::development(),
         };
 
+        let smtp = smtp_config(&lookup)?;
         let oauth = oauth_providers(&lookup)?;
 
         Ok(Self {
@@ -278,9 +349,38 @@ impl AppConfig {
             database,
             app_url,
             secret_key,
+            smtp,
             oauth,
         })
     }
+}
+
+/// Resolves the SMTP relay, when the environment configures one.
+///
+/// The URL is checked for a relay scheme only; the transport parses the rest
+/// when the mailer is built. A relay cannot deliver without a sender, so a URL
+/// without `MAIL_FROM` stops startup rather than failing every send later.
+fn smtp_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<SmtpConfig>, Error> {
+    let Some(url) = non_empty(lookup(SMTP_URL_VAR)) else {
+        return Ok(None);
+    };
+    let url = url.trim().to_owned();
+
+    if !url.starts_with("smtp://") && !url.starts_with("smtps://") {
+        // The URL carries credentials, so the bad value is never quoted back.
+        return Err(Error::invalid_secret(SMTP_URL_VAR, SMTP_URL_FORM));
+    }
+
+    let Some(from) = non_empty(lookup(MAIL_FROM_VAR)) else {
+        return Err(Error::missing(MAIL_FROM_VAR, MAIL_FROM_FORM));
+    };
+    let from = from.trim().to_owned();
+
+    if !crate::mail::is_valid_address(&from) {
+        return Err(Error::invalid(MAIL_FROM_VAR, &from, MAIL_FROM_FORM));
+    }
+
+    Ok(Some(SmtpConfig { url, from }))
 }
 
 /// Resolves every provider whose credentials the environment carries.
@@ -576,6 +676,89 @@ mod tests {
         assert_eq!(error.variable(), "ANUBIS_SECRET_KEY");
         let rendered = error.to_string();
         assert!(!rendered.contains("c2hvcnQ"), "got: {rendered}");
+    }
+
+    #[test]
+    fn smtp_is_unconfigured_until_a_relay_url_is_set() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert!(unset.smtp.is_none());
+
+        // A sender without a relay is harmless: the log mailer ignores it.
+        let lookup = lookup_from(&[("MAIL_FROM", "Acme <no-reply@acme.com>")]);
+        let sender_only = AppConfig::from_lookup(lookup).expect("a lone sender is fine");
+        assert!(sender_only.smtp.is_none());
+    }
+
+    #[test]
+    fn both_smtp_url_forms_are_accepted() {
+        for url in [
+            "smtps://user:hunter2@smtp.example.com:465",
+            "smtp://user:hunter2@smtp.example.com:587?tls=required",
+        ] {
+            let lookup =
+                lookup_from(&[("SMTP_URL", url), ("MAIL_FROM", "Acme <no-reply@acme.com>")]);
+            let config = AppConfig::from_lookup(lookup).expect("relay URLs must parse");
+
+            let smtp = config.smtp.expect("smtp config must be present");
+            assert_eq!(smtp.url(), url);
+            assert_eq!(smtp.from(), "Acme <no-reply@acme.com>");
+        }
+    }
+
+    #[test]
+    fn a_relay_url_of_the_wrong_scheme_is_rejected_without_echoing_it() {
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "https://user:hunter2@smtp.example.com"),
+            ("MAIL_FROM", "no-reply@acme.com"),
+        ]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("only relay schemes are accepted");
+
+        assert_eq!(error.variable(), "SMTP_URL");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(rendered.contains("smtps://"), "got: {rendered}");
+    }
+
+    #[test]
+    fn a_configured_relay_requires_a_sender_address() {
+        let lookup = lookup_from(&[("SMTP_URL", "smtps://smtp.example.com")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("a relay needs a sender");
+        assert_eq!(error.variable(), "MAIL_FROM");
+        assert!(error.to_string().contains("is not set"), "got: {error}");
+
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "no-reply"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("junk senders are rejected");
+        assert_eq!(error.variable(), "MAIL_FROM");
+    }
+
+    #[test]
+    fn smtp_debug_output_never_leaks_credentials() {
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://user:hunter2@smtp.example.com:465"),
+            ("MAIL_FROM", "Acme <no-reply@acme.com>"),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a relay URL is fine");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("SmtpConfig"), "got: {rendered}");
+        assert!(rendered.contains("no-reply@acme.com"), "got: {rendered}");
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+    }
+
+    #[test]
+    fn production_boots_without_a_relay() {
+        let lookup = lookup_from(&[
+            ("ANUBIS_ENV", "production"),
+            ("ANUBIS_SECRET_KEY", SAMPLE_SECRET_KEY),
+        ]);
+
+        let config = AppConfig::from_lookup(lookup).expect("a missing relay must not block boot");
+
+        assert!(config.smtp.is_none());
     }
 
     #[test]

@@ -13,6 +13,9 @@ import { CreativeConceptPage } from './pages/CreativeConceptPage'
 import { CreativeConceptsPage } from './pages/CreativeConceptsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { MembersPage } from './pages/MembersPage'
+import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
+import { SecuritySettingsPage } from './pages/settings/SecuritySettingsPage'
+import { ConfirmEmailChangePage } from './pages/auth/ConfirmEmailChangePage'
 import { ForgotPasswordPage } from './pages/auth/ForgotPasswordPage'
 import { ResetPasswordPage } from './pages/auth/ResetPasswordPage'
 import { SignInPage } from './pages/auth/SignInPage'
@@ -128,6 +131,26 @@ export function App() {
     />
     {/* 🐺 anubis:routes */}
     <Route
+      path={UrlTree.settings}
+      element={<Navigate to={UrlTree.settingsProfile} replace />}
+    />
+    <Route
+      path={UrlTree.settingsProfile}
+      element={
+        <Workspace>
+          <ProfileSettingsPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.settingsSecurity}
+      element={
+        <Workspace>
+          <SecuritySettingsPage />
+        </Workspace>
+      }
+    />
+    <Route
       path={UrlTree.claimInvitation}
       element={
         <RequireAuth>
@@ -166,6 +189,10 @@ export function App() {
     <Route
       path={UrlTree.verifyEmail}
       element={<VerifyEmailPage />}
+    />
+    <Route
+      path={UrlTree.confirmEmailChange}
+      element={<ConfirmEmailChangePage />}
     />
     <Route
       path='*'

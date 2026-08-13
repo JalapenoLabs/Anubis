@@ -8,6 +8,11 @@ export const UrlTree = {
   forgotPassword: '/forgot-password',
   resetPassword: '/reset-password',
   verifyEmail: '/verify-email',
+  /** Where the emailed link confirming a new address lands. */
+  confirmEmailChange: '/change-email',
+  settings: '/settings',
+  settingsProfile: '/settings/profile',
+  settingsSecurity: '/settings/security',
   members: '/members',
   claimInvitation: '/claim-invitation',
   creativeConcepts: '/creative-concepts',

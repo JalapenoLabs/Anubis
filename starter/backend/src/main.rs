@@ -44,9 +44,9 @@ async fn main() {
         .await
         .expect("failed to connect to the database");
 
-    // The log mailer prints emails (and their action links) to the console.
-    // Swap in a transport backend for production delivery.
-    let mailer = anubis::mail::Mailer::log();
+    // SMTP when SMTP_URL is set, otherwise the log mailer, which prints emails
+    // and their action links to the console.
+    let mailer = anubis::mail::Mailer::from_config(&config).expect("invalid mail configuration");
 
     let app = Router::new()
         .route("/healthz", get(healthz))

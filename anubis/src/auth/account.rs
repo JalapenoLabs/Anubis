@@ -21,7 +21,7 @@ use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -353,6 +353,12 @@ struct DeleteAccountBody {
     password: String,
 }
 
+/// Deletes the account and settles the tenancy it leaves behind.
+///
+/// One transaction removes the user's memberships, dissolves organizations
+/// nobody can reach any more, keeps the surviving ones administrable, and then
+/// deletes the user, so the account can never be half gone. The rules live in
+/// `docs/tenancy.md`.
 async fn delete_account(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
@@ -362,8 +368,13 @@ async fn delete_account(
     verify_password_or_reject(&user, body.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    diesel::delete(users::table.find(user.id))
-        .execute(&mut connection)
+    connection
+        .transaction(async |transaction| {
+            crate::tenancy::settle_departure(transaction, user.id).await?;
+            diesel::delete(users::table.find(user.id))
+                .execute(transaction)
+                .await
+        })
         .await
         .map_err(log_internal)?;
 

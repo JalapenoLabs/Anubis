@@ -1,10 +1,16 @@
-//! Tenancy endpoints: inviting members and claiming invitations.
+//! Tenancy endpoints: membership overview, invitations, and management.
 //!
 //! [`router`] returns the routes an application mounts (conventionally under
-//! `/tenancy`): `POST /invitations` sends an invitation to a team or an
-//! organization, `POST /invitations/claim` joins the signed-in user to the
-//! invitation's target. Inviting requires the admin role on the target;
-//! organization admins may invite to any team in their organization.
+//! `/tenancy`). This module serves the read and invitation side:
+//! `GET /memberships` lists what the caller belongs to, `GET
+//! /teams/{team_id}/members` is the team roster, `POST /invitations` sends an
+//! invitation to a team or an organization, and `POST /invitations/claim`
+//! joins the signed-in user to the invitation's target. Inviting requires the
+//! admin role on the target; organization admins may invite to any team in
+//! their organization.
+//!
+//! The management routes, which create, rename, and dissolve tenants and move
+//! members between roles, live in [`super::management`] and merge in here.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +35,7 @@ use crate::roles::RoleSet;
 use crate::schema::{
     invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
-use crate::tenancy::bootstrap::ADMIN_ROLE;
+use crate::tenancy::bootstrap::{DEFAULT_ROLE, holds_admin};
 use crate::tenancy::invitation::{self, InvitationTarget};
 use crate::tenancy::model::{Organization, Team};
 
@@ -43,6 +49,7 @@ pub fn router(pool: DbPool, mailer: Mailer, roles: RoleSet, config: &AppConfig) 
         .route("/teams/{team_id}/members", get(list_team_members))
         .route("/invitations", post(create_invitation))
         .route("/invitations/claim", post(claim_invitation))
+        .merge(super::management::routes())
         .with_state(TenancyState {
             pool: pool.clone(),
             mailer,
@@ -55,10 +62,10 @@ pub fn router(pool: DbPool, mailer: Mailer, roles: RoleSet, config: &AppConfig) 
 }
 
 #[derive(Clone)]
-struct TenancyState {
-    pool: DbPool,
+pub(super) struct TenancyState {
+    pub(super) pool: DbPool,
+    pub(super) roles: RoleSet,
     mailer: Mailer,
-    roles: RoleSet,
     app_url: String,
 }
 
@@ -192,6 +199,8 @@ struct TeamMemberEntry {
     roles: Vec<String>,
     /// True for invited members who have not claimed their membership yet.
     pending: bool,
+    /// The invitation to revoke, for a pending member.
+    invitation_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -199,8 +208,14 @@ struct TeamMembersBody {
     members: Vec<TeamMemberEntry>,
 }
 
-/// One roster row: membership id, roles, account email, invitation email.
-type RosterRow = (Uuid, Vec<String>, Option<String>, Option<String>);
+/// One roster row: membership id, roles, account email, invitation, its email.
+type RosterRow = (
+    Uuid,
+    Vec<String>,
+    Option<String>,
+    Option<Uuid>,
+    Option<String>,
+);
 
 /// The team's roster, visible to any member of the team.
 async fn list_team_members(
@@ -220,6 +235,7 @@ async fn list_team_members(
             team_memberships::id,
             team_memberships::roles,
             users::email.nullable(),
+            invitations::id.nullable(),
             invitations::email.nullable(),
         ))
         .order(team_memberships::created_at.asc())
@@ -230,11 +246,12 @@ async fn list_team_members(
     let members = rows
         .into_iter()
         .map(
-            |(membership_id, roles, user_email, invited_email)| TeamMemberEntry {
+            |(membership_id, roles, user_email, invitation_id, invited_email)| TeamMemberEntry {
                 membership_id,
                 pending: user_email.is_none(),
                 email: user_email.or(invited_email),
                 roles,
+                invitation_id,
             },
         )
         .collect();
@@ -252,18 +269,7 @@ async fn create_invitation(
         return Err(ApiError::validation("Enter a valid email address."));
     }
 
-    let granted_roles = if body.roles.is_empty() {
-        vec!["default".to_owned()]
-    } else {
-        body.roles.clone()
-    };
-    for role in &granted_roles {
-        if !state.roles.is_defined(role) {
-            return Err(ApiError::validation(format!(
-                "Unknown role {role:?}. Define it in config/roles.yml first."
-            )));
-        }
-    }
+    let granted_roles = normalize_roles(&state.roles, body.roles.clone())?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
@@ -434,7 +440,7 @@ async fn holds_admin_on_organization(
         .await
         .optional()?;
 
-    Ok(roles.is_some_and(|held| held.iter().any(|role| role == ADMIN_ROLE)))
+    Ok(roles.is_some_and(|held| holds_admin(&held)))
 }
 
 async fn holds_admin_on_team(
@@ -450,14 +456,39 @@ async fn holds_admin_on_team(
         .await
         .optional()?;
 
-    Ok(roles.is_some_and(|held| held.iter().any(|role| role == ADMIN_ROLE)))
+    Ok(roles.is_some_and(|held| holds_admin(&held)))
 }
 
 fn not_allowed() -> ApiError {
     ApiError::forbidden("You need the admin role to invite members.")
 }
 
-fn log_internal(error: impl std::fmt::Display) -> ApiError {
+/// Validates requested role keys against the application's role set.
+///
+/// An empty list means the baseline role, so a caller who does not care about
+/// roles still lands somewhere defined rather than with none at all.
+pub(super) fn normalize_roles(
+    roles: &RoleSet,
+    requested: Vec<String>,
+) -> Result<Vec<String>, ApiError> {
+    let granted = if requested.is_empty() {
+        vec![DEFAULT_ROLE.to_owned()]
+    } else {
+        requested
+    };
+
+    for role in &granted {
+        if !roles.is_defined(role) {
+            return Err(ApiError::validation(format!(
+                "Unknown role {role:?}. Define it in config/roles.yml first."
+            )));
+        }
+    }
+
+    Ok(granted)
+}
+
+pub(super) fn log_internal(error: impl std::fmt::Display) -> ApiError {
     tracing::error!(
         error.message = %error,
         "tenancy request failed: {{error.message}}",

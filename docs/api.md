@@ -48,6 +48,25 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 
 Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.
 
+## The identity screens
+
+Every route above has a screen. The starter owns the pages; `@jalapenolabs/anubis` owns the typed client (`createAnubisApi`) and the WebAuthn browser helpers, because both are the same in every application.
+
+| Screen | Route | Endpoints |
+|---|---|---|
+| Profile settings | `/settings/profile` | `PATCH /auth/profile`, `POST` and `DELETE /auth/profile/avatar` |
+| Security settings | `/settings/security` | change password, change email, MFA, passkeys, sessions, account deletion |
+| New address confirmation | `/change-email?token=` | `POST /auth/change-email/confirm` |
+| Sign in | `/sign-in` | password, `email-code/request` and `verify`, `mfa/verify`, the passkey login ceremony |
+
+Sign-in is one page with three methods and a shared second-factor step, rather than a route per method, because the preserved `?next=` destination has to survive every branch and a step of the same page keeps it in the URL for free.
+
+Avatar upload has no cropper. The server center-crops to a square, caps the longest edge at 512 px, flattens transparency, and re-encodes as JPEG, so a browser cropper would only be a second opinion the stored image ignores; the picker previews the file and posts the bytes.
+
+Recovery codes appear exactly once, on the step after a confirmed enrollment, with a copy affordance. The server stores only their hashes, so there is no second chance to show them and the screen says so.
+
+WebAuthn needs binary where JSON has none, so the package exports the conversion both ceremonies need: `toCredentialCreationOptions` and `toCredentialRequestOptions` decode a challenge into what `navigator.credentials` accepts, `serializeRegistrationCredential` and `serializeAuthenticationCredential` encode the authenticator's answer back, and `base64UrlToArrayBuffer` and `arrayBufferToBase64Url` are the pair underneath. The serializers take `unknown` and validate, because an authenticator's answer is as much a runtime boundary as an HTTP response.
+
 ## OAuth sign-in
 
 Two framework routes carry a whole provider, and `anubis scaffold oauth <provider>` adds the button that calls them:
@@ -81,6 +100,30 @@ The session cookie is the one password login issues. Failures redirect to `/sign
 | `oauth_failed` | The code exchange, the ID token, or this application failed |
 
 Providers are OpenID Connect only, because a discovery document and a signed ID token are what make an identity verifiable. Google ships in the registry; each provider reads `<PROVIDER>_OAUTH_CLIENT_ID`, `<PROVIDER>_OAUTH_CLIENT_SECRET`, and an optional `<PROVIDER>_OAUTH_ISSUER` override, and is enabled by the presence of the first two. Register `<APP_URL>/auth/oauth/<provider>/callback` as the redirect URI. GitHub publishes no discovery document and issues no ID token, so it needs a plain OAuth 2 path with a provider-specific profile fetch, which the framework does not have.
+
+## Tenancy endpoints
+
+The framework mounts the tenancy surface under `/tenancy`. These are account (browser session) routes, not `/api/v1` routes: they administer the tenant the API itself is scoped to. [Tenancy, teams, and organizations](tenancy.md) covers the model, the invariants each route enforces, and the cascade semantics of the deletions.
+
+| Route | Guard | Effect |
+|---|---|---|
+| `GET /tenancy/memberships` | signed in | Everything the caller belongs to, grouped by organization |
+| `GET /tenancy/teams/{team_id}/members` | team member | The team roster, pending invitations included |
+| `POST /tenancy/invitations` | admin on the target | Invite an email to a team or an organization |
+| `POST /tenancy/invitations/claim` | signed in | Claim an invitation token |
+| `POST /tenancy/organizations` | signed in | Create an organization with its default team |
+| `PATCH /tenancy/organizations/{organization_id}` | org admin | Rename the organization |
+| `DELETE /tenancy/organizations/{organization_id}` | org admin | Delete the organization and everything under it |
+| `POST /tenancy/organizations/{organization_id}/teams` | org admin | Create a team |
+| `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
+| `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke a pending invitation in the organization |
+| `PATCH /tenancy/teams/{team_id}` | team admin | Rename the team |
+| `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | team admin | Replace a member's roles |
+| `DELETE /tenancy/teams/{team_id}/members/{membership_id}` | team admin | Remove a member |
+| `POST /tenancy/teams/{team_id}/leave` | team member | Leave the team |
+| `DELETE /tenancy/teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
+
+Guarded routes answer `401` when signed out, `404` when the caller is not a member of the named tenant, and `403` when a member lacks the role. A request that only the current state refuses, such as demoting a team's last admin, answers `409 Conflict`.
 
 ## Webhooks
 

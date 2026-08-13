@@ -240,6 +240,62 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/tenancy/invitations/claim",
         area: "tenancy",
     },
+    // Tenancy management.
+    RouteEntry {
+        method: "POST",
+        path: "/tenancy/organizations",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PATCH",
+        path: "/tenancy/organizations/{organization_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/organizations/{organization_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tenancy/organizations/{organization_id}/teams",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/organizations/{organization_id}/teams/{team_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/organizations/{organization_id}/invitations/{invitation_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PATCH",
+        path: "/tenancy/teams/{team_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tenancy/teams/{team_id}/leave",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PATCH",
+        path: "/tenancy/teams/{team_id}/members/{membership_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/teams/{team_id}/members/{membership_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/teams/{team_id}/invitations/{invitation_id}",
+        area: "tenancy",
+    },
     // Developer platform applications.
     RouteEntry {
         method: "GET",

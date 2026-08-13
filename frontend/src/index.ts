@@ -1,17 +1,33 @@
 // Copyright © 2026 Jalapeno Labs
 
 export type {
+  AuthSession,
+  ChangePasswordRequest,
   ClaimedInvitation,
   Credentials,
+  EmailChangeRequest,
   InviteMemberRequest,
   MembershipOrganization,
   MembershipTeam,
   MembershipsOverview,
   MessageEnvelope,
+  MfaStatus,
+  Passkey,
+  PasskeyLoginChallenge,
+  PasskeyRegistrationChallenge,
+  ProfileUpdate,
+  SignInResult,
   TeamRosterMember,
+  TotpEnrollment,
   User,
   UserEnvelope,
 } from './api/types'
+export type {
+  AuthenticationCredentialPayload,
+  RegistrationCredentialPayload,
+  WireCreationOptions,
+  WireRequestOptions,
+} from './webauthn/ceremony'
 export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { CurrentUserResult } from './react/useCurrentUser'
@@ -34,6 +50,16 @@ export { SuperSelectField } from './fields/SuperSelectField'
 export { TextAreaField } from './fields/TextAreaField'
 export { TextField } from './fields/TextField'
 export { useFieldState } from './fields/useFieldState'
+
+// WebAuthn
+export { arrayBufferToBase64Url, base64UrlToArrayBuffer } from './webauthn/encoding'
+export {
+  isPasskeySupported,
+  serializeAuthenticationCredential,
+  serializeRegistrationCredential,
+  toCredentialCreationOptions,
+  toCredentialRequestOptions,
+} from './webauthn/ceremony'
 
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'

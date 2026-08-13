@@ -17,8 +17,9 @@ migrations at boot; the app is at http://localhost:5173.
 Emails (verification, password reset, invitations, sign-in codes) go to the
 backend log in development; the action links and codes are in the log lines.
 
-The vite dev server proxies `/auth`, `/tenancy`, and `/healthz` to the backend
-on port 3000, so the SPA and API stay same-origin in development. Same-origin
+The vite dev server proxies `/auth`, `/tenancy`, `/account`, `/users`, and
+`/healthz` to the backend on port 3000, so the SPA and API stay same-origin in
+development. Same-origin
 production serving (the backend shipping the built SPA) is on the roadmap;
 until then the built frontend needs its own static host.
 

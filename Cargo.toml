@@ -35,6 +35,17 @@ hmac = "0.12"
 http-body-util = "0.1"
 # Decoders limited to formats browsers actually upload.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# SMTP delivery for the production mailer. The default feature set links
+# native-tls, so it stays off and the pinned set spells out the policy: the
+# tokio executor, rustls for both smtps:// and STARTTLS, pooled connections,
+# and the message builder. No OpenSSL enters the tree.
+lettre = { version = "0.11", default-features = false, features = [
+  "builder",
+  "pool",
+  "smtp-transport",
+  "tokio1",
+  "tokio1-rustls-tls",
+] }
 mimalloc = "0.1"
 # OpenID Connect sign-in. The default feature pair is exactly the policy we
 # want, spelled out here so a future default change cannot pull in native TLS:

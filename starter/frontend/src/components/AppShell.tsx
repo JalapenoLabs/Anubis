@@ -6,7 +6,7 @@ import type { ReactNode } from 'react'
 
 // Core
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { useAnubisApi, useCurrentUser } from '@jalapenolabs/anubis'
 import { useTeamContext } from '../context/TeamProvider'
 
@@ -40,6 +40,7 @@ type Props = {
 export function AppShell(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const navigate = useNavigate()
   const { refresh } = useCurrentUser()
   const { memberships, current, selectTeam } = useTeamContext()
 
@@ -113,6 +114,8 @@ export function AppShell(props: Props) {
               <Avatar
                 as='button'
                 size='sm'
+                showFallback
+                src={api.avatarUrl(props.user.id)}
                 name={props.user.email.slice(0, 2).toUpperCase()}
                 className='transition-transform'
               />
@@ -120,6 +123,12 @@ export function AppShell(props: Props) {
             <DropdownMenu aria-label={t('dashboard.greeting', { email: props.user.email })}>
               <DropdownItem key='signed-in-as' isReadOnly className='opacity-70'>{
                   t('dashboard.greeting', { email: props.user.email })
+                }</DropdownItem>
+              <DropdownItem
+                key='settings'
+                onPress={() => navigate(UrlTree.settingsProfile)}
+              >{
+                  t('settings.navLink')
                 }</DropdownItem>
               <DropdownItem key='sign-out' color='danger' onPress={onSignOut}>{
                   t('common.signOut')

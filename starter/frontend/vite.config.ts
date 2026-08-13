@@ -15,6 +15,8 @@ export default defineConfig({
       '/auth': 'http://127.0.0.1:3000',
       '/tenancy': 'http://127.0.0.1:3000',
       '/account': 'http://127.0.0.1:3000',
+      // Avatars are served publicly, outside the authenticated prefixes.
+      '/users': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',
     },
   },

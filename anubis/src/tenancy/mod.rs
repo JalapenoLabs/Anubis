@@ -8,15 +8,19 @@
 //! `docs/tenancy.md`.
 //!
 //! Every user gets a personal organization with a default team at signup.
-//! Applications mount [`router`] (conventionally under `/tenancy`) for
-//! invitations; ownership-chain guards arrive with the next milestone step.
+//! Applications mount [`router`] (conventionally under `/tenancy`) for the
+//! membership overview, invitations, and the management endpoints that create,
+//! rename, and dissolve tenants.
 
 mod bootstrap;
+mod departure;
 mod invitation;
+mod management;
 mod model;
 mod routes;
 
 pub(crate) use bootstrap::create_personal_organization;
+pub(crate) use departure::settle_departure;
 
 #[doc(inline)]
 pub use bootstrap::ADMIN_ROLE;

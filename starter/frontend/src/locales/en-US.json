@@ -67,10 +67,132 @@
       "resent": "Check your inbox for a fresh link.",
       "goToDashboard": "Go to the dashboard"
     },
+    "changeEmail": {
+      "title": "New email address",
+      "confirming": "Confirming your new address...",
+      "confirmed": "Done. Your account now signs in with {{email}}.",
+      "failed": "That link is invalid or has expired. Request a new one from your security settings.",
+      "goToDashboard": "Go to the dashboard"
+    },
+    "emailCode": {
+      "switchTo": "Email me a sign-in code instead",
+      "switchBack": "Use your password instead",
+      "requestBody": "We'll email you a code that signs you in. No password needed.",
+      "requestAction": "Send me a code",
+      "sent": "We sent a code to {{email}}. It expires in 10 minutes.",
+      "codeLabel": "Sign-in code",
+      "verifyAction": "Sign in",
+      "useAnotherAddress": "Use a different email address"
+    },
+    "mfa": {
+      "title": "One more step",
+      "subtitle": "This account is protected by two-factor authentication.",
+      "body": "Enter the code from your authenticator app.",
+      "codeLabel": "Authentication code",
+      "codeHelp": "Lost your phone? A recovery code works here too.",
+      "action": "Verify"
+    },
+    "passkey": {
+      "action": "Sign in with a passkey",
+      "failed": "That passkey sign-in did not complete. Try again, or use your password."
+    },
     "validation": {
       "emailInvalid": "Enter a valid email address.",
       "passwordTooShort": "Passwords must be at least {{count}} characters.",
       "fillAllFields": "Fill in every field to continue."
+    }
+  },
+  "settings": {
+    "navLink": "Settings",
+    "title": "Settings",
+    "subtitle": "Your account, and how you sign in to it.",
+    "profile": {
+      "tab": "Profile",
+      "detailsTitle": "Your details",
+      "firstName": "First name",
+      "lastName": "Last name",
+      "timeZone": "Time zone",
+      "timeZoneHelp": "Dates and times are shown in this zone.",
+      "locale": "Language",
+      "localeHelp": "The language this application speaks to you in.",
+      "saved": "Your profile is saved.",
+      "avatarTitle": "Profile picture",
+      "avatarHelp": "JPEG, PNG, WebP, or GIF, up to 5 MB. We crop it square and resize it to 512 pixels.",
+      "avatarChoose": "Choose an image",
+      "avatarSave": "Upload",
+      "avatarRemove": "Remove",
+      "avatarSelected": "Ready to upload: {{name}}",
+      "avatarTooLarge": "That image is larger than 5 MB. Choose a smaller one."
+    },
+    "security": {
+      "tab": "Security",
+      "password": {
+        "title": "Password",
+        "subtitle": "Changing your password signs out every other browser.",
+        "current": "Current password",
+        "new": "New password",
+        "action": "Change password",
+        "changed": "Your password is changed. Other sessions were signed out."
+      },
+      "email": {
+        "title": "Email address",
+        "current": "You sign in with {{email}}.",
+        "newAddress": "New email address",
+        "help": "We'll email a confirmation link there. Nothing changes until you open it.",
+        "action": "Send confirmation link",
+        "sent": "Check {{email}} for the confirmation link."
+      },
+      "twoFactor": {
+        "title": "Two-factor authentication",
+        "subtitle": "An authenticator app code, asked for every time you sign in with a password.",
+        "enabled": "On",
+        "disabled": "Off",
+        "enableAction": "Set up two-factor",
+        "disableAction": "Turn off",
+        "enrollTitle": "Set up two-factor authentication",
+        "enrollBody": "Scan this code with your authenticator app, then enter the code it shows.",
+        "qrAlt": "QR code for your authenticator app",
+        "manualEntry": "Can't scan? Enter this secret by hand:",
+        "codeLabel": "Code from your app",
+        "codeHelp": "Six digits, refreshed every 30 seconds.",
+        "confirmAction": "Turn on two-factor",
+        "recoveryTitle": "Save your recovery codes",
+        "recoveryBody": "Each code signs you in once if you lose your authenticator. This is the only time they are shown.",
+        "recoveryCopy": "Copy the codes",
+        "recoveryCopied": "Copied",
+        "recoveryDone": "I've saved them"
+      },
+      "passkeys": {
+        "title": "Passkeys",
+        "subtitle": "Sign in with your device or password manager, with no password to type.",
+        "name": "Name",
+        "added": "Added",
+        "lastUsed": "Last used",
+        "neverUsed": "Never",
+        "empty": "No passkeys yet.",
+        "nameLabel": "Name this passkey",
+        "nameHelp": "Something you'll recognize, such as the device it lives on.",
+        "addAction": "Add a passkey",
+        "ceremonyFailed": "That passkey was not registered. Try again.",
+        "unsupported": "This browser cannot create passkeys."
+      },
+      "sessions": {
+        "title": "Active sessions",
+        "subtitle": "Every browser currently signed in to this account.",
+        "signedIn": "Signed in",
+        "expires": "Expires",
+        "current": "This browser",
+        "revoke": "Sign out"
+      },
+      "danger": {
+        "title": "Delete this account",
+        "subtitle": "Your account, and everything only you own, is deleted immediately. This cannot be undone.",
+        "action": "Delete account",
+        "modalTitle": "Delete this account?",
+        "modalBody": "This deletes your account and everything only you own. It cannot be undone.",
+        "confirmLabel": "Type {{email}} to confirm",
+        "confirmAction": "Delete my account"
+      }
     }
   },
   "team": {

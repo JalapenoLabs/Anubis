@@ -9,8 +9,9 @@
 //! Call [`init`] once, first thing in `main`. A second call returns an
 //! [`Error`], since the global subscriber can only be installed once per
 //! process. Because it is the first thing with both a live subscriber and the
-//! configuration in hand, [`init`] also announces insecure development
-//! defaults, such as the built-in `ANUBIS_SECRET_KEY` fallback.
+//! configuration in hand, [`init`] also announces configuration that is fine
+//! locally and costly in a live deployment: the built-in `ANUBIS_SECRET_KEY`
+//! fallback, and a production deployment with no mail relay.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -21,7 +22,7 @@ use crate::config::AppConfig;
 
 /// Installs the global tracing subscriber for the application.
 ///
-/// Also warns about insecure development defaults that are in effect.
+/// Also warns about risky defaults that are in effect.
 ///
 /// # Errors
 /// Returns an [`Error`] when a global subscriber is already installed.
@@ -40,18 +41,29 @@ pub fn init(config: &AppConfig) -> Result<(), Error> {
         .try_init()
         .map_err(Error::from_source)?;
 
-    warn_about_development_defaults(config);
+    warn_about_risky_defaults(config);
     Ok(())
 }
 
-/// Announces defaults that are fine locally and dangerous anywhere else.
-fn warn_about_development_defaults(config: &AppConfig) {
+/// Announces defaults that are fine locally and costly anywhere else.
+fn warn_about_risky_defaults(config: &AppConfig) {
     if config.secret_key.is_development() {
         tracing::warn!(
             app.environment = %config.environment,
             "ANUBIS_SECRET_KEY is unset: secrets at rest are encrypted with the built-in \
              development key, which is public. Set ANUBIS_SECRET_KEY before storing anything \
              real. (environment: {{app.environment}})",
+        );
+    }
+
+    // Deliberately a warning rather than a hard failure: a first deploy that
+    // sends no email should not be blocked on mail configuration.
+    if config.smtp.is_none() && config.environment.is_production() {
+        tracing::warn!(
+            app.environment = %config.environment,
+            "SMTP_URL is unset: email delivery is disabled and every message is written to the \
+             log instead. Verification, password reset, sign-in code, and invitation email will \
+             not reach anyone. (environment: {{app.environment}})",
         );
     }
 }
