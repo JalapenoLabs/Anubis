@@ -1,0 +1,37 @@
+name: Branch ancestry
+
+# develop must always contain main. Work that reaches main without reaching
+# develop is missing from every later promotion, and the histories diverge
+# quietly until someone compares the branches by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  develop-contains-main:
+    name: develop contains main
+    runs-on: [self-hosted, rocky9, earthly, docker]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # An ancestry question needs the whole history, not a shallow tip.
+          fetch-depth: 0
+
+      - name: Assert develop contains this commit
+        run: |
+          git fetch --no-tags origin develop
+
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/develop; then
+            echo "develop contains main; nothing to reconcile."
+            exit 0
+          fi
+
+          echo "Commits on main that develop is missing:"
+          git log --oneline "origin/develop..$GITHUB_SHA"
+
+          echo "::error::main is ahead of develop. Merge it back: git fetch origin && git checkout develop && git merge origin/main && git push origin develop. Promoting with 'git merge --ff-only develop' keeps this from happening at all."
+          exit 1

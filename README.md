@@ -37,6 +37,8 @@ Pre-alpha. The architecture is settled and documented in [docs/](docs/); impleme
 
 `main` is production (stable); `develop` is the working branch. Stakeholders push to `develop` directly; everyone else opens a pull request into `develop`.
 
+Only `develop` promotes into `main`, by fast-forward, so `develop` always contains `main`. CI enforces both halves of that rule; see [docs/ci.md](docs/ci.md#branch-flow).
+
 ## License
 
 MIT. Anubis is a Jalapeno Labs project.

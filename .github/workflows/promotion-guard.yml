@@ -1,0 +1,32 @@
+name: Promotion guard
+
+# main is production, and develop is the only branch that promotes into it.
+# A feature branch merged straight into main lands work develop has never
+# seen, which is how the two branches drift apart without anyone noticing.
+on:
+  pull_request:
+    branches: [main]
+    # `edited` fires when a pull request is retargeted, which is the way a
+    # PR opened against develop can end up pointed at main.
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+jobs:
+  source-branch:
+    name: Promotions come from develop
+    runs-on: [self-hosted, rocky9, earthly, docker]
+    steps:
+      - name: Check the source branch
+        env:
+          # Through the environment, never interpolated into the script: a
+          # branch name is attacker-chosen text.
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_BRANCH" = "develop" ]; then
+            echo "Promoting develop into main."
+            exit 0
+          fi
+
+          echo "::error::Pull requests into main must come from develop, not ${HEAD_BRANCH}. Retarget this pull request at develop; it reaches main with the next promotion."
+          exit 1
