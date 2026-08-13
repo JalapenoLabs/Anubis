@@ -54,3 +54,6 @@ If you're a Stakeholder (such as `navarrotech`) then you may push commits straig
 Else you will be required to make a pull request for all other commits.
 
 Stakeholders are responsible for promoting develop to main.
+
+Main should never be ahead of develop by any commits.
+In practice: promote by fast-forwarding or merging develop into main, never by squash-merge. A squash mints a commit that exists only on main until someone merges it back, which is exactly the violation.

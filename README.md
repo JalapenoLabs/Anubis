@@ -35,7 +35,7 @@ Pre-alpha. The architecture is settled and documented in [docs/](docs/); impleme
 
 ## Contributing
 
-`main` is production (stable); `develop` is the working branch. Stakeholders push to `develop` directly; everyone else opens a pull request into `develop`.
+`main` is production (stable); `develop` is the working branch. Stakeholders push to `develop` directly; everyone else opens a pull request into `develop`. Promotion fast-forwards or merges `develop` into `main`, so `main` is never ahead of `develop`.
 
 ## License
 
