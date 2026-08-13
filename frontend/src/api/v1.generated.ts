@@ -12,6 +12,18 @@ export type ErrorV1 = {
   message: string
 }
 
+/** The page a list response describes, beside its records. */
+export type Pagination = {
+  /** The page size in effect. */
+  limit: number
+  /** The page these records came from, 1-based. */
+  page: number
+  /** How many records match the query in total. */
+  total_items: number
+  /** How many pages the total spans; zero when nothing matches. */
+  total_pages: number
+}
+
 /** Envelope for a single team. */
 export type TeamEnvelopeV1 = {
   team: TeamV1

@@ -14,6 +14,7 @@
 //! | `HOST` | `127.0.0.1` | IP address the server binds to |
 //! | `PORT` | `3000` | TCP port the server binds to |
 //! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
+//! | `REDIS_URL` | unset | Redis connection URL, e.g. `redis://localhost:6379`; fans realtime channels out across instances |
 //! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
@@ -73,6 +74,20 @@
 //! deployment leaves it unset. The directory is validated when
 //! [`crate::spa::Assets::new`] opens it, so a deploy that shipped without a
 //! build fails at startup rather than at the first page load.
+//!
+//! # Realtime fanout
+//!
+//! `REDIS_URL` is the switch between the two realtime backends. Unset, the
+//! default, realtime channels are served inside the process: a publish reaches
+//! the browsers connected to this instance, which is everything a
+//! single-instance deployment needs. Set, publishes travel through Redis
+//! pub/sub, so every instance's subscribers hear them. Both `redis://` and
+//! `rediss://` (TLS) are understood, credentials ride in the URL, and the URL
+//! is a secret, so it is never echoed in errors or logs.
+//!
+//! Redis is a fanout here and nothing else. Nothing durable is stored in it,
+//! and losing it costs live delivery until it returns, never data. See
+//! [`crate::realtime`] and `docs/realtime.md`.
 //!
 //! # Rate limiting
 //!
@@ -137,6 +152,13 @@ const PORT_VAR: &str = "PORT";
 
 /// Postgres connection URL.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
+
+/// Redis connection URL, which fans realtime channels out across instances.
+const REDIS_URL_VAR: &str = "REDIS_URL";
+
+/// What a valid `REDIS_URL` looks like, quoted back in errors.
+const REDIS_URL_FORM: &str =
+    "a redis:// or rediss:// connection URL, e.g. `redis://localhost:6379`";
 
 /// Public base URL of the application, used when building email links.
 const APP_URL_VAR: &str = "APP_URL";
@@ -272,6 +294,29 @@ impl fmt::Debug for DatabaseConfig {
     }
 }
 
+/// Redis connection settings for the realtime fanout.
+///
+/// The URL may embed credentials, so this type never exposes it through
+/// `Debug` or `Display`; read it deliberately with [`RedisConfig::url`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedisConfig {
+    url: String,
+}
+
+impl RedisConfig {
+    /// Returns the Redis connection URL, credentials included.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("RedisConfig(...)")
+    }
+}
+
 /// SMTP relay settings for outgoing email.
 ///
 /// The URL embeds credentials, so this type never exposes it through `Debug`;
@@ -313,6 +358,11 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// Postgres connection settings, when `DATABASE_URL` is set.
     pub database: Option<DatabaseConfig>,
+    /// Redis connection settings, when `REDIS_URL` is set.
+    ///
+    /// Present fans realtime channels out across instances, absent serves them
+    /// inside the process; see the module docs and [`crate::realtime`].
+    pub redis: Option<RedisConfig>,
     /// Public base URL of the application, without a trailing slash.
     ///
     /// Used when building links in outgoing email. Defaults to the bind
@@ -403,6 +453,18 @@ impl AppConfig {
             Some(url) => Some(DatabaseConfig { url }),
         };
 
+        let redis = match non_empty(lookup(REDIS_URL_VAR)) {
+            None => None,
+            Some(url) => {
+                let url = url.trim().to_owned();
+                if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+                    // The URL may carry a password, so it is never quoted back.
+                    return Err(Error::invalid_secret(REDIS_URL_VAR, REDIS_URL_FORM));
+                }
+                Some(RedisConfig { url })
+            }
+        };
+
         let app_url = match lookup(APP_URL_VAR) {
             None => format!("http://{host}:{port}"),
             Some(url) => {
@@ -438,6 +500,7 @@ impl AppConfig {
             environment,
             server: ServerConfig { host, port },
             database,
+            redis,
             app_url,
             secret_key,
             smtp,
@@ -812,6 +875,41 @@ mod tests {
         let lookup = lookup_from(&[("DATABASE_URL", "   ")]);
         let error = AppConfig::from_lookup(lookup).expect_err("blank URLs are rejected");
         assert_eq!(error.variable(), "DATABASE_URL");
+    }
+
+    #[test]
+    fn realtime_stays_in_process_until_a_redis_url_is_set() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert!(unset.redis.is_none());
+
+        for url in ["redis://localhost:6379", "rediss://cache.example.com:6380"] {
+            let lookup = lookup_from(&[("REDIS_URL", url)]);
+            let config = AppConfig::from_lookup(lookup).expect("connection URLs must parse");
+            let redis = config.redis.expect("redis config must be present");
+            assert_eq!(redis.url(), url);
+        }
+    }
+
+    #[test]
+    fn a_redis_url_of_the_wrong_scheme_is_rejected_without_echoing_it() {
+        let lookup = lookup_from(&[("REDIS_URL", "http://user:hunter2@cache.example.com")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("only redis schemes are accepted");
+
+        assert_eq!(error.variable(), "REDIS_URL");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(rendered.contains("rediss://"), "got: {rendered}");
+    }
+
+    #[test]
+    fn redis_debug_output_never_leaks_credentials() {
+        let lookup = lookup_from(&[("REDIS_URL", "redis://default:hunter2@localhost:6379")]);
+        let config = AppConfig::from_lookup(lookup).expect("a URL is fine");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("RedisConfig"), "got: {rendered}");
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
     }
 
     #[test]

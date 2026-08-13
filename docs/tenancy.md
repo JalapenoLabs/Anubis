@@ -55,6 +55,9 @@ Tenancy is manageable from the API, not only at signup. The routes mount under `
 | `DELETE /tenancy/organizations/{organization_id}` | org admin | Delete the organization, its teams, and their records |
 | `POST /tenancy/organizations/{organization_id}/teams` | org admin | Create a team, with the creator as its admin member |
 | `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
+| `GET /tenancy/organizations/{organization_id}/members` | org member | The organization roster, outstanding invitations included |
+| `DELETE /tenancy/organizations/{organization_id}/members/{membership_id}` | org admin | Remove another organization member |
+| `POST /tenancy/organizations/{organization_id}/leave` | org member | Leave the organization |
 | `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke any pending invitation in the organization |
 | `PATCH /tenancy/teams/{team_id}` | team admin | Rename the team |
 | `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | team admin | Replace a member's roles |
@@ -66,11 +69,15 @@ Team-scoped routes take the `TeamMember` guard and organization-scoped routes ta
 
 Roles are replaced wholesale rather than patched, so a request states the end state and two admins editing the same member cannot interleave into a set neither asked for. Every requested key is checked against the compiled `roles.yml`; an unknown key is a `400`, and an empty list means the baseline `default` role.
 
+The two rosters answer the two levels. A team roster row is a TeamMembership, so an invited person already holds one and carries the `invitation_id` an admin revokes. An organization roster row is either an OrganizationMembership or an invitation that has not created one yet, which is why its `membership_id` is null exactly when `pending` is true. Team invitations belong to their team's roster rather than to the organization's, so each place is listed once.
+
+Both levels are left the same way: `leave` releases the caller's own membership, and removing somebody else is an admin act with its own route, so a request can never mean both. Trying to remove yourself answers `400` and names the leave route. Leaving an organization releases the organization membership and nothing else; the teams inside it are separate memberships, left team by team, because a person working in one team without standing in its organization is a state the model already has (a team-only invitation produces exactly that).
+
 ### Invariants
 
 **A team always keeps at least one claimed admin.** Demoting the last admin, or the last admin leaving, answers `409 Conflict`: the request is well formed and only the current state refuses it, which is exactly what `409` says. Unclaimed memberships never count as admins, because an invitation is not a person. Removing another member cannot break the rule at all, since the caller is a claimed admin and is not the member being removed.
 
-**Organizations keep an admin too**, and no interactive route can strip the last one: organization memberships are granted by invitation and released only by account deletion, which promotes rather than refuses (below).
+**An organization keeps an admin under the same rule.** The last organization admin cannot leave, and gets the same `409`; every organization membership is claimed, so all of them count. The way out of a personal organization is therefore to promote someone or to delete it, not to walk out of it and leave it unreachable. Account deletion is the one path that cannot refuse, and it promotes instead (below).
 
 **Nothing marks the organization created at signup as special.** Its admin may rename it or delete it like any other. Introducing a "personal" flag purely to forbid one deletion would add a permanent concept to the model in order to protect a state that a user rebuilds with a single `POST /tenancy/organizations`. A user with no organization is a valid, recoverable state; a schema concept nobody else needs is not.
 

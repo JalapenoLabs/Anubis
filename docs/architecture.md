@@ -14,7 +14,8 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Middleware | tower / tower-http | Sessions, auth guards, per-client rate limits, request ids, tracing, security headers, opt-in CORS. See [server.md](server.md) |
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
 | Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
-| Cache + realtime | Redis (optional) | Pub/sub fanout for realtime channels and hot caching; never the system of record |
+| Realtime channels | One websocket at `/realtime`, session-authenticated | Team- and user-scoped channels, published from handlers and jobs, subscribed by the SPA. See [realtime.md](realtime.md) |
+| Cache + realtime fanout | Redis (optional) | Set `REDIS_URL` and a publish reaches every instance's subscribers; unset, channels are served in process. Never the system of record |
 | Background jobs | Postgres-backed queue | Enqueue commits in the same transaction as the domain write that caused it. At-least-once, retried on a widening backoff, then dead-lettered. See [jobs.md](jobs.md) |
 | Passwords | argon2id | |
 | Abuse limits | In-process GCRA, per client and per email recipient | Budgets on the auth endpoints, answering `429` with `Retry-After`. Bounded memory, no Redis, and therefore per instance. See [api.md](api.md#rate-limiting) |
@@ -56,11 +57,11 @@ Bullet Train's most-cited long-term cost is merging upstream starter changes aft
 
 The API contract flows in one direction, from Rust to TypeScript:
 
-1. Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document.
-2. `anubis client generate-ts` turns that document into TypeScript types and ky route functions in house style.
+1. Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document. The application owns that document: its `lib.rs` declares the version's identity and merges the framework's half and one line per scaffolded model into it.
+2. The application's binary exports the merged document (`<binary> openapi`), and `anubis client generate-ts --from <file>` turns it into TypeScript types and ky route functions in house style.
 3. Application code consumes those functions through SWR hooks.
 
-Scaffolding a model or field regenerates the contract; anything the frontend must update surfaces as a TypeScript compile error.
+Scaffolding a model or field changes the document, so the export and the generation run again; anything the frontend must update surfaces as a TypeScript compile error. CI runs both and fails on a diff, for the framework's own client and for the starter's.
 
 ## Deployment
 
@@ -77,7 +78,7 @@ SPA_DIR=starter/frontend/dist cargo run -p anubis-starter
 
 The assets mount as the router's fallback, so the API keeps precedence without a route list: every path a mounted router claims is answered by that router, and everything else resolves to the SPA. Files under `assets/` carry content hashes, so they are served with a one-year `immutable` `Cache-Control`; `index.html`, which names them, is served with `no-cache`, so a deploy is live on the next page load. Any other path serves `index.html` too, which is what makes a cold load of a client-side route work.
 
-Paths under the framework's own prefixes (`/api`, `/auth`, `/developers`, `/tenancy`, `/users`) are the exception: an unmatched path there answers the API's JSON `404` rather than the SPA, because HTML with a `200` turns a routing mistake into a parse error far from its cause. Applications reserve their own prefixes the same way; the starter reserves `/account`.
+Paths under the framework's own prefixes (`/api`, `/auth`, `/developers`, `/realtime`, `/tenancy`, `/users`) are the exception: an unmatched path there answers the API's JSON `404` rather than the SPA, because HTML with a `200` turns a routing mistake into a parse error far from its cause. Applications reserve their own prefixes the same way; the starter reserves `/account`.
 
 Leaving `SPA_DIR` unset serves the API alone, which is both the development default (Vite owns the browser there) and a supported production shape for a frontend hosted on a CDN. Production logs a warning when it is unset. When it is set, the directory is validated at startup, so a deploy that shipped without a build fails immediately instead of at the first page load.
 
@@ -89,4 +90,4 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, billing, i18n polish, eject tooling. The job queue ships; see [jobs.md](jobs.md).
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)).

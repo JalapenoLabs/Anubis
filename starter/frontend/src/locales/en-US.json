@@ -195,25 +195,57 @@
       }
     }
   },
+  "tenancy": {
+    "renameSaved": "The new name is saved.",
+    "typeToConfirm": "Type {{name}} to confirm"
+  },
   "team": {
     "switcher": {
       "ariaLabel": "Switch team",
-      "noTeams": "No teams yet"
+      "noTeams": "No teams yet",
+      "manage": "Manage"
+    },
+    "settings": {
+      "navLink": "Team",
+      "title": "Team settings",
+      "subtitle": "Who works in {{team}}, and what they may do there.",
+      "notFound": "That team is not one of yours.",
+      "nameTitle": "Team name",
+      "nameSubtitle": "What this team is called everywhere in the application.",
+      "nameLabel": "Team name",
+      "leaveSubtitle": "Leaving gives up your access to everything in this team. The team keeps working without you, and an admin can invite you back.",
+      "leaveAction": "Leave team",
+      "leaveModalTitle": "Leave {{team}}?",
+      "leaveModalBody": "You lose access to this team's records right away.",
+      "dangerTitle": "Danger zone",
+      "dangerSubtitle": "Deleting the team deletes every record that belongs to it, immediately. This cannot be undone.",
+      "dangerAction": "Delete team",
+      "dangerModalTitle": "Delete {{team}}?",
+      "dangerModalBody": "This deletes the team and everything that belongs to it. It cannot be undone."
     },
     "members": {
-      "navLink": "Members",
-      "title": "Members of {{team}}",
-      "subtitle": "Everyone with access to this team.",
+      "title": "Members",
+      "subtitle": "Everyone with access to this team, and everyone still invited.",
       "email": "Email",
       "rolesHeader": "Roles",
       "status": "Status",
       "active": "Active",
       "pendingInvitation": "Invited",
+      "empty": "Nobody here yet.",
+      "you": "You",
+      "editRolesAction": "Edit roles",
+      "rolesModalTitle": "Roles for {{email}}",
+      "rolesModalBody": "Roles are replaced by what you choose here. A team always keeps at least one admin.",
+      "removeAction": "Remove",
+      "removeModalTitle": "Remove this member?",
+      "removeModalBody": "{{email}} loses access to this team right away. You can invite them back.",
+      "revokeAction": "Revoke",
+      "revokeModalTitle": "Revoke this invitation?",
+      "revokeModalBody": "The link sent to {{email}} stops working, and the place it holds is released.",
       "inviteTitle": "Invite a member",
       "role": "Role",
       "inviteAction": "Send invitation",
-      "inviteSent": "Invitation sent to {{email}}.",
-      "noTeamSelected": "Select a team to see its members."
+      "inviteSent": "Invitation sent to {{email}}."
     },
     "claim": {
       "title": "Join your team",
@@ -222,6 +254,42 @@
       "joinedOrganization": "You've joined {{organization}}. Welcome aboard!",
       "failed": "That invitation is invalid or has expired. Ask for a new one.",
       "goToDashboard": "Go to the dashboard"
+    }
+  },
+  "organization": {
+    "create": {
+      "title": "New organization",
+      "subtitle": "An organization holds teams, people, and billing. It starts with one team, and you administer both.",
+      "nameLabel": "Organization name",
+      "action": "New organization"
+    },
+    "settings": {
+      "navLink": "Organization",
+      "title": "Organization settings",
+      "subtitle": "The teams, the people, and the name of {{organization}}.",
+      "notFound": "That organization is not one of yours.",
+      "nameTitle": "Organization name",
+      "nameSubtitle": "What this organization is called everywhere in the application.",
+      "nameLabel": "Organization name",
+      "rosterTitle": "People",
+      "rosterSubtitle": "Everyone with standing in this organization. People invited into a single team are listed on that team instead.",
+      "removeModalBody": "{{email}} loses their organization roles. Their team memberships are separate, and stay.",
+      "teamMemberOnly": "You work in a team here, and hold no standing in the organization itself. An organization admin can invite you into it.",
+      "teamsTitle": "Teams",
+      "teamsSubtitle": "The teams you belong to in this organization.",
+      "teamsEmpty": "You are not in any team of this organization yet.",
+      "teamName": "New team name",
+      "createTeamAction": "Create team",
+      "leaveSubtitle": "Leaving gives up your organization roles. The teams you belong to here are separate, and you keep them until you leave each one.",
+      "leaveAction": "Leave organization",
+      "leaveModalTitle": "Leave {{organization}}?",
+      "leaveModalBody": "You give up your standing in this organization. An admin can invite you back.",
+      "dangerTitle": "Danger zone",
+      "dangerSubtitle": "Deleting the organization deletes its teams and every record inside them, immediately. This cannot be undone.",
+      "dangerAction": "Delete organization",
+      "dangerModalTitle": "Delete {{organization}}?",
+      "dangerModalBody": "This deletes the organization, its teams, and everything that belongs to them. It cannot be undone.",
+      "inviteTitle": "Invite someone"
     }
   },
   "dashboard": {

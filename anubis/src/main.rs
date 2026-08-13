@@ -96,6 +96,13 @@ enum ScaffoldCommand {
 enum ClientCommand {
     /// Generate the TypeScript client for the public API.
     GenerateTs {
+        /// An exported OpenAPI document to render instead of the framework's.
+        ///
+        /// An application's document carries its scaffolded endpoints as well
+        /// as the framework's; the starter binary exports it with
+        /// `cargo run -p <app> -- openapi`.
+        #[arg(long)]
+        from: Option<PathBuf>,
         /// Path the generated module is written to.
         #[arg(long, default_value = "frontend/src/api/v1.generated.ts")]
         out: PathBuf,
@@ -161,16 +168,42 @@ fn main() -> ExitCode {
         Command::Roles { command } => run_roles(command),
         Command::Openapi { out } => run_openapi(out.as_deref()),
         Command::Client {
-            command: ClientCommand::GenerateTs { out },
-        } => {
-            if let Err(error) = std::fs::write(&out, anubis::api::v1::typescript_client()) {
-                eprintln!("error: failed to write {}: {error}", out.display());
-                return ExitCode::FAILURE;
-            }
-            println!("wrote {}", out.display());
-            ExitCode::SUCCESS
-        }
+            command: ClientCommand::GenerateTs { from, out },
+        } => run_generate_ts(from.as_deref(), &out),
     }
+}
+
+/// Renders the TypeScript client, from an exported document or the framework's.
+fn run_generate_ts(from: Option<&std::path::Path>, out: &std::path::Path) -> ExitCode {
+    let client = match from {
+        None => anubis::api::v1::typescript_client(),
+        Some(path) => {
+            let exported = match std::fs::read_to_string(path) {
+                Ok(exported) => exported,
+                Err(error) => {
+                    eprintln!("error: failed to read {}: {error}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            match serde_json::from_str(&exported) {
+                Ok(document) => anubis::api::v1::typescript_client_from(&document),
+                Err(error) => {
+                    eprintln!(
+                        "error: {} is not an OpenAPI document: {error}",
+                        path.display(),
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    if let Err(error) = std::fs::write(out, client) {
+        eprintln!("error: failed to write {}: {error}", out.display());
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {}", out.display());
+    ExitCode::SUCCESS
 }
 
 fn run_openapi(out: Option<&std::path::Path>) -> ExitCode {

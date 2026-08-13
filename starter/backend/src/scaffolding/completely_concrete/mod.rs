@@ -4,4 +4,4 @@ mod model;
 mod routes;
 
 pub use model::{MODEL, TangibleThing};
-pub use routes::router;
+pub use routes::{api_router, openapi, router};

@@ -31,12 +31,14 @@ data-encoding = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
+futures-util = { workspace = true }
 getrandom = { workspace = true }
 hmac = { workspace = true }
 image = { workspace = true }
 lettre = { workspace = true }
 openidconnect = { workspace = true }
 qrcode = { workspace = true }
+redis = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
@@ -55,9 +57,13 @@ uuid = { workspace = true }
 webauthn-rs = { workspace = true }
 
 [dev-dependencies]
+# Integration tests are their own crates, so the websocket test needs its own
+# entries for what the library already depends on.
+futures-util = { workspace = true }
 http-body-util = { workspace = true }
 # `start_paused` lets a test prove the request timeout without spending it.
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

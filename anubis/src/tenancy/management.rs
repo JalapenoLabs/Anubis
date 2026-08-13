@@ -11,6 +11,8 @@
 //! | `DELETE /organizations/{organization_id}` | org admin | Delete the organization and everything under it |
 //! | `POST /organizations/{organization_id}/teams` | org admin | Create a team, with the creator as its admin |
 //! | `DELETE /organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
+//! | `DELETE /organizations/{organization_id}/members/{membership_id}` | org admin | Remove an organization member |
+//! | `POST /organizations/{organization_id}/leave` | org member | Leave the organization |
 //! | `DELETE /organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke any pending invitation in the organization |
 //! | `PATCH /teams/{team_id}` | team admin | Rename the team |
 //! | `PATCH /teams/{team_id}/members/{membership_id}` | team admin | Change a member's roles |
@@ -19,7 +21,7 @@
 //! | `DELETE /teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
 //!
 //! Two invariants run through all of it, and `docs/tenancy.md` states them in
-//! full. A team always keeps at least one claimed admin, so the last one
+//! full. A tenant always keeps at least one claimed admin, so the last one
 //! cannot be demoted, removed, or walk out: those answer `409 Conflict`,
 //! because the request is well formed and only the current state refuses it.
 //! And deletion cascades: the framework's foreign keys, and the ones the
@@ -42,9 +44,11 @@ use uuid::Uuid;
 use crate::auth::CurrentUser;
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
-use crate::schema::{invitations, organizations, team_memberships, teams};
+use crate::schema::{
+    invitations, organization_memberships, organizations, team_memberships, teams,
+};
 use crate::tenancy::bootstrap::{self, ADMIN_ROLE, holds_admin};
-use crate::tenancy::model::{Organization, Team, TeamMembership};
+use crate::tenancy::model::{Organization, OrganizationMembership, Team, TeamMembership};
 use crate::tenancy::routes::{TenancyState, log_internal, normalize_roles};
 
 /// Longest accepted organization or team name.
@@ -62,6 +66,14 @@ pub(super) fn routes() -> Router<TenancyState> {
         .route(
             "/organizations/{organization_id}/teams/{team_id}",
             delete(delete_team),
+        )
+        .route(
+            "/organizations/{organization_id}/members/{membership_id}",
+            delete(remove_organization_member),
+        )
+        .route(
+            "/organizations/{organization_id}/leave",
+            post(leave_organization),
         )
         .route(
             "/organizations/{organization_id}/invitations/{invitation_id}",
@@ -225,6 +237,68 @@ async fn delete_team(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Removes someone else from the organization.
+///
+/// An organization membership carries organization-level roles, and nothing
+/// else: membership in the organization's teams is a separate join, released
+/// by leaving each team or by being removed from it.
+async fn remove_organization_member(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+    Path((_organization_id, membership_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_organization_admin(&member)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let target =
+        find_organization_member(&mut connection, member.organization.id, membership_id).await?;
+
+    if target.user_id == member.user.id {
+        return Err(ApiError::validation(
+            "Use the leave endpoint to leave an organization yourself.",
+        ));
+    }
+
+    // The caller is an admin and is not the target, so the organization keeps
+    // an admin whoever else goes.
+    diesel::delete(organization_memberships::table.find(target.id))
+        .execute(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Leaves the organization, provided the organization keeps an admin.
+///
+/// The teams the caller belongs to inside it are separate memberships, and
+/// stay: a person can work in a team without standing in its organization,
+/// which is exactly what an invitation to a single team produces.
+async fn leave_organization(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    if holds_admin(&member.membership.roles)
+        && !another_organization_admin_remains(
+            &mut connection,
+            member.organization.id,
+            member.membership.id,
+        )
+        .await?
+    {
+        return Err(last_admin_conflict("organization", "leave"));
+    }
+
+    diesel::delete(organization_memberships::table.find(member.membership.id))
+        .execute(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn rename_team(
     State(state): State<TenancyState>,
     member: TeamMember,
@@ -266,7 +340,7 @@ async fn change_member_roles(
         && !holds_admin(&roles)
         && !another_admin_remains(&mut connection, member.team.id, target.id).await?
     {
-        return Err(last_admin_conflict("step down"));
+        return Err(last_admin_conflict("team", "step down"));
     }
 
     connection
@@ -331,7 +405,7 @@ async fn leave_team(
     if holds_admin(&member.membership.roles)
         && !another_admin_remains(&mut connection, member.team.id, member.membership.id).await?
     {
-        return Err(last_admin_conflict("leave"));
+        return Err(last_admin_conflict("team", "leave"));
     }
 
     diesel::delete(team_memberships::table.find(member.membership.id))
@@ -436,6 +510,23 @@ async fn find_member(
         .ok_or_else(ApiError::not_found)
 }
 
+/// Loads one membership of the organization, answering `404` for anything else.
+async fn find_organization_member(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    membership_id: Uuid,
+) -> Result<OrganizationMembership, ApiError> {
+    organization_memberships::table
+        .filter(organization_memberships::id.eq(membership_id))
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .select(OrganizationMembership::as_select())
+        .first(connection)
+        .await
+        .optional()
+        .map_err(log_internal)?
+        .ok_or_else(ApiError::not_found)
+}
+
 /// Returns `true` when the team has a claimed admin other than `excluded`.
 ///
 /// Unclaimed memberships are invitations, not people, so they never count.
@@ -449,6 +540,27 @@ async fn another_admin_remains(
         .filter(team_memberships::id.ne(excluded))
         .filter(team_memberships::user_id.is_not_null())
         .filter(team_memberships::roles.contains(vec![ADMIN_ROLE]))
+        .count()
+        .get_result(connection)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(admins > 0)
+}
+
+/// Returns `true` when the organization has an admin other than `excluded`.
+///
+/// Organization memberships exist only once claimed, so every one of them
+/// counts.
+async fn another_organization_admin_remains(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    excluded: Uuid,
+) -> Result<bool, ApiError> {
+    let admins: i64 = organization_memberships::table
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .filter(organization_memberships::id.ne(excluded))
+        .filter(organization_memberships::roles.contains(vec![ADMIN_ROLE]))
         .count()
         .get_result(connection)
         .await
@@ -488,13 +600,14 @@ fn require_organization_admin(member: &OrganizationMember) -> Result<(), ApiErro
     }
 }
 
-/// The refusal that keeps every team administrable.
+/// The refusal that keeps every tenant administrable.
 ///
 /// Only the last admin acting on themselves can reach it: an admin editing
-/// somebody else still counts as the admin the team is left with.
-fn last_admin_conflict(attempt: &str) -> ApiError {
+/// somebody else still counts as the admin the tenant is left with.
+fn last_admin_conflict(tenant: &str, attempt: &str) -> ApiError {
     ApiError::conflict(format!(
-        "A team needs at least one admin. Give someone else the admin role before you {attempt}."
+        "A {tenant} needs at least one admin. \
+         Give someone else the admin role before you {attempt}."
     ))
 }
 

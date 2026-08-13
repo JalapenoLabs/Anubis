@@ -12,6 +12,7 @@ use anubis::db::DbPool;
 use anubis::roles::RoleSet;
 use axum::Router;
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
+use utoipa::OpenApi;
 
 /// The application's role definitions, embedded at compile time.
 pub const ROLES_YML: &str = include_str!("../../config/roles.yml");
@@ -50,11 +51,98 @@ pub fn account_router(pool: &DbPool, roles: &RoleSet) -> Router {
     router
 }
 
+/// The application's own `/api/v1` routes, mounted beside the framework's.
+///
+/// Same models as [`account_router`], authenticated with a platform
+/// application's bearer token instead of a session. One statement per model,
+/// for the same reason: an inserted mount is already `rustfmt`-clean.
+pub fn api_v1_router(pool: &DbPool, roles: &RoleSet) -> Router {
+    let mut router = Router::new();
+    router = router.merge(scaffolding::absolutely_abstract::api_router(
+        pool.clone(),
+        roles.clone(),
+    ));
+    router = router.merge(scaffolding::completely_concrete::api_router(
+        pool.clone(),
+        roles.clone(),
+    ));
+    // 🐺 anubis:api-routes
+    router
+}
+
+/// The application's OpenAPI 3.1 document, and the identity of its v1 API.
+///
+/// The application owns the document: this derive carries the title, the
+/// version, and the description a consumer reads, and the merges below add
+/// the paths and schemas. The framework's half comes first (its `/team`
+/// endpoint, the bearer security scheme, and the shared schemas), then one
+/// line per scaffolded model. `merge` never touches `info`, so the identity
+/// declared here always wins, and a version freezes with this application
+/// rather than with the framework release it was generated against.
+#[derive(OpenApi)]
+#[openapi(info(
+    title = "Anubis starter application API",
+    version = "1",
+    description = "The versioned public REST API. Authenticate with a \
+                   platform application bearer token from the Developers \
+                   section.",
+))]
+struct ApiDoc;
+
+/// Builds the merged document served at `/api/v1/openapi.json` and `/docs`.
+///
+/// `anubis client generate-ts --from <file>` renders it as the frontend's
+/// generated client, and `<binary> openapi` exports it for that.
+#[must_use]
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    let mut document = ApiDoc::openapi();
+    document.merge(anubis::api::v1::openapi());
+    document.merge(scaffolding::absolutely_abstract::openapi());
+    document.merge(scaffolding::completely_concrete::openapi());
+    // 🐺 anubis:api-docs
+    document
+}
+
 #[cfg(test)]
 mod tests {
     use anubis::roles::RoleSet;
 
-    use super::ROLES_YML;
+    use super::{ROLES_YML, openapi};
+
+    #[test]
+    fn the_document_merges_the_framework_and_every_model() {
+        let document = serde_json::to_value(openapi()).expect("the document must serialize");
+
+        assert_eq!(
+            document["info"]["title"], "Anubis starter application API",
+            "the application owns the document's identity",
+        );
+        assert!(
+            document["paths"]["/api/v1/team"].is_object(),
+            "the framework's half must merge in: {document}",
+        );
+        for path in [
+            "/api/v1/creative-concepts",
+            "/api/v1/creative-concepts/{creative_concept_id}",
+            "/api/v1/creative-concepts/{creative_concept_id}/tangible-things",
+            "/api/v1/tangible-things/{tangible_thing_id}",
+        ] {
+            assert!(
+                document["paths"][path].is_object(),
+                "{path} must be documented: {document}",
+            );
+        }
+        for schema in ["CreativeConceptView", "TangibleThingView", "ErrorV1"] {
+            assert!(
+                document["components"]["schemas"][schema].is_object(),
+                "{schema} must be registered: {document}",
+            );
+        }
+        assert!(
+            document["components"]["securitySchemes"]["bearer_token"].is_object(),
+            "the bearer scheme must merge in: {document}",
+        );
+    }
 
     #[test]
     fn the_embedded_roles_file_is_valid() {

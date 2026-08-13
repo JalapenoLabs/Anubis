@@ -164,6 +164,36 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
     assert_anchored(&library, "🐺 anubis:modules", "pub mod projects;");
     assert_anchored(&library, "🐺 anubis:routes", "merge(goals::router");
 
+    // Both surfaces are mounted, and the model's paths join the application's
+    // own OpenAPI document.
+    assert!(
+        library
+            .contains("router = router.merge(projects::api_router(pool.clone(), roles.clone()));"),
+        "{library}",
+    );
+    assert!(library.contains("document.merge(goals::openapi());"));
+    assert_anchored(&library, "🐺 anubis:api-routes", "merge(goals::api_router");
+    assert_anchored(
+        &library,
+        "🐺 anubis:api-docs",
+        "document.merge(projects::openapi());",
+    );
+
+    // The generated `/api/v1` handlers are the model's own, under its own path.
+    let project_routes = read(&app.join("backend/src/projects/routes.rs"));
+    assert!(
+        project_routes.contains("path = \"/api/v1/projects\","),
+        "{project_routes}",
+    );
+    assert!(project_routes.contains("operation_id = \"listProjects\","));
+    assert!(project_routes.contains("pub fn api_router(pool: DbPool, roles: RoleSet) -> Router {"));
+    assert!(project_routes.contains("caller.require(&state.roles, Action::Read, MODEL)?;"));
+    let goal_routes = read(&app.join("backend/src/goals/routes.rs"));
+    assert!(
+        goal_routes.contains("path = \"/api/v1/projects/{project_id}/goals\","),
+        "{goal_routes}",
+    );
+
     let roles = read(&app.join("config/roles.yml"));
     assert_eq!(roles.matches("Project: [read]").count(), 1, "{roles}");
     assert_eq!(roles.matches("Project: [manage]").count(), 1);

@@ -267,6 +267,35 @@ impl ModelScaffold {
         }
     }
 
+    /// The `/api/v1` router mount inserted into `api_v1_router`.
+    ///
+    /// Wrapped the way [`route_mount`] is, and for the same reason.
+    ///
+    /// [`route_mount`]: ModelScaffold::route_mount
+    #[must_use]
+    pub fn api_route_mount(&self) -> String {
+        let module = self.module();
+        let single =
+            format!("router = router.merge({module}::api_router(pool.clone(), roles.clone()));");
+        if single.len() + ROUTER_INDENT <= MAX_WIDTH {
+            single
+        } else {
+            format!(
+                "router = router.merge({module}::api_router(\n    pool.clone(),\n    roles.clone(),\n));"
+            )
+        }
+    }
+
+    /// The OpenAPI merge inserted into the application's `openapi` function.
+    ///
+    /// The model's own `routes.rs` carries the `utoipa` registrations for its
+    /// paths and schemas, so the application's document gains a whole model in
+    /// one line.
+    #[must_use]
+    pub fn api_doc_merge(&self) -> String {
+        format!("document.merge({}::openapi());", self.module())
+    }
+
     /// The `config/roles.yml` grant line for a role, e.g. `Project: [manage]`.
     #[must_use]
     pub fn role_grant(&self, actions: &str) -> String {
@@ -649,6 +678,14 @@ mod tests {
             scaffold.route_mount(),
             "router = router.merge(projects::router(pool.clone(), roles.clone()));"
         );
+        assert_eq!(
+            scaffold.api_route_mount(),
+            "router = router.merge(projects::api_router(pool.clone(), roles.clone()));"
+        );
+        assert_eq!(
+            scaffold.api_doc_merge(),
+            "document.merge(projects::openapi());"
+        );
         assert_eq!(scaffold.role_grant("read"), "Project: [read]");
         assert_eq!(
             scaffold.migration_directory("2026-08-15-101112"),
@@ -756,6 +793,13 @@ mod tests {
         assert!(
             mount.lines().all(|line| line.len() + 4 <= 100),
             "wrapped mount must fit rustfmt's width: {mount}",
+        );
+
+        let api_mount = scaffold.api_route_mount();
+        assert!(api_mount.contains("::api_router(\n    pool.clone(),\n    roles.clone(),\n));"));
+        assert!(
+            api_mount.lines().all(|line| line.len() + 4 <= 100),
+            "wrapped mount must fit rustfmt's width: {api_mount}",
         );
     }
 

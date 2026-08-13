@@ -30,6 +30,12 @@ pub const MODULES: &str = "🐺 anubis:modules";
 /// `backend/src/lib.rs`: router mounts in `account_router`.
 pub const ROUTES: &str = "🐺 anubis:routes";
 
+/// `backend/src/lib.rs`: router mounts in `api_v1_router`.
+pub const API_ROUTES: &str = "🐺 anubis:api-routes";
+
+/// `backend/src/lib.rs`: the per-model merges the application's document takes.
+pub const API_DOCS: &str = "🐺 anubis:api-docs";
+
 /// `backend/src/schema.rs`: `diesel::table!` blocks.
 pub const TABLES: &str = "🐺 anubis:tables";
 

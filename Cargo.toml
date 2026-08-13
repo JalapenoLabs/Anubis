@@ -19,7 +19,8 @@ repository = "https://github.com/JalapenoLabs/Anubis"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 anubis = { path = "anubis", version = "0.1.0" }
 argon2 = { version = "0.5", features = ["std"] }
-axum = "0.8"
+# The `ws` feature carries the realtime channel endpoint; see `anubis::realtime`.
+axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
@@ -30,6 +31,8 @@ data-encoding = "2"
 diesel = { version = "2.3", features = ["postgres_backend", "chrono", "uuid", "serde_json"] }
 diesel-async = { version = "0.9", features = ["postgres", "deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2.3"
+# Stream and sink combinators the websocket and Redis pub/sub loops need.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.4"
 hmac = "0.12"
 http-body-util = "0.1"
@@ -52,6 +55,16 @@ mimalloc = "0.1"
 # reqwest as the async HTTP backend, rustls as its TLS stack, no OpenSSL.
 openidconnect = { version = "4.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 qrcode = "0.14"
+# Redis pub/sub for the optional multi-instance realtime fanout. Defaults add
+# command families the framework never issues, so the set is spelled out: async
+# tokio connections, a reconnecting publisher, and rustls for `rediss://` with
+# the webpki root store. No OpenSSL enters the tree.
+redis = { version = "1.5", default-features = false, features = [
+  "connection-manager",
+  "tls-rustls-webpki-roots",
+  "tokio-comp",
+  "tokio-rustls-comp",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
@@ -59,6 +72,10 @@ sha1 = "0.10"
 sha2 = "0.11"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
+# The websocket client the realtime integration test drives. Plain `ws://` to a
+# test server on loopback, so no TLS feature is enabled. Pinned to the line
+# axum's `ws` feature already builds on, so tests add no second copy of it.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 tower = { version = "0.5", features = ["util"] }
 # The serve path's middleware: filesystem services for the built SPA, request
 # tracing, and the opt-in CORS layer. Request ids, timeouts, and the security

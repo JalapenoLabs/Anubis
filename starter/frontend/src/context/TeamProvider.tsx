@@ -4,7 +4,7 @@ import type { MembershipOrganization, MembershipTeam, MembershipsResult } from '
 import type { ReactNode } from 'react'
 
 // Core
-import { createContext, useContext, useMemo, useState } from 'react'
+import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import { useMemberships } from '@jalapenolabs/anubis'
 
 type CurrentTeam = {
@@ -39,6 +39,18 @@ export function TeamProvider(props: Props) {
     [ memberships.organizations, selectedTeamId ],
   )
 
+  // A team the user just created, left, or had deleted under them makes the
+  // stored selection wrong: the resolver has already fallen back to a team the
+  // user still belongs to, and this writes that answer down.
+  useEffect(() => {
+    if (!current || current.team.id === selectedTeamId) {
+      return
+    }
+
+    window.localStorage.setItem(STORAGE_KEY, current.team.id)
+    setSelectedTeamId(current.team.id)
+  }, [ current, selectedTeamId ])
+
   const value: TeamContextValue = {
     memberships,
     current,
@@ -60,6 +72,31 @@ export function useTeamContext(): TeamContextValue {
     throw new Error('useTeamContext requires a <TeamProvider> above it in the tree')
   }
   return context
+}
+
+/**
+ * Finds one team, and the organization it belongs to, in the overview.
+ *
+ * A screen addressing a team by id wants exactly that team or nothing: the
+ * fallback [`resolveCurrentTeam`] applies would answer a URL for one team with
+ * another team's roster.
+ */
+export function findTeam(
+  organizations: MembershipOrganization[],
+  teamId: string,
+): CurrentTeam | null {
+  for (const organization of organizations) {
+    for (const team of organization.teams) {
+      if (team.id === teamId) {
+        return {
+          organization,
+          team,
+        }
+      }
+    }
+  }
+
+  return null
 }
 
 /** Finds the selected team, falling back to the first team anywhere. */

@@ -185,6 +185,13 @@ async fn roster(router: &Router, team_id: Uuid, cookie: &str) -> Value {
     body
 }
 
+async fn organization_roster(router: &Router, organization_id: Uuid, cookie: &str) -> Value {
+    let path = format!("/tenancy/organizations/{organization_id}/members");
+    let (status, _headers, body) = send(router, "GET", &path, None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body
+}
+
 fn uuid(value: &Value) -> Uuid {
     value
         .as_str()
@@ -210,6 +217,15 @@ fn member_count(roster: &Value) -> usize {
         .len()
 }
 
+/// Whether an email is anywhere on the roster.
+fn lists(roster: &Value, email: &str) -> bool {
+    roster["members"]
+        .as_array()
+        .expect("members must be an array")
+        .iter()
+        .any(|member| member["email"] == json!(email))
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -228,6 +244,7 @@ async fn tenants_are_created_administered_and_dissolved() {
     let teammate_email = format!("teammate-{run}@example.com");
     let contractor_email = format!("contractor-{run}@example.com");
     let biller_email = format!("biller-{run}@example.com");
+    let advisor_email = format!("advisor-{run}@example.com");
     let outsider_email = format!("outsider-{run}@example.com");
     let lurker_email = format!("lurker-{run}@example.com");
 
@@ -544,6 +561,127 @@ async fn tenants_are_created_administered_and_dissolved() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // ------------------------------------------------------------------
+    // The organization roster: its members, and the invitations still out.
+    // ------------------------------------------------------------------
+    let listed = organization_roster(&router, acme_id, &founder_cookie).await;
+    assert_eq!(member_count(&listed), 2, "the founder and the biller");
+    assert_eq!(entry(&listed, &biller_email)["pending"], json!(false));
+    let founder_organization_membership = uuid(&entry(&listed, &founder_email)["membership_id"]);
+
+    let advisor_cookie = register(&router, &advisor_email).await;
+    let (advisor_invitation, token) = invite(
+        &router,
+        &outbox,
+        &founder_cookie,
+        &json!({ "email": advisor_email, "organization_id": acme_id, "roles": ["billing"] }),
+        &advisor_email,
+    )
+    .await;
+
+    // A team invitation holds a place on its team's roster, not on this one.
+    let (_invitation, _token) = invite(
+        &router,
+        &outbox,
+        &founder_cookie,
+        &json!({ "email": lurker_email, "team_id": platform_id }),
+        &lurker_email,
+    )
+    .await;
+
+    let listed = organization_roster(&router, acme_id, &founder_cookie).await;
+    assert!(
+        !lists(&listed, &lurker_email),
+        "that invitation is the team's"
+    );
+    let advisor = entry(&listed, &advisor_email);
+    assert_eq!(advisor["pending"], json!(true));
+    assert_eq!(
+        advisor["membership_id"],
+        Value::Null,
+        "an organization invitation creates no membership until it is claimed",
+    );
+    assert_eq!(uuid(&advisor["invitation_id"]), advisor_invitation);
+
+    // Any member sees the roster; a non-member cannot tell it exists.
+    let listed = organization_roster(&router, acme_id, &biller_cookie).await;
+    assert_eq!(member_count(&listed), 3);
+    let (status, _headers, _body) = send(
+        &router,
+        "GET",
+        &format!("/tenancy/organizations/{acme_id}/members"),
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    claim(&router, &advisor_cookie, &token).await;
+    let listed = organization_roster(&router, acme_id, &founder_cookie).await;
+    let advisor = entry(&listed, &advisor_email);
+    assert_eq!(advisor["pending"], json!(false), "the claim seats them");
+    let advisor_membership = uuid(&advisor["membership_id"]);
+
+    // ------------------------------------------------------------------
+    // Leaving and removing at the organization level.
+    // ------------------------------------------------------------------
+    let advisor_path = format!("/tenancy/organizations/{acme_id}/members/{advisor_membership}");
+    let founder_organization_path =
+        format!("/tenancy/organizations/{acme_id}/members/{founder_organization_membership}");
+
+    let (status, _headers, _body) = send(
+        &router,
+        "DELETE",
+        &founder_organization_path,
+        None,
+        Some(&advisor_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a biller is not an admin");
+
+    let (status, _headers, _body) = send(
+        &router,
+        "DELETE",
+        &founder_organization_path,
+        None,
+        Some(&founder_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "leaving has its own route");
+
+    let (status, _headers, _body) = send(
+        &router,
+        "DELETE",
+        &advisor_path,
+        None,
+        Some(&founder_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let organization_leave_path = format!("/tenancy/organizations/{acme_id}/leave");
+    let (status, _headers, _body) = send(
+        &router,
+        "POST",
+        &organization_leave_path,
+        None,
+        Some(&biller_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let listed = organization_roster(&router, acme_id, &founder_cookie).await;
+    assert_eq!(member_count(&listed), 1, "the founder is what is left");
+
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        &organization_leave_path,
+        None,
+        Some(&founder_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
 
     // ------------------------------------------------------------------
     // Dissolving: a team goes with its organization, or on its own.

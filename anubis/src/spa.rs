@@ -110,7 +110,14 @@ const REVALIDATE: HeaderValue = HeaderValue::from_static("no-cache");
 /// route is not covered here. The probes `/healthz` and `/readyz` are
 /// deliberately absent, being exact routes with nothing nested under them:
 /// they always match their own router and so can never reach the fallback.
-pub const RESERVED_PREFIXES: &[&str] = &["/api", "/auth", "/developers", "/tenancy", "/users"];
+pub const RESERVED_PREFIXES: &[&str] = &[
+    "/api",
+    "/auth",
+    "/developers",
+    "/realtime",
+    "/tenancy",
+    "/users",
+];
 
 /// The built frontend, served as a router fallback.
 ///

@@ -134,6 +134,42 @@ export type TeamRosterMember = {
   roles: string[]
   /** True for invited members who have not claimed their membership yet. */
   pending: boolean
+  /** The invitation to revoke; set exactly for a pending member. */
+  invitationId: string | null
+}
+
+/**
+ * One row of an organization roster.
+ *
+ * An organization invitation creates no membership until it is claimed, so
+ * `membershipId` is null exactly when `pending` is true. Invitations into the
+ * organization's teams belong to those teams' rosters, not to this one.
+ */
+export type OrganizationRosterMember = {
+  membershipId: string | null
+  /** The member's email, from the account or the pending invitation. */
+  email: string
+  roles: string[]
+  pending: boolean
+  /** The invitation to revoke; set exactly for a pending member. */
+  invitationId: string | null
+}
+
+export type TenancyOrganization = {
+  id: string
+  name: string
+}
+
+export type TenancyTeam = {
+  id: string
+  organizationId: string
+  name: string
+}
+
+/** A created organization and the default team it starts with. */
+export type CreatedOrganization = {
+  organization: TenancyOrganization
+  team: TenancyTeam
 }
 
 export type InviteMemberRequest = {

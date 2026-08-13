@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// A user-safe HTTP error: a status code and a JSON `message` body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +254,14 @@ impl ListParams {
 }
 
 /// The pagination object every list response carries alongside its records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// It is part of the public API contract as well as the account one: a
+/// scaffolded model's `/api/v1` list envelope carries it, so it registers with
+/// utoipa and is documented once for every endpoint that pages.
+// The doc comment above is for whoever reads this code; the description below
+// is what an API consumer reads in the published document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(description = "The page a list response describes, beside its records.")]
 pub struct Pagination {
     /// The page these records came from, 1-based.
     pub page: i64,

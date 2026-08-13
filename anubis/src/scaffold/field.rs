@@ -798,11 +798,13 @@ impl FieldScaffold {
         let join_type = join.pascal();
         let loader = format!("{}_ids_by_{}", target.snake(), self.model.snake());
 
-        // The record and its team are both in scope wherever this lands: a
-        // team-owned model carries `team_id`, and a join links two of them.
+        // The connection, the record, and its team are all in scope wherever
+        // this lands: the two functions carrying these anchors take the
+        // connection, a team-owned model carries `team_id`, and a join links
+        // two of them.
         let reconcile = format!(
             "if let Some(requested) = body.{name}.as_deref() {{\n    \
-             crate::{module}::{join_type}::replace_all(\n        &mut connection,\n        \
+             crate::{module}::{join_type}::replace_all(\n        connection,\n        \
              record.id,\n        record.team_id,\n        requested,\n    )\n    .await?;\n}}",
         );
 

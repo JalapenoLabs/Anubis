@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::schema::creative_concepts;
@@ -19,9 +20,17 @@ pub const MODEL: &str = "CreativeConcept";
 pub const SORTABLE: [&str; 3] = ["name", "created_at", "updated_at"];
 
 /// A creative concept, owned by a team.
-#[derive(Debug, Clone, Serialize, Queryable, Selectable, Identifiable)]
+///
+/// `ToSchema` is what puts the record in the `/api/v1` OpenAPI document: the
+/// view the handlers serialize flattens this struct, so a column added by
+/// `anubis scaffold field` reaches the published contract with no second
+/// declaration to keep in step.
+#[derive(Debug, Clone, Serialize, Queryable, Selectable, Identifiable, ToSchema)]
 #[diesel(table_name = creative_concepts)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
+// The doc comment above is for whoever reads this code; the description below
+// is what an API consumer reads in the published document.
+#[schema(description = "A creative concept, owned by a team.")]
 pub struct CreativeConcept {
     /// Primary key.
     pub id: Uuid,
@@ -123,5 +132,28 @@ impl CreativeConcept {
         let membership =
             TeamMembership::for_user(connection, user_id, creative_concept.team_id).await?;
         Ok(membership.map(|membership| (creative_concept, membership)))
+    }
+
+    /// Loads one creative concept owned by `team_id`, for the `/api/v1` handlers.
+    ///
+    /// A platform token authenticates as its team rather than as a user, so the
+    /// ownership chain is one comparison rather than a membership lookup.
+    /// `None` covers both a missing record and another tenant's, which is why
+    /// the API answers `404` for either.
+    ///
+    /// # Errors
+    /// Returns the underlying Diesel error when the query fails.
+    pub async fn load_for_team(
+        connection: &mut AsyncPgConnection,
+        team_id: Uuid,
+        creative_concept_id: Uuid,
+    ) -> QueryResult<Option<Self>> {
+        creative_concepts::table
+            .filter(creative_concepts::id.eq(creative_concept_id))
+            .filter(creative_concepts::team_id.eq(team_id))
+            .select(Self::as_select())
+            .first(connection)
+            .await
+            .optional()
     }
 }

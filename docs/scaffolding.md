@@ -40,6 +40,8 @@ The vocabulary comes in two halves. **Model anchors** sit in files the whole app
 |---|---|---|
 | `// 🐺 anubis:modules` | `backend/src/lib.rs` | module declarations |
 | `// 🐺 anubis:routes` | `backend/src/lib.rs` | router mounts in `account_router` |
+| `// 🐺 anubis:api-routes` | `backend/src/lib.rs` | router mounts in `api_v1_router` |
+| `// 🐺 anubis:api-docs` | `backend/src/lib.rs` | per-model merges in `openapi` |
 | `// 🐺 anubis:tables` | `backend/src/schema.rs` | `diesel::table!` blocks |
 | `// 🐺 anubis:joins` | `backend/src/schema.rs` | `diesel::joinable!` declarations |
 | `// 🐺 anubis:same-query` | `backend/src/schema.rs` | `allow_tables_to_appear_in_same_query!` declarations |
@@ -134,6 +136,14 @@ Application migrations live in `starter/backend/migrations/`, are embedded with 
 
 Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts`) and use the `TeamMember` guard directly. Member routes are shallow (`/account/creative-concepts/{id}`, `/account/tangible-things/{id}`), so they resolve the chain with the model's own `load_for_member`, then authorize against the compiled `RoleSet` held in router state. Both paths answer `404` for records the caller cannot reach, so an id probe cannot tell a missing record from another tenant's.
 
+The `/api/v1` handlers answer the same questions with a bearer token instead of a session: `ApiCaller` resolves the token to its team, `load_for_team` walks the chain in one comparison, and `ApiCaller::require` authorizes against the same `RoleSet`. [api.md](api.md#application-models) states what a token's roles are and why.
+
+### The two surfaces of a generated model
+
+Each model's `routes.rs` carries both surfaces and one implementation. Everything above the query is authorization, and that is the only thing the two do differently, so the file holds three shared functions (`list_page`, `insert_record`, `apply_changes`) that both sets of handlers call. They are where the per-field anchors for normalization and struct literals live.
+
+That sharing is the point rather than a saving: the request bodies, the `<Model>View`, and the response envelopes are one declaration each, so a column `anubis scaffold field` adds is a column both surfaces accept, serialize, and document. The API half adds only its `#[utoipa::path]` attributes, its `ApiDoc` derive, and the `api_router` and `openapi` functions the application's `lib.rs` mounts and merges.
+
 ### Frontend slice
 
 The app's own endpoints get a ky client in `frontend/src/api/index.ts` and one route module per model in `frontend/src/api/routes/`. Wire types keep snake_case field names, because those names are the contract.
@@ -148,9 +158,13 @@ Forms are field components from `@jalapenolabs/anubis`, one per model attribute,
 
 Every page hands `AppShell` a `breadcrumbs` array and the frame renders it, so the trail is decided in one place and every scaffolded page inherits it. Crumbs are page-provided rather than derived from the route: a show page's last crumb is the record's own name, and only the page has it. A crumb with a `to` renders as a router link, the last one as plain text. `Breadcrumbs` is a starter component like `AppShell`, so an application owns and restyles it.
 
-### Deferred: `/api/v1` for application models
+### `/api/v1` for application models
 
-A scaffolded model currently generates account handlers only. Extending the framework-owned v1 OpenAPI document from an application is its own design problem (who owns the document, how an application merges paths into it, how versions freeze per application), and it is settled with the `scaffold model` generator itself rather than here. Until then the template stays honest: no `/api/v1` handlers, no half-built merge hook.
+The application owns its OpenAPI document. `lib.rs` declares the identity of its v1 with a utoipa derive and merges the framework's half and one line per model into it, so a version freezes with the application rather than with the framework release it was generated against. [api.md](api.md#application-models) is the full statement: the merge, the endpoints a model gets, and what a platform token's roles are.
+
+What a `scaffold model` run adds beyond the account slice is two lines in `lib.rs`, above the `api-routes` and `api-docs` anchors, and nothing else: the handlers, the path attributes, and the schema registrations all ride in the model's own stamped `routes.rs`.
+
+`scaffold field` needs no API-specific anchor at all, which is the payoff of the shared declarations. A column joins the record struct, and the record's `ToSchema` puts it in the document; it joins the two request bodies, and their `ToSchema` documents it there. An association's ids join the `<Model>View` through the `view-fields` anchor and are documented the same way. The one thing the generated narrative does not do is assert each column twice: its `/api/v1` section proves the surface, and the account section proves the columns, because both halves serialize through one struct.
 
 ## CLI surface
 
@@ -206,8 +220,8 @@ One run produces, on the backend:
 
 - a timestamped migration (`up.sql` and `down.sql`) with the table, its ownership index, and the shared `set_updated_at()` trigger
 - a `diesel::table!` block in `backend/src/schema.rs`, plus the `joinable!` and `allow_tables_to_appear_in_same_query!` declarations for a nested model
-- the model's module (`mod.rs`, `model.rs`, `routes.rs`) under `backend/src/<models>/`, carrying the ownership chain, the list conventions, the `valid_*` scoping methods, and account CRUD handlers
-- the module declaration and router mount in `backend/src/lib.rs`
+- the model's module (`mod.rs`, `model.rs`, `routes.rs`) under `backend/src/<models>/`, carrying the ownership chain, the list conventions, the `valid_*` scoping methods, account CRUD handlers, and the `/api/v1` handlers with their OpenAPI registrations
+- the module declaration, both router mounts, and the document merge in `backend/src/lib.rs`
 - `read` and `manage` grants in `config/roles.yml`, and a regenerated `frontend/src/roles.generated.ts`
 - the model's own integration test in `backend/tests/<models>_flow.rs`
 
@@ -261,7 +275,7 @@ One run produces:
 - a timestamped migration adding the column, with the `ALTER TABLE ... DROP COLUMN` that takes it back
 - the column in the model's `diesel::table!` block in `backend/src/schema.rs`, above the timestamps
 - the column in the record, insertable, and changeset structs, and in the changeset's emptiness test
-- the column in both request bodies, both handlers' normalizations, and both struct literals in `routes.rs`
+- the column in both request bodies, both normalizations, and both struct literals in `routes.rs`, which is one insertion each for the account and `/api/v1` surfaces together
 - the column in the model's integration test, asserted through the create and the update
 - the wire type and both request types in the model's ky route module
 - the zod schema, the form values, the payload, the field component and its import in the model's form
@@ -465,6 +479,8 @@ Backend, implemented today:
 - Model struct with the ownership chain, validations, and `valid_*` scoping methods
 - Entry in `roles.yml` permission grants, and the regenerated frontend permissions module
 - Account CRUD handlers, routes wired into the router, and the model's integration test
+- `/api/v1` CRUD handlers with utoipa registrations, mounted and merged into the application's OpenAPI document, and proven by the `/api/v1` half of that same test
+- A serializer (`<Model>View`) shared by both surfaces and by the published document, and by outgoing webhooks when they land
 
 Frontend, implemented today:
 
@@ -476,14 +492,13 @@ Frontend, implemented today:
 
 Still to come:
 
-- `/api/v1` handlers (separate, like Bullet Train's account vs api controllers), once [the ownership question](#deferred-apiv1-for-application-models) is settled
-- Serializer registered with utoipa (OpenAPI 3.1), shared by the API and outgoing webhooks
-- A generated-client refresh per scaffold. The generated client is rendered from the `/api/v1` OpenAPI document, and an application model has no `/api/v1` handlers yet, so there is nothing for a scaffold to refresh. Generated pages call the hand-written route module instead, which is the same contract typed by hand.
+- A generated-client refresh per scaffold. The `/api/v1` client (`frontend/src/api/v1.generated.ts`) is rendered from the application's exported document, so a scaffold changes what it would contain, but the run does not regenerate it: that takes compiling the application, which a text generator does not do. Run the two commands in [api.md](api.md#application-models) after a scaffold, as CI does.
+- Scaffolded pages consuming the generated client. They call the hand-written ky route module today, which is the same contract typed by hand; the generated client is additive, for consumers outside the application. Which of the two a generated page should read is its own decision, and it is not settled here.
 - Per-model frontend tests. The starter runs Vitest and the scaffolder's own frontend output is covered by `tsc`, ESLint, the production build, and the integration test that scaffolds two models and reads the result. Playwright end-to-end tests wait on Playwright itself, which the starter does not have.
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
 
-Still deferred for `scaffold field`: one field per run (run it twice for two), and no `/api/v1` handlers to update, for the same reason `scaffold model` writes none.
+Still deferred for `scaffold field`: one field per run (run it twice for two).
 
 ## Locked conventions the generator stamps
 

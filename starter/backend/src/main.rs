@@ -14,15 +14,31 @@
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::{db, server, telemetry};
-use anubis_starter::{APP_MIGRATIONS, ROLES_YML, account_router};
+use anubis_starter::{APP_MIGRATIONS, ROLES_YML, account_router, api_v1_router, openapi};
 use axum::Router;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// The one argument the binary answers instead of serving.
+///
+/// The merged OpenAPI document belongs to the application, so the application
+/// is what exports it: `anubis client generate-ts --from <file>` renders that
+/// export as the frontend's generated client, and CI fails on drift. Answering
+/// it here, before any configuration is read, keeps the export runnable
+/// without a database.
+const EXPORT_OPENAPI: &str = "openapi";
+
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some(EXPORT_OPENAPI) {
+        let document =
+            serde_json::to_string_pretty(&openapi()).expect("the OpenAPI document must serialize");
+        println!("{document}");
+        return;
+    }
+
     let config = AppConfig::from_env().expect("invalid environment configuration");
     telemetry::init(&config).expect("failed to install the tracing subscriber");
 
@@ -53,9 +69,17 @@ async fn main() {
     // and their action links to the console.
     let mailer = anubis::mail::Mailer::from_config(&config).expect("invalid mail configuration");
 
+    // Realtime channels: Redis pub/sub when REDIS_URL is set, in-process
+    // otherwise. Clone this into handlers and jobs that publish events.
+    let channels = anubis::realtime::Channels::from_config(&config)
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+
     let app = Router::new()
         // Public profile pictures at /users/{user_id}/avatar.
         .merge(anubis::auth::avatar_router(pool.clone()))
+        // The realtime channel socket at /realtime.
+        .merge(anubis::realtime::router(pool.clone(), channels))
         .nest(
             "/auth",
             anubis::auth::router(pool.clone(), mailer.clone(), &config),
@@ -68,7 +92,13 @@ async fn main() {
             "/developers",
             anubis::api::management::router(pool.clone(), roles.clone()),
         )
-        .nest("/api/v1", anubis::api::v1::router(pool.clone()))
+        // The application owns its v1 surface: the framework's endpoints, the
+        // application's own, and the merged document at /openapi.json and
+        // /docs, in one call.
+        .nest(
+            "/api/v1",
+            anubis::api::v1::router_with(pool.clone(), api_v1_router(&pool, &roles), openapi()),
+        )
         .nest("/account", account_router(&pool, &roles))
         // Application routes guard with TeamMember / OrganizationMember /
         // CurrentUser through these extensions.

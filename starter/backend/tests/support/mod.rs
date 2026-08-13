@@ -1,16 +1,17 @@
 //! Shared plumbing for the application's integration tests.
 //!
-//! Every model's narrative needs the same four things: a router wired to a
-//! real database, a way to send a JSON request, an account, and a team. They
-//! live here so each `tests/<models>_flow.rs` file reads as the story of one
-//! model's slice, which is exactly what `anubis scaffold model` stamps out.
+//! Every model's narrative needs the same five things: a router wired to a
+//! real database, a way to send a JSON request, an account, a team, and a
+//! platform application's bearer token for the `/api/v1` half. They live here
+//! so each `tests/<models>_flow.rs` file reads as the story of one model's
+//! slice, which is exactly what `anubis scaffold model` stamps out.
 //!
 //! This module is application code, not a living template: the scaffolder
 //! never rewrites it.
 
 use anubis::mail::TestOutbox;
 use anubis::roles::RoleSet;
-use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::{Router, body::Body};
 use http_body_util::BodyExt;
@@ -53,13 +54,26 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
             "/tenancy",
             anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
         )
+        // Where a narrative mints the bearer token its `/api/v1` half uses.
+        .nest(
+            "/developers",
+            anubis::api::management::router(pool.clone(), roles.clone()),
+        )
+        .nest(
+            "/api/v1",
+            anubis::api::v1::router_with(
+                pool.clone(),
+                anubis_starter::api_v1_router(&pool, &roles),
+                anubis_starter::openapi(),
+            ),
+        )
         .nest("/account", anubis_starter::account_router(&pool, &roles))
         .layer(anubis::guard::layer(pool, roles));
 
     Some((router, outbox))
 }
 
-/// Sends one JSON request and returns the status and decoded body.
+/// Sends one JSON request as a signed-in user, or as nobody.
 pub async fn send(
     router: &Router,
     method: &str,
@@ -67,7 +81,28 @@ pub async fn send(
     body: Option<&Value>,
     session_cookie: Option<&str>,
 ) -> (StatusCode, Value) {
-    let (status, _headers, value) = send_full(router, method, path, body, session_cookie).await;
+    let (status, _headers, value) =
+        send_full(router, method, path, body, session_cookie, None).await;
+    (status, value)
+}
+
+/// Sends one JSON request as a platform application's bearer token.
+///
+/// The `/api/v1` half of every model's narrative goes through here: the token
+/// is the whole identity, so no session cookie rides along.
+///
+/// This module compiles into every test binary, and a join's narrative has no
+/// `/api/v1` half, so the lint is allowed rather than expected: it applies in
+/// one binary and not in the others.
+#[allow(dead_code, reason = "a join model's narrative calls no API endpoint")]
+pub async fn send_as_token(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let (status, _headers, value) = send_full(router, method, path, body, None, token).await;
     (status, value)
 }
 
@@ -78,10 +113,14 @@ async fn send_full(
     path: &str,
     body: Option<&Value>,
     session_cookie: Option<&str>,
+    bearer: Option<&str>,
 ) -> (StatusCode, HeaderMap, Value) {
     let mut builder = Request::builder().method(method).uri(path);
     if let Some(cookie) = session_cookie {
         builder = builder.header(COOKIE, format!("anubis_session={cookie}"));
+    }
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
     }
 
     let request = match body {
@@ -115,10 +154,39 @@ async fn send_full(
 /// Registers an account and returns its session cookie.
 pub async fn register(router: &Router, email: &str) -> String {
     let credentials = json!({ "email": email, "password": "correct horse battery staple" });
-    let (status, headers, body) =
-        send_full(router, "POST", "/auth/register", Some(&credentials), None).await;
+    let (status, headers, body) = send_full(
+        router,
+        "POST",
+        "/auth/register",
+        Some(&credentials),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
     session_token(&headers)
+}
+
+/// Creates a platform application in `team_id` and returns its bearer token.
+///
+/// The token is shown exactly once, at creation, which is why it is read out
+/// of this response and carried through the rest of the narrative. The lint is
+/// allowed for the same reason [`send_as_token`]'s is.
+#[allow(dead_code, reason = "a join model's narrative calls no API endpoint")]
+pub async fn platform_token(router: &Router, admin_cookie: &str, team_id: &str) -> String {
+    let (status, body) = send(
+        router,
+        "POST",
+        &format!("/developers/teams/{team_id}/platform-applications"),
+        Some(&json!({ "name": "Integration suite" })),
+        Some(admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    body["token"]
+        .as_str()
+        .expect("the created application carries its token exactly once")
+        .to_owned()
 }
 
 /// The id of the team registration bootstrapped for this account.

@@ -13,7 +13,8 @@ export const UrlTree = {
   settings: '/settings',
   settingsProfile: '/settings/profile',
   settingsSecurity: '/settings/security',
-  members: '/members',
+  teamSettings: '/teams/:teamId/settings',
+  organizationSettings: '/organizations/:organizationId/settings',
   claimInvitation: '/claim-invitation',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
@@ -105,6 +106,14 @@ export function getOauthStartUrl(provider: string, destination: string | null | 
   }
 
   return `/auth/oauth/${provider}/start?${DESTINATION_PARAM}=${encodeURIComponent(safeDestination)}`
+}
+
+export function getTeamSettingsUrl(teamId: string): string {
+  return UrlTree.teamSettings.replace(':teamId', teamId)
+}
+
+export function getOrganizationSettingsUrl(organizationId: string): string {
+  return UrlTree.organizationSettings.replace(':organizationId', organizationId)
 }
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {

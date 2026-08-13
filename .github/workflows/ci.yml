@@ -26,6 +26,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Realtime channels run in process without this; the service exists so
+      # the Redis fanout is covered rather than skipped. See docs/realtime.md.
+      redis:
+        image: redis:7.4.10-alpine
+        ports:
+          # Ephemeral host port, for the same reason Postgres uses one.
+          - 6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +56,7 @@ jobs:
       - name: Test
         env:
           DATABASE_URL: postgres://anubis:anubis@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_test
+          REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports['6379'] }}
         run: cargo test --workspace
 
       # The generated TypeScript permissions module must match roles.yml.
@@ -60,6 +73,17 @@ jobs:
           cargo run --quiet --bin anubis -- client generate-ts \
             --out frontend/src/api/v1.generated.ts
           git diff --exit-code frontend/src/api/v1.generated.ts
+
+      # The starter's client is rendered from the document the starter itself
+      # merges, so the application exports it and the CLI renders that export.
+      - name: Application client drift check
+        run: |
+          exported="$(mktemp)"
+          cargo run --quiet -p anubis-starter -- openapi > "$exported"
+          cargo run --quiet --bin anubis -- client generate-ts \
+            --from "$exported" \
+            --out starter/frontend/src/api/v1.generated.ts
+          git diff --exit-code starter/frontend/src/api/v1.generated.ts
 
       # The runner keeps ~/.cargo/bin between runs, so only the first run on a
       # fresh runner pays the few minutes cargo-audit takes to compile. Failing

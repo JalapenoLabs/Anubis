@@ -19,6 +19,13 @@ use serde_json::Value;
 /// HTTP methods the generator understands, in emission order.
 const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
 
+/// The `max-len` the frontend's `ESLint` configuration enforces.
+///
+/// Output is checked in, so it has to lint clean untouched. Comments wrap and
+/// long calls break across lines rather than run past this, exactly as a
+/// person writing the same code would.
+const MAX_WIDTH: usize = 120;
+
 pub(crate) fn render(document: &Value) -> String {
     let year = chrono::Utc::now().year();
     let mut out = String::new();
@@ -51,40 +58,121 @@ fn render_schemas(out: &mut String, document: &Value) {
 
     let sorted: BTreeMap<&String, &Value> = schemas.iter().collect();
     for (name, schema) in sorted {
-        if let Some(description) = schema.get("description").and_then(Value::as_str) {
-            let _ = writeln!(out, "/** {} */", comment(description));
-        }
-        let _ = writeln!(out, "export type {name} = {{");
-
-        let required: Vec<&str> = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|entries| entries.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        let properties: BTreeMap<&String, &Value> = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|map| map.iter().collect())
-            .unwrap_or_default();
-
-        for (property, property_schema) in properties {
-            if let Some(description) = property_schema.get("description").and_then(Value::as_str) {
-                let _ = writeln!(out, "  /** {} */", comment(description));
-            }
-            let optional = if required.contains(&property.as_str()) {
-                ""
-            } else {
-                "?"
-            };
-            let _ = writeln!(
-                out,
-                "  {}{optional}: {}",
-                property,
-                ts_type(property_schema)
-            );
-        }
-        out.push_str("}\n\n");
+        write_doc(out, "", schema.get("description").and_then(Value::as_str));
+        let _ = writeln!(out, "export type {name} = {}", declaration_body(schema));
+        out.push('\n');
     }
+}
+
+/// Emits a description as a doc comment, if there is one.
+///
+/// One line while it fits, and a wrapped block when it does not, which is what
+/// keeps a long description inside the lint width.
+fn write_doc(out: &mut String, indent: &str, description: Option<&str>) {
+    let Some(description) = description else {
+        return;
+    };
+    let text = comment(description);
+
+    let single = format!("{indent}/** {text} */");
+    if single.chars().count() <= MAX_WIDTH {
+        let _ = writeln!(out, "{single}");
+        return;
+    }
+
+    let _ = writeln!(out, "{indent}/**");
+    // Three characters of the budget go to the ` * ` each line opens with.
+    for line in wrap(&text, MAX_WIDTH.saturating_sub(indent.chars().count() + 3)) {
+        let _ = writeln!(out, "{indent} * {line}");
+    }
+    let _ = writeln!(out, "{indent} */");
+}
+
+/// Greedily breaks `text` into lines of at most `width` characters.
+///
+/// A word longer than the width takes a line of its own rather than being
+/// split, because the only words that long are identifiers and urls.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _full_or_empty => lines.push(word.to_owned()),
+        }
+    }
+    lines
+}
+
+/// The right-hand side of an exported type: an object, or an intersection.
+///
+/// A `serde(flatten)` field reaches the document as `allOf`, which is how a
+/// scaffolded model's view is described: the record's own columns, plus
+/// whatever its associations add. TypeScript spells that as an intersection,
+/// so the generated type stays the record's type plus the extra members rather
+/// than a hand-copied duplicate of every column.
+fn declaration_body(schema: &Value) -> String {
+    let Some(parts) = schema.get("allOf").and_then(Value::as_array) else {
+        return object_literal(schema);
+    };
+
+    let rendered = parts
+        .iter()
+        .map(|part| match part.get("$ref").and_then(Value::as_str) {
+            Some(reference) => schema_name(reference),
+            None => object_literal(part),
+        })
+        // An intersection with `{}` says nothing and trips the empty-object
+        // lint, so a part that contributes no member is dropped.
+        .filter(|part| part != "{\n}")
+        .collect::<Vec<_>>();
+
+    if rendered.is_empty() {
+        return "Record<string, unknown>".to_owned();
+    }
+    rendered.join(" & ")
+}
+
+/// A schema's own properties, rendered as a multi-line object type.
+fn object_literal(schema: &Value) -> String {
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let properties: BTreeMap<&String, &Value> = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|map| map.iter().collect())
+        .unwrap_or_default();
+
+    let mut rendered = String::from("{\n");
+    for (property, property_schema) in properties {
+        write_doc(
+            &mut rendered,
+            "  ",
+            property_schema.get("description").and_then(Value::as_str),
+        );
+        let optional = if required.contains(&property.as_str()) {
+            ""
+        } else {
+            "?"
+        };
+        let _ = writeln!(
+            rendered,
+            "  {property}{optional}: {}",
+            ts_type(property_schema),
+        );
+    }
+    rendered.push('}');
+    rendered
+}
+
+/// The component name a `$ref` points at.
+fn schema_name(reference: &str) -> String {
+    reference.rsplit('/').next().unwrap_or("unknown").to_owned()
 }
 
 /// Emits the client factory with one function per operation.
@@ -170,15 +258,24 @@ fn render_operation(out: &mut String, path: &str, method: &str, operation: &Valu
 
     let return_type = success_type(operation);
 
-    if let Some(summary) = operation.get("summary").and_then(Value::as_str) {
-        let _ = writeln!(out, "  /** {} */", comment(summary));
-    }
-    let _ = writeln!(
-        out,
-        "  async function {name}({}): Promise<{}> {{",
+    write_doc(out, "  ", operation.get("summary").and_then(Value::as_str));
+
+    // A long parameter list takes a line per argument, the way a person would
+    // write it, rather than running past the lint width.
+    let returns = return_type.as_deref().unwrap_or("void");
+    let signature = format!(
+        "  async function {name}({}): Promise<{returns}> {{",
         arguments.join(", "),
-        return_type.as_deref().unwrap_or("void"),
     );
+    if signature.chars().count() <= MAX_WIDTH {
+        let _ = writeln!(out, "{signature}");
+    } else {
+        let _ = writeln!(out, "  async function {name}(");
+        for argument in &arguments {
+            let _ = writeln!(out, "    {argument},");
+        }
+        let _ = writeln!(out, "  ): Promise<{returns}> {{");
+    }
 
     // Build the request path: template-literal when parameters interpolate.
     let mut request_path = path.trim_start_matches('/').to_owned();
@@ -192,18 +289,25 @@ fn render_operation(out: &mut String, path: &str, method: &str, operation: &Valu
         format!("`{request_path}`")
     };
 
-    let request = if body_type.is_some() {
-        format!("client.{method}({quoted_path}, {{ json: body }})")
+    let call = if body_type.is_some() {
+        format!("{method}({quoted_path}, {{ json: body }})")
     } else {
-        format!("client.{method}({quoted_path})")
+        format!("{method}({quoted_path})")
+    };
+    let (keyword, decode) = match &return_type {
+        Some(rendered) => ("return", format!(".json<{rendered}>()")),
+        None => ("await", String::new()),
     };
 
-    match &return_type {
-        Some(rendered) => {
-            let _ = writeln!(out, "    return {request}.json<{rendered}>()");
-        }
-        None => {
-            let _ = writeln!(out, "    await {request}");
+    // The chained form is the house style for a call that does not fit.
+    let statement = format!("    {keyword} client.{call}{decode}");
+    if statement.chars().count() <= MAX_WIDTH {
+        let _ = writeln!(out, "{statement}");
+    } else {
+        let _ = writeln!(out, "    {keyword} client");
+        let _ = writeln!(out, "      .{call}");
+        if !decode.is_empty() {
+            let _ = writeln!(out, "      {decode}");
         }
     }
     out.push_str("  }\n\n");
@@ -229,7 +333,11 @@ fn success_type(operation: &Value) -> Option<String> {
 /// Maps a JSON schema fragment to a TypeScript type expression.
 fn ts_type(schema: &Value) -> String {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        return reference.rsplit('/').next().unwrap_or("unknown").to_owned();
+        return schema_name(reference);
+    }
+    // A flattened struct used inline rather than through a component ref.
+    if schema.get("allOf").is_some() {
+        return declaration_body(schema);
     }
 
     match schema.get("type") {
@@ -301,6 +409,8 @@ fn comment(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::render;
     use crate::api::v1;
 
@@ -328,11 +438,95 @@ mod tests {
             "got:\n{output}"
         );
         assert!(output.contains("showTeam,"), "got:\n{output}");
-        assert!(!output.contains(';'), "no semicolons, got:\n{output}");
+
+        // House style is semicolon-free. Prose is exempt: a description is
+        // copied from the document, and punctuation there is the author's.
+        for line in output.lines().filter(|line| !is_comment(line)) {
+            assert!(!line.contains(';'), "no semicolons, got: {line}");
+        }
+    }
+
+    /// Whether a rendered line is comment text rather than code.
+    fn is_comment(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')
     }
 
     #[test]
     fn output_is_deterministic() {
         assert_eq!(rendered(), rendered());
+    }
+
+    /// A scaffolded model's view: a flattened record, plus what an
+    /// association adds. utoipa spells the flatten as `allOf`.
+    #[test]
+    fn a_flattened_schema_renders_as_an_intersection() {
+        let document = json!({
+            "components": { "schemas": {
+                "Bare": { "allOf": [{ "$ref": "#/components/schemas/Project" }] },
+                "WithIds": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Project" },
+                        {
+                            "type": "object",
+                            "required": ["tag_ids"],
+                            "properties": {
+                                "tag_ids": { "type": "array", "items": { "type": "string" } },
+                            },
+                        },
+                    ],
+                },
+            } },
+        });
+        let output = render(&document);
+
+        assert!(
+            output.contains("export type Bare = Project\n"),
+            "got:\n{output}"
+        );
+        assert!(
+            output.contains("export type WithIds = Project & {\n  tag_ids: string[]\n}\n"),
+            "got:\n{output}",
+        );
+    }
+
+    #[test]
+    fn long_comments_and_calls_stay_inside_the_lint_width() {
+        let sentence = "The quick brown fox jumps over the lazy dog, and keeps on jumping, \
+                        because a description this long has to wrap somewhere.";
+        let document = json!({
+            "components": { "schemas": {
+                "Wide": {
+                    "description": sentence,
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": { "value": { "type": "string", "description": sentence } },
+                },
+            } },
+            "paths": { "/api/v1/international-distribution-agreement-amendments/{amendment_id}": {
+                "patch": {
+                    "operationId": "updateInternationalDistributionAgreementAmendment",
+                    "parameters": [{ "name": "amendment_id", "in": "path",
+                                     "schema": { "type": "string" } }],
+                    "requestBody": { "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/Wide" } } } },
+                    "responses": { "200": { "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/Wide" } } } } },
+                },
+            } },
+        });
+        let output = render(&document);
+
+        for line in output.lines() {
+            assert!(
+                line.chars().count() <= super::MAX_WIDTH,
+                "line runs past the lint width: {line}",
+            );
+        }
+        assert!(
+            output.contains("  /**\n   * The quick brown"),
+            "got:\n{output}"
+        );
+        assert!(output.contains("      .patch(`api/v1/"), "got:\n{output}");
     }
 }

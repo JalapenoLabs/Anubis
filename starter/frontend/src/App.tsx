@@ -12,7 +12,8 @@ import { ClaimInvitationPage } from './pages/ClaimInvitationPage'
 import { CreativeConceptPage } from './pages/CreativeConceptPage'
 import { CreativeConceptsPage } from './pages/CreativeConceptsPage'
 import { DashboardPage } from './pages/DashboardPage'
-import { MembersPage } from './pages/MembersPage'
+import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
+import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
 import { SecuritySettingsPage } from './pages/settings/SecuritySettingsPage'
 import { ConfirmEmailChangePage } from './pages/auth/ConfirmEmailChangePage'
@@ -106,10 +107,18 @@ export function App() {
       }
     />
     <Route
-      path={UrlTree.members}
+      path={UrlTree.teamSettings}
       element={
         <Workspace>
-          <MembersPage />
+          <TeamSettingsPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationSettings}
+      element={
+        <Workspace>
+          <OrganizationSettingsPage />
         </Workspace>
       }
     />

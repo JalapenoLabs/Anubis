@@ -18,6 +18,11 @@ export default defineConfig({
       // Avatars are served publicly, outside the authenticated prefixes.
       '/users': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',
+      // The realtime channel socket, which needs an explicit upgrade.
+      '/realtime': {
+        target: 'ws://127.0.0.1:3000',
+        ws: true,
+      },
     },
   },
 })

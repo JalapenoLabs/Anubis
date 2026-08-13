@@ -4,9 +4,10 @@
 //! application: create under a parent, list with the locked pagination
 //! envelope, refuse another tenant's records with `404`, refuse a read-only
 //! member's writes with `403`, refuse a parent from another team, update, and
-//! destroy. When `anubis scaffold model` transforms the living template, it
-//! transforms this narrative with it, so every generated model arrives with
-//! the same proof.
+//! destroy, on the account routes and then on `/api/v1` with a platform
+//! application's bearer token. When `anubis scaffold model` transforms the
+//! living template, it transforms this narrative with it, so every generated
+//! model arrives with the same proof.
 //!
 //! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
 //! always provides one.
@@ -15,7 +16,9 @@ mod support;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use support::{boot, bootstrapped_team, invite_and_claim, register, send};
+use support::{
+    boot, bootstrapped_team, invite_and_claim, platform_token, register, send, send_as_token,
+};
 use uuid::Uuid;
 
 /// Creates a parent creative concept in `team_id` and returns its id.
@@ -207,5 +210,71 @@ async fn the_tangible_thing_slice_serves_full_crud() {
     let (status, _body) = send(&router, "DELETE", &member_path, None, Some(&owner_cookie)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _body) = send(&router, "GET", &member_path, None, Some(&owner_cookie)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // ---------------------------------------------------------------------
+    // The same slice through `/api/v1`, where a platform application's bearer
+    // token is the whole identity and its team is the whole ownership chain.
+    // The columns are proven above: both surfaces share one serializer.
+    // ---------------------------------------------------------------------
+    let token = platform_token(&router, &owner_cookie, &team_id).await;
+    let api_collection = format!("/api/v1/creative-concepts/{creative_concept_id}/tangible-things");
+
+    // No token, and a forged one, are refused before any record is touched.
+    for bearer in [None, Some("forged-token")] {
+        let (status, _body) = send_as_token(&router, "GET", &api_collection, None, bearer).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    let (status, body) = send_as_token(
+        &router,
+        "POST",
+        &api_collection,
+        Some(&json!({ "name": "Foghorn" })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let api_id = body["tangible_thing"]["id"]
+        .as_str()
+        .expect("the response carries the record")
+        .to_owned();
+    let api_member = format!("/api/v1/tangible-things/{api_id}");
+
+    // The list envelope is the locked one, under the parent the route names.
+    let (status, body) = send_as_token(
+        &router,
+        "GET",
+        &format!("{api_collection}?limit=25&sort=name&name=Foghorn"),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["pagination"]["total_items"], json!(1));
+    assert_eq!(body["tangible_things"][0]["name"], json!("Foghorn"));
+
+    let (status, body) = send_as_token(
+        &router,
+        "PATCH",
+        &api_member,
+        Some(&json!({ "name": "Foghorn mark II" })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["tangible_thing"]["name"], json!("Foghorn mark II"));
+
+    // Another team's token reaches neither the parent nor the record.
+    let outsider_token = platform_token(&router, &outsider_cookie, &outsider_team).await;
+    for path in [&api_collection, &api_member] {
+        let (status, _body) =
+            send_as_token(&router, "GET", path, None, Some(&outsider_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "leaked {path}");
+    }
+
+    let (status, _body) = send_as_token(&router, "DELETE", &api_member, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _body) = send_as_token(&router, "GET", &api_member, None, Some(&token)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

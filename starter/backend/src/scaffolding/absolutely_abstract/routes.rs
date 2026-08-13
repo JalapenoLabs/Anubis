@@ -1,17 +1,25 @@
-//! Account (session-authenticated) CRUD for `CreativeConcept`.
+//! The two surfaces of `CreativeConcept`: account routes and `/api/v1`.
 //!
-//! Collection routes hang off the team, so they authorize with the framework's
-//! [`TeamMember`] guard directly. Member routes are shallow (`/creative-
-//! concepts/{id}`), so they resolve the ownership chain themselves through
-//! [`CreativeConcept::load_for_member`] and authorize against the same
+//! Account collection routes hang off the team, so they authorize with the
+//! framework's [`TeamMember`] guard directly. Account member routes are shallow
+//! (`/creative-concepts/{id}`), so they resolve the ownership chain themselves
+//! through [`CreativeConcept::load_for_member`] and authorize against the same
 //! compiled [`RoleSet`]. Both paths answer `404` for records the caller cannot
 //! reach, so an id probe cannot tell a missing record from another tenant's.
 //!
-//! | Method | Path |
-//! |---|---|
-//! | GET, POST | `/account/teams/{team_id}/creative-concepts` |
-//! | GET, PATCH, DELETE | `/account/creative-concepts/{creative_concept_id}` |
+//! The `/api/v1` routes are the same slice for a platform application's bearer
+//! token: [`ApiCaller`] resolves the token to its team, which is the whole
+//! ownership chain, and the token acts with that team's rights. Both surfaces
+//! read and write through the same request bodies, the same view, and the same
+//! three functions below, which is what keeps the published contract and the
+//! browser's shape one thing rather than two that drift.
+//!
+//! | Method | Account path | API path |
+//! |---|---|---|
+//! | GET, POST | `/account/teams/{team_id}/creative-concepts` | `/api/v1/creative-concepts` |
+//! | GET, PATCH, DELETE | `/account/creative-concepts/{creative_concept_id}` | `/api/v1/creative-concepts/{creative_concept_id}` |
 
+use anubis::api::v1::{ApiCaller, ErrorV1};
 use anubis::auth::CurrentUser;
 use anubis::db::DbPool;
 use anubis::guard::TeamMember;
@@ -26,6 +34,7 @@ use axum::{Json, Router};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use super::model::{CreativeConcept, CreativeConceptChanges, MODEL, NewCreativeConcept, SORTABLE};
@@ -48,6 +57,46 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
         .layer(anubis::guard::layer(pool, roles))
 }
 
+/// Returns the creative concept routes of the public API.
+///
+/// Mounted by `anubis::api::v1::router_with`, which supplies the database
+/// extension [`ApiCaller`] resolves its bearer token through.
+pub fn api_router(pool: DbPool, roles: RoleSet) -> Router {
+    Router::new()
+        .route("/creative-concepts", get(api_list).post(api_create))
+        .route(
+            "/creative-concepts/{creative_concept_id}",
+            get(api_show).patch(api_update).delete(api_destroy),
+        )
+        .with_state(CreativeConceptState { pool, roles })
+}
+
+/// This model's half of the application's OpenAPI document.
+///
+/// The application merges it in `lib.rs`, one line per model. Only the schemas
+/// this module declares are registered here: [`CreativeConcept`] itself, the
+/// shared error shape, and the pagination object all come from documents this
+/// one is merged with.
+#[derive(OpenApi)]
+#[openapi(
+    paths(api_list, api_show, api_create, api_update, api_destroy),
+    components(schemas(
+        CreativeConcept,
+        CreativeConceptView,
+        CreativeConceptBody,
+        CreativeConceptsBody,
+        CreateCreativeConceptBody,
+        UpdateCreativeConceptBody,
+    ))
+)]
+struct ApiDoc;
+
+/// The OpenAPI 3.1 registrations this model contributes.
+#[must_use]
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    ApiDoc::openapi()
+}
+
 #[derive(Clone)]
 struct CreativeConceptState {
     pool: DbPool,
@@ -61,7 +110,8 @@ struct CreativeConceptFilters {
     name: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// The fields a creative concept is created from, on both surfaces.
+#[derive(Deserialize, ToSchema)]
 struct CreateCreativeConceptBody {
     name: String,
     /// Blank or absent stores no description.
@@ -69,7 +119,8 @@ struct CreateCreativeConceptBody {
     // 🐺 anubis:create-body
 }
 
-#[derive(Deserialize)]
+/// The fields a creative concept is updated from, on both surfaces.
+#[derive(Deserialize, ToSchema)]
 struct UpdateCreativeConceptBody {
     name: Option<String>,
     /// Blank clears the description, absent leaves it alone, which is exactly
@@ -78,13 +129,19 @@ struct UpdateCreativeConceptBody {
     // 🐺 anubis:update-body
 }
 
-/// The record as the account endpoints serialize it.
+/// The record as every endpoint serializes it.
 ///
 /// `serde(flatten)` keeps the wire shape identical to the record's own columns,
 /// so a model with no associations serializes exactly as its table does. An
 /// association `anubis scaffold field` adds lands its ids here, which is what
-/// lets one form read and write the same shape.
-#[derive(Serialize)]
+/// lets one form read and write the same shape. It is also the API serializer:
+/// utoipa reads the flatten as a composition of the record's schema, so a
+/// scaffolded column reaches the published document without a second
+/// declaration.
+#[derive(Serialize, ToSchema)]
+// The doc comment above is for whoever reads this code; the description below
+// is what an API consumer reads in the published document.
+#[schema(description = "A creative concept, as every endpoint serializes it.")]
 struct CreativeConceptView {
     #[serde(flatten)]
     creative_concept: CreativeConcept,
@@ -124,42 +181,47 @@ impl CreativeConceptView {
     }
 }
 
-#[derive(Serialize)]
+/// One creative concept, as every endpoint that answers with one wraps it.
+#[derive(Serialize, ToSchema)]
 struct CreativeConceptBody {
     creative_concept: CreativeConceptView,
 }
 
-#[derive(Serialize)]
+/// A page of creative concepts, in the locked list envelope.
+#[derive(Serialize, ToSchema)]
 struct CreativeConceptsBody {
     creative_concepts: Vec<CreativeConceptView>,
     pagination: Pagination,
 }
 
-async fn list(
-    State(state): State<CreativeConceptState>,
-    member: TeamMember,
-    Query(params): Query<ListParams>,
-    Query(filters): Query<CreativeConceptFilters>,
-) -> Result<impl IntoResponse, ApiError> {
-    member.require(Action::Read, MODEL)?;
+// ---------------------------------------------------------------------------
+// The work, shared by both surfaces. Everything above the query is
+// authorization, and that is the only thing the two surfaces do differently.
+// ---------------------------------------------------------------------------
 
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
+/// Reads one page of a team's creative concepts.
+async fn list_page(
+    connection: &mut AsyncPgConnection,
+    team_id: Uuid,
+    params: &ListParams,
+    filters: &CreativeConceptFilters,
+) -> Result<CreativeConceptsBody, ApiError> {
     let pattern = like_pattern(filters.name.as_deref());
 
     let mut counted = creative_concepts::table
-        .filter(creative_concepts::team_id.eq(member.team.id))
+        .filter(creative_concepts::team_id.eq(team_id))
         .into_boxed();
     if let Some(pattern) = pattern.clone() {
         counted = counted.filter(creative_concepts::name.ilike(pattern));
     }
     let total_items: i64 = counted
         .count()
-        .get_result(&mut connection)
+        .get_result(connection)
         .await
         .map_err(log_internal)?;
 
     let mut page = creative_concepts::table
-        .filter(creative_concepts::team_id.eq(member.team.id))
+        .filter(creative_concepts::team_id.eq(team_id))
         .into_boxed();
     if let Some(pattern) = pattern {
         page = page.filter(creative_concepts::name.ilike(pattern));
@@ -181,26 +243,25 @@ async fn list(
         .limit(params.limit())
         .offset(params.offset())
         .select(CreativeConcept::as_select())
-        .load(&mut connection)
+        .load(connection)
         .await
         .map_err(log_internal)?;
-    let creative_concepts = CreativeConceptView::load(&mut connection, records)
+    let creative_concepts = CreativeConceptView::load(connection, records)
         .await
         .map_err(log_internal)?;
 
-    Ok(Json(CreativeConceptsBody {
+    Ok(CreativeConceptsBody {
         creative_concepts,
-        pagination: Pagination::new(&params, total_items),
-    }))
+        pagination: Pagination::new(params, total_items),
+    })
 }
 
-async fn create(
-    State(state): State<CreativeConceptState>,
-    member: TeamMember,
-    Json(body): Json<CreateCreativeConceptBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    member.require(Action::Create, MODEL)?;
-
+/// Writes one new creative concept into a team.
+async fn insert_record(
+    connection: &mut AsyncPgConnection,
+    team_id: Uuid,
+    body: CreateCreativeConceptBody,
+) -> Result<CreativeConceptView, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err(ApiError::validation("Name the creative concept."));
@@ -212,24 +273,98 @@ async fn create(
         .filter(|value| !value.is_empty());
     // 🐺 anubis:create-normalize
 
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
     let record: CreativeConcept = diesel::insert_into(creative_concepts::table)
         .values(NewCreativeConcept {
-            // The team comes from the route, never from the body.
-            team_id: member.team.id,
+            // The team comes from the route or the token, never from the body.
+            team_id,
             name,
             description,
             // 🐺 anubis:insert-values
         })
         .returning(CreativeConcept::as_returning())
-        .get_result(&mut connection)
+        .get_result(connection)
         .await
         .map_err(log_internal)?;
     // 🐺 anubis:create-associations
 
-    let creative_concept = CreativeConceptView::one(&mut connection, record)
+    CreativeConceptView::one(connection, record)
         .await
-        .map_err(log_internal)?;
+        .map_err(log_internal)
+}
+
+/// Applies a submitted change to one creative concept.
+///
+/// A request that submits nothing answers with the record untouched, because
+/// Diesel refuses an empty change set.
+async fn apply_changes(
+    connection: &mut AsyncPgConnection,
+    record: CreativeConcept,
+    body: UpdateCreativeConceptBody,
+) -> Result<CreativeConceptView, ApiError> {
+    let name = match body.name.as_deref().map(str::trim) {
+        Some("") => return Err(ApiError::validation("Name the creative concept.")),
+        other => other.map(str::to_owned),
+    };
+    // A blank description clears the column, which is what the form submits
+    // when the user empties the field.
+    let description = optional_text(body.description.as_deref());
+    // 🐺 anubis:update-normalize
+
+    // Associations are reconciled before the columns, so a request that only
+    // changes an association still takes effect.
+    // 🐺 anubis:update-associations
+
+    let changes = CreativeConceptChanges {
+        name,
+        description,
+        // 🐺 anubis:changeset-values
+    };
+    if changes.is_empty() {
+        return CreativeConceptView::one(connection, record)
+            .await
+            .map_err(log_internal);
+    }
+
+    let updated: CreativeConcept =
+        diesel::update(creative_concepts::table.filter(creative_concepts::id.eq(record.id)))
+            .set(changes)
+            .returning(CreativeConcept::as_returning())
+            .get_result(connection)
+            .await
+            .map_err(log_internal)?;
+
+    CreativeConceptView::one(connection, updated)
+        .await
+        .map_err(log_internal)
+}
+
+// ---------------------------------------------------------------------------
+// Account handlers: a signed-in user, authorized through their membership.
+// ---------------------------------------------------------------------------
+
+async fn list(
+    State(state): State<CreativeConceptState>,
+    member: TeamMember,
+    Query(params): Query<ListParams>,
+    Query(filters): Query<CreativeConceptFilters>,
+) -> Result<impl IntoResponse, ApiError> {
+    member.require(Action::Read, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    Ok(Json(
+        list_page(&mut connection, member.team.id, &params, &filters).await?,
+    ))
+}
+
+async fn create(
+    State(state): State<CreativeConceptState>,
+    member: TeamMember,
+    Json(body): Json<CreateCreativeConceptBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    member.require(Action::Create, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let creative_concept = insert_record(&mut connection, member.team.id, body).await?;
     Ok((
         StatusCode::CREATED,
         Json(CreativeConceptBody { creative_concept }),
@@ -261,42 +396,7 @@ async fn update(
     let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
-    let name = match body.name.as_deref().map(str::trim) {
-        Some("") => return Err(ApiError::validation("Name the creative concept.")),
-        other => other.map(str::to_owned),
-    };
-    // A blank description clears the column, which is what the form submits
-    // when the user empties the field.
-    let description = optional_text(body.description.as_deref());
-    // 🐺 anubis:update-normalize
-
-    // Associations are reconciled before the columns, so a request that only
-    // changes an association still takes effect.
-    // 🐺 anubis:update-associations
-
-    let changes = CreativeConceptChanges {
-        name,
-        description,
-        // 🐺 anubis:changeset-values
-    };
-    if changes.is_empty() {
-        let creative_concept = CreativeConceptView::one(&mut connection, record)
-            .await
-            .map_err(log_internal)?;
-        return Ok(Json(CreativeConceptBody { creative_concept }));
-    }
-
-    let updated: CreativeConcept =
-        diesel::update(creative_concepts::table.filter(creative_concepts::id.eq(record.id)))
-            .set(changes)
-            .returning(CreativeConcept::as_returning())
-            .get_result(&mut connection)
-            .await
-            .map_err(log_internal)?;
-
-    let creative_concept = CreativeConceptView::one(&mut connection, updated)
-        .await
-        .map_err(log_internal)?;
+    let creative_concept = apply_changes(&mut connection, record, body).await?;
     Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
@@ -318,6 +418,169 @@ async fn destroy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---------------------------------------------------------------------------
+// API handlers: a platform application's bearer token, acting as its team.
+// ---------------------------------------------------------------------------
+
+/// List the team's creative concepts.
+#[utoipa::path(
+    get,
+    path = "/api/v1/creative-concepts",
+    operation_id = "listCreativeConcepts",
+    tag = "creative-concepts",
+    params(
+        ("page" = Option<i64>, Query, description = "1-based page number, defaulting to 1"),
+        ("limit" = Option<i64>, Query, description = "Page size, defaulting to 25 and capped at 100"),
+        ("sort" = Option<String>, Query, description = "A sortable field, `-` prefixed for descending"),
+        ("name" = Option<String>, Query, description = "Case-insensitive substring match on the name"),
+    ),
+    responses(
+        (status = 200, description = "A page of creative concepts", body = CreativeConceptsBody),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorV1),
+        (status = 403, description = "The token's roles do not grant this", body = ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn api_list(
+    State(state): State<CreativeConceptState>,
+    caller: ApiCaller,
+    Query(params): Query<ListParams>,
+    Query(filters): Query<CreativeConceptFilters>,
+) -> Result<impl IntoResponse, ApiError> {
+    caller.require(&state.roles, Action::Read, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    Ok(Json(
+        list_page(&mut connection, caller.team.id, &params, &filters).await?,
+    ))
+}
+
+/// Fetch one creative concept.
+#[utoipa::path(
+    get,
+    path = "/api/v1/creative-concepts/{creative_concept_id}",
+    operation_id = "showCreativeConcept",
+    tag = "creative-concepts",
+    params(("creative_concept_id" = Uuid, Path, description = "The creative concept's id")),
+    responses(
+        (status = 200, description = "The creative concept", body = CreativeConceptBody),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorV1),
+        (status = 403, description = "The token's roles do not grant this", body = ErrorV1),
+        (status = 404, description = "No such creative concept in this team", body = ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn api_show(
+    State(state): State<CreativeConceptState>,
+    caller: ApiCaller,
+    Path(creative_concept_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    caller.require(&state.roles, Action::Read, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let record = load_for_token(&mut connection, &caller, creative_concept_id).await?;
+
+    let creative_concept = CreativeConceptView::one(&mut connection, record)
+        .await
+        .map_err(log_internal)?;
+    Ok(Json(CreativeConceptBody { creative_concept }))
+}
+
+/// Create a creative concept in the token's team.
+#[utoipa::path(
+    post,
+    path = "/api/v1/creative-concepts",
+    operation_id = "createCreativeConcept",
+    tag = "creative-concepts",
+    request_body = CreateCreativeConceptBody,
+    responses(
+        (status = 201, description = "The created creative concept", body = CreativeConceptBody),
+        (status = 400, description = "The submitted fields are not valid", body = ErrorV1),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorV1),
+        (status = 403, description = "The token's roles do not grant this", body = ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn api_create(
+    State(state): State<CreativeConceptState>,
+    caller: ApiCaller,
+    Json(body): Json<CreateCreativeConceptBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    caller.require(&state.roles, Action::Create, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let creative_concept = insert_record(&mut connection, caller.team.id, body).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreativeConceptBody { creative_concept }),
+    ))
+}
+
+/// Update one creative concept.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/creative-concepts/{creative_concept_id}",
+    operation_id = "updateCreativeConcept",
+    tag = "creative-concepts",
+    params(("creative_concept_id" = Uuid, Path, description = "The creative concept's id")),
+    request_body = UpdateCreativeConceptBody,
+    responses(
+        (status = 200, description = "The updated creative concept", body = CreativeConceptBody),
+        (status = 400, description = "The submitted fields are not valid", body = ErrorV1),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorV1),
+        (status = 403, description = "The token's roles do not grant this", body = ErrorV1),
+        (status = 404, description = "No such creative concept in this team", body = ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn api_update(
+    State(state): State<CreativeConceptState>,
+    caller: ApiCaller,
+    Path(creative_concept_id): Path<Uuid>,
+    Json(body): Json<UpdateCreativeConceptBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    caller.require(&state.roles, Action::Update, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let record = load_for_token(&mut connection, &caller, creative_concept_id).await?;
+
+    let creative_concept = apply_changes(&mut connection, record, body).await?;
+    Ok(Json(CreativeConceptBody { creative_concept }))
+}
+
+/// Delete one creative concept.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/creative-concepts/{creative_concept_id}",
+    operation_id = "deleteCreativeConcept",
+    tag = "creative-concepts",
+    params(("creative_concept_id" = Uuid, Path, description = "The creative concept's id")),
+    responses(
+        (status = 204, description = "The creative concept is gone"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorV1),
+        (status = 403, description = "The token's roles do not grant this", body = ErrorV1),
+        (status = 404, description = "No such creative concept in this team", body = ErrorV1),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn api_destroy(
+    State(state): State<CreativeConceptState>,
+    caller: ApiCaller,
+    Path(creative_concept_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    caller.require(&state.roles, Action::Destroy, MODEL)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let creative_concept = load_for_token(&mut connection, &caller, creative_concept_id).await?;
+
+    diesel::delete(creative_concepts::table.filter(creative_concepts::id.eq(creative_concept.id)))
+        .execute(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Loads the creative concept, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
@@ -325,6 +588,18 @@ async fn load(
     creative_concept_id: Uuid,
 ) -> Result<(CreativeConcept, TeamMembership), ApiError> {
     CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
+        .await
+        .map_err(log_internal)?
+        .ok_or_else(ApiError::not_found)
+}
+
+/// Loads the creative concept the token's team owns, or answers `404`.
+async fn load_for_token(
+    connection: &mut AsyncPgConnection,
+    caller: &ApiCaller,
+    creative_concept_id: Uuid,
+) -> Result<CreativeConcept, ApiError> {
+    CreativeConcept::load_for_team(connection, caller.team.id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)

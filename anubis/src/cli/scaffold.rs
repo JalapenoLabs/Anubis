@@ -482,7 +482,12 @@ fn update_schema(
     Ok((relative, updated))
 }
 
-/// Declares the model's module and mounts its router in `backend/src/lib.rs`.
+/// Declares the model's module and mounts both of its routers in `lib.rs`.
+///
+/// A model owns two surfaces: the account routes the browser calls and the
+/// `/api/v1` routes a platform token calls. The third insertion merges the
+/// model's own OpenAPI registrations into the application's document, which is
+/// what puts a scaffolded model in the published contract.
 fn update_lib(root: &Path, scaffold: &ModelScaffold) -> Result<(PathBuf, String), String> {
     update_anchors(
         root,
@@ -490,6 +495,8 @@ fn update_lib(root: &Path, scaffold: &ModelScaffold) -> Result<(PathBuf, String)
         &[
             (anchor::MODULES, scaffold.module_declaration()),
             (anchor::ROUTES, scaffold.route_mount()),
+            (anchor::API_ROUTES, scaffold.api_route_mount()),
+            (anchor::API_DOCS, scaffold.api_doc_merge()),
         ],
     )
 }

@@ -2,9 +2,13 @@
 
 import type {
   ClaimedInvitation,
+  CreatedOrganization,
   InviteMemberRequest,
   MembershipsOverview,
+  OrganizationRosterMember,
   TeamRosterMember,
+  TenancyOrganization,
+  TenancyTeam,
 } from '../types'
 import type { KyInstance } from 'ky'
 
@@ -13,6 +17,26 @@ type WireRosterMember = {
   email: string | null
   roles: string[]
   pending: boolean
+  invitation_id: string | null
+}
+
+type WireOrganizationRosterMember = {
+  membership_id: string | null
+  email: string
+  roles: string[]
+  pending: boolean
+  invitation_id: string | null
+}
+
+type WireOrganization = {
+  id: string
+  name: string
+}
+
+type WireTeam = {
+  id: string
+  organization_id: string
+  name: string
 }
 
 /** Organizations, teams, memberships, and invitations. */
@@ -32,6 +56,22 @@ export function createTenancyRoutes(client: KyInstance) {
       email: member.email,
       roles: member.roles,
       pending: member.pending,
+      invitationId: member.invitation_id,
+    }))
+  }
+
+  async function listOrganizationMembers(
+    organizationId: string,
+  ): Promise<OrganizationRosterMember[]> {
+    const response = await client
+      .get(`tenancy/organizations/${organizationId}/members`)
+      .json<{ members: WireOrganizationRosterMember[] }>()
+    return response.members.map((member) => ({
+      membershipId: member.membership_id,
+      email: member.email,
+      roles: member.roles,
+      pending: member.pending,
+      invitationId: member.invitation_id,
     }))
   }
 
@@ -54,10 +94,129 @@ export function createTenancyRoutes(client: KyInstance) {
       .json<ClaimedInvitation>()
   }
 
+  /** Creates an organization; the backend gives it a default team. */
+  async function createOrganization(name: string): Promise<CreatedOrganization> {
+    const response = await client
+      .post('tenancy/organizations', { json: { name }})
+      .json<{ organization: WireOrganization, team: WireTeam }>()
+    return {
+      organization: {
+        id: response.organization.id,
+        name: response.organization.name,
+      },
+      team: {
+        id: response.team.id,
+        organizationId: response.team.organization_id,
+        name: response.team.name,
+      },
+    }
+  }
+
+  async function renameOrganization(
+    organizationId: string,
+    name: string,
+  ): Promise<TenancyOrganization> {
+    const response = await client
+      .patch(`tenancy/organizations/${organizationId}`, { json: { name }})
+      .json<{ organization: WireOrganization }>()
+    return {
+      id: response.organization.id,
+      name: response.organization.name,
+    }
+  }
+
+  /** Deletes the organization, its teams, and everything that chains to them. */
+  async function deleteOrganization(organizationId: string): Promise<void> {
+    await client.delete(`tenancy/organizations/${organizationId}`)
+  }
+
+  async function leaveOrganization(organizationId: string): Promise<void> {
+    await client.post(`tenancy/organizations/${organizationId}/leave`)
+  }
+
+  async function removeOrganizationMember(
+    organizationId: string,
+    membershipId: string,
+  ): Promise<void> {
+    await client.delete(`tenancy/organizations/${organizationId}/members/${membershipId}`)
+  }
+
+  async function revokeOrganizationInvitation(
+    organizationId: string,
+    invitationId: string,
+  ): Promise<void> {
+    await client.delete(`tenancy/organizations/${organizationId}/invitations/${invitationId}`)
+  }
+
+  async function createTeam(organizationId: string, name: string): Promise<TenancyTeam> {
+    const response = await client
+      .post(`tenancy/organizations/${organizationId}/teams`, { json: { name }})
+      .json<{ team: WireTeam }>()
+    return {
+      id: response.team.id,
+      organizationId: response.team.organization_id,
+      name: response.team.name,
+    }
+  }
+
+  /** Dissolving a team is the organization's call, so it is nested under one. */
+  async function deleteTeam(organizationId: string, teamId: string): Promise<void> {
+    await client.delete(`tenancy/organizations/${organizationId}/teams/${teamId}`)
+  }
+
+  async function renameTeam(teamId: string, name: string): Promise<TenancyTeam> {
+    const response = await client
+      .patch(`tenancy/teams/${teamId}`, { json: { name }})
+      .json<{ team: WireTeam }>()
+    return {
+      id: response.team.id,
+      organizationId: response.team.organization_id,
+      name: response.team.name,
+    }
+  }
+
+  /** Replaces a member's roles wholesale; the request states the end state. */
+  async function changeTeamMemberRoles(
+    teamId: string,
+    membershipId: string,
+    roles: string[],
+  ): Promise<string[]> {
+    const response = await client
+      .patch(`tenancy/teams/${teamId}/members/${membershipId}`, { json: { roles }})
+      .json<{ membership_id: string, roles: string[] }>()
+    return response.roles
+  }
+
+  async function removeTeamMember(teamId: string, membershipId: string): Promise<void> {
+    await client.delete(`tenancy/teams/${teamId}/members/${membershipId}`)
+  }
+
+  async function leaveTeam(teamId: string): Promise<void> {
+    await client.post(`tenancy/teams/${teamId}/leave`)
+  }
+
+  async function revokeTeamInvitation(teamId: string, invitationId: string): Promise<void> {
+    await client.delete(`tenancy/teams/${teamId}/invitations/${invitationId}`)
+  }
+
   return {
     listMemberships,
     listTeamMembers,
+    listOrganizationMembers,
     inviteMember,
     claimInvitation,
+    createOrganization,
+    renameOrganization,
+    deleteOrganization,
+    leaveOrganization,
+    removeOrganizationMember,
+    revokeOrganizationInvitation,
+    createTeam,
+    deleteTeam,
+    renameTeam,
+    changeTeamMemberRoles,
+    removeTeamMember,
+    leaveTeam,
+    revokeTeamInvitation,
   } as const
 }

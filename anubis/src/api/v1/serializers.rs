@@ -42,9 +42,14 @@ pub(crate) struct TeamEnvelopeV1 {
 }
 
 /// The error shape every v1 endpoint answers with.
-#[derive(Serialize, ToSchema)]
-#[schema(as = ErrorV1)]
-pub(crate) struct ErrorV1 {
+///
+/// Application handlers name it in their own `#[utoipa::path]` responses, so
+/// every endpoint in the merged document documents failure the same way.
+// The doc comment above is for whoever reads this code; the description below
+// is what an API consumer reads in the published document.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = ErrorV1, description = "The error shape every v1 endpoint answers with.")]
+pub struct ErrorV1 {
     /// A user-safe description of what went wrong.
     pub message: String,
 }

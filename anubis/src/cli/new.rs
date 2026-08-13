@@ -269,6 +269,7 @@ mod tests {
             "tower",
             "tracing",
             "tracing-subscriber",
+            "utoipa",
             "uuid",
         ] {
             let workspace_line = workspace

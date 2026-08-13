@@ -4,6 +4,7 @@ export type {
   AuthSession,
   ChangePasswordRequest,
   ClaimedInvitation,
+  CreatedOrganization,
   Credentials,
   EmailChangeRequest,
   InviteMemberRequest,
@@ -12,12 +13,15 @@ export type {
   MembershipsOverview,
   MessageEnvelope,
   MfaStatus,
+  OrganizationRosterMember,
   Passkey,
   PasskeyLoginChallenge,
   PasskeyRegistrationChallenge,
   ProfileUpdate,
   SignInResult,
   TeamRosterMember,
+  TenancyOrganization,
+  TenancyTeam,
   TotpEnrollment,
   User,
   UserEnvelope,
@@ -33,6 +37,18 @@ export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generat
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
 export type { AnubisFieldProps, FieldOption } from './fields/types'
+export type { RealtimeListener } from './realtime/listeners'
+export type {
+  ClientFrame,
+  RealtimeErrorCode,
+  RealtimeEvent,
+  ServerFrame,
+} from './realtime/protocol'
+export type {
+  ConnectionState,
+  RealtimeClientOptions,
+  WebSocketLike,
+} from './realtime/RealtimeClient'
 
 // Fields
 export { BooleanField } from './fields/BooleanField'
@@ -60,6 +76,11 @@ export {
   toCredentialCreationOptions,
   toCredentialRequestOptions,
 } from './webauthn/ceremony'
+
+// Realtime
+export { REALTIME_PATH, RealtimeClient } from './realtime/RealtimeClient'
+export { RealtimeProvider, useRealtime } from './react/RealtimeProvider'
+export { useChannel } from './react/useChannel'
 
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'

@@ -59,6 +59,13 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/users/{user_id}/avatar",
         area: "auth",
     },
+    // The realtime channel socket. A plain GET is answered `426 Upgrade
+    // Required` by axum once the session is accepted.
+    RouteEntry {
+        method: "GET",
+        path: "/realtime",
+        area: "realtime",
+    },
     // Registration and sessions.
     RouteEntry {
         method: "POST",
@@ -243,6 +250,11 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         area: "tenancy",
     },
     RouteEntry {
+        method: "GET",
+        path: "/tenancy/organizations/{organization_id}/members",
+        area: "tenancy",
+    },
+    RouteEntry {
         method: "POST",
         path: "/tenancy/invitations",
         area: "tenancy",
@@ -276,6 +288,16 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "DELETE",
         path: "/tenancy/organizations/{organization_id}/teams/{team_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/organizations/{organization_id}/members/{membership_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tenancy/organizations/{organization_id}/leave",
         area: "tenancy",
     },
     RouteEntry {
@@ -394,6 +416,10 @@ roles:
         Router::new()
             .merge(crate::server::health_router(pool.clone()))
             .merge(crate::auth::avatar_router(pool.clone()))
+            .merge(crate::realtime::router(
+                pool.clone(),
+                crate::realtime::Channels::in_process(),
+            ))
             .nest(
                 "/auth",
                 crate::auth::router(pool.clone(), mailer.clone(), &config),

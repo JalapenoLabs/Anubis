@@ -3,11 +3,11 @@
 //! [`router`] returns the routes an application mounts (conventionally under
 //! `/tenancy`). This module serves the read and invitation side:
 //! `GET /memberships` lists what the caller belongs to, `GET
-//! /teams/{team_id}/members` is the team roster, `POST /invitations` sends an
-//! invitation to a team or an organization, and `POST /invitations/claim`
-//! joins the signed-in user to the invitation's target. Inviting requires the
-//! admin role on the target; organization admins may invite to any team in
-//! their organization.
+//! /teams/{team_id}/members` and `GET /organizations/{organization_id}/members`
+//! are the two rosters, `POST /invitations` sends an invitation to a team or an
+//! organization, and `POST /invitations/claim` joins the signed-in user to the
+//! invitation's target. Inviting requires the admin role on the target;
+//! organization admins may invite to any team in their organization.
 //!
 //! The management routes, which create, rename, and dissolve tenants and move
 //! members between roles, live in [`super::management`] and merge in here.
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::auth::CurrentUser;
 use crate::config::AppConfig;
 use crate::db::DbPool;
-use crate::guard::TeamMember;
+use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
 use crate::mail::{Email, Mailer};
 use crate::roles::RoleSet;
@@ -47,6 +47,10 @@ pub fn router(pool: DbPool, mailer: Mailer, roles: RoleSet, config: &AppConfig) 
     Router::new()
         .route("/memberships", get(list_memberships))
         .route("/teams/{team_id}/members", get(list_team_members))
+        .route(
+            "/organizations/{organization_id}/members",
+            get(list_organization_members),
+        )
         .route("/invitations", post(create_invitation))
         .route("/invitations/claim", post(claim_invitation))
         .merge(super::management::routes())
@@ -257,6 +261,83 @@ async fn list_team_members(
         .collect();
 
     Ok(Json(TeamMembersBody { members }))
+}
+
+#[derive(Serialize)]
+struct OrganizationMemberEntry {
+    /// The organization membership, absent while an invitation is unclaimed.
+    ///
+    /// An organization invitation creates no membership up front, unlike a
+    /// team one, so a pending row has an invitation to revoke and nothing else.
+    membership_id: Option<Uuid>,
+    /// The member's email, from the account or the pending invitation.
+    email: String,
+    roles: Vec<String>,
+    /// True for invited people who have not claimed their membership yet.
+    pending: bool,
+    /// The invitation to revoke, for a pending member.
+    invitation_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct OrganizationMembersBody {
+    members: Vec<OrganizationMemberEntry>,
+}
+
+/// The organization's roster, visible to any member of the organization.
+///
+/// Claimed memberships come first, then the invitations still outstanding.
+/// Only organization-level invitations belong here: an invitation into one of
+/// the organization's teams holds a place on that team's roster instead.
+async fn list_organization_members(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    let claimed: Vec<(Uuid, Vec<String>, String)> = organization_memberships::table
+        .inner_join(users::table)
+        .filter(organization_memberships::organization_id.eq(member.organization.id))
+        .select((
+            organization_memberships::id,
+            organization_memberships::roles,
+            users::email,
+        ))
+        .order(organization_memberships::created_at.asc())
+        .load(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    let invited: Vec<(Uuid, String, Vec<String>)> = invitations::table
+        .filter(invitations::organization_id.eq(member.organization.id))
+        .filter(invitations::team_id.is_null())
+        .select((invitations::id, invitations::email, invitations::roles))
+        .order(invitations::created_at.asc())
+        .load(&mut connection)
+        .await
+        .map_err(log_internal)?;
+
+    let mut members = Vec::with_capacity(claimed.len() + invited.len());
+    for (membership_id, roles, email) in claimed {
+        members.push(OrganizationMemberEntry {
+            membership_id: Some(membership_id),
+            email,
+            roles,
+            pending: false,
+            invitation_id: None,
+        });
+    }
+    for (invitation_id, email, roles) in invited {
+        members.push(OrganizationMemberEntry {
+            membership_id: None,
+            email,
+            roles,
+            pending: true,
+            invitation_id: Some(invitation_id),
+        });
+    }
+
+    Ok(Json(OrganizationMembersBody { members }))
 }
 
 async fn create_invitation(
