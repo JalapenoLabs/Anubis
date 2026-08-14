@@ -14,7 +14,10 @@
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::{db, server, telemetry};
-use anubis_starter::{APP_MIGRATIONS, ROLES_YML, account_router, api_v1_router, openapi};
+use anubis_starter::{
+    APP_MIGRATIONS, ROLES_YML, account_router, api_v1_router, openapi, register_jobs,
+    webhooks_router,
+};
 use axum::Router;
 use mimalloc::MiMalloc;
 
@@ -106,21 +109,27 @@ async fn main() {
             anubis::api::v1::router_with(pool.clone(), api_v1_router(&pool, &roles), openapi()),
         )
         .nest("/account", account_router(&pool, &roles))
+        // Incoming webhooks from third parties. Unauthenticated on purpose,
+        // and mounted outside /account so no guard ever asks a provider for a
+        // session it does not have.
+        .nest("/webhooks", webhooks_router(&pool))
         // Application routes guard with TeamMember / OrganizationMember /
         // CurrentUser through these extensions.
         .layer(anubis::guard::layer(pool.clone(), roles));
 
     // In production the built frontend ships with the binary: every path the
     // routers above declined resolves to the SPA, so a cold load of a client
-    // route works. `/account` joins the framework's own prefixes as a place
-    // where an unmatched path is a JSON 404 rather than index.html. Unset
-    // SPA_DIR leaves the browser to the Vite dev server, the development
-    // default.
+    // route works. `/account` and `/webhooks` join the framework's own prefixes
+    // as places where an unmatched path is a JSON 404 rather than index.html:
+    // a provider posting to a mistyped path deserves an error it can act on,
+    // not an HTML page and a `200`. Unset SPA_DIR leaves the browser to the
+    // Vite dev server, the development default.
     let app = match &config.spa_dir {
         Some(dir) => {
             let assets = anubis::spa::Assets::new(dir)
                 .expect("SPA_DIR must point at a built frontend (yarn build)")
-                .reserve("/account");
+                .reserve("/account")
+                .reserve("/webhooks");
             app.fallback_service(assets.into_service())
         }
         None => app,
@@ -129,14 +138,16 @@ async fn main() {
     // Background jobs run in this process. Registering a job is the whole of
     // the wiring: it subscribes the worker to that job's queue and captures
     // whatever the handler needs. Outgoing webhook delivery is the framework's
-    // own job; an application's go on the same builder.
+    // own job; the application's own are registered by `register_jobs`, which
+    // is where a scaffolded job lands.
     let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), &config);
-    let worker = anubis::jobs::Worker::builder(pool.clone())
-        .register(move |job: anubis::webhooks::DeliverWebhook| {
+    let worker = anubis::jobs::Worker::builder(pool.clone()).register(
+        move |job: anubis::webhooks::DeliverWebhook| {
             let deliverer = deliverer.clone();
             async move { deliverer.deliver(job).await }
-        })
-        .build();
+        },
+    );
+    let worker = register_jobs(&pool, worker).build();
 
     let (stop_worker, worker_stops) = tokio::sync::oneshot::channel::<()>();
     let working = tokio::spawn(worker.run(async move {

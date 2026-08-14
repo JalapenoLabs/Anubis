@@ -96,6 +96,13 @@ enum ScaffoldCommand {
         /// The side it reaches, e.g. `tag_id{class_name=Tag}`.
         target: String,
     },
+    /// Generate a receiving endpoint for a third party's webhooks: the table
+    /// they are stored in, the route that stores them, the signature check, and
+    /// the background job that processes them.
+    Webhook {
+        /// The provider key, e.g. `stripe`.
+        provider: String,
+    },
     /// Add one field to an existing model, propagated through its migration,
     /// schema, model, handlers, test, API module, form, table, and locale file.
     Field {
@@ -177,6 +184,9 @@ fn main() -> ExitCode {
         Command::Scaffold {
             command: ScaffoldCommand::Oauth { provider },
         } => cli::scaffold::oauth(&provider),
+        Command::Scaffold {
+            command: ScaffoldCommand::Webhook { provider },
+        } => cli::scaffold::webhook(&provider),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),

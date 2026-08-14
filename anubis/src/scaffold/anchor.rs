@@ -36,6 +36,16 @@ pub const API_ROUTES: &str = "🐺 anubis:api-routes";
 /// `backend/src/lib.rs`: the per-model merges the application's document takes.
 pub const API_DOCS: &str = "🐺 anubis:api-docs";
 
+/// `backend/src/lib.rs`: router mounts in `webhooks_router`.
+///
+/// Its own anchor rather than [`ROUTES`], because the two routers answer
+/// different questions: `/account` is mounted behind the session guards and
+/// `/webhooks` is deliberately in front of them.
+pub const WEBHOOK_ROUTES: &str = "🐺 anubis:webhook-routes";
+
+/// `backend/src/lib.rs`: job registrations in `register_jobs`.
+pub const JOBS: &str = "🐺 anubis:jobs";
+
 /// `backend/src/schema.rs`: `diesel::table!` blocks.
 pub const TABLES: &str = "🐺 anubis:tables";
 

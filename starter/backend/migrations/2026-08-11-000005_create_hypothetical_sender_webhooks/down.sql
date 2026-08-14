@@ -1,0 +1,1 @@
+DROP TABLE hypothetical_sender_webhooks;

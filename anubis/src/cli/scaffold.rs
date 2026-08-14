@@ -1,6 +1,6 @@
-//! `anubis scaffold model`, `anubis scaffold field`, and
-//! `anubis scaffold oauth`: generate a model's full-stack slice, grow it a
-//! column at a time, and add a sign-in provider.
+//! The `anubis scaffold` family: generate a model's full-stack slice, grow it a
+//! column at a time, join two models, add a sign-in provider, and receive a
+//! third party's webhooks.
 //!
 //! The templates are application code, not framework assets: `scaffold model`
 //! reads `backend/src/scaffolding/`, the migration that created the template's
@@ -25,8 +25,8 @@ use std::process::{Command, ExitCode};
 
 use anubis::scaffold::{
     Artifact, Field, FieldScaffold, JoinScaffold, LOCALE_FIELDS, ModelScaffold, ModelTemplate,
-    Names, OauthScaffold, Replacements, anchor, insert_above_anchor, insert_json_entries,
-    line_containing, locale_file, model_artifacts, table_block,
+    Names, OauthScaffold, Replacements, WebhookScaffold, anchor, insert_above_anchor,
+    insert_json_entries, line_containing, locale_file, model_artifacts, table_block,
 };
 
 /// The grants a scaffolded model receives, one per role-suffixed anchor.
@@ -115,7 +115,13 @@ fn plan(root: &Path, scaffold: &ModelScaffold) -> Result<Plan, String> {
     let replacements = scaffold.replacements();
 
     let mut created = stamp_module(root, scaffold, template, &replacements)?;
-    created.push(stamp_test(root, scaffold, template, &replacements)?);
+    created.push(stamp_narrative(
+        root,
+        &template.table(),
+        &scaffold.table(),
+        "model",
+        &replacements,
+    )?);
     created.extend(stamp_migration(root, scaffold, template, &replacements)?);
     created.extend(stamp_frontend(root, template, &replacements)?);
     // The stamped files carry the template's per-field anchors, so the fields
@@ -192,25 +198,72 @@ fn stamp_template_module(
     Ok(files)
 }
 
-/// Stamps the template's integration test into the application's test suite.
-fn stamp_test(
+/// Stamps a living template's narrative test into the application's suite.
+///
+/// Shared by every scaffolder that generates a table: each template's narrative
+/// is named after its table, so one transform serves all of them. `noun` names
+/// what is being generated, so a refusal reads in the caller's own vocabulary.
+fn stamp_narrative(
     root: &Path,
-    scaffold: &ModelScaffold,
-    template: ModelTemplate,
+    template_table: &str,
+    table: &str,
+    noun: &str,
     replacements: &Replacements,
 ) -> Result<(PathBuf, String), String> {
     let tests = PathBuf::from("backend/tests");
-    let source = tests.join(format!("{}_flow.rs", template.table()));
-    let destination = tests.join(format!("{}_flow.rs", scaffold.table()));
+    let source = tests.join(format!("{template_table}_flow.rs"));
+    let destination = tests.join(format!("{table}_flow.rs"));
     if root.join(&destination).exists() {
         return Err(format!(
-            "{} already exists; move it aside to scaffold this model again",
+            "{} already exists; move it aside to scaffold this {noun} again",
             display(&destination),
         ));
     }
 
     let contents = replacements.apply(&read(&root.join(&source))?);
     Ok((destination, contents))
+}
+
+/// Stamps the migration that created a template's table, renamed and rewritten.
+///
+/// Shared by the scaffolders whose table is the template's table unchanged;
+/// `scaffold model` adds the run's own columns to the result and so stamps its
+/// own.
+fn stamp_plain_migration(
+    root: &Path,
+    template_table: &str,
+    destination: &Path,
+    replacements: &Replacements,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let source = template_migration(&root.join("backend/migrations"), template_table)?;
+
+    Ok(vec![
+        (
+            destination.join("up.sql"),
+            replacements.apply(&read(&source.join("up.sql"))?),
+        ),
+        (
+            destination.join("down.sql"),
+            replacements.apply(&read(&source.join("down.sql"))?),
+        ),
+    ])
+}
+
+/// The template's `diesel::table!` block, rewritten into the target's names.
+fn template_table_block(
+    schema: &str,
+    relative: &Path,
+    template_table: &str,
+    replacements: &Replacements,
+) -> Result<String, String> {
+    let block = table_block(schema, template_table).ok_or_else(|| {
+        format!(
+            "{} declares no `{template_table}` table; the living template's table is what a \
+             scaffold transforms",
+            display(relative),
+        )
+    })?;
+    Ok(replacements.apply(&block))
 }
 
 /// Stamps the migration that created the template's table.
@@ -436,15 +489,7 @@ fn update_schema(
     let relative = PathBuf::from("backend/src/schema.rs");
     let schema = read(&root.join(&relative))?;
 
-    let block = table_block(&schema, &template.table()).ok_or_else(|| {
-        format!(
-            "{} declares no `{}` table; the living template's table is what a scaffold \
-             transforms",
-            display(&relative),
-            template.table(),
-        )
-    })?;
-    let mut block = replacements.apply(&block);
+    let mut block = template_table_block(&schema, &relative, &template.table(), replacements)?;
     let added = scaffold.added_schema_columns();
     if !added.is_empty() {
         block = insert_above_anchor(&block, "created_at ->", &format!("{}\n", added.join("\n")))
@@ -1078,8 +1123,21 @@ fn plan_join(root: &Path, scaffold: &JoinScaffold) -> Result<Plan, String> {
 
     let mut created =
         stamp_template_module(root, template.module(), &scaffold.module(), &replacements)?;
-    created.push(stamp_join_test(root, scaffold, &replacements)?);
-    created.extend(stamp_join_migration(root, scaffold, &replacements)?);
+    created.push(stamp_narrative(
+        root,
+        &template.table(),
+        &scaffold.table(),
+        "join",
+        &replacements,
+    )?);
+    let migrations = root.join("backend/migrations");
+    let version = migration_version(&migrations, chrono::Utc::now())?;
+    created.extend(stamp_plain_migration(
+        root,
+        &template.table(),
+        &PathBuf::from("backend/migrations").join(scaffold.migration_directory(&version)),
+        &replacements,
+    )?);
     created.extend(stamp_frontend_files(
         root,
         template.frontend_files(),
@@ -1171,50 +1229,6 @@ fn join_declaration(contents: &str) -> Option<[String; 3]> {
     names.try_into().ok()
 }
 
-/// Stamps the join template's narrative test into the application's suite.
-fn stamp_join_test(
-    root: &Path,
-    scaffold: &JoinScaffold,
-    replacements: &Replacements,
-) -> Result<(PathBuf, String), String> {
-    let tests = PathBuf::from("backend/tests");
-    let source = tests.join(format!("{}_flow.rs", scaffold.template().table()));
-    let destination = tests.join(format!("{}_flow.rs", scaffold.table()));
-    if root.join(&destination).exists() {
-        return Err(format!(
-            "{} already exists; move it aside to scaffold this join again",
-            display(&destination),
-        ));
-    }
-
-    let contents = replacements.apply(&read(&root.join(&source))?);
-    Ok((destination, contents))
-}
-
-/// Stamps the migration that created the join template's table.
-fn stamp_join_migration(
-    root: &Path,
-    scaffold: &JoinScaffold,
-    replacements: &Replacements,
-) -> Result<Vec<(PathBuf, String)>, String> {
-    let migrations = root.join("backend/migrations");
-    let source = template_migration(&migrations, &scaffold.template().table())?;
-    let version = migration_version(&migrations, chrono::Utc::now())?;
-    let destination =
-        PathBuf::from("backend/migrations").join(scaffold.migration_directory(&version));
-
-    Ok(vec![
-        (
-            destination.join("up.sql"),
-            replacements.apply(&read(&source.join("up.sql"))?),
-        ),
-        (
-            destination.join("down.sql"),
-            replacements.apply(&read(&source.join("down.sql"))?),
-        ),
-    ])
-}
-
 /// Adds the join's table, both joins, and both same-query pairs to `schema.rs`.
 fn update_join_schema(
     root: &Path,
@@ -1225,19 +1239,9 @@ fn update_join_schema(
     let schema = read(&root.join(&relative))?;
     let template = scaffold.template();
 
-    let block = table_block(&schema, &template.table()).ok_or_else(|| {
-        format!(
-            "{} declares no `{}` table; the living template's table is what a scaffold transforms",
-            display(&relative),
-            template.table(),
-        )
-    })?;
-    let mut updated = insert_above_anchor(
-        &schema,
-        anchor::TABLES,
-        &format!("{}\n\n", replacements.apply(&block)),
-    )
-    .map_err(|error| format!("{}: {error}", display(&relative)))?;
+    let block = template_table_block(&schema, &relative, &template.table(), replacements)?;
+    let mut updated = insert_above_anchor(&schema, anchor::TABLES, &format!("{block}\n\n"))
+        .map_err(|error| format!("{}: {error}", display(&relative)))?;
 
     // A join declares one `joinable!` per side and one same-query pair per
     // side; the pair of sides never meets in a query, so it needs neither.
@@ -1322,6 +1326,147 @@ fn report_join(scaffold: &JoinScaffold, plan: &Plan) {
         scaffold.owner().pascal(),
         scaffold.target().snake(),
         scaffold.target().pascal(),
+    );
+    println!("  cargo test");
+}
+
+/// Runs `anubis scaffold webhook <Provider>`.
+pub(crate) fn webhook(provider: &str) -> ExitCode {
+    let scaffold = match WebhookScaffold::parse(provider) {
+        Ok(scaffold) => scaffold,
+        Err(error) => return fail(error.message()),
+    };
+
+    let root = match app_root() {
+        Ok(root) => root,
+        Err(reason) => return fail(&reason),
+    };
+
+    let plan = match plan_webhook(&root, &scaffold) {
+        Ok(plan) => plan,
+        Err(reason) => return fail(&reason),
+    };
+    if let Err(reason) = plan.apply(&root) {
+        return fail(&reason);
+    }
+
+    report_webhook(&scaffold, &plan);
+    ExitCode::SUCCESS
+}
+
+/// Plans the whole receiver, reading the application's own webhook template.
+fn plan_webhook(root: &Path, scaffold: &WebhookScaffold) -> Result<Plan, String> {
+    require_provider_absent(root, scaffold)?;
+
+    let template = scaffold.template();
+    let replacements = scaffold.replacements();
+
+    let mut created =
+        stamp_template_module(root, template.module(), &scaffold.module(), &replacements)?;
+    created.push(stamp_narrative(
+        root,
+        &template.table(),
+        &scaffold.table(),
+        "receiver",
+        &replacements,
+    )?);
+    let migrations = root.join("backend/migrations");
+    let version = migration_version(&migrations, chrono::Utc::now())?;
+    created.extend(stamp_plain_migration(
+        root,
+        &template.table(),
+        &PathBuf::from("backend/migrations").join(scaffold.migration_directory(&version)),
+        &replacements,
+    )?);
+
+    let relative = PathBuf::from("backend/src/schema.rs");
+    let schema = read(&root.join(&relative))?;
+    // No `joinable!` and no same-query pair: a received webhook points at
+    // nothing until the application decides what it is about.
+    let block = template_table_block(&schema, &relative, &template.table(), &replacements)?;
+    let schema = insert_above_anchor(&schema, anchor::TABLES, &format!("{block}\n\n"))
+        .map_err(|error| format!("{}: {error}", display(&relative)))?;
+
+    let library = update_anchors(
+        root,
+        "backend/src/lib.rs",
+        &[
+            (anchor::MODULES, scaffold.module_declaration()),
+            (anchor::WEBHOOK_ROUTES, scaffold.route_mount()),
+            (anchor::JOBS, scaffold.job_registration()),
+        ],
+    )?;
+
+    Ok(Plan {
+        created,
+        updated: vec![(relative, schema), library],
+    })
+}
+
+/// Refuses a provider this application already receives webhooks from.
+///
+/// One endpoint per provider: a second one would give the provider two URLs
+/// that store the same events into different tables, and nothing would say
+/// which of them the processing lives in.
+fn require_provider_absent(root: &Path, scaffold: &WebhookScaffold) -> Result<(), String> {
+    let module = scaffold.module();
+    if root.join(format!("backend/src/{module}")).exists() {
+        return Err(format!(
+            "this application already receives {} webhooks: backend/src/{module} exists. One \
+             endpoint per provider, so edit that module rather than generating a second.",
+            scaffold.provider().title(),
+        ));
+    }
+    Ok(())
+}
+
+/// Prints what the receiver generated, and the two steps only a person can take.
+fn report_webhook(scaffold: &WebhookScaffold, plan: &Plan) {
+    println!(
+        "scaffolded {} ({} webhooks)",
+        scaffold.model().pascal(),
+        scaffold.provider().title(),
+    );
+
+    println!();
+    println!("created:");
+    for (path, _contents) in &plan.created {
+        println!("  {}", display(path));
+    }
+    println!("updated:");
+    for (path, _contents) in &plan.updated {
+        println!("  {}", display(path));
+    }
+
+    println!();
+    println!(
+        "A received webhook is stored first and processed afterwards, so nothing is lost and \
+         every attempt can be retried. The endpoint answers 200 as soon as the row is committed."
+    );
+
+    // The public origin is what a provider's console needs, so the example is
+    // only useful with the value this application actually runs on.
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_error| "<APP_URL>".to_owned());
+
+    println!();
+    println!("Next steps:");
+    println!("  boot the app to apply the migration");
+    println!(
+        "  register this endpoint with {}:",
+        scaffold.provider().title(),
+    );
+    println!("    {app_url}{}", scaffold.path());
+    println!("  set the shared secret in the environment:");
+    println!("    {}=...", scaffold.signing_secret_var());
+    println!(
+        "  finish `verify_signature` in backend/src/{}/routes.rs: every provider signs \
+         differently, and the one shipped is the generic HMAC-SHA256 scheme",
+        scaffold.module(),
+    );
+    println!(
+        "  finish `act_on` in backend/src/{}/job.rs, which is where a stored event becomes \
+         something your application did",
+        scaffold.module(),
     );
     println!("  cargo test");
 }

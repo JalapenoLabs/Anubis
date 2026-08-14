@@ -58,6 +58,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One webhook received from Hypothetical Sender, stored before processing.
+    ///
+    /// Owned by nobody: a provider posting an event names no team. See
+    /// `docs/webhooks.md` for why a receiver stores first and asks questions
+    /// afterwards.
+    hypothetical_sender_webhooks (id) {
+        id -> Uuid,
+        payload -> Jsonb,
+        headers -> Jsonb,
+        verified -> Bool,
+        received_at -> Timestamptz,
+        processed_at -> Nullable<Timestamptz>,
+        error -> Nullable<Text>,
+        updated_at -> Timestamptz,
+    }
+}
+
 // 🐺 anubis:tables
 
 diesel::joinable!(tangible_things -> creative_concepts (creative_concept_id));

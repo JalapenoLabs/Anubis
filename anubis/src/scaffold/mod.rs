@@ -25,6 +25,8 @@
 //!   endpoints two existing models need before an association can reach them.
 //! - [`OauthScaffold`] plans a `scaffold oauth` run: the sign-in button one
 //!   provider adds, and the string it renders.
+//! - [`WebhookScaffold`] plans a `scaffold webhook` run: the table, endpoint,
+//!   and processing job one third party's events are received through.
 //!
 //! Everything here is pure string-to-string transformation. File discovery,
 //! reading, and writing belong to the CLI, which keeps this engine trivially
@@ -49,6 +51,7 @@ mod join;
 mod model;
 mod oauth;
 mod stamp;
+mod webhook;
 
 #[doc(inline)]
 pub use error::ScaffoldError;
@@ -68,3 +71,5 @@ pub use model::{ChildAttachment, ModelScaffold, ModelTemplate, locale_file, mode
 pub use oauth::OauthScaffold;
 #[doc(inline)]
 pub use stamp::{AnchorError, Replacements, insert_above_anchor, insert_json_entries};
+#[doc(inline)]
+pub use webhook::{WebhookScaffold, WebhookTemplate};

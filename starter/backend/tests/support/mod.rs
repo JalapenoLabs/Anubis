@@ -8,6 +8,15 @@
 //!
 //! This module is application code, not a living template: the scaffolder
 //! never rewrites it.
+//!
+//! It compiles into every test binary, and each narrative uses the parts its
+//! own story needs: one mints a bearer token, another never signs anybody in.
+//! So the whole module opts out of the dead-code lint rather than annotating
+//! the helpers one at a time as narratives come and go.
+#![allow(
+    dead_code,
+    reason = "every narrative compiles this module and uses the part it needs"
+)]
 
 use anubis::mail::TestOutbox;
 use anubis::roles::RoleSet;
@@ -74,9 +83,23 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
             ),
         )
         .nest("/account", anubis_starter::account_router(&pool, &roles))
+        // Where a provider's events arrive, with no session and no token.
+        .nest("/webhooks", anubis_starter::webhooks_router(&pool))
         .layer(anubis::guard::layer(pool, roles));
 
     Some((router, outbox))
+}
+
+/// A connection pool onto the database [`boot`] built its router against.
+///
+/// A received webhook is stored for the application to process, not published,
+/// so the narrative that proves it reads the rows directly. Every other
+/// narrative drives the HTTP surface alone.
+pub async fn pool() -> anubis::db::DbPool {
+    let database_url = std::env::var("DATABASE_URL").expect("boot() already required one");
+    anubis::db::connect(&database_url)
+        .await
+        .expect("database must be reachable")
 }
 
 /// Sends one JSON request as a signed-in user, or as nobody.
@@ -96,11 +119,6 @@ pub async fn send(
 ///
 /// The `/api/v1` half of every model's narrative goes through here: the token
 /// is the whole identity, so no session cookie rides along.
-///
-/// This module compiles into every test binary, and a join's narrative has no
-/// `/api/v1` half, so the lint is allowed rather than expected: it applies in
-/// one binary and not in the others.
-#[allow(dead_code, reason = "a join model's narrative calls no API endpoint")]
 pub async fn send_as_token(
     router: &Router,
     method: &str,
@@ -176,9 +194,7 @@ pub async fn register(router: &Router, email: &str) -> String {
 /// Creates a platform application in `team_id` and returns its bearer token.
 ///
 /// The token is shown exactly once, at creation, which is why it is read out
-/// of this response and carried through the rest of the narrative. The lint is
-/// allowed for the same reason [`send_as_token`]'s is.
-#[allow(dead_code, reason = "a join model's narrative calls no API endpoint")]
+/// of this response and carried through the rest of the narrative.
 pub async fn platform_token(router: &Router, admin_cookie: &str, team_id: &str) -> String {
     let (status, body) = send(
         router,

@@ -43,6 +43,16 @@ const JOIN_TEMPLATE_TOKENS: [&str; 8] = [
     "merely_peripheral",
 ];
 
+/// The names the webhook template adds, which must not survive either.
+const WEBHOOK_TEMPLATE_TOKENS: [&str; 6] = [
+    "HypotheticalSender",
+    "hypotheticalSender",
+    "hypothetical_sender",
+    "hypothetical-sender",
+    "HYPOTHETICAL_SENDER",
+    "hypothetically_remote",
+];
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -314,6 +324,20 @@ fn a_stamped_application_scaffolds_the_same_way() {
     assert!(
         support.contains("acme_crm::APP_MIGRATIONS"),
         "the stamped app keeps its own crate name: {support}",
+    );
+
+    // Every template travels with the stamped app, the webhook one included,
+    // and its narrative is stamped against the app's own crate name.
+    let output = scaffold_webhook(&app, &["Stripe"]);
+    assert!(
+        output.status.success(),
+        "scaffolding a receiver into a stamped app failed: {}",
+        stderr(&output),
+    );
+    let narrative = read(&app.join("backend/tests/stripe_webhooks_flow.rs"));
+    assert!(
+        narrative.contains("acme_crm::stripe_webhooks::"),
+        "the stamped narrative reaches its own crate: {narrative}",
     );
 
     std::fs::remove_dir_all(&scratch).expect("scratch directories are removable");
@@ -830,6 +854,145 @@ fn join_and_association_arguments_are_rejected_with_a_reason() {
     std::fs::remove_dir_all(&app).expect("scratch directories are removable");
 }
 
+/// A whole incoming-webhook receiver, from the provider's POST to the job.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scaffold run inspected artifact by artifact"
+)]
+fn a_webhook_receiver_stores_a_providers_events_and_queues_the_work() {
+    let app = copy_starter("webhook");
+
+    let output = scaffold_webhook(&app, &["Stripe"]);
+    assert!(
+        output.status.success(),
+        "scaffolding the receiver failed: {}",
+        stderr(&output),
+    );
+
+    for expected in [
+        "backend/src/stripe_webhooks/mod.rs",
+        "backend/src/stripe_webhooks/model.rs",
+        "backend/src/stripe_webhooks/routes.rs",
+        "backend/src/stripe_webhooks/job.rs",
+        "backend/tests/stripe_webhooks_flow.rs",
+    ] {
+        assert!(app.join(expected).is_file(), "missing {expected}");
+    }
+    // A receiver has no UI: a provider posts to it, and nobody browses it.
+    assert!(
+        !app.join("frontend/src/api/routes/stripeWebhookRoutes.ts")
+            .exists()
+    );
+    // And no permissions, because the caller is not a team member.
+    let roles = read(&app.join("config/roles.yml"));
+    assert!(!roles.contains("StripeWebhook"), "{roles}");
+
+    // The table stores the request whole, and belongs to no team: a provider
+    // posting an event is not signed in and names nobody.
+    let up = read(&migration(&app, "_create_stripe_webhooks").join("up.sql"));
+    assert!(up.contains("CREATE TABLE stripe_webhooks ("), "{up}");
+    assert!(up.contains("payload JSONB NOT NULL,"));
+    assert!(up.contains("headers JSONB NOT NULL,"));
+    assert!(up.contains("verified BOOLEAN NOT NULL DEFAULT false,"));
+    assert!(up.contains("processed_at TIMESTAMPTZ,"));
+    assert!(up.contains("CREATE TRIGGER set_updated_at BEFORE UPDATE ON stripe_webhooks"));
+    assert!(
+        !up.contains("team_id"),
+        "a provider webhook is not team-owned"
+    );
+    assert_eq!(
+        read(&migration(&app, "_create_stripe_webhooks").join("down.sql")).trim(),
+        "DROP TABLE stripe_webhooks;",
+    );
+
+    let schema = read(&app.join("backend/src/schema.rs"));
+    assert!(schema.contains("    stripe_webhooks (id) {"), "{schema}");
+    assert!(
+        !schema.contains("diesel::joinable!(stripe_webhooks"),
+        "a received webhook points at nothing yet: {schema}",
+    );
+    assert_anchored(&schema, "🐺 anubis:tables", "stripe_webhooks (id) {");
+
+    // The endpoint hangs off the provider's own name, verifies with the
+    // framework's HMAC primitive, and reads its secret from the environment.
+    let routes = read(&app.join("backend/src/stripe_webhooks/routes.rs"));
+    assert!(routes.contains("\"/stripe\""), "{routes}");
+    assert!(routes.contains("pub const SIGNING_SECRET_VAR: &str = \"STRIPE_WEBHOOK_SECRET\";"));
+    assert!(routes.contains("anubis::webhooks::signature::verify_hmac_sha256("));
+    assert!(routes.contains("pub fn verify_signature("));
+    assert!(routes.contains("really came from Stripe"), "{routes}");
+
+    // The job is queued with the row and named after the model it processes.
+    let job = read(&app.join("backend/src/stripe_webhooks/job.rs"));
+    assert!(
+        job.contains("const KIND: &'static str = \"stripe_webhook.process\";"),
+        "{job}",
+    );
+    assert!(job.contains("pub struct ProcessStripeWebhook {"));
+    assert!(
+        job.contains("async fn act_on("),
+        "the stub to fill in: {job}"
+    );
+
+    // Both mounts land above their own anchors, in the application's own
+    // composition functions.
+    let library = read(&app.join("backend/src/lib.rs"));
+    assert!(library.contains("pub mod stripe_webhooks;"), "{library}");
+    assert!(library.contains("router = router.merge(stripe_webhooks::router(pool.clone()));"));
+    assert!(library.contains("worker = stripe_webhooks::register_jobs(pool, worker);"));
+    assert_anchored(
+        &library,
+        "🐺 anubis:webhook-routes",
+        "merge(stripe_webhooks::router",
+    );
+    assert_anchored(&library, "🐺 anubis:jobs", "stripe_webhooks::register_jobs");
+
+    // No template name survives anywhere in the generated files.
+    for generated in [
+        "backend/src/stripe_webhooks/mod.rs",
+        "backend/src/stripe_webhooks/model.rs",
+        "backend/src/stripe_webhooks/routes.rs",
+        "backend/src/stripe_webhooks/job.rs",
+        "backend/tests/stripe_webhooks_flow.rs",
+    ] {
+        let contents = read(&app.join(generated));
+        for token in WEBHOOK_TEMPLATE_TOKENS {
+            assert!(
+                !contents.contains(token),
+                "{generated} still contains `{token}`",
+            );
+        }
+    }
+
+    // A second run for the same provider refuses, and leaves the first alone.
+    let rerun = scaffold_webhook(&app, &["Stripe"]);
+    assert!(!rerun.status.success(), "a repeat provider must refuse");
+    assert!(
+        stderr(&rerun).contains("already receives Stripe webhooks"),
+        "unexpected error: {}",
+        stderr(&rerun),
+    );
+    assert_eq!(
+        read(&app.join("backend/src/lib.rs"))
+            .matches("pub mod stripe_webhooks;")
+            .count(),
+        1,
+        "a refused run must not touch the shared files",
+    );
+
+    // Naming the model instead of the provider is refused by name.
+    let suffixed = scaffold_webhook(&app, &["StripeWebhook"]);
+    assert!(!suffixed.status.success());
+    assert!(
+        stderr(&suffixed).contains("name the provider, not the model"),
+        "unexpected error: {}",
+        stderr(&suffixed),
+    );
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
 /// Runs `anubis scaffold model` inside `app`.
 fn scaffold(app: &Path, arguments: &[&str]) -> Output {
     Command::new(ANUBIS)
@@ -844,6 +1007,16 @@ fn scaffold(app: &Path, arguments: &[&str]) -> Output {
 fn scaffold_join(app: &Path, arguments: &[&str]) -> Output {
     Command::new(ANUBIS)
         .args(["scaffold", "join"])
+        .args(arguments)
+        .current_dir(app)
+        .output()
+        .expect("the anubis binary runs")
+}
+
+/// Runs `anubis scaffold webhook` inside `app`.
+fn scaffold_webhook(app: &Path, arguments: &[&str]) -> Output {
+    Command::new(ANUBIS)
+        .args(["scaffold", "webhook"])
         .args(arguments)
         .current_dir(app)
         .output()

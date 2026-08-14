@@ -45,6 +45,15 @@
 //!
 //! [`router`] serves the team-scoped subscription and debugging endpoints,
 //! mounted alongside platform applications under `/developers`.
+//!
+//! # Receiving
+//!
+//! The other half of webhooks, receiving a third party's events, is generated
+//! rather than mounted: `anubis scaffold webhook <Provider>` writes the table,
+//! the endpoint, and the processing job into the application. The one piece it
+//! borrows from here is
+//! [`signature::verify_hmac_sha256`], the provider-agnostic comparison every
+//! publisher's scheme ends in. See `docs/webhooks.md`.
 
 mod delivery;
 mod endpoint;

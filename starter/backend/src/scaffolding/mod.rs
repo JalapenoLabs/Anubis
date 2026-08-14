@@ -18,8 +18,15 @@
 //! so it needs a second one beside the parent: [`merely_peripheral::PeripheralNotion`]
 //! is that model, reduced to what a join's far side needs, because a real
 //! application's far side always comes from its own `scaffold model` run.
+//!
+//! [`hypothetically_remote::HypotheticalSenderWebhook`] is the fourth, and the
+//! odd one out: `anubis scaffold webhook` transforms it into a receiver for a
+//! third party's events. It is owned by nobody, reached without a session, and
+//! stored before it is understood, which is why it shares none of the other
+//! three's shape.
 
 pub mod absolutely_abstract;
 pub mod completely_concrete;
+pub mod hypothetically_remote;
 pub mod incidentally_linked;
 pub mod merely_peripheral;

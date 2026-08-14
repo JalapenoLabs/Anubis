@@ -208,5 +208,5 @@ Creating and dissolving tenants revalidates the membership overview, which is th
 
 ## Webhooks
 
-- **Outgoing**: a team subscribes an HTTPS endpoint to event types under `/developers`, and every matching domain event arrives there as an HMAC-signed POST carrying the same serializer `/api/v1` answers with. Delivery runs through the background job queue with retries, and a debugging screen shows every attempt. [Outgoing webhooks](webhooks.md) is the full statement: the subscription model, the event catalog convention, the signature scheme with verification code for receivers, the delivery semantics, and the security posture.
+- **Outgoing**: a team subscribes an HTTPS endpoint to event types under `/developers`, and every matching domain event arrives there as an HMAC-signed POST carrying the same serializer `/api/v1` answers with. Delivery runs through the background job queue with retries, and a debugging screen shows every attempt. [Webhooks](webhooks.md) is the full statement: the subscription model, the event catalog convention, the signature scheme with verification code for receivers, the delivery semantics, and the security posture.
 - **Incoming**: `anubis scaffold webhook <name>` generates a receiving endpoint, signature verification stub, and tests. Not implemented yet; it is on the M5 roadmap.

@@ -8,7 +8,7 @@ Templates are real, functional, compiling code, not a DSL. The generator transfo
 
 Generated files contain magic anchor comments (`// 🐺 anubis:record-fields`, `{/* 🐺 anubis:nav */}`) that later scaffold commands use as insertion targets. Do not delete them. This is exactly Bullet Train's magic-comment mechanism, and it is what makes `scaffold field` able to keep editing files you have customized.
 
-The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot. `scaffolding::incidentally_linked::IncidentalLinkage` is the third, the join model, and `scaffolding::merely_peripheral::PeripheralNotion` is the second team-owned model it links.
+The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot. `scaffolding::incidentally_linked::IncidentalLinkage` is the third, the join model, and `scaffolding::merely_peripheral::PeripheralNotion` is the second team-owned model it links. `scaffolding::hypothetically_remote::HypotheticalSenderWebhook` is the fourth, the incoming webhook receiver, named for a sender the application will never meet.
 
 ## The template host app
 
@@ -23,6 +23,12 @@ Each depth has its own narrative test, `starter/backend/tests/creative_concepts_
 `anubis scaffold join` transforms a third template, and a join links two team-owned models, so the host app carries two more of them. `IncidentalLinkage` is the join itself: the table, the model that owns every rule the association needs, and the endpoints that attach, detach, list through, and offer options. `PeripheralNotion` is the far side, an ordinary team-owned model reduced to the two endpoints the join's narrative needs, because `scaffold join` generates no model of its own: a real application's far side always comes from its own `scaffold model` run. `starter/backend/tests/incidental_linkages_flow.rs` is the narrative a generated join inherits, and `frontend/src/api/routes/incidentalLinkageRoutes.ts` is the whole frontend surface a join owns.
 
 The template's own record shape is deliberately plain. A join carries no name and no description because a link is not a thing a user names; what it carries is its two foreign keys, the pair's uniqueness, and the timestamps every table gets.
+
+### The webhook template
+
+`anubis scaffold webhook` transforms a fourth template, and it is the odd one out of the family: `HypotheticalSenderWebhook` is owned by nobody, reached without a session, and stored before it is understood, so it shares none of the other three's shape. Two names are rewritten rather than one, the model's and the provider's, because a receiver's identifiers are named after the model (`stripe_webhooks`, `StripeWebhook`) and its URL is named after the provider (`/webhooks/stripe`). Its module is `hypothetically_remote`, its narrative is `starter/backend/tests/hypothetical_sender_webhooks_flow.rs`, and it owns no frontend file at all.
+
+It is also the only template that ships two deliberate blanks: `verify_signature`, because every provider signs differently, and `act_on`, because only the application knows what an event means. Both are marked in the generated code and named in the run's output. [Incoming webhooks](webhooks.md#incoming-receiving-a-third-partys-events) is the full statement of the model.
 
 The starter backend is a library plus a thin binary. `main.rs` is the composition root; the application itself (models, routes, schema, migrations, role constants) lives in `lib.rs` and its modules, so integration tests drive the real routers. Model modules are public, because an application's library is what its binary and its tests build on.
 
@@ -42,6 +48,8 @@ The vocabulary comes in two halves. **Model anchors** sit in files the whole app
 | `// 🐺 anubis:routes` | `backend/src/lib.rs` | router mounts in `account_router` |
 | `// 🐺 anubis:api-routes` | `backend/src/lib.rs` | router mounts in `api_v1_router` |
 | `// 🐺 anubis:api-docs` | `backend/src/lib.rs` | per-model merges in `openapi` |
+| `// 🐺 anubis:webhook-routes` | `backend/src/lib.rs` | router mounts in `webhooks_router` |
+| `// 🐺 anubis:jobs` | `backend/src/lib.rs` | job registrations in `register_jobs` |
 | `// 🐺 anubis:tables` | `backend/src/schema.rs` | `diesel::table!` blocks |
 | `// 🐺 anubis:joins` | `backend/src/schema.rs` | `diesel::joinable!` declarations |
 | `// 🐺 anubis:same-query` | `backend/src/schema.rs` | `allow_tables_to_appear_in_same_query!` declarations |
@@ -183,13 +191,13 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
 | `anubis scaffold join <JoinModel> <a_id{class_name=A}> <b_id{class_name=B}>` | Join model for has-many-through |
 | `anubis scaffold oauth <provider>` | Add an OAuth login provider (the one-line Google Auth moment) |
-| `anubis scaffold webhook <name>` | Incoming webhook endpoint |
+| `anubis scaffold webhook <Provider>` | Receiving endpoint for a third party's webhooks |
 | `anubis routes` | Print the route table |
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
 | `anubis doctor` | Verify toolchain, database, and config health |
 | `anubis secret generate` | Print a fresh `ANUBIS_SECRET_KEY` |
 
-`anubis new`, `anubis routes`, `anubis doctor`, `anubis secret generate`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, and `anubis scaffold oauth` are implemented; the rest of the `scaffold` family and `eject` are the remainder of M4 and M5.
+`anubis new`, `anubis routes`, `anubis doctor`, `anubis secret generate`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, `anubis scaffold oauth`, and `anubis scaffold webhook` are implemented; `eject` is the remainder of M4 and M5.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
@@ -392,6 +400,30 @@ An application declares its providers by setting their credentials, not by listi
 
 The provider registry itself is framework-owned and OpenID Connect only, so an unknown key is refused by name with the known list. `<PROVIDER>_OAUTH_ISSUER` overrides the registry's issuer, which is what a self-hosted identity server, a single-tenant directory, and the framework's own test suite use.
 
+## `anubis scaffold webhook`: one provider, one endpoint
+
+```
+anubis scaffold webhook Stripe
+```
+
+Bullet Train's `super_scaffold:incoming_webhook`, and the one command in the family that generates no user interface: nobody browses a provider's events, the application processes them. What it produces is a table, an unauthenticated endpoint that stores a request and queues a job in one transaction, the signature check, the job, and the narrative that proves all of it.
+
+The argument is the **provider**, not the model, because the provider is the thing a person has an account with. The model's name follows: `Stripe` gives `StripeWebhook` in `backend/src/stripe_webhooks/`, stored in `stripe_webhooks`, received at `/webhooks/stripe`, signed with `STRIPE_WEBHOOK_SECRET`. Write the provider the way it should read in the URL, exactly as `scaffold oauth` takes its provider: `github` gives `/webhooks/github`. A name that already ends in `Webhook` is refused rather than doubled up, and a provider this application already receives is refused by name: one endpoint per provider, because two would give the provider two URLs storing the same events into different tables.
+
+One run produces:
+
+- a timestamped migration creating `<provider>_webhooks` (payload, headers, verified, received_at, processed_at, error), with a partial index on the unprocessed backlog and the shared `set_updated_at()` trigger
+- the `diesel::table!` block in `backend/src/schema.rs`, with no `joinable!` and no same-query pair, because a received webhook points at nothing until the application decides what it is about
+- the module under `backend/src/<provider>_webhooks/` (`mod.rs`, `model.rs`, `routes.rs`, `job.rs`)
+- the module declaration, the router mount above `webhook-routes`, and the job registration above `jobs`, all in `backend/src/lib.rs`
+- the receiver's integration test in `backend/tests/<provider>_webhooks_flow.rs`
+
+and no entry in `config/roles.yml`, for the same reason a join takes none: the caller is not a team member, and there is no team to scope a permission to.
+
+The run then prints what it cannot do: register the endpoint's URL with the provider, set `<PROVIDER>_WEBHOOK_SECRET`, finish `verify_signature`, and finish `act_on`. The last two are the template's two deliberate blanks, and naming them in the output is the honest alternative to generating a check that only looks like it works.
+
+[Incoming webhooks](webhooks.md#incoming-receiving-a-third-partys-events) covers the design the generated code implements: why storing precedes verifying, what each provider's signature scheme looks like, and why the endpoint carries no rate limit.
+
 ## The field component library
 
 Bullet Train's field partials are its forms backbone. Ours are React components in `@jalapenolabs/anubis`, one per scaffolder field type, exported by name from the package root. A generated form is one component per model attribute with nothing in between.
@@ -469,6 +501,7 @@ All scaffolders share one pure engine, `anubis::scaffold`:
 - **Model planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
 - **Join planning**: `JoinScaffold` does the same for a join, rewriting three model names and three module paths at once so generated code reaches each side through the module that side's own scaffold created.
 - **Provider planning**: `OauthScaffold` turns one provider into the sign-in button it contributes, the string that button renders, and the redirect URI its console needs.
+- **Receiver planning**: `WebhookScaffold` turns one provider into the model name it implies, the module and table that hold its events, the path it is received at, and the environment variable its shared secret is read from.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.
 

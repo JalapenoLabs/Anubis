@@ -9,6 +9,7 @@ mod schema;
 // 🐺 anubis:modules
 
 use anubis::db::DbPool;
+use anubis::jobs::WorkerBuilder;
 use anubis::roles::RoleSet;
 use axum::Router;
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
@@ -68,6 +69,38 @@ pub fn api_v1_router(pool: &DbPool, roles: &RoleSet) -> Router {
     ));
     // 🐺 anubis:api-routes
     router
+}
+
+/// The application's incoming webhook receivers, mounted at `/webhooks`.
+///
+/// Unauthenticated by construction: a provider posting an event carries no
+/// session and no bearer token, only a signature its own endpoint checks. They
+/// are deliberately kept out of [`account_router`] for that reason, and out of
+/// the rate limiter's way: webhooks arrive at machine rates, and the budgets
+/// that protect sign-in would turn a burst of real events into a provider's
+/// retry storm.
+///
+/// One statement per provider, so `anubis scaffold webhook` can insert a new
+/// mount above the anchor and have the result already be `rustfmt`-clean. Keep
+/// the anchor where it is.
+pub fn webhooks_router(pool: &DbPool) -> Router {
+    let mut router = Router::new();
+    router = router.merge(scaffolding::hypothetically_remote::router(pool.clone()));
+    // 🐺 anubis:webhook-routes
+    router
+}
+
+/// The application's own background jobs, registered on the worker.
+///
+/// `main.rs` builds the worker with the framework's jobs and hands it here, so
+/// an application's own registrations live with the application. One statement
+/// per job, for the same reason [`account_router`] mounts one router per
+/// statement. Keep the anchor where it is.
+#[must_use]
+pub fn register_jobs(pool: &DbPool, mut worker: WorkerBuilder) -> WorkerBuilder {
+    worker = scaffolding::hypothetically_remote::register_jobs(pool, worker);
+    // 🐺 anubis:jobs
+    worker
 }
 
 /// The application's OpenAPI 3.1 document, and the identity of its v1 API.
