@@ -1,17 +1,23 @@
 //! OAuth sign-in over OpenID Connect: "Continue with Google" end to end.
 //!
-//! Two routes carry the whole flow, mounted with the rest of authentication
+//! Three routes carry the whole flow, mounted with the rest of authentication
 //! (conventionally under `/auth`):
 //!
 //! | Route | Effect |
 //! |---|---|
+//! | `GET /oauth/providers` | List the providers this deployment configured |
 //! | `GET /oauth/{provider}/start` | Redirect the browser to the provider |
 //! | `GET /oauth/{provider}/callback` | Verify the response and issue the session |
 //!
-//! Both are browser navigations, so both answer with a redirect rather than
-//! JSON: success lands on the destination the user was headed for, and every
-//! failure lands on `/sign-in?error=<code>` with a machine-readable code the
-//! sign-in page renders. The codes are listed in `docs/api.md`.
+//! The two flow routes are browser navigations, so both answer with a redirect
+//! rather than JSON: success lands on the destination the user was headed for,
+//! and every failure lands on `/sign-in?error=<code>` with a machine-readable
+//! code the sign-in page renders. The codes are listed in `docs/api.md`.
+//!
+//! `providers` is the discovery route the sign-in page reads before it renders
+//! anything: a button for a provider whose credentials are unset would fail
+//! with `oauth_unavailable` at click time, so the page asks which buttons are
+//! real. It answers signed out, because that is the only state it is read in.
 //!
 //! # The flow
 //!
@@ -45,10 +51,10 @@ mod provider;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -60,7 +66,7 @@ use openidconnect::{
     EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
     TokenResponse,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::auth::routes::{AuthState, signed_in_jar};
@@ -101,6 +107,7 @@ type DiscoveredClient = CoreClient<
 
 pub(crate) fn router() -> Router<AuthState> {
     Router::new()
+        .route("/oauth/providers", get(providers))
         .route("/oauth/{provider}/start", get(start))
         .route("/oauth/{provider}/callback", get(callback))
 }
@@ -145,6 +152,14 @@ impl Runtime {
                 metadata: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The providers the environment enabled, in registry order.
+    fn enabled(&self) -> impl Iterator<Item = &'static OauthProvider> + '_ {
+        self.inner
+            .providers
+            .iter()
+            .map(OauthProviderConfig::provider)
     }
 
     /// The configuration for `key`, when that provider is enabled.
@@ -196,6 +211,40 @@ impl Runtime {
         cache.insert(key, metadata.clone());
         Ok(metadata)
     }
+}
+
+/// One configured provider, as a sign-in page needs it.
+///
+/// Two fields, and no more: the key the start URL is built from, and the name
+/// a button reads. A client id is not a secret, but an unauthenticated route
+/// is the wrong place to hand one out, and nothing on the page needs it.
+#[derive(Serialize)]
+struct ProviderView {
+    key: &'static str,
+    display_name: &'static str,
+}
+
+#[derive(Serialize)]
+struct ProvidersBody {
+    providers: Vec<ProviderView>,
+}
+
+/// Answers with the providers this deployment can actually sign in with.
+///
+/// The list is the environment's, so it is empty until a provider's
+/// credentials are set, and a sign-in page that renders it renders no button
+/// that would fail.
+async fn providers(State(state): State<AuthState>) -> Json<ProvidersBody> {
+    let providers = state
+        .oauth
+        .enabled()
+        .map(|provider| ProviderView {
+            key: provider.key,
+            display_name: provider.display_name,
+        })
+        .collect();
+
+    Json(ProvidersBody { providers })
 }
 
 #[derive(Deserialize)]
@@ -370,14 +419,22 @@ async fn finish_flow(
         })?;
 
     let asserted = identity::read_claims(claims);
-    let user = identity::sign_in(&mut connection, config.provider().key, &asserted)
-        .await
-        .map_err(|error| match error {
-            identity::LinkError::EmailUnavailable => Failure::EmailUnavailable,
-            identity::LinkError::EmailUnverified => Failure::EmailUnverified,
-            identity::LinkError::Database(error) => internal(error),
-            identity::LinkError::Password(error) => internal(error),
-        })?;
+    let user = identity::sign_in(
+        &mut connection,
+        &state.hasher,
+        config.provider().key,
+        &asserted,
+    )
+    .await
+    .map_err(|error| match error {
+        identity::LinkError::EmailUnavailable => Failure::EmailUnavailable,
+        identity::LinkError::EmailUnverified => Failure::EmailUnverified,
+        identity::LinkError::Database(error) => internal(error),
+        // A shed hash is load rather than a bug, so the sign-in page asks the
+        // user to try again instead of reporting a failure they cannot act on.
+        identity::LinkError::Password(error) if error.is_overloaded() => Failure::Unavailable,
+        identity::LinkError::Password(error) => internal(error),
+    })?;
 
     let jar = signed_in_jar(state, &mut connection, user.id)
         .await

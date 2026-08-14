@@ -29,6 +29,7 @@
       "forgotPassword": "Forgot your password?"
     },
     "oauth": {
+      "continueWith": "Continue with {{provider}}",
       "errors": {
         "unavailable": "That sign-in provider is not available right now. Use your email and password.",
         "denied": "The sign-in was cancelled. Nothing has changed.",

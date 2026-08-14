@@ -105,4 +105,4 @@ A surviving team with no members left is kept rather than deleted: it still owns
 
 ## Billing
 
-Subscriptions attach to the Organization, not the User and not the Team. Plan limits can meter per-organization, per-team, or per-seat.
+Subscriptions attach to the Organization, not the User and not the Team. Plans live in `config/billing.yml`, an organization with no subscription is on the free plan, and Stripe is the system of record for money. Plan limits can meter per-organization, per-team, or per-seat. See [billing.md](billing.md).

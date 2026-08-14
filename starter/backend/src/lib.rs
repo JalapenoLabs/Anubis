@@ -18,6 +18,12 @@ use utoipa::OpenApi;
 /// The application's role definitions, embedded at compile time.
 pub const ROLES_YML: &str = include_str!("../../config/roles.yml");
 
+/// The application's subscription plans, embedded at compile time.
+///
+/// Validated at boot by `main.rs` and by the test below, so a bad edit fails
+/// the build rather than a customer's checkout. See `docs/billing.md`.
+pub const BILLING_YML: &str = include_str!("../../config/billing.yml");
+
 /// The application's own migrations, compiled into the binary.
 ///
 /// Apply them with `anubis::db::run_app_migrations` after the framework's:
@@ -138,9 +144,10 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 
 #[cfg(test)]
 mod tests {
+    use anubis::billing::PlanSet;
     use anubis::roles::RoleSet;
 
-    use super::{ROLES_YML, openapi};
+    use super::{BILLING_YML, ROLES_YML, openapi};
 
     #[test]
     fn the_document_merges_the_framework_and_every_model() {
@@ -183,6 +190,22 @@ mod tests {
         for role in ["default", "editor", "billing", "admin"] {
             assert!(set.is_defined(role), "baseline role {role:?} must exist");
         }
+    }
+
+    #[test]
+    fn the_embedded_plans_file_is_valid() {
+        let plans = PlanSet::from_yaml(BILLING_YML).expect("config/billing.yml must be valid");
+
+        assert_eq!(
+            plans.free().key(),
+            "free",
+            "an organization with no subscription is on the free plan",
+        );
+        let pro = plans.find("pro").expect("the example paid plan must exist");
+        assert!(
+            pro.price(anubis::billing::Interval::Monthly).is_some(),
+            "a paid plan sells at least one interval",
+        );
     }
 
     #[test]

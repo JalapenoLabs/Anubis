@@ -79,6 +79,7 @@ pub(crate) fn read_claims(claims: &CoreIdTokenClaims) -> ProviderIdentity {
 /// otherwise.
 pub(crate) async fn sign_in(
     connection: &mut AsyncPgConnection,
+    hasher: &password::Hasher,
     provider: &str,
     identity: &ProviderIdentity,
 ) -> Result<User, LinkError> {
@@ -112,7 +113,7 @@ pub(crate) async fn sign_in(
 
             let user = match existing {
                 Some(user) => user,
-                None => create_user(transaction, email, identity).await?,
+                None => create_user(transaction, hasher, email, identity).await?,
             };
 
             diesel::insert_into(oauth_identities::table)
@@ -137,10 +138,12 @@ pub(crate) async fn sign_in(
 /// the reset flow, and the column stays `NOT NULL` for every other account.
 async fn create_user(
     connection: &mut AsyncPgConnection,
+    hasher: &password::Hasher,
     email: &str,
     identity: &ProviderIdentity,
 ) -> Result<User, LinkError> {
-    let password_hash = password::hash(token::generate())
+    let password_hash = hasher
+        .hash(token::generate())
         .await
         .map_err(LinkError::Password)?;
 

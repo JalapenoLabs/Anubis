@@ -49,11 +49,17 @@ diesel::table! {
 
 diesel::table! {
     /// Top-level tenants. Every team belongs to exactly one organization.
+    ///
+    /// `stripe_customer_id` is null until the organization's first checkout
+    /// creates a customer. It is deliberately absent from
+    /// [`crate::tenancy::Organization`], which is serialized to members: the
+    /// column belongs to [`crate::billing`] and is read there.
     organizations (id) {
         id -> Uuid,
         name -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        stripe_customer_id -> Nullable<Text>,
     }
 }
 
@@ -287,6 +293,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// An organization's subscription, mirroring Stripe's. See `docs/billing.md`.
+    ///
+    /// The free plan is the absence of a row, and `plan_key` names a plan in
+    /// `config/billing.yml` rather than a row in another table.
+    subscriptions (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        plan_key -> Text,
+        stripe_subscription_id -> Text,
+        status -> Text,
+        billing_interval -> Text,
+        quantity -> Int4,
+        current_period_end -> Nullable<Timestamptz>,
+        cancel_at_period_end -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
@@ -314,6 +340,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     invitations,
     users,
 );
+diesel::joinable!(subscriptions -> organizations (organization_id));
+diesel::allow_tables_to_appear_in_same_query!(subscriptions, organizations);
 diesel::joinable!(webhook_endpoints -> teams (team_id));
 diesel::joinable!(webhook_deliveries -> webhook_endpoints (webhook_endpoint_id));
 diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);

@@ -13,6 +13,7 @@ export type {
   MembershipsOverview,
   MessageEnvelope,
   MfaStatus,
+  OauthProvider,
   OrganizationRosterMember,
   Passkey,
   PasskeyLoginChallenge,
@@ -36,6 +37,7 @@ export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
+export type { OauthProvidersResult } from './react/useOauthProviders'
 export type { AnubisFieldProps, FieldOption } from './fields/types'
 export type { RealtimeListener } from './realtime/listeners'
 export type {
@@ -89,6 +91,7 @@ export { getApiErrorMessage } from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
 export { useCurrentUser } from './react/useCurrentUser'
 export { useMemberships } from './react/useMemberships'
+export { useOauthProviders } from './react/useOauthProviders'
 
 /**
  * The version of the Anubis frontend package.

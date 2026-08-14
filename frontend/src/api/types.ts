@@ -97,6 +97,19 @@ export type EmailChangeRequest = {
   password: string
 }
 
+/**
+ * One OAuth provider this deployment can sign in with.
+ *
+ * The backend lists only providers whose credentials are set, so a button
+ * built from this never fails with `oauth_unavailable` at click time.
+ */
+export type OauthProvider = {
+  /** The key the start URL is built from, such as `google`. */
+  key: string
+  /** The provider's name as a user reads it on a button, such as `Google`. */
+  displayName: string
+}
+
 /** A started passkey registration: the browser's options plus the ceremony's token. */
 export type PasskeyRegistrationChallenge = {
   stateToken: string

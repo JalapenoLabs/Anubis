@@ -1,0 +1,54 @@
+# Subscription plans for the application.
+#
+# One file defines what this application sells: the plans, the Stripe price
+# behind each billing interval, and the limits each plan grants. The backend
+# embeds it at compile time and validates it at boot, the same way it treats
+# config/roles.yml, so a bad edit fails the build rather than a customer's
+# checkout.
+#
+# Rules the validator enforces:
+#
+#   - Exactly one plan sells no prices. That is the free plan, and it is what an
+#     organization with no subscription is on.
+#   - Plan keys and limit names are lowercase letters, digits, and underscores:
+#     they are stored on subscriptions and read by the frontend.
+#   - A Stripe price belongs to one plan, because a price is what identifies the
+#     plan a subscription bought.
+#   - A limit a plan does not name is unlimited. There is no magic number for it.
+#
+# `amount` and `currency` are what the pricing page shows, in the currency's
+# smallest unit (2900 is $29.00). Stripe's price is the source of truth for what
+# a customer is actually charged; only `stripe_price_id` is ever sent to Stripe.
+#
+# Get the price ids from the Stripe dashboard after creating the products
+# (https://dashboard.stripe.com/test/products), and set STRIPE_SECRET_KEY in
+# .env to turn billing on. Until it is set, every organization is on the free
+# plan and checkout answers 503. See docs/billing.md.
+#
+# The limit vocabulary below is this application's own: name whatever the
+# product meters.
+
+plans:
+  - key: free
+    name: Free
+    description: Everything one person needs to try the product.
+    limits:
+      seats: 1
+      creative_concepts: 3
+
+  - key: pro
+    name: Pro
+    description: For a team working together.
+    highlighted: true
+    prices:
+      monthly:
+        stripe_price_id: price_replace_me_pro_monthly
+        amount: 2900
+        currency: usd
+      yearly:
+        stripe_price_id: price_replace_me_pro_yearly
+        amount: 29000
+        currency: usd
+    limits:
+      seats: 25
+      # `creative_concepts` is unlimited here, so the plan does not name it.

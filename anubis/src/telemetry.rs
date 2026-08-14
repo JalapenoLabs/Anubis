@@ -11,7 +11,8 @@
 //! process. Because it is the first thing with both a live subscriber and the
 //! configuration in hand, [`init`] also announces configuration that is fine
 //! locally and costly in a live deployment: the built-in `ANUBIS_SECRET_KEY`
-//! fallback, and a production deployment with no mail relay or no frontend.
+//! fallback, and a production deployment with no frontend, no mail relay, or
+//! no Stripe account.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -65,6 +66,18 @@ fn warn_about_risky_defaults(config: &AppConfig) {
             "SPA_DIR is unset: this binary serves the API only and no frontend. Point it at the \
              built frontend (for example SPA_DIR=frontend/dist) unless the SPA is hosted \
              elsewhere. (environment: {{app.environment}})",
+        );
+    }
+
+    // An application that does not charge for anything is a legitimate shape,
+    // so this is a warning too. It is still the likeliest reason a production
+    // deployment answers every checkout with a 503.
+    if config.stripe.is_none() && config.environment.is_production() {
+        tracing::warn!(
+            app.environment = %config.environment,
+            "STRIPE_SECRET_KEY is unset: billing is disabled, every organization is on the free \
+             plan, and checkout and the customer portal answer 503. (environment: \
+             {{app.environment}})",
         );
     }
 

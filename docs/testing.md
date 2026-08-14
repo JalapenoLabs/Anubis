@@ -16,6 +16,22 @@ A narrative is one linear story with a caller, a sequence, and assertions on wha
 
 Every suite that needs a database gates on `DATABASE_URL` and logs a skip when it is unset, so `cargo test` works on a machine without one. CI always provides it. See [ci.md](ci.md).
 
+## Frontend tests
+
+Both npm packages run Vitest over happy-dom, in the same shape: a `vitest.config.ts` naming the environment, the test glob, and a `vitest.setup.ts` that unmounts every render and restores every stubbed global after each test.
+
+| Kind | Where | What it proves |
+|---|---|---|
+| Unit | `frontend/src/**/*.test.ts`, `starter/frontend/src/*.test.ts` | One pure function: url building, webhook signatures, WebAuthn encoding |
+| Component | `frontend/src/fields/fields.test.tsx`, `starter/frontend/src/**/*.test.tsx` | What a person sees and clicks, rendered with Testing Library |
+
+An application's component tests render through `frontend/src/testing/harness.tsx`, which is two functions:
+
+- `renderWithProviders(ui, initialEntry)` mounts `ui` under the providers `main.tsx` mounts (router, HeroUI, the Anubis API client, i18n) at a chosen URL, with an SWR cache per render so one test's fetches never answer the next one's.
+- `stubFetch(responses)` answers `fetch` from a table keyed by path, so the component under test meets the real ky client, the real status handling, and the real wire shapes. A path nobody listed answers 404, which turns a forgotten route into a failed assertion instead of a timeout.
+
+Two tests establish the pattern, and both ship with `anubis new`: `App.test.tsx` proves the auth guard sends a signed-out visitor to `/sign-in` carrying the page they asked for, and `pages/auth/SignInPage.test.tsx` proves the page renders one OAuth button per provider `GET /auth/oauth/providers` reports.
+
 ## Test-database isolation
 
 `anubis/tests/support/TestDatabase` gives a test a Postgres database of its own. It opens a maintenance connection to the server `DATABASE_URL` names, creates a uniquely named database beside the one in that URL, runs the framework migrations into it, and hands out its URL. `Drop` drops the database, so a test that panics cleans up as surely as one that passes.
@@ -69,3 +85,5 @@ Reference numbers, 32 cores, release, one process:
 | `/healthz`, during the storm | p50 556 µs, p95 6.7 ms |
 
 Read it this way: sign-in latency rising with the queue is the design working, because argon2 is meant to cost. `/healthz` staying in the sub-millisecond range is the isolation working. `/healthz` tracking the sign-in latency would mean the hashing had reached the runtime workers, and that would be a bug.
+
+The storm is 64 sign-ins because that is the default `PASSWORD_HASH_CONCURRENCY`, the number of argon2 computations `password::Hasher` admits at once (see [rate limiting](api.md#rate-limiting)). At that size the gate is saturated and nothing is refused, so the table measures the queue. A larger storm measures the shedding path instead: the excess waits five seconds and is answered `503`.

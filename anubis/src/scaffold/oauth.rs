@@ -1,19 +1,26 @@
 //! Planning one `anubis scaffold oauth <provider>` run.
 //!
-//! This scaffolder is deliberately the thinnest in the family, because almost
-//! all of the feature is framework behavior rather than generated code. The
-//! routes, the flow, the identity linking, and the account bootstrap live in
-//! [`crate::auth::oauth`] and arrive with the dependency; an application adds
-//! a provider by setting two environment variables. What is left to generate
-//! is the part an application owns: the button on its own sign-in page, and
-//! the string on that button.
+//! This scaffolder generates nothing, and that is the design rather than a
+//! gap. Every part of a provider is framework behavior: the routes, the flow,
+//! the identity linking, and the account bootstrap live in
+//! [`crate::auth::oauth`] and arrive with the dependency, and the sign-in page
+//! renders one button per provider that `GET /auth/oauth/providers` reports,
+//! so the page needs no per-provider code either. A provider is added by
+//! setting two environment variables.
 //!
-//! Everything here is pure string transformation, like the rest of the
-//! engine, so the CLI stays a filesystem shell over it.
+//! What is left is the part only a person can do: registering an OAuth client
+//! with the provider, under the exact redirect URI this deployment answers on.
+//! This type computes that URI and carries the registry entry the CLI prints
+//! the variable names from.
+//!
+//! Generating a button instead would put the provider list in two places, the
+//! page and the environment, and the failure mode of that disagreement is a
+//! button that always fails with `oauth_unavailable`. One source of truth is
+//! worth more than one generated element.
 
 use crate::auth::oauth::OauthProvider;
 
-/// One provider's contribution to the application's sign-in page.
+/// One provider's setup, as `anubis scaffold oauth` reports it.
 ///
 /// # Examples
 /// ```
@@ -21,11 +28,11 @@ use crate::auth::oauth::OauthProvider;
 ///
 /// let provider = anubis::auth::oauth::find_provider("google").unwrap();
 /// let scaffold = OauthScaffold::new(provider);
-/// assert!(scaffold.sign_in_button().contains("getOauthStartUrl('google', destination)"));
 /// assert_eq!(
-///     scaffold.locale_entries(),
-///     vec![("google".to_owned(), "Continue with Google".to_owned())],
+///     scaffold.redirect_uri("https://app.example.com"),
+///     "https://app.example.com/auth/oauth/google/callback",
 /// );
+/// assert_eq!(scaffold.provider().client_id_var, "GOOGLE_OAUTH_CLIENT_ID");
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct OauthScaffold {
@@ -39,44 +46,10 @@ impl OauthScaffold {
         Self { provider }
     }
 
-    /// The provider being added.
+    /// The provider being added, including the variables that enable it.
     #[must_use]
     pub fn provider(self) -> &'static OauthProvider {
         self.provider
-    }
-
-    /// The button inserted above the sign-in page's provider anchor.
-    ///
-    /// It is a link, not a form submit: starting a flow means leaving the SPA
-    /// for the provider's consent screen, so the browser navigates rather than
-    /// fetches. `destination` and `t` are the names the sign-in page already
-    /// binds, which is what keeps the insertion a single element.
-    #[must_use]
-    pub fn sign_in_button(self) -> String {
-        format!(
-            "\
-<Button
-  as='a'
-  variant='bordered'
-  className='compact w-full'
-  href={{getOauthStartUrl('{key}', destination)}}
->
-  <span>{{
-      t('auth.oauth.{key}')
-    }}</span>
-</Button>
-",
-            key = self.provider.key,
-        )
-    }
-
-    /// The strings merged into the `auth.oauth` object of the base locale file.
-    #[must_use]
-    pub fn locale_entries(self) -> Vec<(String, String)> {
-        vec![(
-            self.provider.key.to_owned(),
-            format!("Continue with {}", self.provider.display_name),
-        )]
     }
 
     /// The redirect URI the provider must be registered with.
@@ -99,34 +72,19 @@ mod tests {
     }
 
     #[test]
-    fn the_button_links_at_the_provider_and_reads_from_the_locale_file() {
-        let button = google().sign_in_button();
-
-        assert!(
-            button.contains("href={getOauthStartUrl('google', destination)}"),
-            "{button}",
-        );
-        assert!(button.contains("t('auth.oauth.google')"), "{button}");
-        // Every line has to fit the frontend's 120-column lint budget once the
-        // anchor's indentation is added.
-        for line in button.lines() {
-            assert!(line.len() <= 100, "too long to indent: {line}");
-        }
-    }
-
-    #[test]
-    fn the_locale_entry_is_the_string_the_button_renders() {
-        assert_eq!(
-            google().locale_entries(),
-            vec![("google".to_owned(), "Continue with Google".to_owned())],
-        );
-    }
-
-    #[test]
     fn the_redirect_uri_hangs_off_the_public_origin() {
         assert_eq!(
             google().redirect_uri("https://app.example.com"),
             "https://app.example.com/auth/oauth/google/callback",
         );
+    }
+
+    #[test]
+    fn the_scaffold_carries_the_variables_that_enable_the_provider() {
+        let provider = google().provider();
+
+        assert_eq!(provider.client_id_var, "GOOGLE_OAUTH_CLIENT_ID");
+        assert_eq!(provider.client_secret_var, "GOOGLE_OAUTH_CLIENT_SECRET");
+        assert_eq!(provider.display_name, "Google");
     }
 }

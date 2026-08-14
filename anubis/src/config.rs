@@ -20,9 +20,12 @@
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
 //! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
+//! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
+//! | `STRIPE_SECRET_KEY` | unset | Stripe secret key, e.g. `sk_live_...`; setting it enables billing |
+//! | `STRIPE_API_BASE` | `https://api.stripe.com` | Where Stripe's API lives; overridden only by tests and mocks |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
 //! adds three more, named after the provider:
@@ -125,6 +128,14 @@
 //! control appends to that header, because the limiter reads the last entry,
 //! the one that proxy wrote. See [`crate::rate_limit`] and `docs/api.md`.
 //!
+//! `PASSWORD_HASH_CONCURRENCY` is the limit behind those budgets, and it is a
+//! memory budget written as a count: each argon2 computation holds 19 MiB
+//! while it runs, so the default of 64 caps password hashing near 1.2 GiB and
+//! a request that finds every permit taken is shed as `503` rather than
+//! queued. Lower it on a small instance, raise it only alongside the memory
+//! limit it is derived from, and see [`crate::auth::password`] for why a bound
+//! exists at all.
+//!
 //! # Cross-origin access
 //!
 //! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
@@ -135,6 +146,22 @@
 //! wildcard, and is normalized at startup, so a typo fails the boot rather than
 //! the first cross-origin call. See [`crate::server`] and `docs/server.md`.
 //!
+//! # Billing
+//!
+//! `STRIPE_SECRET_KEY` is the switch. Set it and an organization can buy a
+//! plan through Stripe Checkout and manage it in the customer portal; leave it
+//! unset, the development default, and every organization is on the free plan
+//! defined in `config/billing.yml`, the two write endpoints answer `503`
+//! naming this variable, and reading the current plan keeps working. A
+//! production deployment without it boots anyway, with a startup warning from
+//! [`crate::telemetry::init`]: an application that does not charge yet should
+//! not be blocked on billing configuration. The key is a bearer credential for
+//! an account that moves money, so it is never echoed in errors or logs.
+//!
+//! `STRIPE_API_BASE` points the client somewhere other than Stripe. It exists
+//! for tests and Stripe-compatible mocks; a deployment leaves it unset. See
+//! [`crate::billing`] and `docs/billing.md`.
+//!
 //! # OAuth providers
 //!
 //! A provider is enabled by setting both its client id and its client secret;
@@ -142,18 +169,21 @@
 //! because a half-configured provider is a sign-in button that always fails.
 //! The issuer variable overrides the registry's issuer, which is what a
 //! self-hosted or single-tenant deployment needs. Register the redirect URI
-//! `<APP_URL>/auth/oauth/<provider>/callback` with the provider, and add the
-//! button with `anubis scaffold oauth <provider>`.
+//! `<APP_URL>/auth/oauth/<provider>/callback` with the provider; the sign-in
+//! page renders whichever providers are enabled here, so nothing else is
+//! needed. `anubis scaffold oauth <provider>` prints both steps.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZero;
 use std::path::PathBuf;
 
 use axum::http::HeaderName;
 use url::{Origin, Url};
 
 use crate::auth::oauth::{OauthProviderConfig, known_providers};
+use crate::auth::password;
 use crate::auth::secret_box::SecretKey;
 use crate::rate_limit::RateLimitConfig;
 use crate::server::CorsConfig;
@@ -209,12 +239,32 @@ const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
 /// Names the forwarding header that identifies the client behind a proxy.
 const TRUSTED_PROXY_HEADER_VAR: &str = "TRUSTED_PROXY_HEADER";
 
+/// Caps how many argon2 computations may hold memory at once.
+const PASSWORD_HASH_CONCURRENCY_VAR: &str = "PASSWORD_HASH_CONCURRENCY";
+
+/// What a valid `PASSWORD_HASH_CONCURRENCY` looks like, quoted back in errors.
+const PASSWORD_HASH_CONCURRENCY_FORM: &str =
+    "a positive number of concurrent hashes, each holding 19 MiB, e.g. `64`";
+
 /// Lists the origins allowed to call the application from a browser.
 const CORS_ALLOWED_ORIGINS_VAR: &str = "CORS_ALLOWED_ORIGINS";
 
 /// What a valid `CORS_ALLOWED_ORIGINS` entry looks like, quoted back in errors.
 const ORIGIN_FORM: &str =
     "comma-separated exact origins with no path and no wildcard, e.g. `https://app.example.com`";
+
+/// The Stripe secret key that enables billing.
+const STRIPE_SECRET_KEY_VAR: &str = "STRIPE_SECRET_KEY";
+
+/// What a valid `STRIPE_SECRET_KEY` looks like, quoted back in errors.
+const STRIPE_SECRET_KEY_FORM: &str =
+    "a Stripe secret key, e.g. `sk_live_...`, or a restricted key, `rk_live_...`";
+
+/// Where Stripe's API lives, for tests and Stripe-compatible mocks.
+const STRIPE_API_BASE_VAR: &str = "STRIPE_API_BASE";
+
+/// What a valid `STRIPE_API_BASE` looks like, quoted back in errors.
+const STRIPE_API_BASE_FORM: &str = "an http(s) base URL, e.g. `https://api.stripe.com`";
 
 /// What a valid `TRUSTED_PROXY_HEADER` looks like, quoted back in errors.
 const HEADER_NAME_FORM: &str = "an HTTP header name, e.g. `x-forwarded-for`";
@@ -366,6 +416,39 @@ impl fmt::Debug for SmtpConfig {
     }
 }
 
+/// Stripe credentials for the billing module.
+///
+/// The secret key is a bearer credential for an account that can move money,
+/// so this type never exposes it through `Debug`; read it deliberately with
+/// [`StripeConfig::secret_key`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct StripeConfig {
+    secret_key: String,
+    api_base: String,
+}
+
+impl StripeConfig {
+    /// Returns the Stripe secret key.
+    #[must_use]
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    /// Returns the API base URL, without a trailing slash.
+    #[must_use]
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+}
+
+impl fmt::Debug for StripeConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StripeConfig")
+            .field("api_base", &self.api_base)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -414,6 +497,17 @@ pub struct AppConfig {
     /// Empty by default, which sends no CORS headers at all; see the module
     /// docs and [`crate::server`].
     pub cors: CorsConfig,
+    /// Stripe credentials, when `STRIPE_SECRET_KEY` is set.
+    ///
+    /// Present enables checkout and the customer portal, absent leaves every
+    /// organization on the free plan; see the module docs and
+    /// [`crate::billing`].
+    pub stripe: Option<StripeConfig>,
+    /// How many argon2 computations may hold memory at once.
+    ///
+    /// Defaults to [`password::DEFAULT_CONCURRENCY`]; see the module docs and
+    /// [`crate::auth::password`].
+    pub password_hash_concurrency: NonZero<usize>,
 }
 
 impl AppConfig {
@@ -512,6 +606,19 @@ impl AppConfig {
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
         let rate_limit = rate_limit_config(&lookup)?;
         let cors = cors_config(&lookup)?;
+        let stripe = stripe_config(&lookup)?;
+        let password_hash_concurrency = match non_empty(lookup(PASSWORD_HASH_CONCURRENCY_VAR)) {
+            None => password::DEFAULT_CONCURRENCY,
+            // Zero would refuse every sign-in, so it is a typo rather than a
+            // setting; `NonZero` rejects it along with anything unparseable.
+            Some(value) => value.trim().parse().map_err(|_error| {
+                Error::invalid(
+                    PASSWORD_HASH_CONCURRENCY_VAR,
+                    value.trim(),
+                    PASSWORD_HASH_CONCURRENCY_FORM,
+                )
+            })?,
+        };
 
         Ok(Self {
             environment,
@@ -525,6 +632,8 @@ impl AppConfig {
             spa_dir,
             rate_limit,
             cors,
+            stripe,
+            password_hash_concurrency,
         })
     }
 }
@@ -618,6 +727,46 @@ fn parse_origin(value: &str) -> Option<String> {
         Origin::Tuple(..) => Some(url.origin().ascii_serialization()),
         Origin::Opaque(_) => None,
     }
+}
+
+/// Resolves the Stripe credentials, when the environment carries them.
+///
+/// A publishable key is refused by name rather than by its shape: it is the
+/// key a person reaches for first, it is not secret, and every call made with
+/// it would fail at Stripe with a message about the wrong key type.
+fn stripe_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<StripeConfig>, Error> {
+    let Some(secret_key) = non_empty(lookup(STRIPE_SECRET_KEY_VAR)) else {
+        return Ok(None);
+    };
+    let secret_key = secret_key.trim().to_owned();
+
+    if !secret_key.starts_with("sk_") && !secret_key.starts_with("rk_") {
+        // The key spends money, so the bad value is never quoted back.
+        return Err(Error::invalid_secret(
+            STRIPE_SECRET_KEY_VAR,
+            STRIPE_SECRET_KEY_FORM,
+        ));
+    }
+
+    let api_base = match non_empty(lookup(STRIPE_API_BASE_VAR)) {
+        None => crate::billing::stripe::API_BASE.to_owned(),
+        Some(url) => {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(Error::invalid(
+                    STRIPE_API_BASE_VAR,
+                    url.trim(),
+                    STRIPE_API_BASE_FORM,
+                ));
+            }
+            trimmed.to_owned()
+        }
+    };
+
+    Ok(Some(StripeConfig {
+        secret_key,
+        api_base,
+    }))
 }
 
 /// Reads the spellings of yes and no that environment variables use.
@@ -1110,6 +1259,30 @@ mod tests {
     }
 
     #[test]
+    fn password_hashing_is_bounded_by_default_and_tunable_per_deployment() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(
+            defaulted.password_hash_concurrency,
+            crate::auth::password::DEFAULT_CONCURRENCY,
+        );
+
+        let lookup = lookup_from(&[("PASSWORD_HASH_CONCURRENCY", " 8 ")]);
+        let config = AppConfig::from_lookup(lookup).expect("a count must parse");
+        assert_eq!(config.password_hash_concurrency.get(), 8);
+
+        // Zero admits nobody, and a negative or fractional count is a typo.
+        for value in ["0", "-1", "many", "1.5"] {
+            let lookup = lookup_from(&[("PASSWORD_HASH_CONCURRENCY", value)]);
+            let error = AppConfig::from_lookup(lookup).expect_err("junk counts are rejected");
+            assert_eq!(
+                error.variable(),
+                "PASSWORD_HASH_CONCURRENCY",
+                "for input {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_trusted_proxy_header_is_normalized_and_validated() {
         let lookup = lookup_from(&[("TRUSTED_PROXY_HEADER", " X-Forwarded-For ")]);
         let config = AppConfig::from_lookup(lookup).expect("a header name must parse");
@@ -1183,6 +1356,80 @@ mod tests {
                 "http://local.example.com".to_owned(),
             ],
         );
+    }
+
+    #[test]
+    fn billing_stays_off_until_a_stripe_key_is_set() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert!(unset.stripe.is_none());
+
+        for key in ["sk_test_abc123", "rk_live_abc123"] {
+            let lookup = lookup_from(&[("STRIPE_SECRET_KEY", key)]);
+            let config = AppConfig::from_lookup(lookup).expect("a secret key must parse");
+            let stripe = config.stripe.expect("stripe config must be present");
+            assert_eq!(stripe.secret_key(), key);
+            assert_eq!(stripe.api_base(), "https://api.stripe.com");
+        }
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_a_secret_key_is_rejected_without_echoing_it() {
+        // The publishable key is the one people reach for by mistake.
+        let lookup = lookup_from(&[("STRIPE_SECRET_KEY", "pk_live_hunter2")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("only secret keys are accepted");
+
+        assert_eq!(error.variable(), "STRIPE_SECRET_KEY");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(rendered.contains("sk_live_"), "got: {rendered}");
+    }
+
+    #[test]
+    fn stripe_debug_output_never_leaks_the_key() {
+        let lookup = lookup_from(&[("STRIPE_SECRET_KEY", "sk_live_hunter2")]);
+        let config = AppConfig::from_lookup(lookup).expect("a secret key is fine");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("StripeConfig"), "got: {rendered}");
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+    }
+
+    #[test]
+    fn the_stripe_api_base_is_overridable_for_mocks_and_validated() {
+        let lookup = lookup_from(&[
+            ("STRIPE_SECRET_KEY", "sk_test_abc123"),
+            ("STRIPE_API_BASE", " http://127.0.0.1:9999/ "),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a base URL must parse");
+        assert_eq!(
+            config
+                .stripe
+                .as_ref()
+                .map(super::StripeConfig::api_base)
+                .expect("stripe config must be present"),
+            "http://127.0.0.1:9999",
+            "the trailing slash is trimmed so paths append cleanly",
+        );
+
+        let lookup = lookup_from(&[
+            ("STRIPE_SECRET_KEY", "sk_test_abc123"),
+            ("STRIPE_API_BASE", "api.stripe.com"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("junk base URLs are rejected");
+        assert_eq!(error.variable(), "STRIPE_API_BASE");
+    }
+
+    #[test]
+    fn production_boots_without_stripe() {
+        let lookup = lookup_from(&[
+            ("ANUBIS_ENV", "production"),
+            ("ANUBIS_SECRET_KEY", SAMPLE_SECRET_KEY),
+        ]);
+
+        let config = AppConfig::from_lookup(lookup).expect("missing billing must not block boot");
+
+        assert!(config.stripe.is_none());
     }
 
     #[test]

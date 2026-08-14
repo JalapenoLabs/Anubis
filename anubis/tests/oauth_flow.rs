@@ -313,6 +313,56 @@ async fn sign_in_with(
     (status, headers)
 }
 
+/// Discovery answers with the providers the environment enabled, and nothing
+/// else: the sign-in page renders buttons from this list, so a provider that
+/// would fail at click time must be absent from it.
+#[tokio::test]
+async fn provider_discovery_lists_what_the_environment_configured() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping oauth_flow test: DATABASE_URL is not set");
+        return;
+    };
+
+    let pool = anubis::db::connect(&database_url)
+        .await
+        .expect("database must be reachable");
+
+    // An application with no OAuth credentials set: the registry knows Google,
+    // the deployment does not, and the page must render no button for it.
+    let bare = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        "APP_URL" => Some(APP_URL.to_owned()),
+        _ => None,
+    })
+    .expect("test config must parse");
+    let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &bare));
+
+    let (status, _headers, body) = send(&router, "GET", "/auth/oauth/providers", None, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["providers"], serde_json::json!([]));
+
+    // The same application with Google's credentials set.
+    let configured = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        "APP_URL" => Some(APP_URL.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_ID" => Some(CLIENT_ID.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_SECRET" => Some("mock-client-secret".to_owned()),
+        _ => None,
+    })
+    .expect("test config must parse");
+    let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &configured));
+
+    let (status, _headers, body) = send(&router, "GET", "/auth/oauth/providers", None, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["providers"],
+        serde_json::json!([{ "key": "google", "display_name": "Google" }]),
+        "discovery must name the provider and nothing about its credentials",
+    );
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,

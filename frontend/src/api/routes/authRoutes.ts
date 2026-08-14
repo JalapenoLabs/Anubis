@@ -4,6 +4,7 @@ import type {
   Credentials,
   MessageEnvelope,
   MfaStatus,
+  OauthProvider,
   Passkey,
   PasskeyLoginChallenge,
   PasskeyRegistrationChallenge,
@@ -27,6 +28,11 @@ type WirePasskey = {
   name: string
   created_at: string
   last_used_at: string | null
+}
+
+type WireOauthProvider = {
+  key: string
+  display_name: string
 }
 
 /**
@@ -104,6 +110,22 @@ export function createAuthRoutes(client: KyInstance) {
       .post('auth/email-code/verify', { json: { email, code }})
       .json<WireUserEnvelope | WireMfaChallenge>()
     return toSignInResult(response)
+  }
+
+  /**
+   * The OAuth providers this deployment configured.
+   *
+   * Reachable signed out, and empty until a provider's credentials are set,
+   * which is what lets a sign-in page render only buttons that work.
+   */
+  async function listOauthProviders(): Promise<OauthProvider[]> {
+    const response = await client
+      .get('auth/oauth/providers')
+      .json<{ providers: WireOauthProvider[] }>()
+    return response.providers.map((provider) => ({
+      key: provider.key,
+      displayName: provider.display_name,
+    }))
   }
 
   async function getMfaStatus(): Promise<MfaStatus> {
@@ -220,6 +242,7 @@ export function createAuthRoutes(client: KyInstance) {
     confirmPasswordReset,
     requestEmailSignInCode,
     verifyEmailSignInCode,
+    listOauthProviders,
     getMfaStatus,
     startTotpEnrollment,
     confirmTotpEnrollment,

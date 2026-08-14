@@ -6,8 +6,8 @@
 //! configured `DATABASE_URL`, so bad credentials surface here instead of at
 //! first boot. `ANUBIS_SECRET_KEY` is parsed with the same parser
 //! configuration uses, so a key that would fail a production boot fails here.
-//! Run from an application root, doctor also validates `config/roles.yml`
-//! with the same parser the server boots with.
+//! Run from an application root, doctor also validates `config/roles.yml` and
+//! `config/billing.yml` with the same parsers the server boots with.
 
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -38,6 +38,7 @@ pub(crate) fn run() -> ExitCode {
     checks.push(database_check());
     checks.push(secret_key_check());
     checks.push(roles_check());
+    checks.push(billing_check());
 
     let mut failed = false;
     for check in &checks {
@@ -163,6 +164,34 @@ fn roles_check() -> Check {
         Err(_) => Check {
             status: Status::Warn,
             detail: "config/roles.yml not found; run doctor from an application root".to_owned(),
+        },
+    }
+}
+
+/// The application's `config/billing.yml`, parsed the way the server parses it.
+///
+/// Absent is a normal state: an application that charges for nothing has no
+/// plans file, and the framework needs none.
+fn billing_check() -> Check {
+    let Ok(yaml) = std::fs::read_to_string("config/billing.yml") else {
+        return Check {
+            status: Status::Ok,
+            detail: "config/billing.yml not found; billing is off for this application".to_owned(),
+        };
+    };
+
+    match anubis::billing::PlanSet::from_yaml(&yaml) {
+        Ok(plans) => Check {
+            status: Status::Ok,
+            detail: format!(
+                "config/billing.yml is valid ({} plans, free plan {:?})",
+                plans.plans().len(),
+                plans.free().key(),
+            ),
+        },
+        Err(error) => Check {
+            status: Status::Fail,
+            detail: format!("config/billing.yml is invalid: {error}"),
         },
     }
 }

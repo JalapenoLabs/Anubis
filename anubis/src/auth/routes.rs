@@ -67,6 +67,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         secret_key: config.secret_key.clone(),
         oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
         rate_limit: rate_limit.clone(),
+        hasher: password::Hasher::new(config.password_hash_concurrency),
     };
 
     Router::new()
@@ -112,6 +113,9 @@ pub(crate) struct AuthState {
     pub(crate) oauth: crate::auth::oauth::Runtime,
     /// Budgets the handlers charge themselves, keyed by the target address.
     pub(crate) rate_limit: RateLimiter,
+    /// The gate every argon2 computation passes through; see
+    /// [`crate::auth::password`].
+    pub(crate) hasher: password::Hasher,
 }
 
 #[derive(Deserialize)]
@@ -152,9 +156,7 @@ async fn register(
 ) -> Result<impl IntoResponse, ApiError> {
     let credentials = validate_credentials(body)?;
 
-    let password_hash = password::hash(credentials.password)
-        .await
-        .map_err(log_internal)?;
+    let password_hash = state.hasher.hash(credentials.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
@@ -217,14 +219,19 @@ async fn login(
 
     let Some(user) = user else {
         // Burn the same CPU as a real check so timing does not reveal
-        // whether the email is registered.
-        password::verify_against_dummy(credentials.password).await;
+        // whether the email is registered. A shed check propagates, so an
+        // overloaded server answers both paths the same way.
+        state
+            .hasher
+            .verify_against_dummy(credentials.password)
+            .await?;
         return Err(invalid_credentials());
     };
 
-    let matched = password::verify(credentials.password, user.password_hash.clone())
-        .await
-        .map_err(log_internal)?;
+    let matched = state
+        .hasher
+        .verify(credentials.password, user.password_hash.clone())
+        .await?;
 
     if !matched {
         return Err(invalid_credentials());
@@ -395,7 +402,7 @@ async fn confirm_password_reset(
             .map_err(log_internal)?
             .ok_or_else(expired_link)?;
 
-    let password_hash = password::hash(body.password).await.map_err(log_internal)?;
+    let password_hash = state.hasher.hash(body.password).await?;
 
     diesel::update(users::table.find(user_id))
         .set((users::password_hash.eq(&password_hash),))

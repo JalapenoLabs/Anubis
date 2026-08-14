@@ -111,6 +111,10 @@ Rate limiting is not an enumeration oracle. Budgets count requests, never outcom
 
 **Turning it off.** `RATE_LIMIT_DISABLED=true` switches every budget off. It exists for development and for test suites that drive these endpoints hard from one address; deployments leave it unset. The budgets are otherwise identical in every environment, because a limit that differs between development and production is a limit nobody has tested.
 
+**Behind the budgets: bounded password hashing.** Per-client budgets do not see a burst spread across many client addresses, and sign-in is the one endpoint whose cost a stranger controls. Each argon2id verification holds 19 MiB while it runs, and tokio's blocking pool grows to 512 threads, so an unbounded distributed burst would reach roughly 9.5 GiB resident and get the process killed, which serves an attacker better than any number of refused sign-ins. Every hash and verification in the framework therefore passes one gate that admits `PASSWORD_HASH_CONCURRENCY` computations at a time, 64 by default, which caps the hashing working set near 1.2 GiB and stays thousands of sign-ins per second above any real load.
+
+A request that finds the gate full waits five seconds and is then shed with `503` in the standard error shape. Shedding beats queueing because a queue in front of a memory bound just moves the exhaustion: every waiting request holds a task, a database connection, and its buffers, and the ones at the back are answered long after their clients gave up, so the work is spent and the answer wasted. The account-not-found path sheds identically to the account-exists path, so an overloaded server never becomes the account-existence oracle that equal timing exists to prevent. Set `PASSWORD_HASH_CONCURRENCY` from the memory limit it is derived from: lower on a small instance, higher only when the container grew.
+
 **Scope and cost.** State is in-process: two instances behind a load balancer enforce two budgets, so the effective limit multiplies by the instance count. That still bounds an attack at `instances * quota` per period, which is the difference between a bounded attack and an unbounded one. A shared store is the eventual answer, not a prerequisite. Memory is bounded too: the limiter tracks at most 32,768 keys, roughly a hundred bytes each, and prunes when it reaches that, first the keys whose balance is already full and then the least-loaded ones. A client rotating addresses to flood the map evicts its own fresh keys before the keys the limiter is holding back, because those are the heaviest in the map.
 
 ## The identity screens
@@ -134,14 +138,23 @@ WebAuthn needs binary where JSON has none, so the package exports the conversion
 
 ## OAuth sign-in
 
-Two framework routes carry a whole provider, and `anubis scaffold oauth <provider>` adds the button that calls them:
+Three framework routes carry every provider, and the sign-in page needs no per-provider code at all:
 
 | Route | Effect |
 |---|---|
+| `GET /auth/oauth/providers` | List the providers this deployment configured |
 | `GET /auth/oauth/{provider}/start` | Redirect the browser to the provider's consent screen |
 | `GET /auth/oauth/{provider}/callback` | Verify the response, issue the session, land on the destination |
 
-Both are browser navigations, so both answer with a redirect rather than JSON. A `?next=` on `start` is preserved through the round trip and is where a successful callback lands; it is validated as a root-relative path server-side, so it cannot become an open redirect.
+The two flow routes are browser navigations, so both answer with a redirect rather than JSON. A `?next=` on `start` is preserved through the round trip and is where a successful callback lands; it is validated as a root-relative path server-side, so it cannot become an open redirect.
+
+Discovery answers signed out, because signed out is the only state it is read in:
+
+```json
+{ "providers": [{ "key": "google", "display_name": "Google" }] }
+```
+
+Two fields, and no more: the key the start URL is built from, and the name a button reads. A provider whose credentials are unset is absent, so a page that renders this list renders no button that would fail with `oauth_unavailable` at click time. The starter's sign-in page reads it through `useOauthProviders`, which is why adding a provider is setting two environment variables and restarting.
 
 The flow is authorization code with PKCE. `start` discovers the provider's endpoints from its issuer (cached per process), generates the PKCE verifier and the nonce, and stores them server-side under a fresh opaque token. That token is the OAuth `state` parameter, so the provider's echo is what finds the row; only its SHA-256 is stored, and consuming it deletes it, which makes a replayed callback fail exactly like an expired one. Flows expire after 15 minutes.
 
@@ -205,6 +218,18 @@ Two screens cover the surface above, in the settings style the identity screens 
 Affordances come from the compiled role set rather than from hand-written role strings: `roles.generated.ts` types the admin key the management endpoints ask for, so a member without it sees the roster read-only and no danger zone. The screen only mirrors the server, which still answers `403`, and the refusals worth reading (`409` for the last admin, `400` for removing yourself instead of leaving) are surfaced verbatim where the action was taken.
 
 Creating and dissolving tenants revalidates the membership overview, which is the switcher's own source, so a new team appears and a deleted one disappears everywhere at once; a selection that no longer resolves falls back to a team the user still belongs to.
+
+## Billing endpoints
+
+The framework mounts the billing surface under `/billing`, beside tenancy and for the same reason: a subscription administers the organization the API is scoped to. [Billing](billing.md) covers the plan model, the free-plan convention, the Stripe posture, and the configuration.
+
+| Route | Guard | Effect |
+|---|---|---|
+| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the subscription behind it, and whether billing is configured |
+| `POST /billing/organizations/{organization_id}/checkout` | org `admin` or `billing` | Opens a Stripe Checkout session, answers with its URL |
+| `POST /billing/organizations/{organization_id}/portal` | org `admin` or `billing` | Opens the Stripe customer portal, answers with its URL |
+
+The two write routes answer `503` when `STRIPE_SECRET_KEY` is unset, naming the variable, and `409` when the request collides with the current state (a second subscription, or a portal for an organization that has never bought anything). Reading works either way, because an application with no Stripe account is on the free plan and that is a complete answer.
 
 ## Webhooks
 

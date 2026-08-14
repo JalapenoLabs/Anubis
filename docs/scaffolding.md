@@ -60,8 +60,6 @@ The vocabulary comes in two halves. **Model anchors** sit in files the whole app
 | `// 🐺 anubis:page-imports` | `frontend/src/App.tsx` | page imports |
 | `{/* 🐺 anubis:routes */}` | `frontend/src/App.tsx` | `<Route>` elements |
 | `{/* 🐺 anubis:nav */}` | `frontend/src/components/AppShell.tsx` | navigation entries |
-| `// 🐺 anubis:oauth-imports` | `frontend/src/pages/auth/SignInPage.tsx` | url helpers a provider button calls |
-| `{/* 🐺 anubis:oauth-providers */}` | `frontend/src/pages/auth/SignInPage.tsx` | one button per OAuth provider |
 | `// 🐺 anubis:locale-imports` | `frontend/src/i18n.ts` | per-model locale imports |
 | `// 🐺 anubis:locales` | `frontend/src/i18n.ts` | per-model locale spreads |
 | `// 🐺 anubis:child-imports` | every show page | imports of child section components |
@@ -190,7 +188,7 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 | `anubis scaffold model <Model> <ParentChain> <field:type ...>` | Full-stack CRUD scaffold |
 | `anubis scaffold field <Model> <field:type>` | Add a field to an existing model, propagated everywhere |
 | `anubis scaffold join <JoinModel> <a_id{class_name=A}> <b_id{class_name=B}>` | Join model for has-many-through |
-| `anubis scaffold oauth <provider>` | Add an OAuth login provider (the one-line Google Auth moment) |
+| `anubis scaffold oauth <provider>` | Print how to enable an OAuth login provider (the one-line Google Auth moment) |
 | `anubis scaffold webhook <Provider>` | Receiving endpoint for a third party's webhooks |
 | `anubis routes` | Print the route table |
 | `anubis eject <component>` | Copy a framework frontend component into the app to own it |
@@ -385,18 +383,15 @@ Every scaffolded model's `routes.rs` carries a `<Model>View`, a `serde(flatten)`
 anubis scaffold oauth google
 ```
 
-This is Bullet Train's one-line Google Auth moment, and it is deliberately the thinnest command in the family. Almost all of the feature is framework behavior that arrives with the dependency: the two routes, the authorization-code flow with PKCE, the server-side state and nonce, the ID token verification, the identity linking, and the account bootstrap all live in `anubis::auth::oauth` and are described in [api.md](api.md#oauth-sign-in). What is left to generate is the part an application owns.
+This is Bullet Train's one-line Google Auth moment, and it is the thinnest command in the family: **it writes no file at all**. Every part of the feature is framework behavior that arrives with the dependency: the three routes, the authorization-code flow with PKCE, the server-side state and nonce, the ID token verification, the identity linking, and the account bootstrap all live in `anubis::auth::oauth` and are described in [api.md](api.md#oauth-sign-in). The sign-in page renders one button per provider that `GET /auth/oauth/providers` reports, so even the button is not per-provider code.
 
-One run updates two files:
+What the command does is print the two steps only a person can take: registering an OAuth client with the provider, using the redirect URI it spells out from `APP_URL`, and setting `<PROVIDER>_OAUTH_CLIENT_ID` and `<PROVIDER>_OAUTH_CLIENT_SECRET`.
 
-- `frontend/src/pages/auth/SignInPage.tsx`: the provider's button, above the `oauth-providers` anchor, and the url helper it calls, above the `oauth-imports` anchor
-- `frontend/src/locales/en-US.json`: the button's text, merged into the `auth.oauth` object
+### Why the command generates nothing
 
-and then prints the two steps only a person can take: registering an OAuth client with the provider, using the redirect URI the command spells out, and setting `<PROVIDER>_OAUTH_CLIENT_ID` and `<PROVIDER>_OAUTH_CLIENT_SECRET`. Both insertions are idempotent, so a second provider adds a button and nothing else.
+An application declares its providers by setting their credentials, not by listing them somewhere. A generated button is exactly such a list: a second source of truth that disagrees with the environment the moment a deployment differs from development, and the failure mode of that disagreement is a button that always fails with `oauth_unavailable`. So the environment decides and the page follows: a provider with both credentials set is enabled and appears in discovery, a provider with one of the two refuses to start, and a provider with neither is simply absent from the page.
 
-### Why the command owns no configuration file
-
-An application declares its providers by setting their credentials, not by listing them somewhere. A config file naming enabled providers would be a second source of truth that disagrees with the environment the moment a deployment differs from development, and the failure mode of that disagreement (a button that always fails) is exactly what a framework should not ship. So the environment decides: a provider with both credentials set is enabled, a provider with one of the two refuses to start, and a button whose provider is not configured redirects to the sign-in page with `oauth_unavailable` rather than pretending.
+An application that wants a different arrangement owns `SignInPage.tsx` and can lay the buttons out however it likes; what it should keep is rendering the list the backend reports rather than a list of its own.
 
 The provider registry itself is framework-owned and OpenID Connect only, so an unknown key is refused by name with the known list. `<PROVIDER>_OAUTH_ISSUER` overrides the registry's issuer, which is what a self-hosted identity server, a single-tenant directory, and the framework's own test suite use.
 
@@ -500,7 +495,7 @@ All scaffolders share one pure engine, `anubis::scaffold`:
 - **Field planning**: `FieldScaffold` turns one field plus a model's names into every line it contributes, keyed by the `Artifact` that receives it. Both scaffolders read the same table, which is what keeps their output identical.
 - **Model planning**: `ModelScaffold` turns one command's arguments into every decision the generator makes: which template, which replacements, which module, table, migration, and every line the shared backend and frontend files receive above their anchors.
 - **Join planning**: `JoinScaffold` does the same for a join, rewriting three model names and three module paths at once so generated code reaches each side through the module that side's own scaffold created.
-- **Provider planning**: `OauthScaffold` turns one provider into the sign-in button it contributes, the string that button renders, and the redirect URI its console needs.
+- **Provider planning**: `OauthScaffold` turns one provider into the redirect URI its console needs. It contributes no code, because the sign-in page renders the providers the backend reports.
 - **Receiver planning**: `WebhookScaffold` turns one provider into the model name it implies, the module and table that hold its events, the path it is received at, and the environment variable its shared secret is read from.
 
 The engine does no file I/O; the CLI is its thin filesystem shell. That split keeps every transform unit-testable as plain strings.

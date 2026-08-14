@@ -13,6 +13,15 @@
 //! each one, and times `GET /healthz` throughout, which touches nothing and
 //! therefore should stay fast no matter how deep the login queue gets.
 //!
+//! The pool is not the only bound any more. Every computation also takes a
+//! permit from `password::Hasher`, `PASSWORD_HASH_CONCURRENCY` of them (64 by
+//! default), because each one holds 19 MiB and 512 blocking threads of them
+//! would OOM a normally sized container. [`STORM`] sits at that default on
+//! purpose: the storm saturates the gate without shedding, so the numbers
+//! below still describe the queue rather than the refusal. Raise [`STORM`]
+//! past the permit count and the excess is answered `503` after five seconds,
+//! which is the bound working and would make every latency here meaningless.
+//!
 //! Ignored by default, because it is a measurement rather than an assertion.
 //! Run it deliberately:
 //!
@@ -46,7 +55,9 @@ use support::{Harness, PASSWORD, TestDatabase, register, serve};
 ///
 /// Comfortably more than the machine has cores, so the blocking pool is
 /// saturated and the queue behind it is real, and few enough that the whole
-/// run finishes in seconds.
+/// run finishes in seconds. It equals the default hashing permit count, which
+/// is the most a storm can be without measuring the shedding path instead of
+/// the queue; see the module docs.
 const STORM: usize = 64;
 
 /// How often the liveness probe is sampled during the storm.

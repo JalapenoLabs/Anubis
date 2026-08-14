@@ -113,6 +113,7 @@ const REVALIDATE: HeaderValue = HeaderValue::from_static("no-cache");
 pub const RESERVED_PREFIXES: &[&str] = &[
     "/api",
     "/auth",
+    "/billing",
     "/developers",
     "/realtime",
     "/tenancy",

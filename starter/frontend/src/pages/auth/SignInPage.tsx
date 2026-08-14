@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useCurrentUser } from '@jalapenolabs/anubis'
+import { useCurrentUser, useOauthProviders } from '@jalapenolabs/anubis'
 
 // UI
 import { Button } from '@heroui/react'
@@ -19,8 +19,8 @@ import {
   AUTH_ERROR_PARAM,
   DESTINATION_PARAM,
   UrlTree,
+  getOauthStartUrl,
   getUrlWithDestination,
-  // 🐺 anubis:oauth-imports
 } from '../../urls'
 
 /**
@@ -55,6 +55,7 @@ type SignInStep =
 export function SignInPage() {
   const { t } = useTranslation()
   const { refresh } = useCurrentUser()
+  const { providers } = useOauthProviders()
   const [ searchParams ] = useSearchParams()
   const [ step, setStep ] = useState<SignInStep>({ name: 'password' })
 
@@ -124,8 +125,24 @@ export function SignInPage() {
         }</span>
     </Button>
     <PasskeySignInButton onSignedIn={onSignedIn} />
-    {/* One button per provider, written by `anubis scaffold oauth <provider>`. */}
-    {/* 🐺 anubis:oauth-providers */}
+    {/* One button per provider the backend has credentials for, so a button
+        that would fail with `oauth_unavailable` is never rendered. Enable a
+        provider by setting its credentials; `anubis scaffold oauth <provider>`
+        prints exactly which ones. */}
+    { providers.map((provider) =>
+        <Button
+          key={provider.key}
+          as='a'
+          variant='bordered'
+          className='compact w-full'
+          href={getOauthStartUrl(provider.key, destination)}
+        >
+          <span>{
+              t('auth.oauth.continueWith', { provider: provider.displayName })
+            }</span>
+        </Button>,
+      )
+    }
     <div className='level mt-4 text-sm'>
       <Link
         to={getUrlWithDestination(UrlTree.forgotPassword, destination)}

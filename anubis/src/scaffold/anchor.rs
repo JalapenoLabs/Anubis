@@ -76,12 +76,6 @@ pub const PAGE_IMPORTS: &str = "🐺 anubis:page-imports";
 /// `frontend/src/components/AppShell.tsx`: navigation entries.
 pub const NAV: &str = "🐺 anubis:nav";
 
-/// The sign-in page: the url helpers a provider button calls.
-pub const OAUTH_IMPORTS: &str = "🐺 anubis:oauth-imports";
-
-/// The sign-in page: one button per OAuth provider.
-pub const OAUTH_PROVIDERS: &str = "🐺 anubis:oauth-providers";
-
 /// `frontend/src/i18n.ts`: per-model locale imports.
 pub const LOCALE_IMPORTS: &str = "🐺 anubis:locale-imports";
 

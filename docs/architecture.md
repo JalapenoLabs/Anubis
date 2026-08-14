@@ -20,7 +20,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Passwords | argon2id | |
 | Abuse limits | In-process GCRA, per client and per email recipient | Budgets on the auth endpoints, answering `429` with `Retry-After`. Bounded memory, no Redis, and therefore per instance. See [api.md](api.md#rate-limiting) |
 | Secrets at rest | AES-256-GCM (`aes-gcm`, pure Rust) | For secrets the app must read back, such as TOTP seeds; everything else is hashed. Keyed by `ANUBIS_SECRET_KEY` (base64, 32 bytes), required in production, with a public development fallback that warns at startup |
-| OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; providers are added via `anubis scaffold oauth <provider>` and two environment variables. See [api.md](api.md#oauth-sign-in) |
+| OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; a provider is enabled by two environment variables, and the sign-in page renders whichever `GET /auth/oauth/providers` reports. `anubis scaffold oauth <provider>` prints that setup and writes nothing. See [api.md](api.md#oauth-sign-in) |
 | Outgoing email | SMTP via `lettre` (tokio + rustls, no native TLS) | One `Mailer` service with log, test, and SMTP backends, selected by `SMTP_URL`. See [email.md](email.md) |
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
@@ -51,7 +51,7 @@ Rotating without that cost needs a dual-key read path: a second variable holding
 | Data fetching | ky + SWR |
 | Forms | react-hook-form + zod resolvers |
 | i18n | i18next, per-model locale files emitted by the scaffolder |
-| Unit tests | Vitest |
+| Unit and component tests | Vitest, with Testing Library over happy-dom. See [testing.md](testing.md#frontend-tests) |
 | E2E tests | Playwright |
 
 Route guards preserve where the user was headed. When the auth guard turns a signed-out visitor away, it sends them to `/sign-in?next=<path>`, and the guest guard returns them to that path the moment a session exists. The destination rides in the query string because the flow that needs it most, an invitation link opened from an email, is a cold page load that router state would not survive. Every destination passes through `sanitizeDestination` in the app's `urls.ts`, which accepts root-relative paths only, so the parameter cannot become an open redirect.
@@ -60,7 +60,7 @@ Route guards preserve where the user was headed. When the auth guard turns a sig
 
 One Rust crate, one npm package, one monorepo.
 
-- `anubis/` is a single Cargo package. It is both the framework library and the `anubis` CLI binary (`cargo install anubis` provides the CLI). Optional functionality (billing, webhooks) lives behind additive cargo features, all enabled by default.
+- `anubis/` is a single Cargo package. It is both the framework library and the `anubis` CLI binary (`cargo install anubis` provides the CLI). It declares no cargo features: webhooks, jobs, realtime, and billing are all part of the library, and each one costs nothing until an application mounts it. Features are reserved for the day a subsystem carries a dependency an application should be able to refuse; every feature would otherwise be an additive one that is always on.
 - `frontend/` is a single npm package (`@jalapenolabs/anubis`). It ships the app shell (nav, breadcrumbs, team switcher, settings pages), the field component library, the auth pages, and the generated-client runtime. Tree shaking keeps consuming apps lean.
 - `starter/` is the template that `anubis new <name>` stamps out. It is deliberately thin: config, composition, and the application's own domain code. Framework behavior lives in the crate and the npm package so upgrades are version bumps, not template merges. The starter doubles as the host app that keeps the scaffolding templates compiling in CI.
 - `docs/` holds one document per decision category.
@@ -92,7 +92,7 @@ SPA_DIR=starter/frontend/dist cargo run -p anubis-starter
 
 The assets mount as the router's fallback, so the API keeps precedence without a route list: every path a mounted router claims is answered by that router, and everything else resolves to the SPA. Files under `assets/` carry content hashes, so they are served with a one-year `immutable` `Cache-Control`; `index.html`, which names them, is served with `no-cache`, so a deploy is live on the next page load. Any other path serves `index.html` too, which is what makes a cold load of a client-side route work.
 
-Paths under the framework's own prefixes (`/api`, `/auth`, `/developers`, `/realtime`, `/tenancy`, `/users`) are the exception: an unmatched path there answers the API's JSON `404` rather than the SPA, because HTML with a `200` turns a routing mistake into a parse error far from its cause. Applications reserve their own prefixes the same way; the starter reserves `/account`.
+Paths under the framework's own prefixes (`/api`, `/auth`, `/billing`, `/developers`, `/realtime`, `/tenancy`, `/users`) are the exception: an unmatched path there answers the API's JSON `404` rather than the SPA, because HTML with a `200` turns a routing mistake into a parse error far from its cause. Applications reserve their own prefixes the same way; the starter reserves `/account`.
 
 Leaving `SPA_DIR` unset serves the API alone, which is both the development default (Vite owns the browser there) and a supported production shape for a frontend hosted on a CDN. Production logs a warning when it is unset. When it is set, the directory is validated at startup, so a deploy that shipped without a build fails immediately instead of at the first page load.
 
@@ -104,4 +104,4 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)) and both halves of webhooks (see [webhooks.md](webhooks.md)).
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)) and both halves of webhooks (see [webhooks.md](webhooks.md)). Billing's foundation ships: plans in configuration, the Stripe client, subscriptions on the organization, and the checkout and portal endpoints (see [billing.md](billing.md)); the subscription lifecycle and limit enforcement follow.

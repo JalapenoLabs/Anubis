@@ -146,11 +146,9 @@ async fn change_password(
     Json(body): Json<ChangePasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_password(&body.new_password)?;
-    verify_password_or_reject(&user, body.current_password).await?;
+    verify_password_or_reject(&state.hasher, &user, body.current_password).await?;
 
-    let password_hash = password::hash(body.new_password)
-        .await
-        .map_err(log_internal)?;
+    let password_hash = state.hasher.hash(body.new_password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     diesel::update(users::table.find(user.id))
@@ -183,7 +181,7 @@ async fn request_email_change(
     Json(body): Json<EmailChangeRequestBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let new_email = validate_email(&body.new_email)?;
-    verify_password_or_reject(&user, body.password).await?;
+    verify_password_or_reject(&state.hasher, &user, body.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
@@ -365,7 +363,7 @@ async fn delete_account(
     jar: CookieJar,
     Json(body): Json<DeleteAccountBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    verify_password_or_reject(&user, body.password).await?;
+    verify_password_or_reject(&state.hasher, &user, body.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     connection
@@ -385,10 +383,12 @@ async fn delete_account(
 }
 
 /// Verifies the user's password, rejecting with a uniform 401 on mismatch.
-async fn verify_password_or_reject(user: &User, candidate: String) -> Result<(), ApiError> {
-    let matched = password::verify(candidate, user.password_hash.clone())
-        .await
-        .map_err(log_internal)?;
+async fn verify_password_or_reject(
+    hasher: &password::Hasher,
+    user: &User,
+    candidate: String,
+) -> Result<(), ApiError> {
+    let matched = hasher.verify(candidate, user.password_hash.clone()).await?;
     if matched {
         Ok(())
     } else {

@@ -23,8 +23,10 @@
 //!   plans a whole `scaffold model` run.
 //! - [`JoinScaffold`] plans a `scaffold join` run: the join table, model, and
 //!   endpoints two existing models need before an association can reach them.
-//! - [`OauthScaffold`] plans a `scaffold oauth` run: the sign-in button one
-//!   provider adds, and the string it renders.
+//! - [`OauthScaffold`] plans a `scaffold oauth` run, which writes no file: a
+//!   provider is enabled by its credentials and the sign-in page renders the
+//!   providers the backend reports, so all it computes is the redirect URI
+//!   that provider's console needs.
 //! - [`WebhookScaffold`] plans a `scaffold webhook` run: the table, endpoint,
 //!   and processing job one third party's events are received through.
 //!

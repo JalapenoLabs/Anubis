@@ -11,11 +11,12 @@
 //! shutdown, comes from the one call to [`anubis::server::serve`]. See
 //! `docs/server.md`.
 
+use anubis::billing::PlanSet;
 use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::{db, server, telemetry};
 use anubis_starter::{
-    APP_MIGRATIONS, ROLES_YML, account_router, api_v1_router, openapi, register_jobs,
+    APP_MIGRATIONS, BILLING_YML, ROLES_YML, account_router, api_v1_router, openapi, register_jobs,
     webhooks_router,
 };
 use axum::Router;
@@ -50,6 +51,16 @@ async fn main() {
     tracing::info!(
         roles.count = roles.role_keys().count(),
         "role definitions loaded: {{roles.count}} roles",
+    );
+
+    // Same discipline as roles: a bad billing.yml edit stops the boot rather
+    // than a customer's checkout.
+    let plans = PlanSet::from_yaml(BILLING_YML).expect("config/billing.yml is invalid");
+    tracing::info!(
+        billing.plan.count = plans.plans().len(),
+        billing.plan.free = plans.free().key(),
+        "subscription plans loaded: {{billing.plan.count}} plans, free plan \
+         {{billing.plan.free}}",
     );
 
     let database = config
@@ -90,6 +101,13 @@ async fn main() {
         .nest(
             "/tenancy",
             anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+        )
+        // The plan an organization is on, and the two Stripe redirects that
+        // change it. Without STRIPE_SECRET_KEY the read still answers and the
+        // writes answer 503; see docs/billing.md.
+        .nest(
+            "/billing",
+            anubis::billing::router(pool.clone(), roles.clone(), plans, &config),
         )
         .nest(
             "/developers",

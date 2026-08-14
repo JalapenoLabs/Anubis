@@ -36,7 +36,7 @@ use crate::auth::model::UserResponse;
 use crate::auth::routes::AuthState;
 use crate::auth::secret_box::{self, SecretKey};
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{CurrentUser, password, token, totp, user_token};
+use crate::auth::{CurrentUser, token, totp, user_token};
 use crate::http::ApiError;
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::{user_mfa, user_recovery_codes, users};
@@ -207,9 +207,10 @@ async fn disable(
     CurrentUser(user): CurrentUser,
     Json(body): Json<PasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let matched = password::verify(body.password, user.password_hash.clone())
-        .await
-        .map_err(log_internal)?;
+    let matched = state
+        .hasher
+        .verify(body.password, user.password_hash.clone())
+        .await?;
     if !matched {
         return Err(ApiError::unauthorized("Your password was incorrect."));
     }

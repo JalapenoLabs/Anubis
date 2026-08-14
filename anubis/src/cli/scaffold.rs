@@ -40,18 +40,6 @@ const ROLE_GRANTS: [(&str, &str); 2] = [
 /// The Rust edition the framework and every stamped application build on.
 const EDITION: &str = "2024";
 
-/// The page `scaffold oauth` adds a provider button to.
-const SIGN_IN_PAGE: &str = "frontend/src/pages/auth/SignInPage.tsx";
-
-/// The application's own strings, as opposed to a model's locale file.
-const BASE_LOCALE: &str = "frontend/src/locales/en-US.json";
-
-/// The object inside it holding the sign-in providers' button text.
-const LOCALE_OAUTH: &str = "oauth";
-
-/// The url helper every provider button calls, imported once.
-const OAUTH_URL_IMPORT: &str = "getOauthStartUrl,";
-
 /// Runs `anubis scaffold model <Model> <ParentChain> [field:type ...]`.
 pub(crate) fn model(model: &str, ownership: &str, fields: &[String]) -> ExitCode {
     let scaffold = match ModelScaffold::parse(model, ownership, fields) {
@@ -981,60 +969,19 @@ fn report_field(names: &Names, scaffold: &FieldScaffold, plan: &FieldPlan) {
 
 /// Runs `anubis scaffold oauth <provider>`.
 ///
-/// The command is thin on purpose: the flow, the routes, and the identity
-/// linking are framework behavior that arrives with the dependency, so all
-/// that is generated is the part the application owns. What it cannot do for
-/// you, registering the client with the provider, it prints.
+/// It writes no file, which is the design: the flow, the routes, and the
+/// identity linking are framework behavior that arrives with the dependency,
+/// and the sign-in page renders one button per provider that
+/// `GET /auth/oauth/providers` reports, so a provider is added by configuring
+/// it. What is left is the two steps only a person can take, and this command
+/// spells them out for one provider.
 pub(crate) fn oauth(provider: &str) -> ExitCode {
     let Some(known) = anubis::auth::oauth::find_provider(provider) else {
         return fail(&unknown_provider(provider));
     };
-    let scaffold = OauthScaffold::new(known);
 
-    let root = match app_root() {
-        Ok(root) => root,
-        Err(reason) => return fail(&reason),
-    };
-
-    let plan = match plan_oauth(&root, scaffold) {
-        Ok(plan) => plan,
-        Err(reason) => return fail(&reason),
-    };
-    if let Err(reason) = plan.apply(&root) {
-        return fail(&reason);
-    }
-
-    report_oauth(scaffold, &plan);
+    report_oauth(OauthScaffold::new(known));
     ExitCode::SUCCESS
-}
-
-/// Plans the button and the string one provider adds.
-fn plan_oauth(root: &Path, scaffold: OauthScaffold) -> Result<Plan, String> {
-    // The import is one line whatever the provider, and anchor insertion is
-    // idempotent, so a second provider adds a button and nothing else.
-    let page = update_anchors(
-        root,
-        SIGN_IN_PAGE,
-        &[
-            (anchor::OAUTH_IMPORTS, OAUTH_URL_IMPORT.to_owned()),
-            (anchor::OAUTH_PROVIDERS, scaffold.sign_in_button()),
-        ],
-    )?;
-
-    let relative = PathBuf::from(BASE_LOCALE);
-    let locale = read(&root.join(&relative))?;
-    let updated = insert_json_entries(&locale, LOCALE_OAUTH, &scaffold.locale_entries())
-        .ok_or_else(|| {
-            format!(
-                "{BASE_LOCALE} holds no `{LOCALE_OAUTH}` object under `auth` to add the \
-                 provider's button text to",
-            )
-        })?;
-
-    Ok(Plan {
-        created: Vec::new(),
-        updated: vec![page, (relative, updated)],
-    })
 }
 
 /// The message an unknown provider key earns, with the boundary spelled out.
@@ -1051,23 +998,22 @@ fn unknown_provider(provider: &str) -> String {
     )
 }
 
-/// Prints what changed, and the two steps only the developer can take.
-fn report_oauth(scaffold: OauthScaffold, plan: &Plan) {
+/// Prints the two steps only the developer can take, for one provider.
+fn report_oauth(scaffold: OauthScaffold) {
     let provider = scaffold.provider();
-    println!("added {} sign-in", provider.display_name);
-
-    println!();
-    println!("updated:");
-    for (path, _contents) in &plan.updated {
-        println!("  {}", display(path));
-    }
 
     // The public origin is what the provider redirects the browser back to,
     // so the example is only useful with the value this app actually runs on.
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_error| "<APP_URL>".to_owned());
 
+    println!(
+        "{} sign-in needs no generated code: the sign-in page renders every provider this \
+         backend holds credentials for.",
+        provider.display_name,
+    );
+
     println!();
-    println!("Next steps:");
+    println!("To enable it:");
     println!(
         "  register an OAuth client with {}, with this redirect URI:",
         provider.display_name,
@@ -1076,8 +1022,10 @@ fn report_oauth(scaffold: OauthScaffold, plan: &Plan) {
     println!("  set both credentials in the environment:");
     println!("    {}=...", provider.client_id_var);
     println!("    {}=...", provider.client_secret_var);
+    println!("  restart the backend, and the button appears on the sign-in page");
+    println!();
     println!(
-        "  APP_URL must be the origin the browser sees, since it is the base of that redirect URI"
+        "APP_URL must be the origin the browser sees, since it is the base of that redirect URI."
     );
 }
 

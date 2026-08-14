@@ -80,8 +80,8 @@ enum ScaffoldCommand {
         /// Fields as `name:type`, e.g. `name:text_field`.
         fields: Vec<String>,
     },
-    /// Add an OAuth sign-in provider: the sign-in button, its string, and the
-    /// setup instructions for the provider's console.
+    /// Print how to enable an OAuth sign-in provider: its redirect URI and the
+    /// two variables that turn its button on. Writes no file.
     Oauth {
         /// The provider key, e.g. `google`.
         provider: String,

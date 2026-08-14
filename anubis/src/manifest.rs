@@ -3,8 +3,8 @@
 //! Axum routers cannot be introspected after construction, so the framework
 //! keeps this manifest alongside them: one entry per route the framework
 //! mounts, exactly as a starter application composes them (`/auth`,
-//! `/tenancy`, `/developers`, `/api/v1`, the public avatar route, and the
-//! probes [`crate::server::harden`] adds).
+//! `/tenancy`, `/billing`, `/developers`, `/api/v1`, the public avatar route,
+//! and the probes [`crate::server::harden`] adds).
 //!
 //! Drift cannot happen silently: a unit test in this module composes the real
 //! routers and sends a request for every entry, so a route that is renamed,
@@ -226,8 +226,14 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/auth/passkeys/login/finish",
         area: "auth",
     },
-    // OAuth sign-in over OpenID Connect. Both are browser navigations and
-    // answer with a redirect, to the provider or back to the sign-in page.
+    // OAuth sign-in over OpenID Connect. Discovery answers JSON; the two flow
+    // routes are browser navigations and answer with a redirect, to the
+    // provider or back to the sign-in page.
+    RouteEntry {
+        method: "GET",
+        path: "/auth/oauth/providers",
+        area: "auth",
+    },
     RouteEntry {
         method: "GET",
         path: "/auth/oauth/{provider}/start",
@@ -330,6 +336,22 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/tenancy/teams/{team_id}/invitations/{invitation_id}",
         area: "tenancy",
     },
+    // Billing: the plan an organization is on, and the two Stripe redirects.
+    RouteEntry {
+        method: "GET",
+        path: "/billing/organizations/{organization_id}",
+        area: "billing",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/billing/organizations/{organization_id}/checkout",
+        area: "billing",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/billing/organizations/{organization_id}/portal",
+        area: "billing",
+    },
     // Developer platform applications.
     RouteEntry {
         method: "GET",
@@ -428,6 +450,13 @@ roles:
       Team: [manage]
 ";
 
+    /// The smallest valid plan set: one free plan and nothing sold.
+    const PLANS: &str = "
+plans:
+  - key: free
+    name: Free
+";
+
     /// A placeholder for `{param}` segments; requests only need to route.
     const DUMMY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -459,6 +488,15 @@ roles:
             .nest(
                 "/tenancy",
                 crate::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+            )
+            .nest(
+                "/billing",
+                crate::billing::router(
+                    pool.clone(),
+                    roles.clone(),
+                    crate::billing::PlanSet::from_yaml(PLANS).expect("test plans are valid"),
+                    &config,
+                ),
             )
             .nest(
                 "/developers",

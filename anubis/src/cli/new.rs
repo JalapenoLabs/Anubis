@@ -295,6 +295,7 @@ mod tests {
             "backend/src/scaffolding/mod.rs",
             "backend/migrations/2026-08-11-000001_create_creative_concepts/up.sql",
             "config/roles.yml",
+            "config/billing.yml",
             "compose.yaml",
             "frontend/package.json",
             "frontend/src/main.tsx",
