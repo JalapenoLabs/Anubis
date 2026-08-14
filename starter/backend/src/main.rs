@@ -98,9 +98,18 @@ async fn main() {
             "/auth",
             anubis::auth::router(pool.clone(), mailer.clone(), &config),
         )
+        // The plans reach tenancy because the `seats` limit is enforced where
+        // people join: an invitation past the plan's seats is refused, and a
+        // membership change tells Stripe the new count.
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+            anubis::tenancy::router(
+                pool.clone(),
+                mailer,
+                roles.clone(),
+                Some(plans.clone()),
+                &config,
+            ),
         )
         // The plan an organization is on, and the Stripe redirects that change
         // it. Without STRIPE_SECRET_KEY the read still answers and the writes
@@ -186,13 +195,14 @@ async fn main() {
 /// Builds the background job worker this process runs.
 ///
 /// Registering a job is the whole of the wiring: it subscribes the worker to
-/// that job's queue and captures whatever the handler needs. Two jobs are the
-/// framework's own, outgoing webhook delivery and the Stripe subscription
-/// lifecycle; the application's are registered by `register_jobs`, which is
-/// where a scaffolded job lands.
+/// that job's queue and captures whatever the handler needs. Three jobs are the
+/// framework's own, outgoing webhook delivery and the two halves of the Stripe
+/// subscription lifecycle; the application's are registered by `register_jobs`,
+/// which is where a scaffolded job lands.
 fn worker(pool: &anubis::db::DbPool, plans: PlanSet, config: &AppConfig) -> anubis::jobs::Worker {
     let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), config);
     let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans, config);
+    let seats = reconciler.clone();
 
     let worker = anubis::jobs::Worker::builder(pool.clone())
         .register(move |job: anubis::webhooks::DeliverWebhook| {
@@ -203,6 +213,11 @@ fn worker(pool: &anubis::db::DbPool, plans: PlanSet, config: &AppConfig) -> anub
         .register(move |job: anubis::billing::ProcessStripeEvent| {
             let reconciler = reconciler.clone();
             async move { reconciler.process(job).await }
+        })
+        // And a membership change becomes the seat count Stripe bills for.
+        .register(move |job: anubis::billing::SyncSeats| {
+            let seats = seats.clone();
+            async move { seats.sync_seats(job).await }
         });
 
     register_jobs(pool, worker).build()

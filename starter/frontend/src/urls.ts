@@ -22,6 +22,14 @@ export const UrlTree = {
    */
   teamDevelopers: '/teams/:teamId/developers',
   organizationSettings: '/organizations/:organizationId/settings',
+  /**
+   * The organization's billing screen, and where Stripe returns the browser.
+   *
+   * The backend builds this URL from `APP_URL` before a checkout begins, so the
+   * path is a contract with `anubis::billing` rather than a free choice. Not
+   * `/billing`: the backend reserves that prefix for the API itself.
+   */
+  organizationBilling: '/organizations/:organizationId/billing',
   claimInvitation: '/claim-invitation',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
@@ -125,6 +133,10 @@ export function getTeamDevelopersUrl(teamId: string): string {
 
 export function getOrganizationSettingsUrl(organizationId: string): string {
   return UrlTree.organizationSettings.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationBillingUrl(organizationId: string): string {
+  return UrlTree.organizationBilling.replace(':organizationId', organizationId)
 }
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {

@@ -122,7 +122,7 @@ async fn application(database_url: &str) -> (Router, DbPool, anubis::mail::TestO
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles, &config),
+            anubis::tenancy::router(pool.clone(), mailer, roles, None, &config),
         );
 
     (router, pool, outbox)

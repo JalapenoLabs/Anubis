@@ -256,7 +256,7 @@ async fn an_organization_starts_free_buys_a_plan_and_manages_it() {
     let (status, _headers, body) = send(&billing, "GET", &path, None, Some(&owner)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["plan"]["key"], "free", "body: {body}");
-    assert_eq!(body["plan"]["limits"]["seats"], 1, "body: {body}");
+    assert_eq!(body["plan"]["limits"]["seats"]["count"], 1, "body: {body}");
     assert!(body["subscription"].is_null(), "body: {body}");
     assert_eq!(body["billing_enabled"], true, "body: {body}");
     assert!(unlock(&stripe_log).is_empty(), "nothing was bought yet");
@@ -378,7 +378,7 @@ async fn an_organization_starts_free_buys_a_plan_and_manages_it() {
     let (status, _headers, body) = send(&billing, "GET", &path, None, Some(&owner)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["plan"]["key"], "pro", "body: {body}");
-    assert_eq!(body["plan"]["limits"]["seats"], 25, "body: {body}");
+    assert_eq!(body["plan"]["limits"]["seats"]["count"], 25, "body: {body}");
     assert_eq!(body["subscription"]["status"], "active", "body: {body}");
     assert_eq!(
         body["subscription"]["billing_interval"], "monthly",

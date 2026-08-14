@@ -16,6 +16,18 @@
 #     plan a subscription bought.
 #   - A limit a plan does not name is unlimited. There is no magic number for it.
 #
+# A limit written as a bare number is hard: creating past it is refused with a
+# message naming the plan. Writing it as `count` plus `enforcement: soft` lets
+# the record through and leaves the screen to say the organization is over.
+#
+# `seats` is the one limit the framework enforces itself, when an invitation is
+# created; every other limit names something only this application can count, so
+# the application checks it at its own creation choke points with
+# `anubis::billing::Limits::check`. See docs/billing.md.
+#
+# A price marked `per_seat` is bought with the organization's current seat count
+# and kept current as people join and leave, on Stripe's default proration.
+#
 # `amount` and `currency` are what the pricing page shows, in the currency's
 # smallest unit (2900 is $29.00). Stripe's price is the source of truth for what
 # a customer is actually charged; only `stripe_price_id` is ever sent to Stripe.
@@ -31,9 +43,9 @@
 plans:
   - key: free
     name: Free
-    description: Everything one person needs to try the product.
+    description: Everything a small group needs to try the product.
     limits:
-      seats: 1
+      seats: 3
       creative_concepts: 3
 
   - key: pro
@@ -45,10 +57,14 @@ plans:
         stripe_price_id: price_replace_me_pro_monthly
         amount: 2900
         currency: usd
+        per_seat: true
       yearly:
         stripe_price_id: price_replace_me_pro_yearly
         amount: 29000
         currency: usd
+        per_seat: true
     limits:
       seats: 25
-      # `creative_concepts` is unlimited here, so the plan does not name it.
+      creative_concepts:
+        count: 100
+        enforcement: soft

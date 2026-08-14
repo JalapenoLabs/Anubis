@@ -1,9 +1,10 @@
 //! The `anubis` command line interface.
 //!
 //! The CLI is the front door to the framework: stamping new applications,
-//! scaffolding models and fields, and compiling `roles.yml`. `scaffold model`
-//! generates a model's backend slice today; the rest of the `scaffold` family
-//! lands with milestone M4 (see the repository's `docs/scaffolding.md`).
+//! scaffolding models and fields, and compiling `roles.yml` and `billing.yml`
+//! for the frontend. `scaffold model` generates a model's backend slice today;
+//! the rest of the `scaffold` family lands with milestone M4 (see the
+//! repository's `docs/scaffolding.md`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,6 +44,11 @@ enum Command {
     Roles {
         #[command(subcommand)]
         command: RolesCommand,
+    },
+    /// Compile the application's billing.yml for the frontend.
+    Billing {
+        #[command(subcommand)]
+        command: BillingCommand,
     },
     /// Export the framework's OpenAPI 3.1 document as JSON.
     Openapi {
@@ -149,6 +155,22 @@ enum RolesCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum BillingCommand {
+    /// Generate the TypeScript plan catalog from billing.yml.
+    ///
+    /// The pricing page reads the plans it draws from this file rather than
+    /// from an endpoint, because the plans were compiled into the same build.
+    GenerateTs {
+        /// Path to the billing file.
+        #[arg(long, default_value = "config/billing.yml")]
+        file: PathBuf,
+        /// Path the generated module is written to.
+        #[arg(long, default_value = "frontend/src/plans.generated.ts")]
+        out: PathBuf,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -190,6 +212,9 @@ fn main() -> ExitCode {
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),
+        Command::Billing {
+            command: BillingCommand::GenerateTs { file, out },
+        } => run_billing_generate_ts(&file, &out),
         Command::Openapi { out } => run_openapi(out.as_deref()),
         Command::Client {
             command: ClientCommand::GenerateTs { from, out },
@@ -257,6 +282,32 @@ fn run_openapi(out: Option<&std::path::Path>) -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Renders the plan catalog the frontend's pricing page reads.
+fn run_billing_generate_ts(file: &PathBuf, out: &std::path::Path) -> ExitCode {
+    let yaml = match std::fs::read_to_string(file) {
+        Ok(yaml) => yaml,
+        Err(error) => {
+            eprintln!("error: failed to read {}: {error}", file.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let plans = match anubis::billing::PlanSet::from_yaml(&yaml) {
+        Ok(plans) => plans,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(error) = std::fs::write(out, plans.to_typescript()) {
+        eprintln!("error: failed to write {}: {error}", out.display());
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {}", out.display());
+    ExitCode::SUCCESS
 }
 
 fn run_roles(command: RolesCommand) -> ExitCode {

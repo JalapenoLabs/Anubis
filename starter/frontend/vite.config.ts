@@ -14,6 +14,8 @@ export default defineConfig({
       // The backend serves the API; the SPA stays same-origin in production.
       '/auth': 'http://127.0.0.1:3000',
       '/tenancy': 'http://127.0.0.1:3000',
+      // The organization's plan, and the Stripe redirects that change it.
+      '/billing': 'http://127.0.0.1:3000',
       '/account': 'http://127.0.0.1:3000',
       // Platform applications and outgoing webhook subscriptions.
       '/developers': 'http://127.0.0.1:3000',

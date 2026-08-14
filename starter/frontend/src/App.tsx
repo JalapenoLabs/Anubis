@@ -12,6 +12,7 @@ import { ClaimInvitationPage } from './pages/ClaimInvitationPage'
 import { CreativeConceptPage } from './pages/CreativeConceptPage'
 import { CreativeConceptsPage } from './pages/CreativeConceptsPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { BillingPage } from './pages/billing/BillingPage'
 import { DevelopersPage } from './pages/developers/DevelopersPage'
 import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
 import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
@@ -128,6 +129,14 @@ export function App() {
       element={
         <Workspace>
           <OrganizationSettingsPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationBilling}
+      element={
+        <Workspace>
+          <BillingPage />
         </Workspace>
       }
     />

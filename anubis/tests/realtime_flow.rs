@@ -76,7 +76,7 @@ impl TestServer {
             )
             .nest(
                 "/tenancy",
-                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), None, &config),
             )
             .layer(anubis::guard::layer(pool.clone(), roles));
 

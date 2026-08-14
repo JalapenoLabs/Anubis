@@ -138,7 +138,7 @@ async fn invitations_are_sent_claimed_and_guarded() {
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles, &config),
+            anubis::tenancy::router(pool.clone(), mailer, roles, None, &config),
         );
 
     let run = Uuid::new_v4();

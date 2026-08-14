@@ -10,6 +10,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::net::SocketAddr;
 
+use anubis::billing::PlanSet;
 use anubis::db::DbPool;
 use anubis::mail::TestOutbox;
 use anubis::realtime::Channels;
@@ -75,6 +76,22 @@ impl Harness {
     /// Panics when the database is unreachable or the test config, which is
     /// this file's own, does not parse.
     pub async fn boot(database: &TestDatabase) -> Self {
+        Self::boot_with(database, None).await
+    }
+
+    /// Composes the same routers with an application's plans in force.
+    ///
+    /// The difference the plans make is the `seats` limit: an invitation past
+    /// it is refused. A suite that is not about limits boots without them, the
+    /// way an application with no `config/billing.yml` runs.
+    ///
+    /// # Panics
+    /// Panics for the same reasons [`Harness::boot`] does.
+    pub async fn boot_with_plans(database: &TestDatabase, plans: PlanSet) -> Self {
+        Self::boot_with(database, Some(plans)).await
+    }
+
+    async fn boot_with(database: &TestDatabase, plans: Option<PlanSet>) -> Self {
         let pool = database.pool().await;
 
         let config = Self::config();
@@ -89,7 +106,7 @@ impl Harness {
             )
             .nest(
                 "/tenancy",
-                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), plans, &config),
             )
             .nest(
                 "/developers",

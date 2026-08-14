@@ -203,6 +203,83 @@ export type ClaimedInvitation = {
   } | null
 }
 
+/** How a plan behaves at one of its limits. */
+export type BillingEnforcement = 'hard' | 'soft'
+
+/** What a plan allows of one metered thing. An absent limit is unlimited. */
+export type BillingPlanLimit = {
+  count: number
+  enforcement: BillingEnforcement
+}
+
+/** What one billing interval of a plan costs. */
+export type BillingPlanPrice = {
+  stripePriceId: string
+  /** In the currency's smallest unit: 2900 is $29.00. */
+  amount: number
+  /** Lowercase ISO 4217, as Stripe writes it. */
+  currency: string
+  /** True when the price is charged per seat rather than per organization. */
+  perSeat: boolean
+}
+
+/**
+ * A plan as the API reports it, which is the plan in force.
+ *
+ * The pricing grid reads `plans.generated.ts` instead, because the catalog is
+ * configuration compiled into the same build rather than something to fetch.
+ * This is the one plan an organization is on right now.
+ */
+export type BillingPlan = {
+  key: string
+  name: string
+  description: string | null
+  highlighted: boolean
+  /** Keyed by interval: `monthly`, `yearly`. */
+  prices: Record<string, BillingPlanPrice>
+  /** Keyed by the application's own vocabulary: `seats`, `projects`. */
+  limits: Record<string, BillingPlanLimit>
+}
+
+/**
+ * The organization's subscription, mirroring Stripe's own record.
+ *
+ * `status` is Stripe's vocabulary verbatim: `trialing`, `active`, `past_due`,
+ * `canceled`, and the rest. `past_due` still grants access, because Stripe is
+ * still retrying the card.
+ */
+export type BillingSubscription = {
+  id: string
+  organizationId: string
+  planKey: string
+  stripeSubscriptionId: string
+  status: string
+  /** `monthly` or `yearly`. */
+  interval: string
+  /** Seats bought, which is the line item's quantity. */
+  quantity: number
+  currentPeriodEnd: string | null
+  cancelAtPeriodEnd: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+/** What a billing screen renders: the plan, the subscription, and the seats. */
+export type BillingOverview = {
+  plan: BillingPlan
+  /** Absent on the free plan, which is the absence of a subscription. */
+  subscription: BillingSubscription | null
+  /** False when this deployment has no Stripe key, so nothing can be bought. */
+  billingEnabled: boolean
+  /** People who can reach the organization, claimed and invited alike. */
+  seatsUsed: number
+}
+
+export type BillingCheckoutRequest = {
+  planKey: string
+  interval: string
+}
+
 /** Raw wire shape; the backend serializes snake_case fields. */
 export type WireUser = {
   id: string

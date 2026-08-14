@@ -345,5 +345,57 @@
         }
       }
     }
+  },
+  "billing": {
+    "navLink": "Billing",
+    "title": "Billing",
+    "subtitle": "The plan {{organization}} is on, and what it includes.",
+    "cardTitle": "Billing",
+    "cardSubtitle": "The plan this organization is on, its seats, and the way to change it.",
+    "cardAction": "Manage billing",
+    "currentPlanTitle": "Current plan: {{plan}}",
+    "freeSubtitle": "Everything an organization gets without a subscription.",
+    "noSubscription": "No subscription",
+    "seatsLabel": "Seats",
+    "seatsOfLimit": "{{used}} of {{allowed}} in use",
+    "seatsUnlimited": "{{used}} in use",
+    "overSeats": "This organization is over the seats its plan includes. Upgrade, or remove someone.",
+    "renewsLabel": "Renews",
+    "accessEndsLabel": "Access ends",
+    "cancelAtPeriodEnd": "This subscription is set to end when the current period does. Restart it in the billing portal.",
+    "pastDueWarning": "A payment failed and is being retried. Update the card in the billing portal to keep access.",
+    "managePortal": "Manage billing",
+    "refresh": "Refresh from Stripe",
+    "plansTitle": "Plans",
+    "plansSubtitle": "Choose a plan to start a checkout. Changing an existing subscription happens in the billing portal.",
+    "plansReadOnly": "An organization admin, or anyone holding the billing role, can change the plan.",
+    "currentBadge": "Current plan",
+    "highlightedBadge": "Most popular",
+    "chooseAction": "Choose",
+    "freePrice": "Free",
+    "limitLine": "{{count}} {{limit}}",
+    "softLimitSuffix": "(soft limit)",
+    "per": {
+      "monthly": "per month",
+      "yearly": "per year"
+    },
+    "perSeat": {
+      "monthly": "per seat, per month",
+      "yearly": "per seat, per year"
+    },
+    "checkoutSuccess": "Thanks! Stripe is setting the subscription up. It appears here within a moment of the payment clearing.",
+    "checkoutCanceled": "Checkout was cancelled. Nothing has changed.",
+    "disabledTitle": "Billing is not configured",
+    "disabledBody": "This deployment has no Stripe key, so every organization is on the {{plan}} plan and nothing can be bought. Set STRIPE_SECRET_KEY to turn billing on.",
+    "statuses": {
+      "trialing": "Trial",
+      "active": "Active",
+      "past_due": "Payment failed",
+      "canceled": "Cancelled",
+      "unpaid": "Unpaid",
+      "paused": "Paused",
+      "incomplete": "Incomplete",
+      "incomplete_expired": "Expired"
+    }
   }
 }

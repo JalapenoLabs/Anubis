@@ -2,9 +2,9 @@
 #
 # It holds both ends to the same bar: the Rust workspace is formatted, linted,
 # and tested against a real Postgres, the frontend is typechecked, linted,
-# tested, and built, and the two generated files are regenerated and compared,
-# so a roles or API change that was never regenerated fails here instead of in
-# review. This file is yours; relax or extend it freely.
+# tested, and built, and the three generated files are regenerated and
+# compared, so a roles, billing, or API change that was never regenerated fails
+# here instead of in review. This file is yours; relax or extend it freely.
 name: CI
 
 on:
@@ -67,6 +67,14 @@ jobs:
             --file config/roles.yml \
             --out frontend/src/roles.generated.ts
           git diff --exit-code frontend/src/roles.generated.ts
+
+      # The generated TypeScript plan catalog must match billing.yml.
+      - name: Plans drift check
+        run: |
+          anubis billing generate-ts \
+            --file config/billing.yml \
+            --out frontend/src/plans.generated.ts
+          git diff --exit-code frontend/src/plans.generated.ts
 
       # The generated TypeScript client must match the OpenAPI document this
       # application merges, so the application binary exports it and the CLI

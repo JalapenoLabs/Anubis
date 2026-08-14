@@ -10,6 +10,9 @@
 //! - **Reconciliation**, the repair path. [`Reconciler::reconcile`] reads an
 //!   organization's subscriptions out of Stripe and converges the local rows
 //!   with what it finds, which is how a missed event stops mattering.
+//! - **Seat synchronization**, the outbound path. [`SyncSeats`] runs through
+//!   [`Reconciler::sync_seats`] after a membership changes, tells Stripe the
+//!   new quantity of a per-seat price, and writes back what Stripe answers.
 //!
 //! # Reading rather than trusting
 //!
@@ -50,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::event::StripeBillingEvent;
+use super::limits;
 use super::model::{Subscription, SubscriptionStatus};
 use super::plans::{Interval, PlanSet};
 use super::stripe::{self, CompletedCheckout};
@@ -110,6 +114,25 @@ impl Job for ProcessStripeEvent {
     /// Namespaced, because a `KIND` is data shared with every row already
     /// enqueued and an application's own job must never collide with it.
     const KIND: &'static str = "anubis.billing.stripe_event";
+    const QUEUE: &'static str = QUEUE;
+}
+
+/// The background job that tells Stripe how many seats an organization uses.
+///
+/// Queued by [`crate::billing::Limits::queue_seat_sync`] whenever a membership
+/// changes, and only when some plan sells a per-seat price. The payload is the
+/// organization and nothing else: the seat count is read when the job runs, so
+/// a burst of invitations converges on one number rather than replaying every
+/// intermediate one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncSeats {
+    /// The organization whose membership changed.
+    pub organization_id: Uuid,
+}
+
+impl Job for SyncSeats {
+    /// Namespaced, for the same reason [`ProcessStripeEvent`] is.
+    const KIND: &'static str = "anubis.billing.sync_seats";
     const QUEUE: &'static str = QUEUE;
 }
 
@@ -175,6 +198,102 @@ impl Reconciler {
                 Err(failure.into())
             }
         }
+    }
+
+    /// Bills an organization for the seats it is actually using.
+    ///
+    /// Runs [`SyncSeats`], and does nothing at all unless every condition for a
+    /// per-seat charge holds: billing configured, a subscription that grants
+    /// access, and a price its plan sells per seat. The quantity is read back
+    /// from Stripe and written into the projection, so the row a screen renders
+    /// agrees with the invoice the customer will get.
+    ///
+    /// Proration is Stripe's default, `create_prorations`: a seat added
+    /// mid-period is charged for the part of the period it exists, and a seat
+    /// removed earns a credit against the next invoice. That is the behavior
+    /// customers expect from per-seat billing, and it is the account's own
+    /// setting to change rather than this framework's.
+    ///
+    /// # Errors
+    /// Returns the failure so the queue retries it. Running twice is harmless:
+    /// a quantity already correct sends nothing.
+    pub async fn sync_seats(&self, job: SyncSeats) -> Result<(), BoxError> {
+        let Some(stripe) = self.stripe.as_ref() else {
+            // Billing is off, so there is no subscription to bill against. Not
+            // a failure: the membership change itself succeeded.
+            return Ok(());
+        };
+        let mut connection = self.pool.get().await?;
+
+        let Some(held) =
+            Subscription::current_for_organization(&mut connection, job.organization_id)
+                .await?
+                .filter(Subscription::grants_access)
+        else {
+            return Ok(());
+        };
+        if !self.charges_per_seat(&held) {
+            return Ok(());
+        }
+
+        // At least one: Stripe refuses a quantity of zero, and an organization
+        // whose last member just left still holds the subscription they bought.
+        let seats = limits::seats_used(&mut connection, job.organization_id)
+            .await?
+            .max(1);
+        if seats == i64::from(held.quantity) {
+            return Ok(());
+        }
+
+        let current = stripe
+            .retrieve_subscription(&held.stripe_subscription_id)
+            .await?;
+        let item_id = current.item_id().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Data,
+                format!(
+                    "Stripe subscription {} has no line item to set a quantity on",
+                    held.stripe_subscription_id,
+                ),
+            )
+        })?;
+
+        let updated = stripe
+            .update_subscription_quantity(&held.stripe_subscription_id, item_id, seats)
+            .await?;
+
+        tracing::info!(
+            organization.id = %job.organization_id,
+            billing.subscription.id = updated.id,
+            billing.seats.previous = held.quantity,
+            billing.seats.current = seats,
+            "seats on {{billing.subscription.id}} moved from {{billing.seats.previous}} to \
+             {{billing.seats.current}}",
+        );
+
+        // Written from Stripe's answer, stamped now, exactly as reconciliation
+        // is: this read Stripe directly and is at least as current as anything
+        // in flight.
+        let origin = Origin {
+            organization_id: Some(job.organization_id),
+            metadata: None,
+        };
+        self.converge(&mut connection, &updated, &origin, Utc::now())
+            .await?;
+
+        Ok(())
+    }
+
+    /// Whether the subscription's own price is charged per seat.
+    ///
+    /// Read from the plan the row names rather than from Stripe, because that
+    /// is the same file the checkout bought from and the events keep current.
+    fn charges_per_seat(&self, held: &Subscription) -> bool {
+        self.plans
+            .find(&held.plan_key)
+            .zip(Interval::parse(&held.billing_interval))
+            .and_then(|(plan, interval)| plan.price(interval))
+            .is_some_and(super::plans::Price::is_per_seat)
     }
 
     /// Converges an organization's subscriptions with Stripe's own record.

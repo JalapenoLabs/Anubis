@@ -243,6 +243,11 @@ async fn delete_team(
     if deleted == 0 {
         return Err(ApiError::not_found());
     }
+    // The team's memberships went with it, and some of those people may have
+    // held a seat nowhere else.
+    state
+        .queue_seat_sync(&mut connection, member.organization.id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -287,6 +292,9 @@ async fn remove_organization_member(
                 )
                 .await?;
             }
+            state
+                .queue_seat_sync(transaction, member.organization.id)
+                .await?;
             Ok(())
         })
         .await?;
@@ -320,6 +328,9 @@ async fn leave_organization(
                 require_organization_keeps_an_admin(transaction, member.organization.id, "leave")
                     .await?;
             }
+            state
+                .queue_seat_sync(transaction, member.organization.id)
+                .await?;
             Ok(())
         })
         .await?;
@@ -425,6 +436,9 @@ async fn remove_member(
             if stepped_down(&target, &[]) {
                 require_team_keeps_an_admin(transaction, member.team.id, "remove them").await?;
             }
+            state
+                .queue_seat_sync(transaction, member.team.organization_id)
+                .await?;
             Ok(())
         })
         .await?;
@@ -453,6 +467,9 @@ async fn leave_team(
             if stepped_down(&leaving, &[]) {
                 require_team_keeps_an_admin(transaction, member.team.id, "leave").await?;
             }
+            state
+                .queue_seat_sync(transaction, member.team.organization_id)
+                .await?;
             Ok(())
         })
         .await?;
@@ -481,6 +498,10 @@ async fn revoke_team_invitation(
     .ok_or_else(ApiError::not_found)?;
 
     discard_pending_membership(&mut connection, pending_membership).await?;
+    // An invitation holds a seat until it is claimed or taken back.
+    state
+        .queue_seat_sync(&mut connection, member.team.organization_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -509,6 +530,9 @@ async fn revoke_organization_invitation(
     .ok_or_else(ApiError::not_found)?;
 
     discard_pending_membership(&mut connection, pending_membership).await?;
+    state
+        .queue_seat_sync(&mut connection, member.organization.id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -599,8 +623,10 @@ async fn lock_team(connection: &mut AsyncPgConnection, team_id: Uuid) -> Result<
 
 /// Locks an organization for the length of the caller's transaction.
 ///
-/// The organization half of [`lock_team`], for the same reason.
-async fn lock_organization(
+/// The organization half of [`lock_team`], for the same reason. Invitation
+/// creation takes it too, so the seats limit is counted under the same order
+/// the membership rules are.
+pub(super) async fn lock_organization(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
 ) -> Result<(), ApiError> {

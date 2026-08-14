@@ -20,9 +20,22 @@
 //!         stripe_price_id: price_1QpbQSKKAAAAAAAAAAAAAAAA
 //!         amount: 2900
 //!         currency: usd
+//!         per_seat: true
 //!     limits:
 //!       seats: 25
+//!       projects:
+//!         count: 100
+//!         enforcement: soft
 //! ```
+//!
+//! # Limits are hard unless they say otherwise
+//!
+//! A limit written as a bare number is [`Enforcement::Hard`]: the creation past
+//! it is refused. Writing it as a mapping opts into [`Enforcement::Soft`],
+//! which lets the record through and leaves the screen to say so. Both
+//! spellings mean the same count, so the terse one stays the common case and
+//! the verbose one is only paid for where the choice is being made. See
+//! [`crate::billing::Limits`], which is what enforces them.
 //!
 //! # The free plan
 //!
@@ -51,7 +64,8 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// How often a price recurs.
 ///
@@ -120,6 +134,128 @@ impl Display for Interval {
     }
 }
 
+/// What a plan does when an organization reaches one of its limits.
+///
+/// The vocabulary is Bullet Train's, and so is the behavior: a hard limit
+/// refuses the creation, a soft limit allows it and leaves the screen to warn.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Enforcement {
+    /// Creating past the limit is refused. The default.
+    #[default]
+    Hard,
+    /// Creating past the limit is allowed, and reported as over.
+    Soft,
+}
+
+impl Enforcement {
+    /// The word used in `billing.yml`, in the API, and in generated TypeScript.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+        }
+    }
+}
+
+impl Display for Enforcement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a plan allows of one metered thing, and what happens at the ceiling.
+///
+/// Written in `billing.yml` either as a bare count, which is hard, or as a
+/// mapping that names the enforcement:
+///
+/// ```yaml
+/// limits:
+///   seats: 25
+///   projects:
+///     count: 100
+///     enforcement: soft
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Limit {
+    count: i64,
+    enforcement: Enforcement,
+}
+
+impl Limit {
+    /// How many of the thing the plan allows.
+    #[must_use]
+    pub fn count(self) -> i64 {
+        self.count
+    }
+
+    /// Whether reaching the count refuses the next one or merely reports it.
+    #[must_use]
+    pub fn enforcement(self) -> Enforcement {
+        self.enforcement
+    }
+
+    /// Whether reaching the count refuses the next one.
+    #[must_use]
+    pub fn is_hard(self) -> bool {
+        self.enforcement == Enforcement::Hard
+    }
+}
+
+/// The mapping spelling of a limit, which is the one that names enforcement.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetailedLimit {
+    count: i64,
+    #[serde(default)]
+    enforcement: Enforcement,
+}
+
+impl<'de> Deserialize<'de> for Limit {
+    /// Reads either spelling, so the common case stays one number.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LimitVisitor)
+    }
+}
+
+struct LimitVisitor;
+
+#[expect(
+    clippy::renamed_function_params,
+    reason = "`count` says what the number is; serde's own parameter name is `v`"
+)]
+impl<'de> Visitor<'de> for LimitVisitor {
+    type Value = Limit;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a count, or a mapping of `count` and `enforcement`")
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, count: i64) -> Result<Limit, E> {
+        Ok(Limit {
+            count,
+            enforcement: Enforcement::Hard,
+        })
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, count: u64) -> Result<Limit, E> {
+        let count = i64::try_from(count)
+            .map_err(|_overflow| E::custom(format!("{count} is larger than a limit can be")))?;
+        self.visit_i64(count)
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Limit, M::Error> {
+        let detailed = DetailedLimit::deserialize(MapAccessDeserializer::new(map))?;
+        Ok(Limit {
+            count: detailed.count,
+            enforcement: detailed.enforcement,
+        })
+    }
+}
+
 /// One price of one plan: what Stripe charges, and what the page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +263,8 @@ pub struct Price {
     stripe_price_id: String,
     amount: i64,
     currency: String,
+    #[serde(default)]
+    per_seat: bool,
 }
 
 impl Price {
@@ -150,6 +288,17 @@ impl Price {
     pub fn currency(&self) -> &str {
         &self.currency
     }
+
+    /// Whether the amount is charged per seat rather than per organization.
+    ///
+    /// A per-seat price is bought with the organization's current seat count as
+    /// the line item's quantity, and [`crate::billing::SyncSeats`] keeps that
+    /// quantity current as people join and leave. The amount above is still
+    /// what one seat costs, which is what a pricing page shows.
+    #[must_use]
+    pub fn is_per_seat(&self) -> bool {
+        self.per_seat
+    }
 }
 
 /// One plan an application sells.
@@ -165,7 +314,7 @@ pub struct Plan {
     #[serde(default)]
     prices: BTreeMap<Interval, Price>,
     #[serde(default)]
-    limits: BTreeMap<String, i64>,
+    limits: BTreeMap<String, Limit>,
 }
 
 impl Plan {
@@ -207,7 +356,7 @@ impl Plan {
 
     /// Every limit this plan grants, keyed by the application's own vocabulary.
     #[must_use]
-    pub fn limits(&self) -> &BTreeMap<String, i64> {
+    pub fn limits(&self) -> &BTreeMap<String, Limit> {
         &self.limits
     }
 
@@ -217,7 +366,7 @@ impl Plan {
     /// rather than a magic number, because "unlimited" written as `-1` is a
     /// value every caller has to remember to special-case.
     #[must_use]
-    pub fn limit(&self, name: &str) -> Option<i64> {
+    pub fn limit(&self, name: &str) -> Option<Limit> {
         self.limits.get(name).copied()
     }
 
@@ -225,6 +374,12 @@ impl Plan {
     #[must_use]
     pub fn is_free(&self) -> bool {
         self.prices.is_empty()
+    }
+
+    /// Whether any of this plan's prices is charged per seat.
+    #[must_use]
+    pub fn sells_per_seat(&self) -> bool {
+        self.prices.values().any(Price::is_per_seat)
     }
 }
 
@@ -345,6 +500,27 @@ impl PlanSet {
         &self.plans[self.free]
     }
 
+    /// Renders the plan catalog as the frontend's generated TypeScript module.
+    ///
+    /// The output of `anubis billing generate-ts`, and deterministic, so CI
+    /// regenerates it and fails on a plain diff. See
+    /// [`crate::roles::RoleSet::to_typescript`], which is the same discipline
+    /// for permissions.
+    #[must_use]
+    pub fn to_typescript(&self) -> String {
+        super::typescript::render(self)
+    }
+
+    /// Whether any plan sells a per-seat price.
+    ///
+    /// The switch behind seat synchronization: an application whose prices are
+    /// all flat never queues a [`crate::billing::SyncSeats`] job, because there
+    /// is no quantity at Stripe for a membership change to move.
+    #[must_use]
+    pub fn sells_per_seat(&self) -> bool {
+        self.plans.iter().any(Plan::sells_per_seat)
+    }
+
     /// The plan and interval a Stripe price belongs to.
     ///
     /// This is how an incoming subscription event resolves the plan it bought:
@@ -398,7 +574,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
         }
     }
 
-    for (name, count) in &plan.limits {
+    for (name, limit) in &plan.limits {
         if !is_config_key(name) {
             return Err(Error::new(format!(
                 "plan {:?} names limit {name:?}: limit names are lowercase letters, digits, and \
@@ -406,11 +582,11 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
                 plan.key,
             )));
         }
-        if *count < 0 {
+        if limit.count < 0 {
             return Err(Error::new(format!(
-                "plan {:?} limits {name:?} to {count}: a limit cannot be negative, and a limit \
+                "plan {:?} limits {name:?} to {}: a limit cannot be negative, and a limit \
                  the plan does not name is unlimited",
-                plan.key,
+                plan.key, limit.count,
             )));
         }
     }
@@ -461,7 +637,7 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Interval, PlanSet};
+    use super::{Enforcement, Interval, PlanSet};
 
     const BASELINE: &str = "
 plans:
@@ -479,12 +655,16 @@ plans:
         stripe_price_id: price_pro_monthly
         amount: 2900
         currency: usd
+        per_seat: true
       yearly:
         stripe_price_id: price_pro_yearly
         amount: 29000
         currency: usd
     limits:
       seats: 25
+      projects:
+        count: 100
+        enforcement: soft
 ";
 
     #[test]
@@ -498,7 +678,13 @@ plans:
         assert_eq!(free.key(), "free");
         assert!(free.is_free());
         assert_eq!(free.description(), Some("Everything one person needs."));
-        assert_eq!(free.limit("projects"), Some(3));
+        assert_eq!(free.limit("projects").map(super::Limit::count), Some(3));
+        assert!(
+            free.limit("projects")
+                .expect("free limits projects")
+                .is_hard(),
+            "a limit written as a bare count is hard",
+        );
         assert_eq!(
             free.limit("webhooks"),
             None,
@@ -512,9 +698,70 @@ plans:
         assert_eq!(monthly.stripe_price_id(), "price_pro_monthly");
         assert_eq!(monthly.amount(), 2900);
         assert_eq!(monthly.currency(), "usd");
-        assert_eq!(pro.limit("seats"), Some(25));
+        assert_eq!(pro.limit("seats").map(super::Limit::count), Some(25));
 
         assert!(plans.find("enterprise").is_none());
+    }
+
+    #[test]
+    fn a_limit_is_hard_unless_the_mapping_says_soft() {
+        let plans = PlanSet::from_yaml(BASELINE).expect("the baseline must parse");
+        let pro = plans.find("pro").expect("pro must be defined");
+
+        let projects = pro.limit("projects").expect("pro limits projects");
+        assert_eq!(projects.count(), 100);
+        assert_eq!(projects.enforcement(), Enforcement::Soft);
+        assert!(!projects.is_hard(), "a soft limit lets the record through");
+
+        let seats = pro.limit("seats").expect("pro limits seats");
+        assert_eq!(seats.enforcement(), Enforcement::Hard);
+        assert_eq!(Enforcement::default(), Enforcement::Hard);
+    }
+
+    #[test]
+    fn per_seat_is_a_property_of_one_price() {
+        let plans = PlanSet::from_yaml(BASELINE).expect("the baseline must parse");
+        let pro = plans.find("pro").expect("pro must be defined");
+
+        assert!(
+            pro.price(Interval::Monthly)
+                .expect("pro sells monthly")
+                .is_per_seat(),
+        );
+        assert!(
+            !pro.price(Interval::Yearly)
+                .expect("pro sells yearly")
+                .is_per_seat(),
+            "a price says nothing about its plan's other prices",
+        );
+        assert!(pro.sells_per_seat());
+        assert!(plans.sells_per_seat());
+        assert!(
+            !plans.free().sells_per_seat(),
+            "the free plan sells nothing"
+        );
+    }
+
+    #[test]
+    fn a_flat_priced_application_sells_no_seats() {
+        const FLAT: &str = "
+plans:
+  - key: free
+    name: Free
+  - key: pro
+    name: Pro
+    prices:
+      monthly:
+        stripe_price_id: price_pro_monthly
+        amount: 2900
+        currency: usd
+";
+        let plans = PlanSet::from_yaml(FLAT).expect("the flat plans must parse");
+
+        assert!(
+            !plans.sells_per_seat(),
+            "nothing queues a seat sync when no price is per seat",
+        );
     }
 
     #[test]
@@ -693,5 +940,40 @@ plans:
         PlanSet::from_yaml("not yaml: [").expect_err("malformed yaml is rejected");
         PlanSet::from_yaml("plans:\n  - key: free\n    name: Free\n    typo: 1\n")
             .expect_err("unknown fields are rejected");
+    }
+
+    #[test]
+    fn a_limit_mapping_is_read_strictly() {
+        const MISSPELLED_FIELD: &str = "
+plans:
+  - key: free
+    name: Free
+    limits:
+      seats:
+        count: 3
+        enforcment: soft
+";
+        const UNKNOWN_ENFORCEMENT: &str = "
+plans:
+  - key: free
+    name: Free
+    limits:
+      seats:
+        count: 3
+        enforcement: advisory
+";
+        const NO_COUNT: &str = "
+plans:
+  - key: free
+    name: Free
+    limits:
+      seats:
+        enforcement: soft
+";
+
+        for yaml in [MISSPELLED_FIELD, UNKNOWN_ENFORCEMENT, NO_COUNT] {
+            let error = PlanSet::from_yaml(yaml).expect_err("must be rejected");
+            assert!(error.to_string().contains("does not parse"), "got: {error}");
+        }
     }
 }

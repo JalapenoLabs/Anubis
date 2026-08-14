@@ -146,7 +146,7 @@ async fn guards_enforce_membership_and_permissions() {
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+            anubis::tenancy::router(pool.clone(), mailer, roles.clone(), None, &config),
         )
         .route("/teams/{team_id}/probe", get(team_probe))
         .route(

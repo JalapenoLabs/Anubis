@@ -459,7 +459,7 @@ async fn stripes_events_write_the_subscription_and_keep_it_current() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["plan"]["key"], "pro", "body: {body}");
-    assert_eq!(body["plan"]["limits"]["seats"], 25, "body: {body}");
+    assert_eq!(body["plan"]["limits"]["seats"]["count"], 25, "body: {body}");
 
     // 2. The customer changes plan in the portal. The event's own body is
     //    deliberately stale here, and what lands is what Stripe answers with.

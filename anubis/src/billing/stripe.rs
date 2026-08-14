@@ -2,11 +2,11 @@
 //!
 //! Anubis talks to Stripe over its REST API directly, with [`Client`], rather
 //! than through a generated SDK. The reasoning is in `docs/billing.md`, and it
-//! comes down to surface area: the whole integration is three calls today and
-//! five when subscription events land, every one of them a form-encoded POST
-//! answering flat JSON. The framework already carries a `reqwest` client built
-//! on rustls for outgoing webhooks, so this module adds no dependency, no
-//! second TLS stack, and no compile time worth measuring.
+//! comes down to surface area: the whole integration is six calls, four
+//! form-encoded POSTs and two reads, every one of them answering flat JSON.
+//! The framework already carries a `reqwest` client built on rustls for
+//! outgoing webhooks, so this module adds no dependency, no second TLS stack,
+//! and no compile time worth measuring.
 //!
 //! # What is here
 //!
@@ -15,6 +15,7 @@
 //! | [`Client::create_customer`] | `POST /v1/customers` | The first checkout an organization starts |
 //! | [`Client::create_checkout_session`] | `POST /v1/checkout/sessions` | Starting a subscription |
 //! | [`Client::create_portal_session`] | `POST /v1/billing_portal/sessions` | Managing an existing one |
+//! | [`Client::update_subscription_quantity`] | `POST /v1/subscriptions/{id}` | Billing a per-seat price for the seats in use |
 //! | [`Client::retrieve_subscription`] | `GET /v1/subscriptions/{id}` | Reading current state when an event arrives |
 //! | [`Client::list_subscriptions`] | `GET /v1/subscriptions` | Reconciling an organization against Stripe |
 //!
@@ -194,6 +195,36 @@ impl Client {
         // and a path segment is never a place to paste unescaped input.
         let path = format!("/v1/subscriptions/{}", encode_path_segment(id));
         self.get(&path, &[]).await
+    }
+
+    /// Sets how many seats a subscription's single line item bills for.
+    ///
+    /// Stripe carries the quantity on the item rather than on the subscription,
+    /// so the item's id has to be named; [`Subscription::item_id`] is where it
+    /// comes from. Nothing about proration is sent, which leaves Stripe's own
+    /// default of `create_prorations`: a seat added mid-period is charged for
+    /// the rest of that period, and a seat removed earns a credit. Changing
+    /// that is an account-level decision rather than a framework one.
+    ///
+    /// Answers with the subscription as it stands afterwards, which is what the
+    /// caller writes into the projection.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    pub async fn update_subscription_quantity(
+        &self,
+        subscription_id: &str,
+        item_id: &str,
+        quantity: i64,
+    ) -> Result<Subscription, Error> {
+        let mut form = Form::new();
+        form.text("items[0][id]", item_id);
+        form.text("items[0][quantity]", &quantity.to_string());
+
+        // Percent-encoded for the same reason `retrieve_subscription` does it:
+        // the id reaches here from a stored row that an event body wrote.
+        let path = format!("/v1/subscriptions/{}", encode_path_segment(subscription_id));
+        self.post(&path, &form, None).await
     }
 
     /// Lists every subscription a customer has ever held, newest first.
@@ -430,6 +461,16 @@ impl Subscription {
             .map(|recurring| recurring.interval.as_str())
     }
 
+    /// The line item a quantity is set on, when the subscription has one.
+    ///
+    /// The framework bills a single price, so the first item is the item.
+    #[must_use]
+    pub fn item_id(&self) -> Option<&str> {
+        self.first_item()
+            .map(|item| item.id.as_str())
+            .filter(|id| !id.is_empty())
+    }
+
     /// Seats bought, which is the line item's quantity.
     #[must_use]
     pub fn quantity(&self) -> i64 {
@@ -467,9 +508,12 @@ struct SubscriptionItems {
     data: Vec<SubscriptionItem>,
 }
 
-/// One line item: a price, how many of it, and when its period ends.
+/// One line item: its id, a price, how many of it, and when its period ends.
 #[derive(Debug, Clone, Deserialize)]
 struct SubscriptionItem {
+    /// Stripe's id for the item, e.g. `si_1Q...`, which a quantity update names.
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     price: Option<ItemPrice>,
     #[serde(default)]
@@ -747,6 +791,7 @@ mod tests {
         )
         .expect("Stripe's subscription must parse");
 
+        assert_eq!(on_the_item.item_id(), Some("si_1"));
         assert_eq!(on_the_item.price_id(), Some("price_pro_monthly"));
         assert_eq!(on_the_item.recurring_interval(), Some("month"));
         assert_eq!(on_the_item.quantity(), 3);
@@ -767,6 +812,11 @@ mod tests {
 
         assert_eq!(on_the_subscription.period_end(), Some(1_750_000_000));
         assert_eq!(on_the_subscription.recurring_interval(), None);
+        assert_eq!(
+            on_the_subscription.item_id(),
+            None,
+            "an item with no id is no place to set a quantity",
+        );
         assert_eq!(
             on_the_subscription.quantity(),
             1,

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::CurrentUser;
 use crate::auth::routes::validate_email;
+use crate::billing::{Limits, PlanSet};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::{OrganizationMember, TeamMember};
@@ -38,13 +39,26 @@ use crate::schema::{
 };
 use crate::tenancy::bootstrap::{DEFAULT_ROLE, holds_admin};
 use crate::tenancy::invitation::{self, InvitationTarget};
+use crate::tenancy::management::lock_organization;
 use crate::tenancy::model::{Organization, Team};
 
 /// Returns the tenancy routes for an application to mount.
 ///
 /// The role set validates requested role keys; the mailer delivers
 /// invitation email; the config supplies the public base URL for links.
-pub fn router(pool: DbPool, mailer: Mailer, roles: RoleSet, config: &AppConfig) -> Router {
+///
+/// `plans` is the application's validated `config/billing.yml`, and it is what
+/// makes the `seats` limit real: an invitation past it is refused, and a
+/// membership change tells Stripe the new seat count. An application without a
+/// billing file passes `None`, which is the honest reading of "no plans, no
+/// limits" rather than a plan of unlimited everything invented here.
+pub fn router(
+    pool: DbPool,
+    mailer: Mailer,
+    roles: RoleSet,
+    plans: Option<PlanSet>,
+    config: &AppConfig,
+) -> Router {
     Router::new()
         .route("/memberships", get(list_memberships))
         .route("/teams/{team_id}/members", get(list_team_members))
@@ -59,6 +73,7 @@ pub fn router(pool: DbPool, mailer: Mailer, roles: RoleSet, config: &AppConfig) 
             pool: pool.clone(),
             mailer,
             roles: roles.clone(),
+            limits: plans.map(Limits::new),
             app_url: config.app_url.clone(),
         })
         // CurrentUser and the guard extractors resolve their dependencies
@@ -71,7 +86,37 @@ pub(super) struct TenancyState {
     pub(super) pool: DbPool,
     pub(super) roles: RoleSet,
     mailer: Mailer,
+    /// Absent for an application with no `config/billing.yml`.
+    limits: Option<Limits>,
     app_url: String,
+}
+
+impl TenancyState {
+    /// Queues the seat-count update Stripe needs after a membership change.
+    ///
+    /// One method rather than a condition at each call site, because every
+    /// place a person joins or leaves has to do this and none of them should
+    /// have to know whether the application sells seats. The insert rides
+    /// `connection`, so a change that rolls back queues nothing.
+    ///
+    /// # Errors
+    /// Returns a `500` when the insert fails, which rolls the caller's
+    /// transaction back: a membership change Stripe is never told about would
+    /// bill the wrong number until the next one.
+    pub(super) async fn queue_seat_sync(
+        &self,
+        connection: &mut AsyncPgConnection,
+        organization_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let Some(limits) = self.limits.as_ref() else {
+            return Ok(());
+        };
+
+        limits
+            .queue_seat_sync(connection, organization_id)
+            .await
+            .map_err(log_internal)
+    }
 }
 
 #[derive(Deserialize)]
@@ -346,6 +391,12 @@ async fn list_organization_members(
 /// The address goes through the same [`validate_email`] registration uses,
 /// which is what keeps a line break out of the recipient of an email this
 /// handler is about to send, and out of the row it stores.
+///
+/// This is where the plan's `seats` limit is enforced, because it is the one
+/// place a person joins an organization. The check runs inside the transaction
+/// that creates the invitation, after locking the organization, so two admins
+/// inviting at the same instant are ordered rather than each seeing room for
+/// one more and both committing.
 async fn create_invitation(
     State(state): State<TenancyState>,
     CurrentUser(inviter): CurrentUser,
@@ -358,13 +409,28 @@ async fn create_invitation(
 
     let (target, target_name) =
         resolve_invitation_target(&mut connection, &body, inviter.id).await?;
+    let organization_id = match target {
+        InvitationTarget::Organization(organization_id)
+        | InvitationTarget::Team {
+            organization_id, ..
+        } => organization_id,
+    };
 
     let token = connection
-        .transaction(async |transaction| {
-            invitation::create(transaction, target, &email, &granted_roles, inviter.id).await
+        .transaction::<String, ApiError, _>(async |transaction| {
+            lock_organization(transaction, organization_id).await?;
+            if let Some(limits) = state.limits.as_ref() {
+                limits
+                    .check_seats(transaction, organization_id, &email)
+                    .await?;
+            }
+
+            let token =
+                invitation::create(transaction, target, &email, &granted_roles, inviter.id).await?;
+            state.queue_seat_sync(transaction, organization_id).await?;
+            Ok(token)
         })
-        .await
-        .map_err(log_internal)?;
+        .await?;
 
     let link = format!("{}/claim-invitation?token={token}", state.app_url);
     let mail = Email {
@@ -415,11 +481,19 @@ async fn claim_invitation(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
     let claimed = connection
-        .transaction(async |transaction| {
-            invitation::claim(transaction, &body.token, claimant.id).await
+        .transaction::<_, ApiError, _>(async |transaction| {
+            let claimed = invitation::claim(transaction, &body.token, claimant.id).await?;
+            // A claim turns an invited seat into a held one. The count rarely
+            // moves, since both spellings of the same person hold one seat, but
+            // the claimant may already have been counted under another address.
+            if let Some(claimed) = claimed.as_ref() {
+                state
+                    .queue_seat_sync(transaction, claimed.organization_id)
+                    .await?;
+            }
+            Ok(claimed)
         })
-        .await
-        .map_err(log_internal)?
+        .await?
         .ok_or_else(|| {
             ApiError::validation("That invitation is invalid or has expired. Ask for a new one.")
         })?;

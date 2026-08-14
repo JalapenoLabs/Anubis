@@ -2,6 +2,13 @@
 
 export type {
   AuthSession,
+  BillingCheckoutRequest,
+  BillingEnforcement,
+  BillingOverview,
+  BillingPlan,
+  BillingPlanLimit,
+  BillingPlanPrice,
+  BillingSubscription,
   ChangePasswordRequest,
   ClaimedInvitation,
   CreatedOrganization,

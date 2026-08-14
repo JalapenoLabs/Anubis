@@ -18,6 +18,7 @@
     reason = "every narrative compiles this module and uses the part it needs"
 )]
 
+use anubis::billing::PlanSet;
 use anubis::mail::TestOutbox;
 use anubis::roles::RoleSet;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE};
@@ -61,7 +62,15 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+            anubis::tenancy::router(
+                pool.clone(),
+                mailer,
+                roles.clone(),
+                // The application's own plans, so a narrative meets the same
+                // seats limit a customer does.
+                Some(PlanSet::from_yaml(anubis_starter::BILLING_YML).expect("billing.yml parses")),
+                &config,
+            ),
         )
         // Where a narrative mints the bearer token its `/api/v1` half uses,
         // and where it subscribes the webhook endpoint whose deliveries prove

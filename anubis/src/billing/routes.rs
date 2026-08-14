@@ -4,7 +4,7 @@
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
-//! | `GET /organizations/{organization_id}` | org member | The plan in force, and the subscription behind it |
+//! | `GET /organizations/{organization_id}` | org member | The plan in force, the subscription behind it, and the seats in use |
 //! | `POST /organizations/{organization_id}/checkout` | org admin or billing | Opens a Stripe Checkout session and answers with its URL |
 //! | `POST /organizations/{organization_id}/portal` | org admin or billing | Opens the Stripe customer portal and answers with its URL |
 //! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscription this application shows |
@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::lifecycle::{self, Reconciler};
+use super::limits;
 use super::model::Subscription;
 use super::plans::{Interval, Plan, PlanSet};
 use super::stripe::{self, NewCheckoutSession, NewCustomer, NewPortalSession};
@@ -59,12 +60,12 @@ fn return_url(app_url: &str, organization_id: Uuid) -> String {
     format!("{app_url}/organizations/{organization_id}/billing")
 }
 
-/// Seats bought by a checkout the framework starts.
+/// Seats bought by a checkout of a price that is not sold per seat.
 ///
-/// Flat pricing until per-seat billing lands: the column and Stripe's line
-/// item both carry a quantity already, so the change is the number that goes
-/// here and the event that keeps it current.
-const DEFAULT_QUANTITY: i64 = 1;
+/// One organization, one line item. A price marked `per_seat` in
+/// `billing.yml` is bought with the organization's seat count instead, and
+/// [`super::SyncSeats`] keeps that number current afterwards.
+const FLAT_QUANTITY: i64 = 1;
 
 /// Returns the billing routes for an application to mount under `/billing`.
 ///
@@ -117,6 +118,13 @@ struct BillingBody {
     subscription: Option<Subscription>,
     /// Whether this deployment can start a checkout at all.
     billing_enabled: bool,
+    /// People who can reach the organization, claimed and invited alike.
+    ///
+    /// The one usage figure the framework can count for every application,
+    /// because memberships are its own table. A screen reads it against the
+    /// plan's `seats` limit to show how full the organization is; an
+    /// application's own limits are counted by the application.
+    seats_used: i64,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +152,9 @@ async fn show(
         Subscription::current_for_organization(&mut connection, member.organization.id)
             .await
             .map_err(log_internal)?;
+    let seats_used = limits::seats_used(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?;
 
     // Cloned into the response: a plan is a handful of strings, and the
     // alternative is a body that borrows the request's own state.
@@ -153,6 +164,7 @@ async fn show(
         plan,
         subscription,
         billing_enabled: state.stripe.is_some(),
+        seats_used,
     }))
 }
 
@@ -202,6 +214,18 @@ async fn start_checkout(
         ));
     }
 
+    // A per-seat price bills for the people the organization already has, so
+    // the first invoice is right without waiting for a membership to change.
+    // Never zero: Stripe refuses a line item of none, and the buyer is one.
+    let quantity = if price.is_per_seat() {
+        limits::seats_used(&mut connection, member.organization.id)
+            .await
+            .map_err(log_internal)?
+            .max(1)
+    } else {
+        FLAT_QUANTITY
+    };
+
     let customer_id = ensure_customer(&mut connection, stripe, &member).await?;
     let landing = return_url(&state.app_url, member.organization.id);
     // `{CHECKOUT_SESSION_ID}` is a placeholder Stripe substitutes on the way
@@ -214,7 +238,7 @@ async fn start_checkout(
         .create_checkout_session(NewCheckoutSession {
             customer_id: &customer_id,
             price_id: price.stripe_price_id(),
-            quantity: DEFAULT_QUANTITY,
+            quantity,
             success_url: &success_url,
             cancel_url: &cancel_url,
             organization_id: member.organization.id,
@@ -227,9 +251,10 @@ async fn start_checkout(
         organization.id = %member.organization.id,
         billing.plan = plan.key(),
         billing.interval = interval.as_str(),
+        billing.quantity = quantity,
         billing.checkout.session = %session.id,
         "checkout {{billing.checkout.session}} opened for {{billing.plan}} \
-         ({{billing.interval}})",
+         ({{billing.interval}}), {{billing.quantity}} seats",
     );
 
     Ok(Json(RedirectBody { url: session.url }))
@@ -257,10 +282,16 @@ async fn reconcile(
         .map_err(|error| reconcile_failed(&error))?;
     let plan = resolve_plan(&state.plans, subscription.as_ref()).clone();
 
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let seats_used = limits::seats_used(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?;
+
     Ok(Json(BillingBody {
         plan,
         subscription,
         billing_enabled: true,
+        seats_used,
     }))
 }
 

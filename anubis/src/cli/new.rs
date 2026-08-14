@@ -401,6 +401,29 @@ mod tests {
         }
     }
 
+    /// Every file the framework regenerates in CI is regenerated in a stamped
+    /// application's CI too. Without this, a new generator would be checked for
+    /// drift here and nowhere in the applications that ship it.
+    #[test]
+    fn the_ci_overlay_checks_every_generated_file_for_drift() {
+        let template = overlay(".github/workflows/ci.yml");
+
+        for (command, generated) in [
+            ("roles generate-ts", "frontend/src/roles.generated.ts"),
+            ("billing generate-ts", "frontend/src/plans.generated.ts"),
+            ("client generate-ts", "frontend/src/api/v1.generated.ts"),
+        ] {
+            assert!(
+                template.contains(command),
+                "the CI overlay never runs `anubis {command}`",
+            );
+            assert!(
+                template.contains(&format!("git diff --exit-code {generated}")),
+                "the CI overlay never compares {generated}",
+            );
+        }
+    }
+
     /// The repository's own `.env.example` is the template, unstamped: the
     /// monorepo runs the starter, so the two files describe the same app and
     /// must not drift.

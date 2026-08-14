@@ -17,5 +17,15 @@ import { RoleGrants } from './roles.generated'
  */
 export const ADMIN_ROLE: RoleKey = 'admin'
 
+/**
+ * The role that may spend the organization's money without administering it.
+ *
+ * The billing endpoints accept it or `admin`, so the screen offers checkout,
+ * the customer portal, and reconciliation to exactly those two. Typed as a
+ * `RoleKey` for the same reason `ADMIN_ROLE` is: drop it from
+ * `config/roles.yml` and this stops compiling.
+ */
+export const BILLING_ROLE: RoleKey = 'billing'
+
 /** Every role a member can hold, as the generated module lists them. */
 export const ROLE_OPTIONS = Object.keys(RoleGrants)

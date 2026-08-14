@@ -500,7 +500,13 @@ plans:
             )
             .nest(
                 "/tenancy",
-                crate::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
+                crate::tenancy::router(
+                    pool.clone(),
+                    mailer,
+                    roles.clone(),
+                    Some(crate::billing::PlanSet::from_yaml(PLANS).expect("test plans are valid")),
+                    &config,
+                ),
             )
             .nest(
                 "/billing",

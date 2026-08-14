@@ -8,7 +8,8 @@ import { useAnubisApi, useCurrentUser } from '@jalapenolabs/anubis'
 import { useTeamContext } from '../../context/TeamProvider'
 
 // UI
-import { Spinner } from '@heroui/react'
+import { Button, Card, CardBody, Spinner } from '@heroui/react'
+import { Link } from 'react-router'
 import { AppShell } from '../../components/AppShell'
 import { InviteMemberCard } from '../../components/tenancy/InviteMemberCard'
 import { OrganizationDangerZoneCard } from '../../components/tenancy/OrganizationDangerZoneCard'
@@ -18,6 +19,7 @@ import { RenameTenantCard } from '../../components/tenancy/RenameTenantCard'
 
 // Misc
 import { ADMIN_ROLE } from '../../permissions'
+import { getOrganizationBillingUrl } from '../../urls'
 
 /**
  * Administering one organization: its name, its people, and its teams.
@@ -88,6 +90,34 @@ export function OrganizationSettingsPage() {
         await memberships.refresh()
       }}
     />
+    {/* Billing attaches to the organization, so its link belongs here rather
+        than in a team's settings. Every member may open it: the plan explains
+        what the whole organization can do. */}
+    <Card className='relaxed p-2'>
+      <CardBody>
+        <div className='level items-start'>
+          <div>
+            <h3 className='compact text-xl font-semibold'>{
+                t('billing.cardTitle')
+              }</h3>
+            <p className='opacity-70'>{
+                t('billing.cardSubtitle')
+              }</p>
+          </div>
+          <Button
+            as={Link}
+            to={getOrganizationBillingUrl(organization.id)}
+            color='primary'
+            variant='flat'
+            className='shrink-0'
+          >
+            <span>{
+                t('billing.cardAction')
+              }</span>
+          </Button>
+        </div>
+      </CardBody>
+    </Card>
     <OrganizationTeamsCard
       organizationId={organization.id}
       teams={organization.teams}

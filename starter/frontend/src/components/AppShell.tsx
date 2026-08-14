@@ -31,6 +31,7 @@ import { CreateOrganizationModal } from './tenancy/CreateOrganizationModal'
 // Misc
 import {
   UrlTree,
+  getOrganizationBillingUrl,
   getOrganizationSettingsUrl,
   getTeamDevelopersUrl,
   getTeamSettingsUrl,
@@ -52,6 +53,7 @@ type Props = {
 const TENANCY_ACTIONS = {
   teamSettings: 'tenancy:team-settings',
   organizationSettings: 'tenancy:organization-settings',
+  organizationBilling: 'tenancy:organization-billing',
   newOrganization: 'tenancy:new-organization',
 } as const
 
@@ -87,6 +89,15 @@ export function AppShell(props: Props) {
         return
       }
       navigate(getOrganizationSettingsUrl(current.organization.id))
+      return
+    }
+
+    if (action === TENANCY_ACTIONS.organizationBilling) {
+      if (!current) {
+        console.debug('billing chosen with no team selected')
+        return
+      }
+      navigate(getOrganizationBillingUrl(current.organization.id))
       return
     }
 
@@ -126,7 +137,11 @@ export function AppShell(props: Props) {
             disabledKeys={
               current
                 ? []
-                : [ TENANCY_ACTIONS.teamSettings, TENANCY_ACTIONS.organizationSettings ]
+                : [
+                    TENANCY_ACTIONS.teamSettings,
+                    TENANCY_ACTIONS.organizationSettings,
+                    TENANCY_ACTIONS.organizationBilling,
+                  ]
             }
             onAction={onSwitcherAction}
           >
@@ -155,6 +170,9 @@ export function AppShell(props: Props) {
                   }</DropdownItem>
                 <DropdownItem key={TENANCY_ACTIONS.organizationSettings}>{
                     t('organization.settings.navLink')
+                  }</DropdownItem>
+                <DropdownItem key={TENANCY_ACTIONS.organizationBilling}>{
+                    t('billing.navLink')
                   }</DropdownItem>
                 <DropdownItem key={TENANCY_ACTIONS.newOrganization}>{
                     t('organization.create.action')

@@ -6,22 +6,23 @@ CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with
 
 `.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `develop`:
 
-- **Rust job**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, the roles and client drift checks, then `cargo audit`.
+- **Rust job**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, the roles, plans, and client drift checks, then `cargo audit`.
 - **Frontend job**: `yarn install --immutable`, then typecheck, lint, test, build, and `yarn npm audit`.
 
 The Rust job runs two service containers on ephemeral host ports, so concurrent runs on a shared runner never collide: Postgres, which every integration test needs through `DATABASE_URL`, and Redis, which only the realtime fanout test needs through `REDIS_URL`. Tests gate on those variables and skip without them, so a local run needs neither, while CI covers both fanout backends. See [realtime.md](realtime.md).
 
 ## Drift checks
 
-Three files are generated and checked in, so CI regenerates each one and fails on a diff:
+Four files are generated and checked in, so CI regenerates each one and fails on a diff:
 
 | File | Rendered from |
 |---|---|
 | `starter/frontend/src/roles.generated.ts` | `starter/config/roles.yml` |
+| `starter/frontend/src/plans.generated.ts` | `starter/config/billing.yml` |
 | `frontend/src/api/v1.generated.ts` | the framework's OpenAPI document |
 | `starter/frontend/src/api/v1.generated.ts` | the starter's merged OpenAPI document, exported by `cargo run -p anubis-starter -- openapi` |
 
-The third runs the application binary because the document belongs to the application, not to the framework: see [api.md](api.md#application-models).
+The last runs the application binary because the document belongs to the application, not to the framework: see [api.md](api.md#application-models).
 
 ## Dependency audit
 
@@ -36,7 +37,7 @@ Both jobs end with a vulnerability audit: `cargo audit` against RustSec advisori
 - `runs-on: ubuntu-latest`, with `Swatinem/rust-cache` standing in for the warm target dir a self-hosted runner keeps.
 - The drift checks run the `anubis` CLI, installed with `cargo install anubis --git https://github.com/JalapenoLabs/Anubis.git --locked`, because the CLI is a framework binary rather than one of the application's. It becomes `cargo install anubis --version <x>` once the crate is published.
 
-The application's drift checks are the two that belong to it: `frontend/src/roles.generated.ts` from its own `config/roles.yml`, and `frontend/src/api/v1.generated.ts` from the document its binary exports. Its Postgres service is named after the app and takes an ephemeral host port, exactly as the framework's does.
+The application's drift checks are the three that belong to it: `frontend/src/roles.generated.ts` from its own `config/roles.yml`, `frontend/src/plans.generated.ts` from its own `config/billing.yml`, and `frontend/src/api/v1.generated.ts` from the document its binary exports. A test asserts the template runs every generator the framework's own workflow does, so a fourth one cannot be added here and forgotten there. Its Postgres service is named after the app and takes an ephemeral host port, exactly as the framework's does.
 
 A test pins the template's tool versions to this repository's workflow, so bumping Postgres, Rust, Node, or Yarn here reaches every application stamped afterwards.
 

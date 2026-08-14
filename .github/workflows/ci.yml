@@ -67,6 +67,14 @@ jobs:
             --out starter/frontend/src/roles.generated.ts
           git diff --exit-code starter/frontend/src/roles.generated.ts
 
+      # The generated TypeScript plan catalog must match billing.yml.
+      - name: Plans drift check
+        run: |
+          cargo run --quiet --bin anubis -- billing generate-ts \
+            --file starter/config/billing.yml \
+            --out starter/frontend/src/plans.generated.ts
+          git diff --exit-code starter/frontend/src/plans.generated.ts
+
       # The generated TypeScript client must match the OpenAPI document.
       - name: Client drift check
         run: |

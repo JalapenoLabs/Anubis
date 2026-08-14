@@ -144,6 +144,21 @@ Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts
 
 The `/api/v1` handlers answer the same questions with a bearer token instead of a session: `ApiCaller` resolves the token to its team, `load_for_team` walks the chain in one comparison, and `ApiCaller::require` authorizes against the same `RoleSet`. [api.md](api.md#application-models) states what a token's roles are and why.
 
+### Plan limits
+
+A generated `create` handler does **not** check a plan limit, and that is deliberate. Whether a model is metered at all, what the limit is called, and whether it is counted per team or per organization are product decisions; a template that guessed would generate a check nobody asked for and a limit name no `billing.yml` defines.
+
+The helper is one line when the answer is yes, at the top of `insert_record`, before the write it guards:
+
+```rust
+let held = CreativeConcept::count_for_team(connection, team.id).await?;
+limits.check(connection, organization_id, "creative_concepts", held).await?;
+```
+
+`anubis::billing::Limits::check` takes the caller's own connection, so it runs inside the transaction that inserts, and its error converts into `ApiError`: a hard limit answers `409` with a message naming the plan, a soft one returns `Ok` and leaves the screen to warn. The limit name convention is the model's snake-case plural, which is what a scaffolded check will use the day the generator writes one. See [billing.md](billing.md#limits).
+
+`seats` is the exception that is already wired: the framework enforces it itself at invitation creation, because memberships are its own table.
+
 ### Outgoing webhooks
 
 Every generated model publishes its lifecycle. `routes.rs` declares three event types (`<model>.created`, `<model>.updated`, `<model>.destroyed`) and the three shared functions emit them: `insert_record`, `apply_changes`, and `delete_record`. Emission lives in the shared half deliberately, so a record written through the browser and one written through a bearer token produce byte-identical events, and a column `scaffold field` adds reaches subscribers with no second declaration.

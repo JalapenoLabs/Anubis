@@ -19,6 +19,8 @@
 //! - [`StripeBillingEvent`] is one thing Stripe said, stored before anything is
 //!   made of it, and [`Reconciler`] is the only thing that writes the
 //!   projection from it.
+//! - [`Limits`] is what makes a plan's limits mean something: it resolves the
+//!   plan an organization is on and answers whether one more record fits.
 //!
 //! [`router`] serves the organization-scoped endpoints an application mounts
 //! under `/billing`; [`webhook_router`] serves the receiver Stripe posts to,
@@ -37,18 +39,40 @@
 //! 3. [`Reconciler::reconcile`] repairs an organization whose events were
 //!    missed, and is exposed as an endpoint for the day one is.
 //!
-//! Registering the job is three lines on the worker builder, beside the
-//! framework's webhook deliverer:
+//! Registering the two jobs is the whole of the wiring, beside the framework's
+//! webhook deliverer:
 //!
 //! ```ignore
 //! let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans.clone(), &config);
+//! let seats = reconciler.clone();
 //! let worker = anubis::jobs::Worker::builder(pool)
 //!     .register(move |job: anubis::billing::ProcessStripeEvent| {
 //!         let reconciler = reconciler.clone();
 //!         async move { reconciler.process(job).await }
 //!     })
+//!     .register(move |job: anubis::billing::SyncSeats| {
+//!         let seats = seats.clone();
+//!         async move { seats.sync_seats(job).await }
+//!     })
 //!     .build();
 //! ```
+//!
+//! # Limits
+//!
+//! A plan's limits are configuration until something checks them. [`Limits`]
+//! is that check, and the split is Bullet Train's: a hard limit refuses the
+//! creation with `409`, a soft limit lets it through and leaves the screen to
+//! report it. [`SEATS`] is the one limit the framework enforces itself, at
+//! invitation creation, because memberships are its own table; every other
+//! limit names something only the application can count, so the application
+//! calls [`Limits::check`] at its own creation choke points.
+//!
+//! # Per-seat pricing
+//!
+//! A price marked `per_seat` in `billing.yml` is bought with the
+//! organization's current seat count, and [`SyncSeats`] keeps that quantity
+//! current: every membership change queues one, and it tells Stripe the new
+//! number on Stripe's default proration terms.
 //!
 //! # The free plan is the absence of a row
 //!
@@ -77,28 +101,29 @@
 //! production deployment missing either is warned at startup by
 //! [`crate::telemetry::init`].
 //!
-//! # What lands next
-//!
-//! One piece is deliberately not here yet, and `docs/billing.md` states what it
-//! needs: **limit enforcement and the billing UI**. [`Plan::limit`] is read by
-//! nothing yet, and the frontend has no billing screen.
+//! Limits are the exception: they are a product decision rather than a Stripe
+//! one, so the free plan's limits hold whether or not Stripe is configured.
 
 mod event;
 pub mod lifecycle;
+pub mod limits;
 mod model;
 pub mod plans;
 mod routes;
 pub mod stripe;
+mod typescript;
 mod webhook;
 
 #[doc(inline)]
 pub use event::StripeBillingEvent;
 #[doc(inline)]
-pub use lifecycle::{HANDLED_EVENTS, ProcessStripeEvent, QUEUE, Reconciler};
+pub use lifecycle::{HANDLED_EVENTS, ProcessStripeEvent, QUEUE, Reconciler, SyncSeats};
+#[doc(inline)]
+pub use limits::{Limits, SEATS};
 #[doc(inline)]
 pub use model::{Subscription, SubscriptionStatus};
 #[doc(inline)]
-pub use plans::{Interval, Plan, PlanSet, Price};
+pub use plans::{Enforcement, Interval, Limit, Plan, PlanSet, Price};
 #[doc(inline)]
 pub use routes::{BILLING_ROLE, router};
 #[doc(inline)]
