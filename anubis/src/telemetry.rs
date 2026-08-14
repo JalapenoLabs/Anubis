@@ -81,6 +81,23 @@ fn warn_about_risky_defaults(config: &AppConfig) {
         );
     }
 
+    // Billing that takes money without hearing what happened to it is worse
+    // than billing that is switched off: a customer pays, no event is believed,
+    // and the application keeps showing the free plan.
+    if config
+        .stripe
+        .as_ref()
+        .is_some_and(|stripe| stripe.webhook_secret().is_none())
+        && config.environment.is_production()
+    {
+        tracing::warn!(
+            app.environment = %config.environment,
+            "STRIPE_WEBHOOK_SECRET is unset while billing is enabled: the receiver refuses \
+             every event, so a completed checkout will charge the customer and leave this \
+             application on the free plan. (environment: {{app.environment}})",
+        );
+    }
+
     // Deliberately a warning rather than a hard failure: a first deploy that
     // sends no email should not be blocked on mail configuration.
     if config.smtp.is_none() && config.environment.is_production() {

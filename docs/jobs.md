@@ -86,8 +86,9 @@ Both tables are ordinary Postgres tables and are meant to be queried:
 | Job | Queue | What it does |
 |---|---|---|
 | `anubis::webhooks::DeliverWebhook` | `webhooks` | POSTs one signed outgoing webhook delivery, recording the answer on its row |
+| `anubis::billing::ProcessStripeEvent` | `billing` | Turns one stored Stripe event into the organization's subscription row |
 
-Registering it is three lines on the worker builder, and the starter's `main.rs` shows them. It runs on its own queue so a customer endpoint that hangs for ten seconds cannot hold up an application's own work. An application's own jobs are registered beside it, through `register_jobs` in `backend/src/lib.rs`, which is where `anubis scaffold webhook` writes the job that processes a provider's events. [Webhooks](webhooks.md) covers the rest.
+Registering each is three lines on the worker builder, and the starter's `main.rs` shows both. Each runs on its own queue so a customer endpoint that hangs for ten seconds, or Stripe replaying a day of events, cannot hold up an application's own work. An application's own jobs are registered beside it, through `register_jobs` in `backend/src/lib.rs`, which is where `anubis scaffold webhook` writes the job that processes a provider's events. [Webhooks](webhooks.md) covers the rest.
 
 ## Roadmap
 

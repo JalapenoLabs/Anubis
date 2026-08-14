@@ -102,12 +102,20 @@ async fn main() {
             "/tenancy",
             anubis::tenancy::router(pool.clone(), mailer, roles.clone(), &config),
         )
-        // The plan an organization is on, and the two Stripe redirects that
-        // change it. Without STRIPE_SECRET_KEY the read still answers and the
-        // writes answer 503; see docs/billing.md.
+        // The plan an organization is on, and the Stripe redirects that change
+        // it. Without STRIPE_SECRET_KEY the read still answers and the writes
+        // answer 503; see docs/billing.md.
         .nest(
             "/billing",
-            anubis::billing::router(pool.clone(), roles.clone(), plans, &config),
+            anubis::billing::router(pool.clone(), roles.clone(), plans.clone(), &config),
+        )
+        // Stripe's own events, at /webhooks/stripe-billing. Framework-mounted
+        // because the subscription lifecycle is the framework's, and named so
+        // that an application scaffolding its own Stripe receiver keeps
+        // /webhooks/stripe for itself.
+        .nest(
+            "/webhooks",
+            anubis::billing::webhook_router(pool.clone(), &config),
         )
         .nest(
             "/developers",
@@ -137,35 +145,23 @@ async fn main() {
 
     // In production the built frontend ships with the binary: every path the
     // routers above declined resolves to the SPA, so a cold load of a client
-    // route works. `/account` and `/webhooks` join the framework's own prefixes
-    // as places where an unmatched path is a JSON 404 rather than index.html:
-    // a provider posting to a mistyped path deserves an error it can act on,
+    // route works. `/account` joins the framework's own prefixes (`/webhooks`
+    // among them) as a place where an unmatched path is a JSON 404 rather than
+    // index.html: a caller that asked for JSON deserves an error it can act on,
     // not an HTML page and a `200`. Unset SPA_DIR leaves the browser to the
     // Vite dev server, the development default.
     let app = match &config.spa_dir {
         Some(dir) => {
             let assets = anubis::spa::Assets::new(dir)
                 .expect("SPA_DIR must point at a built frontend (yarn build)")
-                .reserve("/account")
-                .reserve("/webhooks");
+                .reserve("/account");
             app.fallback_service(assets.into_service())
         }
         None => app,
     };
 
-    // Background jobs run in this process. Registering a job is the whole of
-    // the wiring: it subscribes the worker to that job's queue and captures
-    // whatever the handler needs. Outgoing webhook delivery is the framework's
-    // own job; the application's own are registered by `register_jobs`, which
-    // is where a scaffolded job lands.
-    let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), &config);
-    let worker = anubis::jobs::Worker::builder(pool.clone()).register(
-        move |job: anubis::webhooks::DeliverWebhook| {
-            let deliverer = deliverer.clone();
-            async move { deliverer.deliver(job).await }
-        },
-    );
-    let worker = register_jobs(&pool, worker).build();
+    // Background jobs run in this process, in a worker built beside this one.
+    let worker = worker(&pool, plans, &config);
 
     let (stop_worker, worker_stops) = tokio::sync::oneshot::channel::<()>();
     let working = tokio::spawn(worker.run(async move {
@@ -185,4 +181,29 @@ async fn main() {
     working
         .await
         .expect("the job worker must shut down cleanly");
+}
+
+/// Builds the background job worker this process runs.
+///
+/// Registering a job is the whole of the wiring: it subscribes the worker to
+/// that job's queue and captures whatever the handler needs. Two jobs are the
+/// framework's own, outgoing webhook delivery and the Stripe subscription
+/// lifecycle; the application's are registered by `register_jobs`, which is
+/// where a scaffolded job lands.
+fn worker(pool: &anubis::db::DbPool, plans: PlanSet, config: &AppConfig) -> anubis::jobs::Worker {
+    let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), config);
+    let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans, config);
+
+    let worker = anubis::jobs::Worker::builder(pool.clone())
+        .register(move |job: anubis::webhooks::DeliverWebhook| {
+            let deliverer = deliverer.clone();
+            async move { deliverer.deliver(job).await }
+        })
+        // Stripe's events become subscription rows here, on their own queue.
+        .register(move |job: anubis::billing::ProcessStripeEvent| {
+            let reconciler = reconciler.clone();
+            async move { reconciler.process(job).await }
+        });
+
+    register_jobs(pool, worker).build()
 }

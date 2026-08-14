@@ -194,7 +194,7 @@ fn billing_router(pool: anubis::db::DbPool, config: &AppConfig) -> Router {
     )
 }
 
-/// Writes one subscription row, the way the next slab's webhook will.
+/// Writes one subscription row, the way Stripe's events do.
 ///
 /// Returns the insert's own result rather than unwrapping it, because two of
 /// its callers are asserting that the database refuses.
@@ -358,8 +358,8 @@ async fn an_organization_starts_free_buys_a_plan_and_manages_it() {
     // 4. Once a subscription exists, the plan it names is the plan in force,
     //    and a second checkout is refused in favor of the portal.
     //
-    //    The row is written here by hand because writing it from Stripe's
-    //    events is the next slab's work; the shape is the one that lands.
+    //    The row is written here by hand to keep this narrative about the
+    //    purchase; `billing_webhooks_flow.rs` is where Stripe's events write it.
     let period_end = Utc::now() + Duration::days(30);
     diesel::insert_into(subscriptions::table)
         .values((

@@ -310,6 +310,25 @@ diesel::table! {
         cancel_at_period_end -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        stripe_event_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Subscription events received from Stripe. See `docs/billing.md`.
+    ///
+    /// Written the moment a signed request arrives and never rewritten, only
+    /// stamped: `processed_at` when its job succeeds, `error` when it fails.
+    stripe_billing_events (id) {
+        id -> Uuid,
+        stripe_event_id -> Text,
+        event_type -> Text,
+        payload -> Jsonb,
+        stripe_created_at -> Nullable<Timestamptz>,
+        received_at -> Timestamptz,
+        processed_at -> Nullable<Timestamptz>,
+        error -> Nullable<Text>,
+        updated_at -> Timestamptz,
     }
 }
 

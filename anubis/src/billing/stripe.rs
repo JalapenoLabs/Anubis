@@ -15,9 +15,13 @@
 //! | [`Client::create_customer`] | `POST /v1/customers` | The first checkout an organization starts |
 //! | [`Client::create_checkout_session`] | `POST /v1/checkout/sessions` | Starting a subscription |
 //! | [`Client::create_portal_session`] | `POST /v1/billing_portal/sessions` | Managing an existing one |
+//! | [`Client::retrieve_subscription`] | `GET /v1/subscriptions/{id}` | Reading current state when an event arrives |
+//! | [`Client::list_subscriptions`] | `GET /v1/subscriptions` | Reconciling an organization against Stripe |
 //!
-//! Everything else about a subscription arrives as an event rather than being
-//! asked for, which is why the client stays this small.
+//! The two reads exist because an event's body is a snapshot of the moment it
+//! was created, and a job may process it minutes later. Stripe's own guidance
+//! is to treat a payload as possibly stale and read the object back, which is
+//! what [`crate::billing::Reconciler`] does; see `docs/billing.md`.
 //!
 //! # Conventions
 //!
@@ -38,7 +42,8 @@
 //! [idempotency]: https://docs.stripe.com/api/idempotent_requests
 
 use std::backtrace::{Backtrace, BacktraceStatus};
-use std::fmt::{self, Debug, Display, Formatter};
+use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Display, Formatter, Write as _};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -62,6 +67,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Long enough for any real API message, short enough that an unexpected body
 /// cannot fill a log line.
 const MAX_MESSAGE_LENGTH: usize = 2_000;
+
+/// How many of a customer's subscriptions one reconciliation reads.
+///
+/// Stripe's own maximum for a list page. An organization that has held more
+/// subscriptions than this has a decade of history and the oldest of them are
+/// long over, so a second page would correct nothing; taking one page keeps
+/// reconciliation a single call.
+const MAX_SUBSCRIPTIONS_LISTED: u8 = 100;
 
 /// A Stripe API client, holding the secret key and the base URL.
 ///
@@ -166,6 +179,46 @@ impl Client {
         self.post("/v1/billing_portal/sessions", &form, None).await
     }
 
+    /// Reads one subscription's current state.
+    ///
+    /// This is how an event is turned into something worth writing down: the
+    /// event says which subscription changed, and this says what it looks like
+    /// now, which is not always what the event's own body said.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    /// A subscription Stripe has never heard of is an API refusal carrying the
+    /// code `resource_missing`.
+    pub async fn retrieve_subscription(&self, id: &str) -> Result<Subscription, Error> {
+        // Percent-encoded because the id reaches this call from an event body,
+        // and a path segment is never a place to paste unescaped input.
+        let path = format!("/v1/subscriptions/{}", encode_path_segment(id));
+        self.get(&path, &[]).await
+    }
+
+    /// Lists every subscription a customer has ever held, newest first.
+    ///
+    /// `status=all` is deliberate: reconciliation has to see the cancelled ones
+    /// too, or a row this application still believes is live would have nothing
+    /// to correct it.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    pub async fn list_subscriptions(&self, customer_id: &str) -> Result<Vec<Subscription>, Error> {
+        let list: List<Subscription> = self
+            .get(
+                "/v1/subscriptions",
+                &[
+                    ("customer", customer_id),
+                    ("status", "all"),
+                    ("limit", &MAX_SUBSCRIPTIONS_LISTED.to_string()),
+                ],
+            )
+            .await?;
+
+        Ok(list.data)
+    }
+
     /// POSTs a form to one Stripe endpoint and parses what comes back.
     ///
     /// The one place the secret key is used, so it is also the one place that
@@ -190,6 +243,30 @@ impl Client {
             request = request.header("Idempotency-Key", key);
         }
 
+        self.send(request, path).await
+    }
+
+    /// GETs one Stripe endpoint with `query` and parses what comes back.
+    async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, Error> {
+        let request = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.secret_key)
+            .query(query);
+
+        self.send(request, path).await
+    }
+
+    /// Sends one prepared request and reads Stripe's answer.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<T, Error> {
         let response = request
             .send()
             .await
@@ -281,6 +358,146 @@ pub struct PortalSession {
     pub url: String,
 }
 
+/// The checkout session as it arrives on `checkout.session.completed`.
+///
+/// A second reading of the same Stripe object as [`CheckoutSession`], because
+/// the two readings want different halves of it: opening a session cares about
+/// the URL to send a browser to, and a completed one cares about what was
+/// bought and for whom.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletedCheckout {
+    /// Stripe's id for the session, e.g. `cs_test_...`.
+    pub id: String,
+    /// The subscription the purchase created, absent for a one-off payment.
+    #[serde(default)]
+    pub subscription: Option<String>,
+    /// The customer that paid, e.g. `cus_1Q...`.
+    #[serde(default)]
+    pub customer: Option<String>,
+    /// What [`NewCheckoutSession`] put on the session: the organization and plan.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// A Stripe subscription, as much of one as the framework reads.
+///
+/// The fields are read through the accessors below rather than directly,
+/// because Stripe has moved some of them between API versions and the accessor
+/// is where that is absorbed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Subscription {
+    /// Stripe's id for the subscription, e.g. `sub_1Q...`.
+    pub id: String,
+    /// Stripe's status vocabulary: `active`, `past_due`, `canceled`, and so on.
+    pub status: String,
+    /// The customer being billed, e.g. `cus_1Q...`.
+    pub customer: String,
+    /// Whether the subscription stops at the end of the paid-for period.
+    #[serde(default)]
+    pub cancel_at_period_end: bool,
+    /// End of the paid-for period, on API versions that carry it here.
+    #[serde(default)]
+    current_period_end: Option<i64>,
+    /// What `subscription_data[metadata]` carried through the checkout.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// The line items, one per price. The framework bills a single price.
+    #[serde(default)]
+    items: SubscriptionItems,
+}
+
+impl Subscription {
+    /// The Stripe price this subscription buys, which names the plan.
+    ///
+    /// `None` for a subscription with no line items, which Stripe does not
+    /// produce but a mock or a future API version might.
+    #[must_use]
+    pub fn price_id(&self) -> Option<&str> {
+        self.first_item()
+            .and_then(|item| item.price.as_ref())
+            .map(|price| price.id.as_str())
+    }
+
+    /// The price's recurrence as Stripe spells it, `month` or `year`.
+    ///
+    /// Read only when a price is not one `config/billing.yml` names, which is
+    /// the one case where the interval cannot come from the plan.
+    #[must_use]
+    pub fn recurring_interval(&self) -> Option<&str> {
+        self.first_item()
+            .and_then(|item| item.price.as_ref())
+            .and_then(|price| price.recurring.as_ref())
+            .map(|recurring| recurring.interval.as_str())
+    }
+
+    /// Seats bought, which is the line item's quantity.
+    #[must_use]
+    pub fn quantity(&self) -> i64 {
+        self.first_item()
+            .and_then(|item| item.quantity)
+            .unwrap_or(1)
+    }
+
+    /// When the paid-for period ends, as Unix seconds.
+    ///
+    /// Stripe moved this field from the subscription onto its items in the
+    /// 2025 API versions, and the framework pins no version, so both places are
+    /// read and whichever the account's version fills in wins.
+    #[must_use]
+    pub fn period_end(&self) -> Option<i64> {
+        self.current_period_end
+            .or_else(|| self.first_item().and_then(|item| item.current_period_end))
+    }
+
+    /// The value Stripe's metadata holds under `name`.
+    #[must_use]
+    pub fn metadata(&self, name: &str) -> Option<&str> {
+        self.metadata.get(name).map(String::as_str)
+    }
+
+    fn first_item(&self) -> Option<&SubscriptionItem> {
+        self.items.data.first()
+    }
+}
+
+/// The line items of a subscription.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SubscriptionItems {
+    #[serde(default)]
+    data: Vec<SubscriptionItem>,
+}
+
+/// One line item: a price, how many of it, and when its period ends.
+#[derive(Debug, Clone, Deserialize)]
+struct SubscriptionItem {
+    #[serde(default)]
+    price: Option<ItemPrice>,
+    #[serde(default)]
+    quantity: Option<i64>,
+    #[serde(default)]
+    current_period_end: Option<i64>,
+}
+
+/// A price on a line item, as much of one as the framework reads.
+#[derive(Debug, Clone, Deserialize)]
+struct ItemPrice {
+    id: String,
+    #[serde(default)]
+    recurring: Option<Recurring>,
+}
+
+/// How often a price recurs, in Stripe's own words.
+#[derive(Debug, Clone, Deserialize)]
+struct Recurring {
+    interval: String,
+}
+
+/// One page of a Stripe list response.
+#[derive(Debug, Clone, Deserialize)]
+struct List<T> {
+    data: Vec<T>,
+}
+
 /// Stripe's error envelope, the one shape every refusal arrives in.
 #[derive(Debug, Deserialize)]
 struct ApiErrorEnvelope {
@@ -291,6 +508,27 @@ struct ApiErrorEnvelope {
 struct ApiErrorBody {
     message: Option<String>,
     code: Option<String>,
+}
+
+/// Percent-encodes one path segment.
+///
+/// Stripe's ids are alphanumeric with underscores, so in practice this returns
+/// what it was given. It exists because the ids reaching [`Client`] come out of
+/// an event body, and a path is never a place to paste unescaped input.
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            // The unreserved set of RFC 3986, which needs no encoding anywhere.
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => {
+                write!(encoded, "%{other:02X}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    encoded
 }
 
 /// Builds an `application/x-www-form-urlencoded` body, Stripe's request format.
@@ -433,7 +671,7 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{API_BASE, Client, Error, Form};
+    use super::{API_BASE, Client, Error, Form, Subscription, encode_path_segment};
     use crate::config::AppConfig;
 
     /// A key shaped like a real one, belonging to nobody.
@@ -491,6 +729,60 @@ mod tests {
         assert_eq!(error.status(), Some(400));
         assert_eq!(error.code(), Some("resource_missing"));
         assert!(error.to_string().contains("price_nope"), "got: {error}");
+    }
+
+    #[test]
+    fn a_subscription_reads_its_price_quantity_and_period_from_either_shape() {
+        // The 2025 shape: the period lives on the line item.
+        let on_the_item: Subscription = serde_json::from_str(
+            r#"{
+                "id": "sub_1", "object": "subscription", "status": "active",
+                "customer": "cus_1", "cancel_at_period_end": false,
+                "metadata": { "organization_id": "9f4a", "plan_key": "pro" },
+                "items": { "object": "list", "data": [{
+                    "id": "si_1", "quantity": 3, "current_period_end": 1760000000,
+                    "price": { "id": "price_pro_monthly", "recurring": { "interval": "month" } }
+                }] }
+            }"#,
+        )
+        .expect("Stripe's subscription must parse");
+
+        assert_eq!(on_the_item.price_id(), Some("price_pro_monthly"));
+        assert_eq!(on_the_item.recurring_interval(), Some("month"));
+        assert_eq!(on_the_item.quantity(), 3);
+        assert_eq!(on_the_item.period_end(), Some(1_760_000_000));
+        assert_eq!(on_the_item.metadata("plan_key"), Some("pro"));
+        assert_eq!(on_the_item.metadata("nothing"), None);
+
+        // The older shape: the period lives on the subscription, and fields the
+        // framework does not read are simply absent.
+        let on_the_subscription: Subscription = serde_json::from_str(
+            r#"{
+                "id": "sub_2", "status": "canceled", "customer": "cus_2",
+                "current_period_end": 1750000000,
+                "items": { "data": [{ "price": { "id": "price_pro_yearly" } }] }
+            }"#,
+        )
+        .expect("the older shape must parse too");
+
+        assert_eq!(on_the_subscription.period_end(), Some(1_750_000_000));
+        assert_eq!(on_the_subscription.recurring_interval(), None);
+        assert_eq!(
+            on_the_subscription.quantity(),
+            1,
+            "a line item without a quantity is one seat",
+        );
+    }
+
+    #[test]
+    fn a_path_segment_carries_no_id_of_its_own_making() {
+        assert_eq!(encode_path_segment("sub_1QpbQS"), "sub_1QpbQS");
+        assert_eq!(
+            encode_path_segment("../customers/cus_1"),
+            "..%2Fcustomers%2Fcus_1",
+            "an id out of an event body cannot climb the path",
+        );
+        assert_eq!(encode_path_segment("a b"), "a%20b");
     }
 
     #[test]

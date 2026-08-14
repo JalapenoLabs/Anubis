@@ -108,8 +108,9 @@ impl WebhookScaffold {
     /// `/webhooks/stripe`, and `SendGrid` gives `/webhooks/send-grid`.
     ///
     /// # Errors
-    /// Returns an error when the name does not parse, or when it already ends
-    /// in `Webhook`, which would generate a `StripeWebhookWebhook`.
+    /// Returns an error when the name does not parse, when it already ends in
+    /// `Webhook`, which would generate a `StripeWebhookWebhook`, or when its
+    /// path is the one the framework's own billing receiver serves.
     pub fn parse(provider: &str) -> Result<Self, ScaffoldError> {
         let provider = Names::parse(provider)?;
         let snake = provider.snake();
@@ -126,7 +127,24 @@ impl WebhookScaffold {
         }
 
         let model = Names::parse(&format!("{}{MODEL_SUFFIX}", provider.pascal()))?;
-        Ok(Self { provider, model })
+        let scaffold = Self { provider, model };
+
+        if scaffold.path() == crate::billing::WEBHOOK_PATH {
+            // The framework mounts its own receiver there for the subscription
+            // lifecycle, and two routers claiming one path panic at boot.
+            // `anubis scaffold webhook Stripe` is still available, and is the
+            // right command for an application's own Stripe events.
+            return Err(ScaffoldError::new(format!(
+                "`{}` would generate {}, which the framework's own billing receiver already \
+                 serves. Scaffold `Stripe` instead: an application's Stripe receiver and the \
+                 framework's subscription lifecycle are separate endpoints with separate \
+                 signing secrets.",
+                scaffold.provider.pascal(),
+                crate::billing::WEBHOOK_PATH,
+            )));
+        }
+
+        Ok(scaffold)
     }
 
     /// The provider's names, e.g. `Stripe`.
@@ -311,5 +329,21 @@ mod tests {
 
         WebhookScaffold::parse("").unwrap_err();
         WebhookScaffold::parse("9lives").unwrap_err();
+    }
+
+    #[test]
+    fn the_frameworks_own_billing_receiver_cannot_be_scaffolded_over() {
+        let error = WebhookScaffold::parse("StripeBilling")
+            .expect_err("the framework already serves that path");
+        assert!(
+            error.message().contains(crate::billing::WEBHOOK_PATH),
+            "the refusal names the path: {}",
+            error.message(),
+        );
+
+        // The provider a person actually reaches for stays available: an
+        // application's own Stripe events are its own endpoint.
+        let scaffold = WebhookScaffold::parse("Stripe").expect("Stripe is still scaffoldable");
+        assert_eq!(scaffold.path(), "/webhooks/stripe");
     }
 }

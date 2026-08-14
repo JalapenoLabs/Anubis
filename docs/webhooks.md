@@ -185,6 +185,8 @@ One command generates a whole receiver for one provider: the table its requests 
 
 The argument is the provider, not the model. `Stripe` gives a `StripeWebhook` model in `backend/src/stripe_webhooks/`, stored in `stripe_webhooks`, received at `/webhooks/stripe`, signed with `STRIPE_WEBHOOK_SECRET`. Write the provider the way it should read in the URL: `github` gives `/webhooks/github`.
 
+**The framework has one receiver of its own**, and it mounts beside these: `POST /webhooks/stripe-billing` takes the Stripe events that keep subscriptions current, because the subscription lifecycle is a framework feature rather than an application's ([billing.md](billing.md)). The paths do not collide, which is the point of the name: an application that scaffolds `Stripe` for its own Connect accounts or one-off payments keeps `/webhooks/stripe`, with its own table, its own job, and its own signing secret. `anubis scaffold webhook StripeBilling` is refused by name, since two routers claiming one path panic at boot.
+
 ### Store, then process
 
 The endpoint does two things and no more: it writes the request down, and it queues a job. Both happen in one transaction, so a stored webhook always has work queued for it and a queued job always has a row to read. Then it answers `200`, and everything the payload means is decided afterwards.
@@ -217,11 +219,11 @@ What ships is the shape they all share: read the signature header, recompute the
 | Stripe | `Stripe-Signature: t=<unix>,v1=<hex>` | `<t>.<body>` |
 | Another Anubis application | `anubis-webhook-signature: v1=<hex>` | `<timestamp>.<body>` |
 
-An Anubis publisher is the one case that needs no work at all: call `anubis::webhooks::signature::verify` instead, and the timestamp window and the multi-scheme header come with it.
+Two of those rows need no work at all. An Anubis publisher is verified with `anubis::webhooks::signature::verify`, and the timestamp window and the multi-scheme header come with it. Stripe is verified with `anubis::webhooks::signature::verify_stripe`, which parses the `t=,v1=` header, MACs `<t>.<body>`, accepts any of several `v1` entries so a secret rotation at Stripe is seamless, and refuses a timestamp more than five minutes from now. It lives here rather than in the billing module because the scheme is a scheme: the framework's own billing receiver calls it, and so should an application's Stripe receiver.
 
 Whatever the scheme, **MAC the raw bytes**. Re-serializing the parsed JSON is free to reorder keys and change spacing, and the signature then never matches. The generated handler verifies before anything parses, for exactly that reason.
 
-The answer is recorded in `verified` rather than used to refuse the request, which is deliberate and is what Bullet Train does. Refusing at the edge throws away the one piece of evidence that explains what happened, and a signature check that is subtly wrong then looks exactly like a provider that never called. Storing it means an operator can read the request, compare it with the provider's own delivery log, and fix the check. What an unverified event is *worth* is a different question, and the job answers it: usually nothing, so it returns an error and the row stays as evidence.
+The answer is recorded in `verified` rather than used to refuse the request, which is deliberate and is what Bullet Train does. (The framework's own billing receiver refuses instead, and stores nothing: it knows Stripe's scheme exactly, so a request that fails is an attacker or a mistyped secret rather than an unfinished function. [billing.md](billing.md) states the trade in full.) Refusing at the edge throws away the one piece of evidence that explains what happened, and a signature check that is subtly wrong then looks exactly like a provider that never called. Storing it means an operator can read the request, compare it with the provider's own delivery log, and fix the check. What an unverified event is *worth* is a different question, and the job answers it: usually nothing, so it returns an error and the row stays as evidence.
 
 A provider with no signing scheme has weaker options, and the generated handler is where they go: an allowlist of source addresses, a secret in a header the provider lets you set, or a secret in the path. All three are worse than an HMAC, and all three beat nothing.
 
@@ -235,7 +237,7 @@ Processing runs on its own `incoming_webhooks` queue, so a provider replaying a 
 
 ### Routing, and why receivers are not rate limited
 
-Receivers mount under `/webhooks`, through the application's own `webhooks_router` in `backend/src/lib.rs`, deliberately outside `/account` so no guard ever asks a provider for a session it does not have. `/webhooks` joins the SPA's reserved prefixes, so a provider posting to a mistyped path gets a JSON `404` it can act on rather than an HTML page and a `200`.
+Receivers mount under `/webhooks`, through the application's own `webhooks_router` in `backend/src/lib.rs`, deliberately outside `/account` so no guard ever asks a provider for a session it does not have. The framework's billing receiver nests under the same prefix from `main.rs`, and `/webhooks` is one of the SPA's reserved prefixes, so a provider posting to a mistyped path gets a JSON `404` it can act on rather than an HTML page and a `200`.
 
 They carry **no rate limit**. The budgets in `anubis::rate_limit` exist to make credential guessing expensive and are sized for humans; webhooks arrive at machine rates and in bursts, so those budgets would refuse real events, and a refused event is what puts an endpoint on a provider's retry schedule and eventually gets it disabled. What bounds the work is its shape instead: one insert per request, over a body the server already caps.
 
@@ -259,4 +261,4 @@ Tracked in GitHub issues under M5:
 - **Retention on both sides**: deliveries and received webhooks accumulate forever today. Pruning belongs with the recurring-schedule work in [jobs.md](jobs.md#roadmap).
 - **A per-endpoint event picker** in the UI, once the application's model catalog is exposed to the frontend; the field takes typed event types today and validates their shape.
 - **A screen for received webhooks**: the table is read through the database today. An operator's view of what arrived, what was verified, and what failed belongs beside the outgoing delivery log.
-- **A provider registry**, the way `anubis scaffold oauth` already has one: a Stripe or GitHub receiver would then arrive with that provider's real header and message shape rather than the generic HMAC default, and `verify_signature` would be a review rather than a task.
+- **A provider registry**, the way `anubis scaffold oauth` already has one: a Stripe or GitHub receiver would then arrive with that provider's real header and message shape rather than the generic HMAC default, and `verify_signature` would be a review rather than a task. Stripe's half of that already exists as `signature::verify_stripe`; what is missing is the scaffolder knowing to call it.

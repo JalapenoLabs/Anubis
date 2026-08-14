@@ -41,6 +41,12 @@
 //! into the message and how the header is spelled; the arithmetic underneath is
 //! the same. [`verify_hmac_sha256`] is that arithmetic on its own, which is
 //! what a generated incoming-webhook endpoint calls. See `docs/webhooks.md`.
+//!
+//! One publisher's scheme is spelled out here rather than left to each
+//! receiver: [`verify_stripe`] reads Stripe's `t=,v1=` header, because the
+//! framework's own billing receiver has to verify it and an application
+//! receiving Stripe events for its own purposes should not write that parser a
+//! second time.
 
 use std::time::Duration;
 
@@ -185,6 +191,73 @@ pub fn verify_hmac_sha256(secret: &str, message: &[u8], presented: &str) -> bool
         .is_ok_and(|presented| constant_time_eq(&expected, &presented))
 }
 
+/// The header Stripe puts its signature in, lowercase as HTTP/2 sends it.
+pub const STRIPE_SIGNATURE_HEADER: &str = "stripe-signature";
+
+/// Returns `true` when `header` is Stripe's signature over `body`.
+///
+/// Stripe sends `Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>]`, and the
+/// signed message is the timestamp, a literal `.`, and the exact request body.
+/// Several `v1` entries appear while an endpoint's secret is being rotated, and
+/// any one of them accepting is what makes that rotation seamless; entries in
+/// schemes this function does not know (Stripe's `v0`, for thin events) are
+/// ignored rather than refused.
+///
+/// A timestamp further from `now` than [`MAX_CLOCK_SKEW`] is refused, which is
+/// what stops a captured request from being replayed forever, and the
+/// comparison itself is constant time.
+///
+/// `body` must be the bytes that arrived. Re-serializing parsed JSON is free to
+/// reorder keys, and the signature then never matches.
+///
+/// # Examples
+/// ```
+/// use anubis::webhooks::signature;
+///
+/// let timestamp = 1_760_000_000;
+/// let body = br#"{"id":"evt_1","type":"customer.subscription.updated"}"#;
+///
+/// // What Stripe signs, and therefore what a test has to sign.
+/// let mut message = format!("{timestamp}.").into_bytes();
+/// message.extend_from_slice(body);
+/// let signed = signature::sign_hmac_sha256("whsec_example", &message);
+/// let header = format!("t={timestamp},v1={signed}");
+///
+/// assert!(signature::verify_stripe("whsec_example", &header, body, timestamp + 30));
+/// assert!(!signature::verify_stripe("whsec_other", &header, body, timestamp + 30));
+/// ```
+#[must_use]
+pub fn verify_stripe(secret: &str, header: &str, body: &[u8], now: i64) -> bool {
+    let mut timestamp = None;
+    let mut presented = Vec::new();
+
+    for element in header.split(',') {
+        let Some((scheme, value)) = element.trim().split_once('=') else {
+            continue;
+        };
+        match scheme.trim() {
+            "t" => timestamp = value.trim().parse::<i64>().ok(),
+            "v1" => presented.push(value.trim()),
+            _other => {}
+        }
+    }
+
+    let Some(timestamp) = timestamp else {
+        return false;
+    };
+    if now.saturating_sub(timestamp).unsigned_abs() > MAX_CLOCK_SKEW.as_secs() {
+        return false;
+    }
+
+    let mut message = timestamp.to_string().into_bytes();
+    message.push(b'.');
+    message.extend_from_slice(body);
+
+    presented
+        .iter()
+        .any(|candidate| verify_hmac_sha256(secret, &message, candidate))
+}
+
 /// The raw MAC over `<timestamp>.<body>`.
 fn mac(secret: &str, timestamp: i64, body: &str) -> Vec<u8> {
     let timestamp = timestamp.to_string();
@@ -219,7 +292,10 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use data_encoding::HEXLOWER;
 
-    use super::{MAX_CLOCK_SKEW, SCHEME, mac_over, sign, verify, verify_hmac_sha256};
+    use super::{
+        MAX_CLOCK_SKEW, SCHEME, mac_over, sign, sign_hmac_sha256, verify, verify_hmac_sha256,
+        verify_stripe,
+    };
 
     const FIXTURE_SECRET: &str = "whsec_2hSVgKZ8sYqvVQeXK1oPq0RmA6c9tYJc";
     const FIXTURE_TIMESTAMP: i64 = 1_760_000_000;
@@ -368,6 +444,114 @@ mod tests {
             &format!("sha256={presented}"),
         ));
         assert!(!verify_hmac_sha256(FIXTURE_SECRET, message, ""));
+    }
+
+    /// One Stripe signature, hex and nothing else.
+    fn stripe_signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
+        let mut message = format!("{timestamp}.").into_bytes();
+        message.extend_from_slice(body);
+        sign_hmac_sha256(secret, &message)
+    }
+
+    /// Stripe's own header, as a receiver would have to build it in a test.
+    fn stripe_header(secret: &str, timestamp: i64, body: &[u8]) -> String {
+        format!(
+            "t={timestamp},v1={}",
+            stripe_signature(secret, timestamp, body)
+        )
+    }
+
+    #[test]
+    fn stripes_scheme_verifies_over_the_timestamp_and_the_raw_body() {
+        let body = FIXTURE_BODY.as_bytes();
+        let header = stripe_header(FIXTURE_SECRET, FIXTURE_TIMESTAMP, body);
+
+        assert!(verify_stripe(
+            FIXTURE_SECRET,
+            &header,
+            body,
+            FIXTURE_TIMESTAMP + 30
+        ));
+        // Whitespace after the commas is how Stripe's own examples render it.
+        assert!(verify_stripe(
+            FIXTURE_SECRET,
+            &header.replace(',', ", "),
+            body,
+            FIXTURE_TIMESTAMP,
+        ));
+        // A second signature accompanies a secret being rotated, and either
+        // half accepting is what makes the rotation seamless. Schemes this
+        // function does not know are ignored rather than refused.
+        let rotating = format!(
+            "t={FIXTURE_TIMESTAMP},v1={},v0=deadbeef,v1={}",
+            stripe_signature("whsec_previous", FIXTURE_TIMESTAMP, body),
+            stripe_signature(FIXTURE_SECRET, FIXTURE_TIMESTAMP, body),
+        );
+        assert!(verify_stripe(
+            FIXTURE_SECRET,
+            &rotating,
+            body,
+            FIXTURE_TIMESTAMP
+        ));
+
+        assert!(!verify_stripe(
+            "whsec_other",
+            &header,
+            body,
+            FIXTURE_TIMESTAMP
+        ));
+        assert!(!verify_stripe(
+            FIXTURE_SECRET,
+            &header,
+            b"{}",
+            FIXTURE_TIMESTAMP
+        ));
+    }
+
+    #[test]
+    fn stripes_scheme_refuses_a_malformed_header_or_a_stale_timestamp() {
+        let body = FIXTURE_BODY.as_bytes();
+        let header = stripe_header(FIXTURE_SECRET, FIXTURE_TIMESTAMP, body);
+        let window = i64::try_from(MAX_CLOCK_SKEW.as_secs()).expect("the window fits");
+
+        for malformed in [
+            "",
+            "garbage",
+            // The signature alone says nothing about when it was made.
+            header
+                .rsplit(',')
+                .next()
+                .expect("the header carries a signature"),
+            // A timestamp alone signs nothing.
+            &format!("t={FIXTURE_TIMESTAMP}"),
+            &format!("t=not-a-number,v1={}", "0".repeat(64)),
+        ] {
+            assert!(
+                !verify_stripe(FIXTURE_SECRET, malformed, body, FIXTURE_TIMESTAMP),
+                "{malformed:?} must be refused",
+            );
+        }
+
+        // A captured request stops being useful once it leaves the window, in
+        // either direction.
+        assert!(verify_stripe(
+            FIXTURE_SECRET,
+            &header,
+            body,
+            FIXTURE_TIMESTAMP + window
+        ));
+        assert!(!verify_stripe(
+            FIXTURE_SECRET,
+            &header,
+            body,
+            FIXTURE_TIMESTAMP + window + 1,
+        ));
+        assert!(!verify_stripe(
+            FIXTURE_SECRET,
+            &header,
+            body,
+            FIXTURE_TIMESTAMP - window - 1,
+        ));
     }
 
     #[test]

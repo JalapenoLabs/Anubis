@@ -1,12 +1,13 @@
 //! The organization-scoped billing endpoints.
 //!
-//! Three routes, mounted by an application under `/billing`:
+//! Four routes, mounted by an application under `/billing`:
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
 //! | `GET /organizations/{organization_id}` | org member | The plan in force, and the subscription behind it |
 //! | `POST /organizations/{organization_id}/checkout` | org admin or billing | Opens a Stripe Checkout session and answers with its URL |
 //! | `POST /organizations/{organization_id}/portal` | org admin or billing | Opens the Stripe customer portal and answers with its URL |
+//! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscription this application shows |
 //!
 //! Reading is open to every member because the plan and its limits explain
 //! what the whole organization can do. Spending money is not: it takes the
@@ -28,6 +29,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::lifecycle::{self, Reconciler};
 use super::model::Subscription;
 use super::plans::{Interval, Plan, PlanSet};
 use super::stripe::{self, NewCheckoutSession, NewCustomer, NewPortalSession};
@@ -72,6 +74,10 @@ const DEFAULT_QUANTITY: i64 = 1;
 pub fn router(pool: DbPool, roles: RoleSet, plans: PlanSet, config: &AppConfig) -> Router {
     let state = BillingState {
         pool: pool.clone(),
+        // The reconciler holds the same plans, because it resolves the plan a
+        // Stripe price belongs to; building it here rather than taking one is
+        // what keeps the application's mount a single call.
+        reconciler: Reconciler::new(pool.clone(), plans.clone(), config),
         plans: Arc::new(plans),
         stripe: config.stripe.as_ref().map(stripe::Client::new),
         app_url: config.app_url.clone(),
@@ -84,6 +90,10 @@ pub fn router(pool: DbPool, roles: RoleSet, plans: PlanSet, config: &AppConfig) 
             post(start_checkout),
         )
         .route("/organizations/{organization_id}/portal", post(open_portal))
+        .route(
+            "/organizations/{organization_id}/reconcile",
+            post(reconcile),
+        )
         .with_state(state)
         // The OrganizationMember guard resolves its dependencies from these.
         .layer(crate::guard::layer(pool, roles))
@@ -93,8 +103,9 @@ pub fn router(pool: DbPool, roles: RoleSet, plans: PlanSet, config: &AppConfig) 
 struct BillingState {
     pool: DbPool,
     plans: Arc<PlanSet>,
-    /// Absent until `STRIPE_SECRET_KEY` is set, which disables the two writes.
+    /// Absent until `STRIPE_SECRET_KEY` is set, which disables every write.
     stripe: Option<stripe::Client>,
+    reconciler: Reconciler,
     app_url: String,
 }
 
@@ -222,6 +233,35 @@ async fn start_checkout(
     );
 
     Ok(Json(RedirectBody { url: session.url }))
+}
+
+/// Reads Stripe and corrects what this application shows.
+///
+/// The lifecycle keeps itself current from Stripe's events, so this exists for
+/// the times it could not: an endpoint that was misconfigured for a week, a
+/// deployment that was down while Stripe gave up retrying, a plan whose price
+/// reached `config/billing.yml` after the first customer bought it. It answers
+/// with the same body as [`show`], so the screen that triggered it re-renders
+/// from the answer.
+async fn reconcile(
+    State(state): State<BillingState>,
+    member: OrganizationMember,
+) -> Result<impl IntoResponse, ApiError> {
+    require_billing_authority(&member)?;
+    configured(&state)?;
+
+    let subscription = state
+        .reconciler
+        .reconcile(member.organization.id)
+        .await
+        .map_err(|error| reconcile_failed(&error))?;
+    let plan = resolve_plan(&state.plans, subscription.as_ref()).clone();
+
+    Ok(Json(BillingBody {
+        plan,
+        subscription,
+        billing_enabled: true,
+    }))
 }
 
 /// Opens the Stripe customer portal for an organization that has a customer.
@@ -378,6 +418,24 @@ fn stripe_failed(error: &stripe::Error, attempt: &str) -> ApiError {
         error.message = %error,
         billing.attempt = attempt,
         "failed to {{billing.attempt}} at Stripe: {{error.message}}",
+    );
+
+    if error.is_transport() {
+        ApiError::unavailable("Billing is temporarily unavailable. Try again in a moment.")
+    } else {
+        ApiError::internal()
+    }
+}
+
+/// Renders a failed reconciliation as an answer the caller can act on.
+///
+/// The split mirrors [`stripe_failed`]: being unable to reach Stripe is
+/// temporary and says so, and everything else is a misconfiguration on this
+/// side with the detail in the log.
+fn reconcile_failed(error: &lifecycle::Error) -> ApiError {
+    tracing::error!(
+        error.message = error.message(),
+        "failed to reconcile a subscription with Stripe: {{error.message}}",
     );
 
     if error.is_transport() {

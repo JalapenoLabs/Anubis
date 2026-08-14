@@ -118,6 +118,11 @@ pub const RESERVED_PREFIXES: &[&str] = &[
     "/realtime",
     "/tenancy",
     "/users",
+    // The framework's own Stripe billing receiver lives here, and an
+    // application's scaffolded receivers mount beside it. A provider posting to
+    // a mistyped path deserves a JSON `404` it can act on rather than an HTML
+    // page and a `200`.
+    "/webhooks",
 ];
 
 /// The built frontend, served as a router fallback.

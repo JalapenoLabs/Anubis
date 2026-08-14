@@ -3,8 +3,9 @@
 //! Axum routers cannot be introspected after construction, so the framework
 //! keeps this manifest alongside them: one entry per route the framework
 //! mounts, exactly as a starter application composes them (`/auth`,
-//! `/tenancy`, `/billing`, `/developers`, `/api/v1`, the public avatar route,
-//! and the probes [`crate::server::harden`] adds).
+//! `/tenancy`, `/billing`, `/developers`, `/api/v1`, the framework's own
+//! receiver under `/webhooks`, the public avatar route, and the probes
+//! [`crate::server::harden`] adds).
 //!
 //! Drift cannot happen silently: a unit test in this module composes the real
 //! routers and sends a request for every entry, so a route that is renamed,
@@ -352,6 +353,18 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/billing/organizations/{organization_id}/portal",
         area: "billing",
     },
+    RouteEntry {
+        method: "POST",
+        path: "/billing/organizations/{organization_id}/reconcile",
+        area: "billing",
+    },
+    // The framework's own incoming receiver, mounted under `/webhooks` beside
+    // whatever an application scaffolded for itself.
+    RouteEntry {
+        method: "POST",
+        path: "/webhooks/stripe-billing",
+        area: "billing",
+    },
     // Developer platform applications.
     RouteEntry {
         method: "GET",
@@ -497,6 +510,10 @@ plans:
                     crate::billing::PlanSet::from_yaml(PLANS).expect("test plans are valid"),
                     &config,
                 ),
+            )
+            .nest(
+                "/webhooks",
+                crate::billing::webhook_router(pool.clone(), &config),
             )
             .nest(
                 "/developers",

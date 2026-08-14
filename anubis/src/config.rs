@@ -25,6 +25,7 @@
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
 //! | `STRIPE_SECRET_KEY` | unset | Stripe secret key, e.g. `sk_live_...`; setting it enables billing |
+//! | `STRIPE_WEBHOOK_SECRET` | unset | Secret Stripe signs billing events with, e.g. `whsec_...`; setting it enables the billing receiver |
 //! | `STRIPE_API_BASE` | `https://api.stripe.com` | Where Stripe's API lives; overridden only by tests and mocks |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
@@ -158,6 +159,14 @@
 //! not be blocked on billing configuration. The key is a bearer credential for
 //! an account that moves money, so it is never echoed in errors or logs.
 //!
+//! `STRIPE_WEBHOOK_SECRET` is the secret Stripe signs its events with, copied
+//! from the endpoint's page in the Stripe dashboard. The billing receiver
+//! verifies every request against it and refuses the ones that do not check
+//! out, so an unset secret means the receiver answers `503` and subscriptions
+//! stop being kept current. It is only read when `STRIPE_SECRET_KEY` is set,
+//! and setting it alone stops the boot: the receiver reads each subscription
+//! back from Stripe, which needs the key.
+//!
 //! `STRIPE_API_BASE` points the client somewhere other than Stripe. It exists
 //! for tests and Stripe-compatible mocks; a deployment leaves it unset. See
 //! [`crate::billing`] and `docs/billing.md`.
@@ -265,6 +274,13 @@ const STRIPE_API_BASE_VAR: &str = "STRIPE_API_BASE";
 
 /// What a valid `STRIPE_API_BASE` looks like, quoted back in errors.
 const STRIPE_API_BASE_FORM: &str = "an http(s) base URL, e.g. `https://api.stripe.com`";
+
+/// The secret Stripe signs webhook requests to the billing receiver with.
+const STRIPE_WEBHOOK_SECRET_VAR: &str = "STRIPE_WEBHOOK_SECRET";
+
+/// What a valid `STRIPE_WEBHOOK_SECRET` looks like, quoted back in errors.
+const STRIPE_WEBHOOK_SECRET_FORM: &str = "a Stripe webhook signing secret, e.g. `whsec_...`, from the endpoint's page in the \
+     Stripe dashboard";
 
 /// What a valid `TRUSTED_PROXY_HEADER` looks like, quoted back in errors.
 const HEADER_NAME_FORM: &str = "an HTTP header name, e.g. `x-forwarded-for`";
@@ -418,13 +434,14 @@ impl fmt::Debug for SmtpConfig {
 
 /// Stripe credentials for the billing module.
 ///
-/// The secret key is a bearer credential for an account that can move money,
-/// so this type never exposes it through `Debug`; read it deliberately with
-/// [`StripeConfig::secret_key`].
+/// Both values are bearer credentials for an account that can move money, so
+/// this type never exposes either through `Debug`; read them deliberately with
+/// [`StripeConfig::secret_key`] and [`StripeConfig::webhook_secret`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct StripeConfig {
     secret_key: String,
     api_base: String,
+    webhook_secret: Option<String>,
 }
 
 impl StripeConfig {
@@ -438,6 +455,16 @@ impl StripeConfig {
     #[must_use]
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// Returns the secret Stripe signs webhook requests with, when set.
+    ///
+    /// Absent, the billing receiver refuses every request with `503` rather
+    /// than believing an unsigned one, and subscriptions stop being kept
+    /// current. See [`crate::billing`].
+    #[must_use]
+    pub fn webhook_secret(&self) -> Option<&str> {
+        self.webhook_secret.as_deref()
     }
 }
 
@@ -735,10 +762,41 @@ fn parse_origin(value: &str) -> Option<String> {
 /// key a person reaches for first, it is not secret, and every call made with
 /// it would fail at Stripe with a message about the wrong key type.
 fn stripe_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<StripeConfig>, Error> {
+    let webhook_secret = non_empty(lookup(STRIPE_WEBHOOK_SECRET_VAR)).map(|secret| {
+        // Trimmed rather than validated by prefix: `whsec_` is the shape Stripe
+        // hands out today, and refusing anything else would refuse a
+        // Stripe-compatible mock for no gain. The one mistake worth naming is
+        // below.
+        secret.trim().to_owned()
+    });
+
     let Some(secret_key) = non_empty(lookup(STRIPE_SECRET_KEY_VAR)) else {
+        if webhook_secret.is_some() {
+            // A receiver with no API key could store events and read nothing
+            // back, so half-configured billing stops the boot the same way a
+            // half-configured OAuth provider does.
+            return Err(Error::invalid_secret(
+                STRIPE_SECRET_KEY_VAR,
+                "set alongside STRIPE_WEBHOOK_SECRET: the billing receiver reads each \
+                 subscription back from Stripe, which needs the secret key",
+            ));
+        }
         return Ok(None);
     };
     let secret_key = secret_key.trim().to_owned();
+
+    if webhook_secret.as_deref().is_some_and(|secret| {
+        ["sk_", "rk_", "pk_"]
+            .iter()
+            .any(|key| secret.starts_with(key))
+    }) {
+        // An API key pasted into the signing secret: it would verify nothing and
+        // every real event would be refused. The value is never quoted back.
+        return Err(Error::invalid_secret(
+            STRIPE_WEBHOOK_SECRET_VAR,
+            STRIPE_WEBHOOK_SECRET_FORM,
+        ));
+    }
 
     if !secret_key.starts_with("sk_") && !secret_key.starts_with("rk_") {
         // The key spends money, so the bad value is never quoted back.
@@ -766,6 +824,7 @@ fn stripe_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<Stri
     Ok(Some(StripeConfig {
         secret_key,
         api_base,
+        webhook_secret,
     }))
 }
 
@@ -1387,12 +1446,42 @@ mod tests {
 
     #[test]
     fn stripe_debug_output_never_leaks_the_key() {
-        let lookup = lookup_from(&[("STRIPE_SECRET_KEY", "sk_live_hunter2")]);
+        let lookup = lookup_from(&[
+            ("STRIPE_SECRET_KEY", "sk_live_hunter2"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_hunter3"),
+        ]);
         let config = AppConfig::from_lookup(lookup).expect("a secret key is fine");
 
         let rendered = format!("{config:?}");
         assert!(rendered.contains("StripeConfig"), "got: {rendered}");
         assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(!rendered.contains("hunter3"), "got: {rendered}");
+    }
+
+    #[test]
+    fn the_webhook_secret_is_read_beside_the_key_and_never_alone() {
+        let lookup = lookup_from(&[
+            ("STRIPE_SECRET_KEY", "sk_test_abc123"),
+            ("STRIPE_WEBHOOK_SECRET", " whsec_abc123 "),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("both secrets must parse");
+        let stripe = config.stripe.expect("stripe config must be present");
+        assert_eq!(stripe.webhook_secret(), Some("whsec_abc123"));
+
+        // The receiver reads each subscription back from Stripe, so a signing
+        // secret without an API key is a half-configured deployment.
+        let lookup = lookup_from(&[("STRIPE_WEBHOOK_SECRET", "whsec_abc123")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the key is required");
+        assert_eq!(error.variable(), "STRIPE_SECRET_KEY");
+
+        // An API key pasted into the signing secret verifies nothing.
+        let lookup = lookup_from(&[
+            ("STRIPE_SECRET_KEY", "sk_test_abc123"),
+            ("STRIPE_WEBHOOK_SECRET", "sk_test_hunter2"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("an API key is not a signing secret");
+        assert_eq!(error.variable(), "STRIPE_WEBHOOK_SECRET");
+        assert!(!error.to_string().contains("hunter2"), "got: {error}");
     }
 
     #[test]
