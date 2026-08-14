@@ -19,7 +19,7 @@ mod extract;
 mod mfa;
 mod model;
 mod passkey;
-mod routes;
+pub(crate) mod routes;
 mod session;
 pub(crate) mod token;
 mod user_token;

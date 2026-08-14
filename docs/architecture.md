@@ -25,6 +25,12 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Observability | tracing | Structured events with named properties |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
 
+### Migrations at boot
+
+An application applies the framework's embedded migrations and then its own, both at startup, so a freshly stamped app migrates itself on first start and a deploy carries its schema with it.
+
+Applying takes a Postgres advisory lock over one fixed key, held for the length of the pass. Two instances booting at the same moment is the ordinary case, not the exotic one, and without the lock they race in Postgres' catalog: the loser fails a `CREATE TABLE` with a unique violation on `pg_type_typname_nsp_index`, which reads like nothing to do with migrations. With it, the second waits and then finds nothing pending. See [testing.md](testing.md#concurrent-migrations).
+
 ### Secrets at rest and key rotation
 
 `ANUBIS_SECRET_KEY` is base64 for exactly 32 random bytes. `anubis secret generate` prints one, and `anubis doctor` warns when the variable is unset (the public development key is in use) and fails when it holds something that cannot be a key.

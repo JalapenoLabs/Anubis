@@ -26,6 +26,7 @@ Pre-alpha. The architecture is settled and documented in [docs/](docs/); impleme
 - [The server](docs/server.md)
 - [Background jobs](docs/jobs.md)
 - [Webhooks](docs/webhooks.md)
+- [Testing](docs/testing.md)
 
 ## Repository layout
 

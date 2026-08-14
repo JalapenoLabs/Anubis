@@ -322,6 +322,34 @@ mod tests {
         }
     }
 
+    /// A subject is assembled from application data (a team's name rides in
+    /// the invitation subject), so a line break in it must not become a header
+    /// of the attacker's choosing. Encoding is what stops it: the word holding
+    /// the break is emitted as an RFC 2047 encoded word, break and all.
+    #[tokio::test]
+    async fn a_line_break_in_a_subject_cannot_forge_a_header() {
+        let mut email = sample_email();
+        email.subject = "Ops\r\nBcc: attacker@example.com".to_owned();
+
+        let message = offline_smtp()
+            .message(&email)
+            .expect("the message must render");
+        let rendered = String::from_utf8(message.formatted()).expect("messages are UTF-8");
+
+        let (_headers, body) = rendered
+            .split_once("\r\n\r\n")
+            .expect("a message separates its headers from its body");
+        assert!(
+            !rendered.contains("\r\nBcc:"),
+            "the break was emitted verbatim: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("Subject: =?utf-8?b?"),
+            "the subject must be encoded rather than passed through: {rendered:?}",
+        );
+        assert_eq!(body, email.text_body, "the body is untouched");
+    }
+
     #[tokio::test]
     async fn the_test_outbox_captures_sent_email_in_order() {
         let (mailer, outbox) = Mailer::test();

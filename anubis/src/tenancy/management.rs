@@ -21,10 +21,19 @@
 //! | `DELETE /teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
 //!
 //! Two invariants run through all of it, and `docs/tenancy.md` states them in
-//! full. A tenant always keeps at least one claimed admin, so the last one
-//! cannot be demoted, removed, or walk out: those answer `409 Conflict`,
-//! because the request is well formed and only the current state refuses it.
-//! And deletion cascades: the framework's foreign keys, and the ones the
+//! full.
+//!
+//! A tenant always keeps at least one claimed admin, so the last one cannot be
+//! demoted, removed, or walk out: those answer `409 Conflict`, because the
+//! request is well formed and only the current state refuses it. Every
+//! membership change runs inside a transaction that locks the tenant's own row
+//! first ([`lock_team`]), and any change that takes the admin role off a real
+//! person ([`stepped_down`]) counts the survivors before committing. Ordering
+//! is what makes the count mean anything: two admins acting at the same
+//! instant would otherwise each read the other as the one who remains, and
+//! both would commit.
+//!
+//! Deletion cascades: the framework's foreign keys, and the ones the
 //! scaffolder generates, are `ON DELETE CASCADE` from `teams` and
 //! `organizations`, so deleting a tenant deletes the records that chain to it.
 //! An application that declares its own restricting foreign key gets a `409`
@@ -250,21 +259,37 @@ async fn remove_organization_member(
     require_organization_admin(&member)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let target =
-        find_organization_member(&mut connection, member.organization.id, membership_id).await?;
+    connection
+        .transaction::<(), ApiError, _>(async |transaction| {
+            lock_organization(transaction, member.organization.id).await?;
+            let target =
+                find_organization_member(transaction, member.organization.id, membership_id)
+                    .await?;
 
-    if target.user_id == member.user.id {
-        return Err(ApiError::validation(
-            "Use the leave endpoint to leave an organization yourself.",
-        ));
-    }
+            if target.user_id == member.user.id {
+                return Err(ApiError::validation(
+                    "Use the leave endpoint to leave an organization yourself.",
+                ));
+            }
 
-    // The caller is an admin and is not the target, so the organization keeps
-    // an admin whoever else goes.
-    diesel::delete(organization_memberships::table.find(target.id))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
+            diesel::delete(organization_memberships::table.find(target.id))
+                .execute(transaction)
+                .await?;
+
+            // Two admins removing each other at the same instant would each
+            // leave the other standing on their own reading; the lock orders
+            // them and this count catches whichever arrives second.
+            if holds_admin(&target.roles) {
+                require_organization_keeps_an_admin(
+                    transaction,
+                    member.organization.id,
+                    "remove them",
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -279,22 +304,25 @@ async fn leave_organization(
     member: OrganizationMember,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
+    connection
+        .transaction::<(), ApiError, _>(async |transaction| {
+            lock_organization(transaction, member.organization.id).await?;
+            // Re-read under the lock; see the note in `leave_team`.
+            let leaving =
+                find_organization_member(transaction, member.organization.id, member.membership.id)
+                    .await?;
 
-    if holds_admin(&member.membership.roles)
-        && !another_organization_admin_remains(
-            &mut connection,
-            member.organization.id,
-            member.membership.id,
-        )
-        .await?
-    {
-        return Err(last_admin_conflict("organization", "leave"));
-    }
+            diesel::delete(organization_memberships::table.find(leaving.id))
+                .execute(transaction)
+                .await?;
 
-    diesel::delete(organization_memberships::table.find(member.membership.id))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
+            if holds_admin(&leaving.roles) {
+                require_organization_keeps_an_admin(transaction, member.organization.id, "leave")
+                    .await?;
+            }
+            Ok(())
+        })
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -333,34 +361,33 @@ async fn change_member_roles(
     let roles = normalize_roles(&state.roles, body.roles)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let target = find_member(&mut connection, member.team.id, membership_id).await?;
+    let target_id = connection
+        .transaction::<Uuid, ApiError, _>(async |transaction| {
+            lock_team(transaction, member.team.id).await?;
+            let target = find_member(transaction, member.team.id, membership_id).await?;
 
-    if target.user_id.is_some()
-        && holds_admin(&target.roles)
-        && !holds_admin(&roles)
-        && !another_admin_remains(&mut connection, member.team.id, target.id).await?
-    {
-        return Err(last_admin_conflict("team", "step down"));
-    }
-
-    connection
-        .transaction(async |transaction| {
             diesel::update(team_memberships::table.find(target.id))
                 .set(team_memberships::roles.eq(&roles))
                 .execute(transaction)
                 .await?;
             // A pending member's invitation carries a copy of the roles; keep
             // the record honest even though the claim adopts the membership.
-            diesel::update(invitations::table.filter(invitations::team_membership_id.eq(target.id)))
-                .set(invitations::roles.eq(&roles))
-                .execute(transaction)
-                .await
+            diesel::update(
+                invitations::table.filter(invitations::team_membership_id.eq(target.id)),
+            )
+            .set(invitations::roles.eq(&roles))
+            .execute(transaction)
+            .await?;
+
+            if stepped_down(&target, &roles) {
+                require_team_keeps_an_admin(transaction, member.team.id, "step down").await?;
+            }
+            Ok(target.id)
         })
-        .await
-        .map_err(log_internal)?;
+        .await?;
 
     Ok(Json(MembershipBody {
-        membership_id: target.id,
+        membership_id: target_id,
         roles,
     }))
 }
@@ -377,20 +404,30 @@ async fn remove_member(
     require_team_admin(&member)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let target = find_member(&mut connection, member.team.id, membership_id).await?;
+    connection
+        .transaction::<(), ApiError, _>(async |transaction| {
+            lock_team(transaction, member.team.id).await?;
+            let target = find_member(transaction, member.team.id, membership_id).await?;
 
-    if target.user_id == Some(member.user.id) {
-        return Err(ApiError::validation(
-            "Use the leave endpoint to leave a team yourself.",
-        ));
-    }
+            if target.user_id == Some(member.user.id) {
+                return Err(ApiError::validation(
+                    "Use the leave endpoint to leave a team yourself.",
+                ));
+            }
 
-    // The caller is a claimed admin and is not the target, so the team keeps
-    // an admin whoever else goes.
-    diesel::delete(team_memberships::table.find(target.id))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
+            diesel::delete(team_memberships::table.find(target.id))
+                .execute(transaction)
+                .await?;
+
+            // The caller is a claimed admin and is not the target, so this only
+            // fires when the caller was demoted by a request that committed
+            // while this one was in flight.
+            if stepped_down(&target, &[]) {
+                require_team_keeps_an_admin(transaction, member.team.id, "remove them").await?;
+            }
+            Ok(())
+        })
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -401,17 +438,24 @@ async fn leave_team(
     member: TeamMember,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
+    connection
+        .transaction::<(), ApiError, _>(async |transaction| {
+            lock_team(transaction, member.team.id).await?;
+            // Re-read under the lock: a request that committed while this one
+            // was in flight may already have taken the caller's admin role, in
+            // which case they are free to go.
+            let leaving = find_member(transaction, member.team.id, member.membership.id).await?;
 
-    if holds_admin(&member.membership.roles)
-        && !another_admin_remains(&mut connection, member.team.id, member.membership.id).await?
-    {
-        return Err(last_admin_conflict("team", "leave"));
-    }
+            diesel::delete(team_memberships::table.find(leaving.id))
+                .execute(transaction)
+                .await?;
 
-    diesel::delete(team_memberships::table.find(member.membership.id))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
+            if stepped_down(&leaving, &[]) {
+                require_team_keeps_an_admin(transaction, member.team.id, "leave").await?;
+            }
+            Ok(())
+        })
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -527,54 +571,127 @@ async fn find_organization_member(
         .ok_or_else(ApiError::not_found)
 }
 
-/// Returns `true` when the team has a claimed admin other than `excluded`.
+/// Locks a team for the length of the caller's transaction.
 ///
-/// Unclaimed memberships are invitations, not people, so they never count.
-async fn another_admin_remains(
+/// The last-admin rule is a read of who else administers the team followed by
+/// a write to one membership. Left unordered, two admins acting at the same
+/// instant each read the other, each commit, and the team is left adminless:
+/// the `409` never fires because neither request ever saw the other coming.
+///
+/// Locking the team's own row gives every membership change of one team a
+/// single order. One shared row rather than the membership rows themselves,
+/// because two transactions each locking the other's target deadlock, and a
+/// deadlock is a `500` where a `409` belongs.
+///
+/// Answers `404` when the team is gone, which a concurrent organization
+/// deletion can do between the guard and here.
+async fn lock_team(connection: &mut AsyncPgConnection, team_id: Uuid) -> Result<(), ApiError> {
+    teams::table
+        .find(team_id)
+        .select(teams::id)
+        .for_update()
+        .first::<Uuid>(connection)
+        .await
+        .optional()?
+        .ok_or_else(ApiError::not_found)
+        .map(|_id| ())
+}
+
+/// Locks an organization for the length of the caller's transaction.
+///
+/// The organization half of [`lock_team`], for the same reason.
+async fn lock_organization(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+) -> Result<(), ApiError> {
+    organizations::table
+        .find(organization_id)
+        .select(organizations::id)
+        .for_update()
+        .first::<Uuid>(connection)
+        .await
+        .optional()?
+        .ok_or_else(ApiError::not_found)
+        .map(|_id| ())
+}
+
+/// Returns `true` when a change took the team's admin role off a real person.
+///
+/// The one condition the invariant has to be checked after: a membership that
+/// was a claimed admin and, once `roles` are in force, is not. Leaving and
+/// being removed pass an empty set, since they leave no roles at all.
+/// Unclaimed memberships never count, because an invitation is not a person,
+/// and losing one can never cost the team an admin.
+fn stepped_down(membership: &TeamMembership, roles: &[String]) -> bool {
+    membership.user_id.is_some() && holds_admin(&membership.roles) && !holds_admin(roles)
+}
+
+/// Refuses a change that left the team with no claimed admin.
+///
+/// Counted after the change rather than before it, so one rule covers
+/// demotion, removal, and leaving alike, and the transaction rolls the change
+/// back when it fires. Unclaimed memberships never count, because an
+/// invitation is not a person.
+async fn require_team_keeps_an_admin(
     connection: &mut AsyncPgConnection,
     team_id: Uuid,
-    excluded: Uuid,
-) -> Result<bool, ApiError> {
+    attempt: &str,
+) -> Result<(), ApiError> {
     let admins: i64 = team_memberships::table
         .filter(team_memberships::team_id.eq(team_id))
-        .filter(team_memberships::id.ne(excluded))
         .filter(team_memberships::user_id.is_not_null())
         .filter(team_memberships::roles.contains(vec![ADMIN_ROLE]))
         .count()
         .get_result(connection)
-        .await
-        .map_err(log_internal)?;
+        .await?;
 
-    Ok(admins > 0)
+    if admins > 0 {
+        Ok(())
+    } else {
+        Err(last_admin_conflict("team", attempt))
+    }
 }
 
-/// Returns `true` when the organization has an admin other than `excluded`.
+/// Refuses a change that left the organization with no admin.
 ///
-/// Organization memberships exist only once claimed, so every one of them
-/// counts.
-async fn another_organization_admin_remains(
+/// The organization half of [`require_team_keeps_an_admin`]. Organization
+/// memberships exist only once claimed, so every one of them counts.
+async fn require_organization_keeps_an_admin(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
-    excluded: Uuid,
-) -> Result<bool, ApiError> {
+    attempt: &str,
+) -> Result<(), ApiError> {
     let admins: i64 = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(organization_id))
-        .filter(organization_memberships::id.ne(excluded))
         .filter(organization_memberships::roles.contains(vec![ADMIN_ROLE]))
         .count()
         .get_result(connection)
-        .await
-        .map_err(log_internal)?;
+        .await?;
 
-    Ok(admins > 0)
+    if admins > 0 {
+        Ok(())
+    } else {
+        Err(last_admin_conflict("organization", attempt))
+    }
 }
 
 /// Trims and bounds a submitted display name.
+///
+/// Control characters are refused along with the wrong length. A tenant's name
+/// is rendered into an invitation's subject line and into the UI, and a line
+/// break in either is at best a display bug and at worst an attempt at a
+/// header of the caller's own. The mail layer encodes what it is given (see
+/// `crate::mail`), so this is the second lock rather than the only one.
 fn validate_name(raw: &str, label: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME_CHARS {
         return Err(ApiError::validation(format!(
             "Give the {label} a name of 1 to {MAX_NAME_CHARS} characters."
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ApiError::validation(format!(
+            "Give the {label} a name without line breaks or control characters."
         )));
     }
     Ok(trimmed.to_owned())
@@ -602,8 +719,11 @@ fn require_organization_admin(member: &OrganizationMember) -> Result<(), ApiErro
 
 /// The refusal that keeps every tenant administrable.
 ///
-/// Only the last admin acting on themselves can reach it: an admin editing
-/// somebody else still counts as the admin the tenant is left with.
+/// Normally only the last admin acting on themselves reaches it: an admin
+/// editing somebody else still counts as the admin the tenant is left with.
+/// The exception is a race, where the caller's own admin role was taken by a
+/// request that committed while theirs was in flight; the tenant lock orders
+/// the two so exactly one of them gets this answer.
 fn last_admin_conflict(tenant: &str, attempt: &str) -> ApiError {
     ApiError::conflict(format!(
         "A {tenant} needs at least one admin. \

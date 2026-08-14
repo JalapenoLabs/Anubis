@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::CurrentUser;
+use crate::auth::routes::validate_email;
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::{OrganizationMember, TeamMember};
@@ -340,16 +341,17 @@ async fn list_organization_members(
     Ok(Json(OrganizationMembersBody { members }))
 }
 
+/// Invites an email address to a team or an organization.
+///
+/// The address goes through the same [`validate_email`] registration uses,
+/// which is what keeps a line break out of the recipient of an email this
+/// handler is about to send, and out of the row it stores.
 async fn create_invitation(
     State(state): State<TenancyState>,
     CurrentUser(inviter): CurrentUser,
     Json(body): Json<CreateInvitationBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let email = body.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(ApiError::validation("Enter a valid email address."));
-    }
-
+    let email = validate_email(&body.email)?;
     let granted_roles = normalize_roles(&state.roles, body.roles.clone())?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
