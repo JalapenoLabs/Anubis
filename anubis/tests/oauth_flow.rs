@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use anubis::schema::{organization_memberships, organizations, team_memberships, teams};
 use axum::extract::State;
 use axum::http::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -22,6 +23,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use http_body_util::BodyExt;
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
@@ -734,4 +737,99 @@ async fn oauth_sign_up_obeys_the_registration_mode() {
     let (status, _headers, body) = send(&router, "GET", "/auth/me", None, Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["user"]["id"], member_id);
+}
+
+/// A shared deployment puts an OAuth signup where it puts a form signup.
+///
+/// Both paths call the one bootstrap function, and this is the assertion that
+/// keeps them from drifting: the form creates the organization configuration
+/// named, and the button joins that organization and its default team rather
+/// than minting a private one.
+#[tokio::test]
+async fn oauth_sign_up_joins_the_shared_organization() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping oauth_flow test: DATABASE_URL is not set");
+        return;
+    };
+
+    anubis::db::run_pending_migrations(&database_url)
+        .await
+        .expect("migrations must apply");
+    let pool = anubis::db::connect(&database_url)
+        .await
+        .expect("database must be reachable");
+
+    let (issuer, mock) = start_mock_provider().await;
+
+    // Named per run, because this suite shares one database with the others
+    // and the count below is a claim about this deployment's organization.
+    let shared_organization = format!("Shared {}", Uuid::new_v4());
+    let config = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        "APP_URL" => Some(APP_URL.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_ID" => Some(CLIENT_ID.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_SECRET" => Some("mock-client-secret".to_owned()),
+        "GOOGLE_OAUTH_ISSUER" => Some(issuer.clone()),
+        "ANUBIS_BOOTSTRAP" => Some("shared".to_owned()),
+        "ANUBIS_SHARED_ORGANIZATION" => Some(shared_organization.clone()),
+        _ => None,
+    })
+    .expect("test config must parse");
+
+    let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &config));
+
+    // The sign-up form gets there first and creates the organization.
+    let form_email = format!("shared-form-{}@example.com", Uuid::new_v4());
+    let credentials =
+        serde_json::json!({ "email": form_email, "password": "correct horse battery staple" });
+    let (status, _headers, body) =
+        send(&router, "POST", "/auth/register", Some(&credentials), None).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    // The button arrives at an organization that already exists, and joins it.
+    let (status, headers) = sign_in_with(
+        &router,
+        &mock,
+        "/auth/oauth/google/start",
+        Assertion {
+            subject: format!("subject-{}", Uuid::new_v4()),
+            email: format!("shared-oauth-{}@example.com", Uuid::new_v4()),
+            email_verified: true,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let _session = session_token(&headers);
+
+    let mut connection = pool.get().await.expect("a connection");
+    let organization_ids: Vec<Uuid> = organizations::table
+        .filter(organizations::name.eq(&shared_organization))
+        .select(organizations::id)
+        .load(&mut connection)
+        .await
+        .expect("the query must run");
+    assert_eq!(
+        organization_ids.len(),
+        1,
+        "one organization, whichever door the account came through",
+    );
+    let organization_id = organization_ids[0];
+
+    let members: i64 = organization_memberships::table
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("the count must run");
+    assert_eq!(members, 2, "the form signup and the OAuth signup");
+
+    let team_members: i64 = team_memberships::table
+        .inner_join(teams::table)
+        .filter(teams::organization_id.eq(organization_id))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("the count must run");
+    assert_eq!(team_members, 2, "both in the organization's default team");
 }

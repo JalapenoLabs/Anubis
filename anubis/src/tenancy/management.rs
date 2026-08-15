@@ -66,12 +66,9 @@ use crate::http::ApiError;
 use crate::schema::{
     invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
-use crate::tenancy::bootstrap::{self, ADMIN_ROLE, holds_admin};
+use crate::tenancy::bootstrap::{self, ADMIN_ROLE, MAX_NAME_CHARS, holds_admin};
 use crate::tenancy::model::{Organization, OrganizationMembership, Team, TeamMembership};
 use crate::tenancy::routes::{TenancyState, log_internal, normalize_roles};
-
-/// Longest accepted organization or team name.
-const MAX_NAME_CHARS: usize = 100;
 
 /// Returns the management routes, merged into the tenancy router.
 pub(super) fn routes() -> Router<TenancyState> {

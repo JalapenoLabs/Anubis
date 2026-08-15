@@ -25,6 +25,10 @@
 //! hashed, and `GET /registration` is what a sign-up screen reads to know
 //! whether to draw its form at all.
 //!
+//! What a new account joins is a second deployment decision, `ANUBIS_BOOTSTRAP`
+//! and [`crate::tenancy::BootstrapMode`]: an organization of its own, or the
+//! one organization everybody shares.
+//!
 //! Every route above that an attacker can drive without credentials carries a
 //! per-client budget from [`crate::rate_limit`], declared beside the route.
 //! The endpoints that send email additionally charge the address they would
@@ -56,6 +60,7 @@ use crate::http::ApiError;
 use crate::mail::{Email, Mailer};
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
+use crate::tenancy::BootstrapMode;
 
 /// Upper bound from RFC 3696; anything longer cannot be a deliverable address.
 const MAX_EMAIL_CHARS: usize = 320;
@@ -75,6 +80,7 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         secret_key: config.secret_key.clone(),
         oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
         registration: config.registration.clone(),
+        bootstrap: config.bootstrap.clone(),
         rate_limit: rate_limit.clone(),
         hasher: password::Hasher::new(config.password_hash_concurrency),
     };
@@ -123,6 +129,8 @@ pub(crate) struct AuthState {
     pub(crate) oauth: crate::auth::oauth::Runtime,
     /// Who may create an account here; see [`crate::auth::registration`].
     pub(crate) registration: RegistrationMode,
+    /// What a new account joins; see [`crate::tenancy::BootstrapMode`].
+    pub(crate) bootstrap: BootstrapMode,
     /// Budgets the handlers charge themselves, keyed by the target address.
     pub(crate) rate_limit: RateLimiter,
     /// The gate every argon2 computation passes through; see
@@ -195,7 +203,7 @@ async fn register(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    // One transaction creates the user and their personal organization, so a
+    // One transaction creates the user and the tenancy they land in, so a
     // half-bootstrapped account can never exist.
     let created: User = connection
         .transaction(async |transaction| {
@@ -208,7 +216,7 @@ async fn register(
                 .get_result(transaction)
                 .await?;
 
-            crate::tenancy::create_personal_organization(transaction, &user).await?;
+            crate::tenancy::bootstrap_account(transaction, &state.bootstrap, &user).await?;
 
             Ok::<User, diesel::result::Error>(user)
         })

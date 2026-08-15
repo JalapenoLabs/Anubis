@@ -21,6 +21,8 @@
 //! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
 //! | `ANUBIS_REGISTRATION` | `open` | Who may create an account: `open`, `invite_only`, or `domain_allowlist` |
 //! | `ANUBIS_REGISTRATION_DOMAINS` | unset | Comma-separated email domains a `domain_allowlist` admits, e.g. `acme.com` |
+//! | `ANUBIS_BOOTSTRAP` | `personal` | What a new account joins: `personal` or `shared` |
+//! | `ANUBIS_SHARED_ORGANIZATION` | unset | Name of the organization a `shared` bootstrap puts every account in, e.g. `Acme` |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
@@ -153,6 +155,20 @@
 //! mode would leave an instance open to the internet while its operator
 //! believes it is closed. See [`crate::auth::registration`].
 //!
+//! # The signup bootstrap
+//!
+//! `ANUBIS_BOOTSTRAP` decides what a new account joins: `personal`, the
+//! default, gives every account an organization of its own holding one team,
+//! which is what public multi-tenant SaaS wants; `shared` puts every account
+//! in the one organization `ANUBIS_SHARED_ORGANIZATION` names, together with
+//! its default team, which is what internal tooling wants.
+//!
+//! Both halves have to agree, for the reason the registration pair does. A
+//! shared bootstrap with nothing to name has no organization to find or
+//! create, and a name under `personal` does nothing at all, which reads as one
+//! shared workspace to whoever wrote it while every account quietly gets a
+//! private one. See [`crate::tenancy::BootstrapMode`].
+//!
 //! # Cross-origin access
 //!
 //! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
@@ -213,6 +229,7 @@ use crate::auth::registration::RegistrationMode;
 use crate::auth::secret_box::SecretKey;
 use crate::rate_limit::RateLimitConfig;
 use crate::server::CorsConfig;
+use crate::tenancy::{BootstrapMode, MAX_NAME_CHARS};
 
 /// Selects the runtime environment.
 const ENV_VAR: &str = "ANUBIS_ENV";
@@ -270,6 +287,19 @@ const REGISTRATION_DOMAINS_VAR: &str = "ANUBIS_REGISTRATION_DOMAINS";
 
 /// What a valid `ANUBIS_REGISTRATION_DOMAINS` looks like, quoted back in errors.
 const DOMAIN_FORM: &str = "comma-separated bare email domains, e.g. `acme.com,acme.co.uk`";
+
+/// Chooses what a new account joins at signup.
+const BOOTSTRAP_VAR: &str = "ANUBIS_BOOTSTRAP";
+
+/// What a valid `ANUBIS_BOOTSTRAP` looks like, quoted back in errors.
+const BOOTSTRAP_FORM: &str = "one of personal, shared";
+
+/// Names the organization a `shared` bootstrap puts every account in.
+const SHARED_ORGANIZATION_VAR: &str = "ANUBIS_SHARED_ORGANIZATION";
+
+/// What a valid `ANUBIS_SHARED_ORGANIZATION` looks like, quoted back in errors.
+const SHARED_ORGANIZATION_FORM: &str = "the name of the organization every account joins, up to a hundred characters and free of \
+     control characters, e.g. `Acme`";
 
 /// Switches off the per-client budgets on the abuse-prone endpoints.
 const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
@@ -549,6 +579,11 @@ pub struct AppConfig {
     /// Open to anybody by default; see the module docs and
     /// [`crate::auth::registration`].
     pub registration: RegistrationMode,
+    /// What a new account joins at signup.
+    ///
+    /// An organization of its own by default; see the module docs and
+    /// [`crate::tenancy::BootstrapMode`].
+    pub bootstrap: BootstrapMode,
     /// Whether the abuse limits are on, and how clients are addressed.
     ///
     /// On by default; see the module docs and [`crate::rate_limit`].
@@ -666,6 +701,7 @@ impl AppConfig {
         // the assets service's question, asked once at startup.
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
         let registration = registration_mode(&lookup)?;
+        let bootstrap = bootstrap_mode(&lookup)?;
         let rate_limit = rate_limit_config(&lookup)?;
         let cors = cors_config(&lookup)?;
         let stripe = stripe_config(&lookup)?;
@@ -693,6 +729,7 @@ impl AppConfig {
             oauth,
             spa_dir,
             registration,
+            bootstrap,
             rate_limit,
             cors,
             stripe,
@@ -847,6 +884,61 @@ fn registration_mode(lookup: &impl Fn(&str) -> Option<String>) -> Result<Registr
             REGISTRATION_FORM,
         )),
     }
+}
+
+/// Resolves what a new account joins, and which organization it joins.
+///
+/// The two variables have to agree, and a disagreement stops startup rather
+/// than being reinterpreted: a shared bootstrap with nothing to name has no
+/// organization to find or create, and a name under any other mode does
+/// nothing at all, which reads as one shared workspace to whoever wrote it
+/// while every account quietly gets a private one.
+fn bootstrap_mode(lookup: &impl Fn(&str) -> Option<String>) -> Result<BootstrapMode, Error> {
+    let organization =
+        non_empty(lookup(SHARED_ORGANIZATION_VAR)).map(|name| name.trim().to_owned());
+
+    let Some(value) = non_empty(lookup(BOOTSTRAP_VAR)) else {
+        if organization.is_some() {
+            return Err(Error::missing(
+                BOOTSTRAP_VAR,
+                "shared, the one mode that reads ANUBIS_SHARED_ORGANIZATION; without it every \
+                 account gets an organization of its own",
+            ));
+        }
+        return Ok(BootstrapMode::default());
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "personal" => match organization {
+            Some(name) => Err(Error::invalid(
+                SHARED_ORGANIZATION_VAR,
+                &name,
+                "no name unless ANUBIS_BOOTSTRAP is shared, the one mode that reads it",
+            )),
+            None => Ok(BootstrapMode::Personal),
+        },
+        "shared" => match organization {
+            None => Err(Error::missing(
+                SHARED_ORGANIZATION_VAR,
+                SHARED_ORGANIZATION_FORM,
+            )),
+            // The organization is a tenant like any other, and its name is
+            // rendered into invitation subject lines and into the UI, so it is
+            // held to the rule a name submitted through the API is held to.
+            Some(name) if !is_tenant_name(&name) => Err(Error::invalid(
+                SHARED_ORGANIZATION_VAR,
+                &name,
+                SHARED_ORGANIZATION_FORM,
+            )),
+            Some(name) => Ok(BootstrapMode::Shared(name)),
+        },
+        _ => Err(Error::invalid(BOOTSTRAP_VAR, value.trim(), BOOTSTRAP_FORM)),
+    }
+}
+
+/// Whether a trimmed, non-empty string may name an organization or a team.
+fn is_tenant_name(value: &str) -> bool {
+    value.chars().count() <= MAX_NAME_CHARS && !value.chars().any(char::is_control)
 }
 
 /// Renders one allowlist entry as the domain an address is matched against.
@@ -1105,6 +1197,7 @@ mod tests {
     use super::{AppConfig, Environment};
     use crate::auth::registration::RegistrationMode;
     use crate::auth::secret_box::SecretKey;
+    use crate::tenancy::BootstrapMode;
 
     /// A syntactically valid `ANUBIS_SECRET_KEY`, for tests that need one.
     const SAMPLE_SECRET_KEY: &str = "bkVLZLd1zHBqxWvKGKp5gRTZKcTf9UvHT5vXbHvWJ0M=";
@@ -1506,6 +1599,83 @@ mod tests {
                 "ANUBIS_REGISTRATION_DOMAINS",
                 "for mode {mode:?}",
             );
+        }
+    }
+
+    #[test]
+    fn every_account_gets_its_own_tenancy_until_a_deployment_shares_one() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(defaulted.bootstrap, BootstrapMode::Personal);
+
+        for value in ["personal", "PERSONAL", " personal "] {
+            let lookup = lookup_from(&[("ANUBIS_BOOTSTRAP", value)]);
+            let config = AppConfig::from_lookup(lookup).expect("a mode must parse");
+            assert_eq!(
+                config.bootstrap,
+                BootstrapMode::Personal,
+                "for input {value:?}",
+            );
+        }
+
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP", "shared"),
+            ("ANUBIS_SHARED_ORGANIZATION", " Acme Corporation "),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a shared bootstrap must parse");
+        assert_eq!(
+            config.bootstrap,
+            BootstrapMode::Shared("Acme Corporation".to_owned()),
+            "the name is trimmed and otherwise taken as written",
+        );
+
+        let lookup = lookup_from(&[("ANUBIS_BOOTSTRAP", "team")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("unknown modes are rejected");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP");
+        assert!(error.to_string().contains("shared"), "got: {error}");
+    }
+
+    #[test]
+    fn a_shared_bootstrap_with_no_organization_to_join_stops_the_boot() {
+        // Nothing to find and nothing to create: every account would land
+        // nowhere, which is the one state the mode exists to prevent.
+        for name in [None, Some("   ")] {
+            let mut pairs = vec![("ANUBIS_BOOTSTRAP", "shared")];
+            if let Some(name) = name {
+                pairs.push(("ANUBIS_SHARED_ORGANIZATION", name));
+            }
+            let error = AppConfig::from_lookup(lookup_from(&pairs))
+                .expect_err("a shared bootstrap must name an organization");
+            assert_eq!(error.variable(), "ANUBIS_SHARED_ORGANIZATION");
+            assert!(error.to_string().contains("is not set"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn an_organization_the_mode_would_ignore_stops_the_boot() {
+        // The dangerous half: whoever named an organization believes everybody
+        // shares it, and every account gets a private one instead.
+        let lookup = lookup_from(&[("ANUBIS_SHARED_ORGANIZATION", "Acme")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the mode is required");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP");
+        assert!(error.to_string().contains("shared"), "got: {error}");
+
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP", "personal"),
+            ("ANUBIS_SHARED_ORGANIZATION", "Acme"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("a dead name is rejected");
+        assert_eq!(error.variable(), "ANUBIS_SHARED_ORGANIZATION");
+    }
+
+    #[test]
+    fn a_shared_organization_is_named_the_way_every_other_tenant_is() {
+        for name in ["x".repeat(101), "Acme\nInc".to_owned()] {
+            let lookup = lookup_from(&[
+                ("ANUBIS_BOOTSTRAP", "shared"),
+                ("ANUBIS_SHARED_ORGANIZATION", &name),
+            ]);
+            let error = AppConfig::from_lookup(lookup).expect_err("only tenant names are accepted");
+            assert_eq!(error.variable(), "ANUBIS_SHARED_ORGANIZATION");
         }
     }
 

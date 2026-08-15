@@ -8,8 +8,8 @@
 //!    The identity is linked to that account, so a user who registered with a
 //!    password can start using the button without a second account appearing.
 //! 3. Nobody owns the address. A user is created with the same bootstrap
-//!    registration performs (personal organization, default team, admin
-//!    memberships), and the identity is linked to it.
+//!    registration performs, `ANUBIS_BOOTSTRAP`'s decision run through the one
+//!    function both paths call, and the identity is linked to it.
 //!
 //! An unverified email is never matched against an existing account: the
 //! provider's assertion is the only proof of ownership there is, and without
@@ -32,6 +32,7 @@ use crate::auth::model::User;
 use crate::auth::registration::RegistrationMode;
 use crate::auth::{password, token};
 use crate::schema::{oauth_identities, users};
+use crate::tenancy::BootstrapMode;
 
 /// What a provider asserted about the person who just signed in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,7 @@ pub(crate) async fn sign_in(
     connection: &mut AsyncPgConnection,
     hasher: &password::Hasher,
     registration: &RegistrationMode,
+    bootstrap: &BootstrapMode,
     provider: &str,
     identity: &ProviderIdentity,
 ) -> Result<User, LinkError> {
@@ -128,7 +130,7 @@ pub(crate) async fn sign_in(
                 None if registration.refusal(email).is_some() => {
                     return Err(LinkError::RegistrationClosed);
                 }
-                None => create_user(transaction, hasher, email, identity).await?,
+                None => create_user(transaction, hasher, bootstrap, email, identity).await?,
             };
 
             diesel::insert_into(oauth_identities::table)
@@ -154,6 +156,7 @@ pub(crate) async fn sign_in(
 async fn create_user(
     connection: &mut AsyncPgConnection,
     hasher: &password::Hasher,
+    bootstrap: &BootstrapMode,
     email: &str,
     identity: &ProviderIdentity,
 ) -> Result<User, LinkError> {
@@ -176,7 +179,7 @@ async fn create_user(
         .get_result(connection)
         .await?;
 
-    crate::tenancy::create_personal_organization(connection, &user).await?;
+    crate::tenancy::bootstrap_account(connection, bootstrap, &user).await?;
     Ok(user)
 }
 

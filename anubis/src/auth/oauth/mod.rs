@@ -426,6 +426,7 @@ async fn finish_flow(
         &mut connection,
         &state.hasher,
         &state.registration,
+        &state.bootstrap,
         config.provider().key,
         &asserted,
     )

@@ -14,7 +14,7 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
@@ -26,7 +26,7 @@ use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
 use axum::http::{Request, StatusCode};
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use http_body_util::BodyExt;
 use image::codecs::png::PngEncoder;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,24 @@ const RACERS: usize = 8;
 /// otherwise scheduler-dependent race arrive together. It bounds nothing and
 /// overshooting only costs the test its own time.
 const QUEUING_WINDOW: Duration = Duration::from_millis(250);
+
+/// How long [`wait_until_queued`] gives racers to reach a lock a test holds.
+///
+/// An upper bound and nothing else: the wait returns the moment they arrive,
+/// and a test that hits this deadline fails rather than quietly proving
+/// nothing. It is measured in seconds because a signup computes an argon2 hash
+/// before it opens a transaction, and several of those share the machine.
+const QUEUING_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often that wait re-asks.
+const QUEUING_POLL: Duration = Duration::from_millis(10);
+
+/// How many first signups race to create the one shared organization.
+///
+/// Two is what the property is about, and two is what the connection pool can
+/// always spare: each racer holds a pooled connection for as long as it queues
+/// behind the lock, and the pool is sized from the machine's core count.
+const FIRST_SIGNUPS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Migrations
@@ -770,6 +788,153 @@ fn demote_member(
             send(&router, "PATCH", &path, Some(&roles), Some(&cookie)).await;
         status
     })
+}
+
+// ---------------------------------------------------------------------------
+// The shared bootstrap
+// ---------------------------------------------------------------------------
+
+/// The race the advisory lock in `tenancy::bootstrap` exists for. A shared
+/// deployment's first signups each find no organization to join, and without
+/// ordering each creates one, leaving as many organizations of the same name
+/// as there were racers and no way to say which is the one everybody shares.
+///
+/// The racers are made to arrive together, because a signup spends most of its
+/// time hashing a password and firing them at once is not enough on a busy
+/// machine. A connection of the test's own holds `organizations` locked
+/// against writes: reads are untouched, so both racers get past the question
+/// "does it exist yet?" and then queue, which is exactly the interleaving the
+/// lock defends against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_first_signups_create_one_shared_organization() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let harness = Harness::boot_with_config(
+        &database,
+        Harness::config_with(&[
+            ("ANUBIS_BOOTSTRAP", "shared"),
+            ("ANUBIS_SHARED_ORGANIZATION", "Acme Corporation"),
+        ]),
+    )
+    .await;
+
+    // Both the blocker and the wait below connect outside the application's
+    // pool, so every pooled connection is left for a racer to hold while it
+    // queues.
+    let mut blocker = AsyncPgConnection::establish(database.url())
+        .await
+        .expect("a blocking connection");
+    let mut observer = AsyncPgConnection::establish(database.url())
+        .await
+        .expect("an observing connection");
+
+    let racing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::sql_query("LOCK TABLE organizations IN EXCLUSIVE MODE")
+                .execute(transaction)
+                .await?;
+
+            let mut signups = Vec::with_capacity(FIRST_SIGNUPS);
+            for racer in 0..FIRST_SIGNUPS {
+                let router = harness.router.clone();
+                signups.push(tokio::spawn(async move {
+                    let credentials = json!({
+                        "email": format!("racer-{racer}@example.com"),
+                        "password": PASSWORD,
+                    });
+                    let (status, _headers, body) =
+                        send(&router, "POST", "/auth/register", Some(&credentials), None).await;
+                    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+                }));
+            }
+            wait_until_queued(&mut observer, FIRST_SIGNUPS).await;
+            Ok(signups)
+        })
+        .await
+        .expect("holding the organizations lock must succeed");
+    drop(blocker);
+
+    for signup in racing {
+        signup.await.expect("a signup task must not panic");
+    }
+
+    let racers = i64::try_from(FIRST_SIGNUPS).expect("the racer count fits");
+    let mut connection = harness.pool.get().await.expect("connection");
+
+    let organizations_created: i64 = organizations::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(
+        organizations_created, 1,
+        "the deployment has the one organization it named",
+    );
+
+    let teams_created: i64 = teams::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(teams_created, 1, "and that organization's default team");
+
+    // Whoever lost the race joined rather than failing, so every account is
+    // inside, in the organization and in its team.
+    let members: i64 = organization_memberships::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(members, racers, "every signup is an organization member");
+
+    let team_members: i64 = team_memberships::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(team_members, racers, "and a member of its team");
+}
+
+/// Waits until `count` of this database's sessions are queued on a lock.
+///
+/// What a test means by "the racers arrived together", asked as the condition
+/// itself rather than approximated with a sleep, which on a slow machine
+/// releases the blocker before anybody queued and proves nothing at all.
+///
+/// # Panics
+/// Panics when they have not all queued within [`QUEUING_DEADLINE`], because a
+/// race that never formed is a failed test rather than a passing one.
+async fn wait_until_queued(connection: &mut AsyncPgConnection, count: usize) {
+    /// One row of the count, for `sql_query`.
+    #[derive(QueryableByName)]
+    struct Queued {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        queued: i64,
+    }
+
+    let count = i64::try_from(count).expect("the racer count fits");
+    let deadline = Instant::now() + QUEUING_DEADLINE;
+
+    loop {
+        let queued = diesel::sql_query(
+            "SELECT count(*) AS queued FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .get_result::<Queued>(&mut *connection)
+        .await
+        .expect("the activity query must run")
+        .queued;
+
+        if queued >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {queued} of {count} racers queued behind the lock",
+        );
+        tokio::time::sleep(QUEUING_POLL).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

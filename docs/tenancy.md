@@ -17,7 +17,7 @@ User ─< TeamMembership >─ Team ─> Organization
 - **Invitation**: created when someone is added to a Team or Organization by email. The emailed 256-bit token (hashed at rest, 14-day expiry) is the credential; whichever signed-in account holds it may claim, and claiming consumes the invitation. Team invitations pre-create the unclaimed TeamMembership, so the membership (id, roles, and any resource assignments) survives the claim intact; organization invitations create the OrganizationMembership at claim time. Re-inviting an email replaces the pending invitation. Inviting requires the admin role on the target, and organization admins may invite to any team in their organization. An admin can revoke a pending invitation, which discards the unclaimed membership with it; a claimed invitation no longer exists, so a claim cannot be taken back.
 - **Role**: declared in `roles.yml`, granted through memberships at either level.
 
-At signup, every user gets a personal Organization containing a default Team, so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
+At signup, every user gets a personal Organization containing a default Team, so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it. A deployment that wants one shared workspace instead says so in configuration; see [what a new account joins](#what-a-new-account-joins).
 
 ## Who may register
 
@@ -38,6 +38,27 @@ The mode gates account **creation** and nothing else. `POST /auth/register` refu
 `GET /auth/registration` answers `{"open": true}` or `{"open": false}` signed out, which is what the sign-in and sign-up screens read through `useRegistrationOpen` before rendering: a deployment that registers nobody offers no sign-up link and no form. An allowlist answers `true`, since its form is worth filling in and the address decides. The mode itself and the admitted domains stay server-side.
 
 Under `invite_only` the person being invited needs an account already, because a claim is made by a signed-in user. Registering with an invitation token in hand, which would let an invited stranger create the account the invitation is waiting for, is future work.
+
+## What a new account joins
+
+The tenancy a signup lands in is a deployment decision too, so it is configuration. `ANUBIS_BOOTSTRAP` names one of two modes and `ANUBIS_SHARED_ORGANIZATION` names the organization the second one uses:
+
+| Mode | What a new account joins |
+|---|---|
+| `personal` | An Organization of its own, named after the address's local part, holding one Team. The default, and what an unset variable means |
+| `shared` | The one Organization `ANUBIS_SHARED_ORGANIZATION` names, and its default Team |
+
+`personal` is public multi-tenant SaaS, where two accounts are two tenants until somebody invites somebody. `shared` is internal tooling, where every account is a colleague and the point is that they all see the same resources.
+
+Both variables are validated at configuration load, the way the registration pair is, and a disagreement stops the boot. A shared bootstrap with nothing to name has no organization to find or create; a name under `personal` does nothing at all, which reads as one shared workspace to whoever wrote it while every account quietly gets a private one. The name is held to the rule every tenant name is held to: one to a hundred characters, no control characters.
+
+Both signup paths call one function, `anubis::tenancy::bootstrap_account`, so `POST /auth/register` and an OAuth first sign-in cannot drift. The shared Organization is created by the first signup that finds it missing, inside that signup's own transaction, so the account and the tenancy it lands in commit together or not at all. Concurrent first signups are ordered by a transaction-scoped Postgres advisory lock: the winner creates and commits, and the loser wakes holding the lock, finds what the winner committed, and joins that. A deployment therefore ends with the one Organization it named rather than one per racer.
+
+Whoever creates an Organization administers it, which is true of every Organization in the system and is what keeps a shared deployment administrable from its first signup. Every account joining an Organization that already exists gets the baseline `default` role, in the Organization and in its Team; promoting one is an administrator's act.
+
+The default Team is the one the Organization was created with, which is its oldest, so renaming it does not move it. An Organization whose Teams were all dissolved gets its default Team back at the next signup, because the mode promises a Team to land in.
+
+One interaction is worth naming: the `seats` limit is enforced when an invitation is created, and a signup is not an invitation, so a `shared` deployment that also accepts open registration adds seats nobody checked against the plan. Pair `shared` with `invite_only` or a `domain_allowlist`, which is what an internal deployment wants anyway.
 
 ## Ownership chain
 

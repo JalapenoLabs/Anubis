@@ -7,10 +7,12 @@
 //! directly to users. The full design lives in the repository's
 //! `docs/tenancy.md`.
 //!
-//! Every user gets a personal organization with a default team at signup.
-//! Applications mount [`router`] (conventionally under `/tenancy`) for the
-//! membership overview, invitations, and the management endpoints that create,
-//! rename, and dissolve tenants.
+//! What a new account joins at signup is a deployment decision:
+//! [`BootstrapMode`] gives every account an organization of its own, or puts
+//! every account in one shared organization. Applications mount [`router`]
+//! (conventionally under `/tenancy`) for the membership overview,
+//! invitations, and the management endpoints that create, rename, and
+//! dissolve tenants.
 
 mod bootstrap;
 mod departure;
@@ -19,11 +21,11 @@ mod management;
 mod model;
 mod routes;
 
-pub(crate) use bootstrap::create_personal_organization;
+pub(crate) use bootstrap::{MAX_NAME_CHARS, bootstrap_account};
 pub(crate) use departure::settle_departure;
 
 #[doc(inline)]
-pub use bootstrap::ADMIN_ROLE;
+pub use bootstrap::{ADMIN_ROLE, BootstrapMode};
 #[doc(inline)]
 pub use invitation::{INVITATION_TTL_DAYS, Invitation};
 #[doc(inline)]
