@@ -23,6 +23,8 @@
 //! | `ANUBIS_REGISTRATION_DOMAINS` | unset | Comma-separated email domains a `domain_allowlist` admits, e.g. `acme.com` |
 //! | `ANUBIS_BOOTSTRAP` | `personal` | What a new account joins: `personal` or `shared` |
 //! | `ANUBIS_SHARED_ORGANIZATION` | unset | Name of the organization a `shared` bootstrap puts every account in, e.g. `Acme` |
+//! | `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` | unset | Address of the administrator an empty deployment is seeded with, e.g. `admin@acme.com` |
+//! | `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD` | unset | That administrator's provisioning password, replaced at its first sign-in |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
@@ -169,6 +171,21 @@
 //! shared workspace to whoever wrote it while every account quietly gets a
 //! private one. See [`crate::tenancy::BootstrapMode`].
 //!
+//! # The first administrator
+//!
+//! `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` and `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD` are the
+//! way into a deployment that has nobody in it yet. Set both and a startup with
+//! no users at all creates that account, verified and holding `admin`; set
+//! neither, the default, and nothing happens. Setting one is a boot failure,
+//! for the reason the pairs above are: an address with no password creates
+//! nothing, and a password with no address names nobody.
+//!
+//! The address is normalized and validated the way a registration is, and the
+//! password is held to the same length policy, because it is a real credential
+//! that a real sign-in will use. It is a *provisioning* credential though, so
+//! the seeded account is flagged for rotation and the value is never echoed in
+//! errors or logs. See [`crate::tenancy::seed_first_administrator`].
+//!
 //! # Cross-origin access
 //!
 //! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
@@ -300,6 +317,16 @@ const SHARED_ORGANIZATION_VAR: &str = "ANUBIS_SHARED_ORGANIZATION";
 /// What a valid `ANUBIS_SHARED_ORGANIZATION` looks like, quoted back in errors.
 const SHARED_ORGANIZATION_FORM: &str = "the name of the organization every account joins, up to a hundred characters and free of \
      control characters, e.g. `Acme`";
+
+/// Names the administrator an empty deployment is seeded with.
+const BOOTSTRAP_ADMIN_EMAIL_VAR: &str = "ANUBIS_BOOTSTRAP_ADMIN_EMAIL";
+
+/// What a valid `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` looks like, quoted back in errors.
+const BOOTSTRAP_ADMIN_EMAIL_FORM: &str =
+    "the email address of the first administrator, e.g. `admin@acme.com`";
+
+/// Carries that administrator's provisioning password.
+const BOOTSTRAP_ADMIN_PASSWORD_VAR: &str = "ANUBIS_BOOTSTRAP_ADMIN_PASSWORD";
 
 /// Switches off the per-client budgets on the abuse-prone endpoints.
 const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
@@ -491,6 +518,38 @@ impl fmt::Debug for SmtpConfig {
     }
 }
 
+/// The account an empty deployment is seeded with at startup.
+///
+/// The password is a credential, so this type never exposes it through
+/// `Debug`; read it deliberately with [`BootstrapAdmin::password`], which only
+/// the seeding path in [`crate::tenancy`] does.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootstrapAdmin {
+    email: String,
+    password: String,
+}
+
+impl BootstrapAdmin {
+    /// Returns the address the account is created with, normalized.
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// Returns the password the account is created with.
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl fmt::Debug for BootstrapAdmin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootstrapAdmin")
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Stripe credentials for the billing module.
 ///
 /// Both values are bearer credentials for an account that can move money, so
@@ -584,6 +643,13 @@ pub struct AppConfig {
     /// An organization of its own by default; see the module docs and
     /// [`crate::tenancy::BootstrapMode`].
     pub bootstrap: BootstrapMode,
+    /// The administrator an empty deployment is seeded with, when both
+    /// `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` and `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD`
+    /// are set.
+    ///
+    /// Absent, the default, seeds nothing; see the module docs and
+    /// [`crate::tenancy::seed_first_administrator`].
+    pub bootstrap_admin: Option<BootstrapAdmin>,
     /// Whether the abuse limits are on, and how clients are addressed.
     ///
     /// On by default; see the module docs and [`crate::rate_limit`].
@@ -702,6 +768,7 @@ impl AppConfig {
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
         let registration = registration_mode(&lookup)?;
         let bootstrap = bootstrap_mode(&lookup)?;
+        let bootstrap_admin = bootstrap_admin(&lookup)?;
         let rate_limit = rate_limit_config(&lookup)?;
         let cors = cors_config(&lookup)?;
         let stripe = stripe_config(&lookup)?;
@@ -730,6 +797,7 @@ impl AppConfig {
             spa_dir,
             registration,
             bootstrap,
+            bootstrap_admin,
             rate_limit,
             cors,
             stripe,
@@ -934,6 +1002,64 @@ fn bootstrap_mode(lookup: &impl Fn(&str) -> Option<String>) -> Result<BootstrapM
         },
         _ => Err(Error::invalid(BOOTSTRAP_VAR, value.trim(), BOOTSTRAP_FORM)),
     }
+}
+
+/// Resolves the administrator an empty deployment is seeded with, if any.
+///
+/// The two variables have to agree, for the reason the pairs above do: an
+/// address with no password creates nothing, and a password with no address
+/// names nobody, so either alone is a deployment whose operator believes it
+/// has a way in and does not.
+///
+/// Both halves are held to the rules a registration is held to, because the
+/// seeded account is an ordinary account that an ordinary sign-in will use. The
+/// password is trimmed, unlike one submitted through the API: it arrives on a
+/// `.env` line, where trailing whitespace is a typo rather than a character
+/// somebody chose, and seeding happens once, so a hash of an invisible space
+/// would be a deployment nobody can sign into and nobody can re-seed.
+fn bootstrap_admin(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<BootstrapAdmin>, Error> {
+    let email = non_empty(lookup(BOOTSTRAP_ADMIN_EMAIL_VAR));
+    let password = non_empty(lookup(BOOTSTRAP_ADMIN_PASSWORD_VAR));
+
+    let (email, password) = match (email, password) {
+        (None, None) => return Ok(None),
+        (Some(email), Some(password)) => (email, password),
+        (Some(_email), None) => {
+            return Err(Error::missing(
+                BOOTSTRAP_ADMIN_PASSWORD_VAR,
+                "the password that goes with the address; without it the account is never created",
+            ));
+        }
+        (None, Some(_password)) => {
+            return Err(Error::missing(
+                BOOTSTRAP_ADMIN_EMAIL_VAR,
+                "the address that goes with the password; without it there is nobody to create",
+            ));
+        }
+    };
+
+    let email = crate::auth::routes::validate_email(&email).map_err(|_refusal| {
+        Error::invalid(
+            BOOTSTRAP_ADMIN_EMAIL_VAR,
+            email.trim(),
+            BOOTSTRAP_ADMIN_EMAIL_FORM,
+        )
+    })?;
+
+    let password = password.trim().to_owned();
+    if let Err(refusal) = crate::auth::routes::validate_password(&password) {
+        // The policy belongs to the sign-in this password will be used at, so
+        // the sentence a sign-up form would have shown is the sentence the
+        // operator gets. The value itself is never echoed.
+        return Err(Error::invalid_secret(
+            BOOTSTRAP_ADMIN_PASSWORD_VAR,
+            refusal.message(),
+        ));
+    }
+
+    Ok(Some(BootstrapAdmin { email, password }))
 }
 
 /// Whether a trimmed, non-empty string may name an organization or a team.
@@ -1146,7 +1272,7 @@ impl Error {
     }
 
     /// The variable holds a value that does not parse and must not be logged.
-    fn invalid_secret(variable: &'static str, expected: &'static str) -> Self {
+    fn invalid_secret(variable: &'static str, expected: &str) -> Self {
         Self::new(
             variable,
             format!("invalid value for {variable}: expected {expected}"),
@@ -1677,6 +1803,85 @@ mod tests {
             let error = AppConfig::from_lookup(lookup).expect_err("only tenant names are accepted");
             assert_eq!(error.variable(), "ANUBIS_SHARED_ORGANIZATION");
         }
+    }
+
+    #[test]
+    fn no_administrator_is_seeded_until_a_deployment_names_one() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(defaulted.bootstrap_admin, None);
+
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", " Admin@Acme.com "),
+            ("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", " provisioned once  "),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a complete pair must parse");
+        let administrator = config
+            .bootstrap_admin
+            .expect("a complete pair configures an administrator");
+
+        assert_eq!(
+            administrator.email(),
+            "admin@acme.com",
+            "normalized the way a registration is",
+        );
+        assert_eq!(
+            administrator.password(),
+            "provisioned once",
+            "trimmed, because a .env line's trailing space is a typo and seeding happens once",
+        );
+    }
+
+    #[test]
+    fn half_a_bootstrap_administrator_stops_the_boot() {
+        // An address with no password creates nothing, and a password with no
+        // address names nobody. Either way the operator believes the deployment
+        // has a way in that was never made.
+        let lookup = lookup_from(&[("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", "admin@acme.com")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the password is required");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP_ADMIN_PASSWORD");
+        assert!(error.to_string().contains("is not set"), "got: {error}");
+
+        let lookup = lookup_from(&[("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", "provisioned once")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the address is required");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP_ADMIN_EMAIL");
+        assert!(error.to_string().contains("is not set"), "got: {error}");
+    }
+
+    #[test]
+    fn a_bootstrap_administrator_is_held_to_the_rules_an_account_is() {
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", "not-an-address"),
+            ("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", "provisioned once"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("only addresses are accepted");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP_ADMIN_EMAIL");
+
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", "admin@acme.com"),
+            // Seven characters, one short of the policy every password meets.
+            ("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", "hunter2"),
+        ]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the password policy applies");
+        assert_eq!(error.variable(), "ANUBIS_BOOTSTRAP_ADMIN_PASSWORD");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("hunter2"),
+            "the password must never be echoed: {rendered}",
+        );
+        assert!(rendered.contains("at least"), "got: {rendered}");
+    }
+
+    #[test]
+    fn bootstrap_administrator_debug_output_never_leaks_the_password() {
+        let lookup = lookup_from(&[
+            ("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", "admin@acme.com"),
+            ("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", "provisioned once"),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a complete pair must parse");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("admin@acme.com"), "got: {rendered}");
+        assert!(!rendered.contains("provisioned once"), "got: {rendered}");
     }
 
     #[test]

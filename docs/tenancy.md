@@ -60,6 +60,31 @@ The default Team is the one the Organization was created with, which is its olde
 
 One interaction is worth naming: the `seats` limit is enforced when an invitation is created, and a signup is not an invitation, so a `shared` deployment that also accepts open registration adds seats nobody checked against the plan. Pair `shared` with `invite_only` or a `domain_allowlist`, which is what an internal deployment wants anyway.
 
+## The first administrator
+
+The two settings above leave a deployment that nobody can get into. Under `invite_only` nobody may register, and under `shared` the first account to arrive is the one that administers the shared Organization, so a closed internal deployment has neither a way to create an account nor anybody who could invite one. `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` and `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD` are that way in:
+
+```sh
+ANUBIS_BOOTSTRAP_ADMIN_EMAIL=admin@acme.com
+ANUBIS_BOOTSTRAP_ADMIN_PASSWORD=<a provisioning password>
+```
+
+`anubis::tenancy::seed_first_administrator(&pool, &config)` runs at startup, after the migrations and before the server takes traffic, and the stamped `main.rs` already calls it. It does nothing unless **both** variables are set **and** the deployment has no users at all. Setting one alone stops the boot, the way the two pairs above do: an address with no password creates nothing, and a password with no address names nobody, so either half leaves an operator believing there is a way in that was never made. The address is normalized and validated the way a registration is, and the password is held to the same length policy, because a real sign-in will use it.
+
+Emptiness is decided under a transaction-scoped Postgres advisory lock, in the transaction that acts on it, so two instances booting together seed one administrator. Without the ordering both would find nothing and both would insert, and the loser would fail its boot on the unique index over `users.email`, which is a crash loop rather than a deployment.
+
+What gets created:
+
+- The **account**, with its address already verified. Nothing could deliver a verification email to a deployment nobody can sign into yet, so demanding one would be a door locked from the inside.
+- The **tenancy**, through `anubis::tenancy::bootstrap_account`, the same function both signup paths call, so the account lands where this deployment puts accounts: a personal Organization under `personal`, the named one under `shared`.
+- The `admin` role on that Organization and its default Team, granted unconditionally. Whoever creates an Organization administers it already; stating it here is what makes the promise hold under `shared` if the named Organization somehow exists before anybody does.
+
+The password is a **provisioning credential**: it was typed into a deployment manifest and is readable by whoever can read the environment. So the account is created already owing a password change, and the first sign-in can do exactly one thing, which is replace it (see [account state](#account-state)). Remove both variables once it has; every later boot is a no-op regardless.
+
+Startup says what happened, at `WARN` either way. A seeded deployment names the account, the Organization, and the Team it created, and says to sign in and change the password. A deployment that already had accounts says the variables were inert and names the account it did **not** create, so an operator learns that from the log rather than from a missing administrator.
+
+Registration mode is deliberately not consulted. It governs who may create an account through the API; this is the deployment creating its own first account from its own configuration, and a closed deployment is exactly the one that needs it.
+
 ## Ownership chain
 
 Every scaffolded model declares its parent chain back to a Team, exactly like Bullet Train:

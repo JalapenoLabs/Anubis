@@ -1,6 +1,7 @@
 //! The Anubis starter application server.
 //!
-//! The composition root: it reads configuration, migrates the database, and
+//! The composition root: it reads configuration, migrates the database, seeds
+//! the first administrator when an empty deployment configures one, and
 //! mounts the framework's routers alongside the application's own
 //! [`account_router`], with the built frontend behind them all. The
 //! application itself lives in the library beside this file, which is what
@@ -63,21 +64,7 @@ async fn main() {
          {{billing.plan.free}}",
     );
 
-    let database = config
-        .database
-        .as_ref()
-        .expect("DATABASE_URL is required (e.g. postgres://user:pass@localhost/app_development)");
-
-    // Framework tables first: the application's reference them.
-    db::run_pending_migrations(database.url())
-        .await
-        .expect("failed to run framework migrations");
-    db::run_app_migrations(database.url(), APP_MIGRATIONS)
-        .await
-        .expect("failed to run application migrations");
-    let pool = db::connect(database.url())
-        .await
-        .expect("failed to connect to the database");
+    let pool = open_database(&config).await;
 
     // SMTP when SMTP_URL is set, otherwise the log mailer, which prints emails
     // and their action links to the console.
@@ -190,6 +177,38 @@ async fn main() {
     working
         .await
         .expect("the job worker must shut down cleanly");
+}
+
+/// Migrates the database, connects to it, and opens the first door.
+///
+/// The order is the design. The framework's tables come first, because the
+/// application's reference them. The seed comes last, once there is a pool to
+/// run it on: it creates the administrator `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` and
+/// `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD` name when the deployment has no users at
+/// all, and does nothing on every boot after that. It is what opens a
+/// deployment whose registration is closed; see `docs/tenancy.md`.
+async fn open_database(config: &AppConfig) -> anubis::db::DbPool {
+    let database = config
+        .database
+        .as_ref()
+        .expect("DATABASE_URL is required (e.g. postgres://user:pass@localhost/app_development)");
+
+    db::run_pending_migrations(database.url())
+        .await
+        .expect("failed to run framework migrations");
+    db::run_app_migrations(database.url(), APP_MIGRATIONS)
+        .await
+        .expect("failed to run application migrations");
+
+    let pool = db::connect(database.url())
+        .await
+        .expect("failed to connect to the database");
+
+    anubis::tenancy::seed_first_administrator(&pool, config)
+        .await
+        .expect("failed to seed the first administrator");
+
+    pool
 }
 
 /// Builds the background job worker this process runs.

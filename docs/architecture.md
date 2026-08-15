@@ -31,6 +31,10 @@ An application applies the framework's embedded migrations and then its own, bot
 
 Applying takes a Postgres advisory lock over one fixed key, held for the length of the pass. Two instances booting at the same moment is the ordinary case, not the exotic one, and without the lock they race in Postgres' catalog: the loser fails a `CREATE TABLE` with a unique violation on `pg_type_typname_nsp_index`, which reads like nothing to do with migrations. With it, the second waits and then finds nothing pending. See [testing.md](testing.md#concurrent-migrations).
 
+### The first administrator at boot
+
+Right after the migrations, an application calls `anubis::tenancy::seed_first_administrator`, which creates the account named by `ANUBIS_BOOTSTRAP_ADMIN_EMAIL` and `ANUBIS_BOOTSTRAP_ADMIN_PASSWORD` when the deployment has no users at all, and does nothing otherwise. It is what opens a deployment whose registration is closed. Emptiness is decided under an advisory lock of its own, in the transaction that acts on it, so instances booting together seed one administrator. See [tenancy.md](tenancy.md#the-first-administrator).
+
 ### Secrets at rest and key rotation
 
 `ANUBIS_SECRET_KEY` is base64 for exactly 32 random bytes. `anubis secret generate` prints one, and `anubis doctor` warns when the variable is unset (the public development key is in use) and fails when it holds something that cannot be a key.

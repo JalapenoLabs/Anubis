@@ -13,9 +13,14 @@
 //! (conventionally under `/tenancy`) for the membership overview,
 //! invitations, and the management endpoints that create, rename, and
 //! dissolve tenants.
+//!
+//! A deployment with nobody in it yet has nobody to invite the first person
+//! either, so [`seed_first_administrator`] opens one from configuration at
+//! startup; see [`first_administrator`].
 
 mod bootstrap;
 mod departure;
+pub mod first_administrator;
 mod invitation;
 mod management;
 mod model;
@@ -26,6 +31,8 @@ pub(crate) use departure::settle_departure;
 
 #[doc(inline)]
 pub use bootstrap::{ADMIN_ROLE, BootstrapMode};
+#[doc(inline)]
+pub use first_administrator::seed_first_administrator;
 #[doc(inline)]
 pub use invitation::{INVITATION_TTL_DAYS, Invitation};
 #[doc(inline)]

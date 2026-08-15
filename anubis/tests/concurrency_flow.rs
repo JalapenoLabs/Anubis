@@ -71,6 +71,9 @@ const QUEUING_POLL: Duration = Duration::from_millis(10);
 /// behind the lock, and the pool is sized from the machine's core count.
 const FIRST_SIGNUPS: usize = 2;
 
+/// The administrator two instances booting together both try to seed.
+const BOOTSTRAP_ADMIN_EMAIL: &str = "founder@example.com";
+
 // ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
@@ -935,6 +938,98 @@ async fn wait_until_queued(connection: &mut AsyncPgConnection, count: usize) {
         );
         tokio::time::sleep(QUEUING_POLL).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The first administrator
+// ---------------------------------------------------------------------------
+
+/// The race the advisory lock in `tenancy::first_administrator` exists for. Two
+/// instances of a deployment boot together, both find no users at all, and
+/// without ordering both act on that answer: one of them loses to the unique
+/// index on the address it was told to create and fails its boot, which is a
+/// crash loop rather than a deployment.
+///
+/// They are made to arrive together the way the shared bootstrap's racers are.
+/// A connection of the test's own holds `users` locked against writes, so the
+/// first racer gets past "is anybody here?" and stops at its insert while the
+/// second queues on the lock, which is exactly the interleaving that has to be
+/// safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_booting_together_seed_one_administrator() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let config = Harness::config_with(&[
+        ("ANUBIS_BOOTSTRAP_ADMIN_EMAIL", BOOTSTRAP_ADMIN_EMAIL),
+        ("ANUBIS_BOOTSTRAP_ADMIN_PASSWORD", PASSWORD),
+    ]);
+    // A pool each, because two instances are two processes.
+    let instances = [database.pool().await, database.pool().await];
+
+    let mut blocker = AsyncPgConnection::establish(database.url())
+        .await
+        .expect("a blocking connection");
+    let mut observer = AsyncPgConnection::establish(database.url())
+        .await
+        .expect("an observing connection");
+
+    let racing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::sql_query("LOCK TABLE users IN EXCLUSIVE MODE")
+                .execute(transaction)
+                .await?;
+
+            let mut booting = Vec::with_capacity(instances.len());
+            for pool in instances.clone() {
+                let config = config.clone();
+                booting.push(tokio::spawn(async move {
+                    anubis::tenancy::seed_first_administrator(&pool, &config).await
+                }));
+            }
+            wait_until_queued(&mut observer, instances.len()).await;
+            Ok(booting)
+        })
+        .await
+        .expect("holding the users lock must succeed");
+    drop(blocker);
+
+    for instance in racing {
+        instance
+            .await
+            .expect("a booting instance must not panic")
+            .expect("both instances must boot: seeding is safe to run everywhere");
+    }
+
+    let mut connection = instances[0].get().await.expect("connection");
+
+    let accounts: i64 = users::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(accounts, 1, "one administrator, not one per instance");
+
+    let organizations_created: i64 = organizations::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(
+        organizations_created, 1,
+        "and the one tenancy it was bootstrapped into",
+    );
+
+    let administers: i64 = organization_memberships::table
+        .filter(organization_memberships::roles.contains(vec![anubis::tenancy::ADMIN_ROLE]))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(
+        administers, 1,
+        "the account that exists is the one that can invite everybody else",
+    );
 }
 
 // ---------------------------------------------------------------------------
