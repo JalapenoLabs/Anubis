@@ -206,11 +206,12 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 | `anubis scaffold oauth <provider>` | Print how to enable an OAuth login provider (the one-line Google Auth moment) |
 | `anubis scaffold webhook <Provider>` | Receiving endpoint for a third party's webhooks |
 | `anubis routes` | Print the route table |
-| `anubis eject <component>` | Copy a framework frontend component into the app to own it |
+| `anubis eject <component>` | Copy a framework field component into the app to own it |
+| `anubis eject --list` | Print every component that can be ejected |
 | `anubis doctor` | Verify toolchain, database, and config health |
 | `anubis secret generate` | Print a fresh `ANUBIS_SECRET_KEY` |
 
-`anubis new`, `anubis routes`, `anubis doctor`, `anubis secret generate`, `anubis scaffold model`, `anubis scaffold field`, `anubis scaffold join`, `anubis scaffold oauth`, and `anubis scaffold webhook` are implemented; `eject` is the remainder of M4 and M5.
+Every command in the table is implemented.
 
 Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
 
@@ -497,6 +498,74 @@ These field types have no component yet, and each waits on something specific:
 
 The package ships TypeScript source, so a consuming application's Tailwind build must scan it. The starter stylesheet carries the glob twice, `../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}` and `../../../node_modules/...`, exactly as it does for HeroUI: yarn workspaces hoist the package to the repo root while a standalone install keeps it local, and Tailwind skips whichever glob matches nothing. Without it a field's own utilities never reach the stylesheet. The fields also use the vertical rhythm helpers (`compact`, `relaxed`) and the HeroUI theme scale, both of which the starter stylesheet defines.
 
+Shipping the source is also what makes `anubis eject` possible: the command copies a component out of the installed package, so the copy is the code that application is running.
+
+## `anubis eject`: the ownership escape hatch
+
+```
+anubis eject --list
+anubis eject TextField
+```
+
+Bullet Train's `bin/resolve --eject` copies a framework file into the application so the developer owns it. This is that command, for the frontend package. It runs inside an application, exactly as the scaffolders do, and one run copies a field component into `frontend/src/anubis/`, records where the file came from, and moves every import of it in the application from the package to the copy:
+
+```
+ejected TextField from @jalapenolabs/anubis v0.1.0
+
+created:
+  frontend/src/anubis/fields/TextField.tsx
+  frontend/src/anubis/fields/internal/TextualField.tsx
+rewired:
+  frontend/src/components/CreativeConceptForm.tsx
+  frontend/src/components/settings/ProfileForm.tsx
+  ...
+```
+
+### What is ejectable, and what is not
+
+The ejectable surface is the [field component library](#the-field-component-library): the thirteen field components, `FieldWrapper`, and `useFieldState`. `anubis eject --list` prints it with a line each.
+
+Everything else the package ships stays framework-owned on purpose. The API client, the realtime client, the React hooks, and the WebAuthn helpers speak a protocol the backend keeps moving, so a copy of one would fork that contract rather than restyle a control, and the fork would be silent until an upgrade broke it. Bullet Train draws the same line: partials and locales eject, framework concerns are extended rather than copied. An application that wants different behavior composes those APIs in the pages it already owns, because the starter owns every page.
+
+An unknown name is refused with the catalog rather than guessed at.
+
+### Where the copy lands, and how imports are rewritten
+
+The ejected tree mirrors the package's own layout under `frontend/src/anubis/`, so `src/fields/TextField.tsx` becomes `frontend/src/anubis/fields/TextField.tsx`. The mirror is what makes provenance obvious at a glance, and it is also load-bearing: a copied file's relative imports of its siblings still resolve, unchanged.
+
+Each relative import inside a copied file takes one of three roads, decided by the package's own `index.ts` rather than by a list in the CLI:
+
+- a dependency the package **exports** is read from the package (`import type { AnubisFieldProps } from '@jalapenolabs/anubis'`), so an ejected `TextField` still shares one `FieldWrapper` and one `useFieldState` with every field that was not ejected
+- a dependency the package **keeps to itself** rides along, reported as an extra file. `TextField`, `EmailField`, `PasswordField`, and `PhoneField` differ only in input type, and the control behind them (`internal/TextualField.tsx`) is not exported, so leaving it behind would leave an import that does not resolve
+- a dependency this application **already ejected** is reached where it lies, so ejecting `FieldWrapper` first and a field afterwards gives that field your wrapper, not the package's
+
+In the application's own files, only the ejected name moves. A shared import line splits, and the rest stays with the package:
+
+```tsx
+import { OptionsField, SuperSelectField } from '@jalapenolabs/anubis'
+import { TextField } from '../../anubis/fields/TextField'
+```
+
+A scaffolded form imports its fields through a list closed by the `🐺 anubis:field-imports` anchor, and the anchor stays in the package's line, where the next `anubis scaffold field` run inserts. Ejecting a field never costs a model its scaffoldability.
+
+### The trade
+
+An ejected file is yours, and that is the whole point and the whole price: upgrading `@jalapenolabs/anubis` no longer improves it, and a fix that lands upstream has to be brought over by hand. This is Bullet Train's documented caveat about ejected views, and it applies here for the same reason. Every copied file says so in a comment under its copyright header, naming the version and the date it came from, which is what makes a later upstream diff possible:
+
+```tsx
+// Copyright © 2026 Jalapeno Labs
+
+// Ejected from @jalapenolabs/anubis v0.1.0 (src/fields/TextField.tsx) on 2026-08-15.
+// This file belongs to this application now: upstream improvements to it no longer
+// arrive. Delete it to go back to the package's copy.
+```
+
+Deleting the file is the way back, and re-ejecting is refused by name while the copy exists, so the command can never quietly overwrite work. The application's imports of the deleted copy are the developer's to point back at the package; nothing else needs undoing.
+
+### How the package is found
+
+Ejecting reads the installed package, not the framework's own tree, so the copy matches the version the application runs. The search walks up from `frontend/`, exactly as node resolution does: yarn hoists a workspace dependency to the workspace root, while a standalone install keeps it beside the package that asked for it, and both arrangements are found. An application whose dependencies are not installed is told to run `yarn install` rather than handed a copy of something else.
+
 ## The stamping engine
 
 All scaffolders share one pure engine, `anubis::scaffold`:
@@ -560,7 +629,7 @@ Still to come:
 
 - A generated-client refresh per scaffold. The `/api/v1` client (`frontend/src/api/v1.generated.ts`) is rendered from the application's exported document, so a scaffold changes what it would contain, but the run does not regenerate it: that takes compiling the application, which a text generator does not do. Run the two commands in [api.md](api.md#application-models) after a scaffold, as CI does.
 - Scaffolded pages consuming the generated client. They call the hand-written ky route module today, which is the same contract typed by hand; the generated client is additive, for consumers outside the application. Which of the two a generated page should read is its own decision, and it is not settled here.
-- Per-model frontend tests. The starter runs Vitest and the scaffolder's own frontend output is covered by `tsc`, ESLint, the production build, and the integration test that scaffolds two models and reads the result. Playwright end-to-end tests wait on Playwright itself, which the starter does not have.
+- Per-model frontend tests. The starter runs Vitest and the scaffolder's own frontend output is covered by `tsc`, ESLint, the production build, and the integration test that scaffolds two models and reads the result. The starter now has Playwright and three specs that drive the templates' own screens end to end (see [testing.md](testing.md#end-to-end-tests)); what remains is emitting one per scaffolded model, the narrative that creates a record, opens it, and edits it.
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
 
@@ -571,6 +640,20 @@ Still deferred for `scaffold field`: one field per run (run it twice for two).
 - **List endpoints** follow the page/limit, sort, and filter conventions in [api.md](api.md); the scaffolder maintains each model's sortable and filterable whitelists. `anubis::http::ListParams` and `anubis::http::Pagination` implement the convention once, so every generated endpoint pages and sorts identically.
 - **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method, `valid_<associations>(connection, team_id) -> QueryResult<Vec<_>>`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on write, so a form can never smuggle in another tenant's record. One definition, both duties. For an ownership-chain parent it lives on the model that points at it; for a has-many-through it lives on the join model, which is the only artifact that knows both sides and is generated once for every association that uses it.
 - **Timestamps**: `created_at`/`updated_at` come from the database. `updated_at` is maintained by the shared `set_updated_at()` trigger, attached to every generated table; application code never sets either.
+
+## Proving the generators
+
+A generator is only as good as its last run, so the proof is continuous rather than ceremonial. `scripts/ci-scaffold-proof.sh` runs the whole family against the real `starter/` tree, in one sequence that covers every shape a template takes: a team-owned model with extra fields, a field added afterwards, every field type the templates prove, a nested model attaching itself to its parent's page, a join with the association field that reads through it, a sign-in provider, and an incoming webhook receiver. It then holds the output to the bar the hand-written code is held to: `cargo fmt --check` on untouched generated Rust, clippy with warnings denied, the generated narratives against a real Postgres, and the frontend typecheck, lint, test, and production build over the generated TypeScript.
+
+CI runs it on every push and pull request, and the job is blocking. Run it yourself before touching a living template, with `yarn dev` stopped so nothing else writes to the database it uses:
+
+```sh
+docker compose --env-file .env.example -f starter/compose.yaml up -d --wait
+DATABASE_URL=postgres://anubis_starter:anubis-starter-dev-password@localhost:54321/anubis_starter_development \
+  bash scripts/ci-scaffold-proof.sh
+```
+
+It leaves the generated models in `starter/` so the output is there to read, and [ci.md](ci.md#the-scaffold-proof) carries the three-path checkout and clean that takes the tree back. [ci.md](ci.md#the-scaffold-proof) states what each gate catches.
 
 ## Workflow
 

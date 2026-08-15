@@ -17,7 +17,8 @@
     "typecheck": "yarn workspaces foreach -A run typecheck",
     "lint": "yarn workspaces foreach -A run lint",
     "lint:fix": "yarn workspaces foreach -A run lint:fix",
-    "test": "yarn workspaces foreach -A run test"
+    "test": "yarn workspaces foreach -A run test",
+    "e2e": "yarn dev:env && docker compose --env-file .env -f compose.yaml up -d --wait && dotenv -v RATE_LIMIT_DISABLED=true -- concurrently --kill-others --success command-e2e -n api,web,e2e -c blue,green,magenta \"cargo run -p anubis-starter\" \"yarn workspace anubis-starter-frontend dev\" \"yarn workspace anubis-starter-frontend test:e2e\""
   },
   "devDependencies": {
     "concurrently": "^9.2.0",

@@ -7,6 +7,10 @@ dist/
 coverage/
 .vite/
 
+# Playwright (reports and traces from the end-to-end suite)
+playwright-report/
+test-results/
+
 # Yarn (zero-install artifacts are not committed)
 .yarn/*
 .pnp.*

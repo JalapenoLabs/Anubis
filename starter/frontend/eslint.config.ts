@@ -25,14 +25,15 @@ export default defineConfig([
     },
   },
   // Tooling configs (`export default defineConfig(...)`) legitimately rely on
-  // default exports, and Tailwind's `@plugin` directive requires one from
-  // hero.ts. The repo bans default exports everywhere else, so the exception
-  // is scoped tightly.
+  // default exports, Tailwind's `@plugin` directive requires one from hero.ts,
+  // and Playwright loads its global setup by default export. The repo bans
+  // default exports everywhere else, so the exception is scoped tightly.
   {
     files: [
       '*.config.ts',
       'eslint.config.ts',
       'src/hero.ts',
+      'e2e/global-setup.ts',
     ],
     rules: {
       'import/no-default-export': 'off',

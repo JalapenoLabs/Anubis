@@ -218,6 +218,10 @@ export function AppShell(props: Props) {
                 as='button'
                 size='sm'
                 showFallback
+                // The trigger shows a picture or two initials, so it needs a
+                // name of its own: without one, the only control that reaches
+                // settings and sign-out is unaddressable to a screen reader.
+                aria-label={t('common.accountMenu')}
                 src={api.avatarUrl(props.user.id)}
                 name={props.user.email.slice(0, 2).toUpperCase()}
                 className='transition-transform'

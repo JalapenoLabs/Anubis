@@ -47,6 +47,8 @@ fn new_stamps_a_complete_renamed_application() {
         "backend/src/main.rs",
         "frontend/package.json",
         "frontend/src/main.tsx",
+        "frontend/playwright.config.ts",
+        "frontend/e2e/creative-concepts.spec.ts",
         "config/roles.yml",
         "compose.yaml",
         "package.json",
@@ -120,7 +122,7 @@ fn new_stamps_ci_and_development_configuration() {
         workflow.contains("POSTGRES_DB: acme_books_test"),
         "{workflow}"
     );
-    for expected in ["Roles drift check", "Client drift check"] {
+    for expected in ["Roles drift check", "Client drift check", "name: E2E"] {
         assert!(workflow.contains(expected), "CI is missing {expected}");
     }
 

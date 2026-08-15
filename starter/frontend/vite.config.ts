@@ -10,6 +10,20 @@ export default defineConfig({
     tailwindcss(),
   ],
   server: {
+    // `.env` names this origin in APP_URL, and the email links, OAuth redirect
+    // URIs, and Stripe returns are all built from it. Silently moving to the
+    // next free port would leave every one of them pointing at nothing, so a
+    // taken port is an error worth seeing.
+    strictPort: true,
+    // Playwright writes its report and its failure artifacts into this
+    // package. Watching them means a screenshot taken mid-run reloads the page
+    // the run is driving, which is flake the application did not cause.
+    watch: {
+      ignored: [
+        '**/playwright-report/**',
+        '**/test-results/**',
+      ],
+    },
     proxy: {
       // The backend serves the API; the SPA stays same-origin in production.
       '/auth': 'http://127.0.0.1:3000',

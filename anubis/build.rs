@@ -11,15 +11,19 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Directory names never embedded: build outputs and dependency caches that
-/// may exist locally but are not part of the template.
-const SKIPPED_DIRECTORIES: [&str; 6] = [
+/// Directory names never embedded: build outputs, test artifacts, and
+/// dependency caches that may exist locally but are not part of the template.
+const SKIPPED_DIRECTORIES: [&str; 8] = [
     "node_modules",
     "target",
     "dist",
     "coverage",
     ".vite",
     ".git",
+    // What a local `yarn test:e2e` leaves behind: the HTML report and the
+    // traces, screenshots, and videos of failed runs.
+    "playwright-report",
+    "test-results",
 ];
 
 fn main() {

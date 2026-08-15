@@ -1,10 +1,10 @@
 //! The `anubis` command line interface.
 //!
 //! The CLI is the front door to the framework: stamping new applications,
-//! scaffolding models and fields, and compiling `roles.yml` and `billing.yml`
-//! for the frontend. `scaffold model` generates a model's backend slice today;
-//! the rest of the `scaffold` family lands with milestone M4 (see the
-//! repository's `docs/scaffolding.md`).
+//! scaffolding models and fields, ejecting a framework component into an
+//! application that wants to own it, and compiling `roles.yml` and
+//! `billing.yml` for the frontend. The repository's `docs/scaffolding.md`
+//! states what each command produces.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +35,15 @@ enum Command {
     Scaffold {
         #[command(subcommand)]
         command: ScaffoldCommand,
+    },
+    /// Copy a framework frontend component into the application to own it.
+    Eject {
+        /// The component to eject, e.g. `TextField`.
+        #[arg(required_unless_present = "list")]
+        component: Option<String>,
+        /// Print every component that can be ejected, and stop.
+        #[arg(long)]
+        list: bool,
     },
     /// Verify toolchain, database, and config health.
     Doctor,
@@ -209,6 +218,7 @@ fn main() -> ExitCode {
         Command::Scaffold {
             command: ScaffoldCommand::Webhook { provider },
         } => cli::scaffold::webhook(&provider),
+        Command::Eject { component, list } => cli::eject::run(component.as_deref(), list),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),

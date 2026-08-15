@@ -299,6 +299,10 @@ mod tests {
             "compose.yaml",
             "frontend/package.json",
             "frontend/src/main.tsx",
+            // The end-to-end suite ships with every stamped app.
+            "frontend/playwright.config.ts",
+            "frontend/e2e/global-setup.ts",
+            "frontend/e2e/auth.spec.ts",
         ] {
             assert!(
                 embedded::STARTER_FILES
@@ -422,6 +426,23 @@ mod tests {
                 "the CI overlay never compares {generated}",
             );
         }
+    }
+
+    /// The stamped workflow runs the end-to-end suite the application ships,
+    /// so the specs under `frontend/e2e/` are covered where they run rather
+    /// than only in this repository.
+    #[test]
+    fn the_ci_overlay_runs_the_end_to_end_suite() {
+        let template = overlay(".github/workflows/ci.yml");
+
+        assert!(
+            template.contains("playwright install --with-deps chromium"),
+            "the CI overlay never provisions a browser",
+        );
+        assert!(
+            template.contains("test:e2e"),
+            "the CI overlay never runs the end-to-end suite",
+        );
     }
 
     /// The repository's own `.env.example` is the template, unstamped: the

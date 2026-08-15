@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@heroui/react": "^2.8.10",
@@ -36,6 +37,7 @@
   },
   "devDependencies": {
     "@jalapenolabs/cli": "https://github.com/jalapenolabs/cli.git",
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/dom": "^10.4.0",
     "@testing-library/react": "^16.3.0",

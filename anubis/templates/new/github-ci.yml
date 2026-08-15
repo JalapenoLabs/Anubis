@@ -119,3 +119,84 @@ jobs:
 
       - name: Build
         run: yarn build
+
+  # Browser-level proof that the screens work against the real stack: Postgres,
+  # the backend, and Vite, driven by Chromium. Three specs ship with the app,
+  # covering sign-up, the auth round trip, and a write that survives a reload.
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: anubis_starter
+          POSTGRES_PASSWORD: anubis-starter-dev-password
+          POSTGRES_DB: anubis_starter_e2e
+        ports:
+          # Ephemeral host port, for the same reason the Rust job uses one.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U anubis_starter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Pin Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.17.0 --activate
+
+      - name: Install
+        run: yarn install --immutable
+
+      - name: Build the backend
+        run: cargo build -p anubis-starter
+
+      # `--with-deps` installs the system libraries Chromium needs, which this
+      # runner image allows.
+      - name: Install Chromium
+        run: yarn workspace anubis-starter-frontend exec playwright install --with-deps chromium
+
+      # The suite drives the same three processes `yarn dev` starts. Playwright
+      # waits for the stack itself (frontend/e2e/global-setup.ts), so this step
+      # starts the two servers, runs the specs, and stops them on the way out
+      # however the run ended.
+      - name: Run the suite
+        env:
+          DATABASE_URL: postgres://anubis_starter:anubis-starter-dev-password@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_starter_e2e
+          APP_URL: http://localhost:5173
+          E2E_BASE_URL: http://localhost:5173
+          # The suite registers an account per spec, which is a rate a person
+          # never reaches and the auth limiter refuses. The limiter has its own
+          # Rust narrative; this job is about the screens.
+          RATE_LIMIT_DISABLED: "true"
+          RUST_LOG: warn
+        run: |
+          ./target/debug/anubis-starter &
+          backend=$!
+          yarn workspace anubis-starter-frontend dev &
+          web=$!
+          trap 'kill "$backend" "$web" 2>/dev/null || true' EXIT
+          yarn workspace anubis-starter-frontend test:e2e
+
+      # The report carries the trace, the screenshot, and the DOM snapshot of
+      # every failed step, which is the difference between reading a failure
+      # and reproducing it.
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
+          retention-days: 7

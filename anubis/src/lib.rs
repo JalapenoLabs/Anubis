@@ -14,6 +14,7 @@ pub mod auth;
 pub mod billing;
 pub mod config;
 pub mod db;
+pub mod eject;
 pub mod guard;
 pub mod http;
 pub mod jobs;

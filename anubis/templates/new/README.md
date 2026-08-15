@@ -24,6 +24,20 @@ machine-specific values in `.env`, which is git-ignored.
 Emails (verification, password reset, invitations, sign-in codes) go to the
 backend log in development; the action links and codes are in the log lines.
 
+## Tests
+
+```sh
+yarn test                              # Rust-free: Vitest over the frontend
+cargo test --workspace                 # the backend narratives, against Postgres
+yarn playwright install chromium       # once per machine
+yarn e2e                               # the browser suite, on a stack it starts
+```
+
+`yarn e2e` starts Postgres, the backend, and Vite, runs the Playwright specs in
+`frontend/e2e/`, and stops the servers however the run ended. With a stack
+already running, `yarn workspace anubis-starter-frontend test:e2e` drives it
+directly.
+
 ## Layout
 
 - `backend/`: the Rust application server (Axum on tokio, via the anubis crate)

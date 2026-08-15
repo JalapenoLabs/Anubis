@@ -145,3 +145,150 @@ jobs:
       - name: Audit npm dependencies
         continue-on-error: true
         run: yarn npm audit --all --recursive
+
+  # The real-scaffold proof: every scaffolder run against the real starter,
+  # with the generated code held to the same bar as the hand-written code.
+  # Blocking from day one, because template rot is exactly what it catches.
+  scaffold:
+    name: Scaffold
+    runs-on: [self-hosted, rocky9, earthly, docker]
+    services:
+      # Postgres only. The generated narratives are the only tests this job
+      # runs, and none of them touches the Redis fanout.
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: anubis
+          POSTGRES_PASSWORD: anubis
+          POSTGRES_DB: anubis_scaffold_test
+        ports:
+          # Ephemeral host port, for the same reason the Rust job uses one.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U anubis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # `clean: true` is the default, and it is spelled out because this is the
+      # job that dirties its own workspace: it scaffolds into the starter tree
+      # and never reverts. A failed run must not leak generated models into the
+      # next one, which the proof would refuse to start against.
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Pin Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.17.0 --activate
+
+      # The procedure lives in the script rather than here, so a developer runs
+      # the same proof before touching a living template. See docs/ci.md.
+      - name: Scaffold proof
+        env:
+          DATABASE_URL: postgres://anubis:anubis@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_scaffold_test
+        run: bash scripts/ci-scaffold-proof.sh
+
+  # Browser-level proof that the starter's screens work against the real stack:
+  # Postgres, the Rust backend, and Vite, driven by Chromium.
+  #
+  # Advisory to start with. Playwright's browsers need system libraries the
+  # self-hosted Rocky 9 runners are not guaranteed to carry, and `playwright
+  # install --with-deps` shells out to the system package manager as root,
+  # which a runner may refuse; a missing libatk must not block unrelated work
+  # from merging. Flip continue-on-error to false once a run on a fresh runner
+  # provisions its browser cleanly, the same convention the audits above use.
+  e2e:
+    name: E2E
+    runs-on: [self-hosted, rocky9, earthly, docker]
+    continue-on-error: true
+    # The backend binds 3000 and Vite binds 5173, because Vite proxies to a
+    # fixed backend address and the browser has to reach the origin APP_URL
+    # names. Fixed ports cannot be shared, so runs queue behind each other
+    # rather than colliding on a runner that hosts several at once.
+    concurrency:
+      group: anubis-e2e
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: anubis
+          POSTGRES_PASSWORD: anubis
+          POSTGRES_DB: anubis_e2e
+        ports:
+          # Ephemeral host port, for the same reason the Rust job uses one.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U anubis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Pin Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.17.0 --activate
+
+      - name: Install
+        run: yarn install --immutable
+
+      - name: Build the backend
+        run: cargo build -p anubis-starter
+
+      # Idempotent: the runner keeps ~/.cache/ms-playwright between runs, so
+      # only a fresh runner pays the download. Allowed to fail on its own,
+      # because a runner that already carries the libraries still runs the
+      # suite, and the failure is worth seeing in the log either way.
+      - name: Install Chromium
+        continue-on-error: true
+        run: yarn workspace anubis-starter-frontend exec playwright install --with-deps chromium
+
+      # The suite drives the same three processes `yarn dev` starts. Playwright
+      # waits for the stack itself (e2e/global-setup.ts), so this step starts
+      # the two servers, runs the specs, and stops them on the way out however
+      # the run ended.
+      - name: Run the suite
+        env:
+          DATABASE_URL: postgres://anubis:anubis@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_e2e
+          APP_URL: http://localhost:5173
+          E2E_BASE_URL: http://localhost:5173
+          # The suite registers an account per spec, which is a rate a person
+          # never reaches and the auth limiter refuses. The limiter has its own
+          # Rust narrative; this job is about the screens.
+          RATE_LIMIT_DISABLED: "true"
+          RUST_LOG: warn
+        run: |
+          ./target/debug/anubis-starter &
+          backend=$!
+          yarn workspace anubis-starter-frontend dev &
+          web=$!
+          trap 'kill "$backend" "$web" 2>/dev/null || true' EXIT
+          yarn workspace anubis-starter-frontend test:e2e
+
+      # The report carries the trace, the screenshot, and the DOM snapshot of
+      # every failed step, which is the difference between reading a failure
+      # and reproducing it.
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: starter/frontend/playwright-report
+          retention-days: 7

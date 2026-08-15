@@ -70,6 +70,18 @@ has to be the origin the browser sees, which is why the commands above set it
 to the dev server rather than the backend. Until both credentials are set the
 button lands back on the sign-in page with `oauth_unavailable`.
 
+## End-to-end tests
+
+```sh
+yarn playwright install chromium   # once per machine
+yarn e2e                           # from the repository root
+```
+
+`yarn e2e` starts Postgres, the backend, and Vite, runs the Playwright specs in
+`frontend/e2e/`, and stops the servers however the run ended. With a stack
+already running, `yarn workspace anubis-starter-frontend test:e2e` drives it
+directly. See [testing.md](../docs/testing.md#end-to-end-tests).
+
 ## Running pieces individually
 
 ```sh
