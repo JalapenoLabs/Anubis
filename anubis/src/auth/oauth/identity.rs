@@ -16,6 +16,12 @@
 //! it anyone who can register `you@example.com` at a sloppy identity provider
 //! could claim your account. The same rule blocks account creation, because a
 //! `users` row is keyed by an address the framework treats as verified.
+//!
+//! The third case is registration, so it obeys the deployment's registration
+//! mode exactly as `POST /auth/register` does: a closed deployment refuses,
+//! and the flow lands on the sign-in page with `oauth_registration_closed`.
+//! The first two cases are unaffected, because signing an existing account in
+//! is not creating one. See [`crate::auth::registration`].
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -23,6 +29,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use openidconnect::core::CoreIdTokenClaims;
 
 use crate::auth::model::User;
+use crate::auth::registration::RegistrationMode;
 use crate::auth::{password, token};
 use crate::schema::{oauth_identities, users};
 
@@ -75,11 +82,13 @@ pub(crate) fn read_claims(claims: &CoreIdTokenClaims) -> ProviderIdentity {
 /// # Errors
 /// Returns [`LinkError::EmailUnavailable`] when the provider returned no
 /// address for an unlinked identity, [`LinkError::EmailUnverified`] when it
-/// returned one it does not vouch for, and the database or hashing error
-/// otherwise.
+/// returned one it does not vouch for, [`LinkError::RegistrationClosed`] when
+/// the account would have to be created and `registration` does not admit the
+/// address, and the database or hashing error otherwise.
 pub(crate) async fn sign_in(
     connection: &mut AsyncPgConnection,
     hasher: &password::Hasher,
+    registration: &RegistrationMode,
     provider: &str,
     identity: &ProviderIdentity,
 ) -> Result<User, LinkError> {
@@ -113,6 +122,12 @@ pub(crate) async fn sign_in(
 
             let user = match existing {
                 Some(user) => user,
+                // Nobody owns the address, so this is a registration, and a
+                // closed deployment refuses it here for the same reason it
+                // refuses one at the sign-up form.
+                None if registration.refusal(email).is_some() => {
+                    return Err(LinkError::RegistrationClosed);
+                }
                 None => create_user(transaction, hasher, email, identity).await?,
             };
 
@@ -172,6 +187,8 @@ pub(crate) enum LinkError {
     EmailUnavailable,
     /// The provider returned an address it does not vouch for.
     EmailUnverified,
+    /// This deployment creates no account for the address the provider returned.
+    RegistrationClosed,
     /// The database refused the read or the write.
     Database(diesel::result::Error),
     /// The placeholder password could not be hashed.

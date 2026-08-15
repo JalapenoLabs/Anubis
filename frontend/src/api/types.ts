@@ -168,6 +168,18 @@ export type OrganizationRosterMember = {
   invitationId: string | null
 }
 
+/**
+ * The account state an administrative action left a member in.
+ *
+ * A disabled account authenticates against nothing, and one owing a password
+ * change may do nothing until it makes one.
+ */
+export type MemberAccountStatus = {
+  membershipId: string
+  disabled: boolean
+  passwordChangeRequired: boolean
+}
+
 export type TenancyOrganization = {
   id: string
   name: string

@@ -12,6 +12,9 @@
 //! | `POST /organizations/{organization_id}/teams` | org admin | Create a team, with the creator as its admin |
 //! | `DELETE /organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
 //! | `DELETE /organizations/{organization_id}/members/{membership_id}` | org admin | Remove an organization member |
+//! | `POST /organizations/{organization_id}/members/{membership_id}/disable` | org admin | Disable a member's account, revoking its sessions |
+//! | `POST /organizations/{organization_id}/members/{membership_id}/enable` | org admin | Return a disabled account to use |
+//! | `POST /organizations/{organization_id}/members/{membership_id}/require-password-change` | org admin | Make a member choose a new password |
 //! | `POST /organizations/{organization_id}/leave` | org member | Leave the organization |
 //! | `DELETE /organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke any pending invitation in the organization |
 //! | `PATCH /teams/{team_id}` | team admin | Rename the team |
@@ -33,6 +36,13 @@
 //! instant would otherwise each read the other as the one who remains, and
 //! both would commit.
 //!
+//! Account state is administered here for the same reason roles are: an
+//! organization's admins are who decides whether one of their people can sign
+//! in. The three account routes are refused against oneself, and disabling
+//! runs under the organization lock so it cannot leave the organization with
+//! no admin who is able to sign in. What the states mean, and where they are
+//! enforced, is [`crate::auth::account_status`].
+//!
 //! Deletion cascades: the framework's foreign keys, and the ones the
 //! scaffolder generates, are `ON DELETE CASCADE` from `teams` and
 //! `organizations`, so deleting a tenant deletes the records that chain to it.
@@ -50,11 +60,11 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::CurrentUser;
+use crate::auth::{CurrentUser, account_status};
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
 use crate::schema::{
-    invitations, organization_memberships, organizations, team_memberships, teams,
+    invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
 use crate::tenancy::bootstrap::{self, ADMIN_ROLE, holds_admin};
 use crate::tenancy::model::{Organization, OrganizationMembership, Team, TeamMembership};
@@ -79,6 +89,18 @@ pub(super) fn routes() -> Router<TenancyState> {
         .route(
             "/organizations/{organization_id}/members/{membership_id}",
             delete(remove_organization_member),
+        )
+        .route(
+            "/organizations/{organization_id}/members/{membership_id}/disable",
+            post(disable_member),
+        )
+        .route(
+            "/organizations/{organization_id}/members/{membership_id}/enable",
+            post(enable_member),
+        )
+        .route(
+            "/organizations/{organization_id}/members/{membership_id}/require-password-change",
+            post(require_member_password_change),
         )
         .route(
             "/organizations/{organization_id}/leave",
@@ -132,6 +154,18 @@ struct TeamBody {
 struct MembershipBody {
     membership_id: Uuid,
     roles: Vec<String>,
+}
+
+/// The account state an administrative action left a member in.
+///
+/// Keyed by the membership the request named rather than by the user behind
+/// it, because the membership is what the roster shows and the only id the
+/// caller already holds.
+#[derive(Serialize)]
+struct AccountStatusBody {
+    membership_id: Uuid,
+    disabled: bool,
+    password_change_required: bool,
 }
 
 /// Creates an organization owned by the caller.
@@ -300,6 +334,102 @@ async fn remove_organization_member(
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Disables a member's account, revoking every session it holds.
+///
+/// Offboarding that keeps what the person wrote: the memberships, the
+/// assignments, and the records stay exactly where they are, and the account
+/// simply stops authenticating. Re-enabling is one request, which is what
+/// makes this the answer to "they are gone for now" as well as to "lock them
+/// out this minute".
+async fn disable_member(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+    Path((_organization_id, membership_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_organization_admin(&member)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let status = connection
+        .transaction::<AccountStatusBody, ApiError, _>(async |transaction| {
+            lock_organization(transaction, member.organization.id).await?;
+            let target =
+                find_organization_member(transaction, member.organization.id, membership_id)
+                    .await?;
+            refuse_self(&member, target.user_id, "disable")?;
+
+            let disabled = account_status::disable(transaction, target.user_id).await?;
+            // Two admins disabling each other at the same instant would each
+            // read the other as the one still able to sign in; the lock orders
+            // them and this count catches whichever arrives second.
+            require_organization_keeps_an_enabled_admin(transaction, member.organization.id)
+                .await?;
+
+            Ok(AccountStatusBody {
+                membership_id: target.id,
+                disabled: disabled.disabled_at.is_some(),
+                password_change_required: disabled.password_change_required,
+            })
+        })
+        .await?;
+
+    Ok(Json(status))
+}
+
+/// Returns a disabled account to use.
+///
+/// The sessions disabling revoked stay revoked, so the person signs in again;
+/// nothing else about the account changed while it was out of use.
+async fn enable_member(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+    Path((_organization_id, membership_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_organization_admin(&member)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let target =
+        find_organization_member(&mut connection, member.organization.id, membership_id).await?;
+    refuse_self(&member, target.user_id, "enable")?;
+
+    let enabled = account_status::enable(&mut connection, target.user_id)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(Json(AccountStatusBody {
+        membership_id: target.id,
+        disabled: enabled.disabled_at.is_some(),
+        password_change_required: enabled.password_change_required,
+    }))
+}
+
+/// Makes a member choose a new password before they do anything else.
+///
+/// What an administrator who provisioned a credential reaches for. The account
+/// keeps its sessions and may sign in; every route but the password change
+/// refuses until the change lands, and the change is what clears the demand.
+async fn require_member_password_change(
+    State(state): State<TenancyState>,
+    member: OrganizationMember,
+    Path((_organization_id, membership_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_organization_admin(&member)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let target =
+        find_organization_member(&mut connection, member.organization.id, membership_id).await?;
+    refuse_self(&member, target.user_id, "require a password change for")?;
+
+    let flagged = account_status::demand_password_change(&mut connection, target.user_id)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(Json(AccountStatusBody {
+        membership_id: target.id,
+        disabled: flagged.disabled_at.is_some(),
+        password_change_required: flagged.password_change_required,
+    }))
 }
 
 /// Leaves the organization, provided the organization keeps an admin.
@@ -675,6 +805,51 @@ async fn require_team_keeps_an_admin(
         Ok(())
     } else {
         Err(last_admin_conflict("team", attempt))
+    }
+}
+
+/// Refuses an account action an administrator aimed at themselves.
+///
+/// Administering accounts here means administering other people's; an
+/// administrator's own account is theirs to manage in settings. The rule is
+/// also what keeps a live way in, since it is the last thing standing between
+/// an organization and an administrator disabling the account they are signed
+/// in with.
+fn refuse_self(member: &OrganizationMember, target: Uuid, act: &str) -> Result<(), ApiError> {
+    if target == member.user.id {
+        return Err(ApiError::validation(format!(
+            "You cannot {act} your own account."
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a change that left the organization with no admin who can sign in.
+///
+/// The disable half of [`require_organization_keeps_an_admin`], and it counts
+/// a stricter thing: an admin whose account is disabled holds the role but
+/// cannot use it, and an organization administered only by such accounts is
+/// one nobody can re-open.
+async fn require_organization_keeps_an_enabled_admin(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+) -> Result<(), ApiError> {
+    let admins: i64 = organization_memberships::table
+        .inner_join(users::table)
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .filter(organization_memberships::roles.contains(vec![ADMIN_ROLE]))
+        .filter(users::disabled_at.is_null())
+        .count()
+        .get_result(connection)
+        .await?;
+
+    if admins > 0 {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "An organization needs at least one admin who can sign in. \
+             Give someone else the admin role before you disable them.",
+        ))
     }
 }
 

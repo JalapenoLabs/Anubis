@@ -19,6 +19,8 @@
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
 //! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
+//! | `ANUBIS_REGISTRATION` | `open` | Who may create an account: `open`, `invite_only`, or `domain_allowlist` |
+//! | `ANUBIS_REGISTRATION_DOMAINS` | unset | Comma-separated email domains a `domain_allowlist` admits, e.g. `acme.com` |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
@@ -137,6 +139,20 @@
 //! limit it is derived from, and see [`crate::auth::password`] for why a bound
 //! exists at all.
 //!
+//! # Registration
+//!
+//! `ANUBIS_REGISTRATION` decides who may create an account: `open`, the
+//! default, takes anybody; `invite_only` takes nobody, leaving an invitation
+//! to an existing account as the only way in; and `domain_allowlist` takes the
+//! addresses whose domain `ANUBIS_REGISTRATION_DOMAINS` names, as a
+//! comma-separated list of bare domains such as `acme.com,acme.co.uk`.
+//!
+//! Both halves have to agree, and a disagreement stops the boot rather than
+//! being reinterpreted, because both mistakes are silent ones: an allowlist
+//! naming no domains would lock everybody out, and domains named without the
+//! mode would leave an instance open to the internet while its operator
+//! believes it is closed. See [`crate::auth::registration`].
+//!
 //! # Cross-origin access
 //!
 //! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
@@ -193,6 +209,7 @@ use url::{Origin, Url};
 
 use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::password;
+use crate::auth::registration::RegistrationMode;
 use crate::auth::secret_box::SecretKey;
 use crate::rate_limit::RateLimitConfig;
 use crate::server::CorsConfig;
@@ -241,6 +258,18 @@ const MAIL_FROM_FORM: &str =
 
 /// Directory of built frontend assets the server hands the browser.
 const SPA_DIR_VAR: &str = "SPA_DIR";
+
+/// Chooses who may create an account.
+const REGISTRATION_VAR: &str = "ANUBIS_REGISTRATION";
+
+/// What a valid `ANUBIS_REGISTRATION` looks like, quoted back in errors.
+const REGISTRATION_FORM: &str = "one of open, invite_only, domain_allowlist";
+
+/// Lists the email domains a `domain_allowlist` registration admits.
+const REGISTRATION_DOMAINS_VAR: &str = "ANUBIS_REGISTRATION_DOMAINS";
+
+/// What a valid `ANUBIS_REGISTRATION_DOMAINS` looks like, quoted back in errors.
+const DOMAIN_FORM: &str = "comma-separated bare email domains, e.g. `acme.com,acme.co.uk`";
 
 /// Switches off the per-client budgets on the abuse-prone endpoints.
 const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
@@ -515,6 +544,11 @@ pub struct AppConfig {
     /// Present means the binary also serves the SPA, absent means it serves
     /// only the API; see the module docs and [`crate::spa`].
     pub spa_dir: Option<PathBuf>,
+    /// Who may create an account here.
+    ///
+    /// Open to anybody by default; see the module docs and
+    /// [`crate::auth::registration`].
+    pub registration: RegistrationMode,
     /// Whether the abuse limits are on, and how clients are addressed.
     ///
     /// On by default; see the module docs and [`crate::rate_limit`].
@@ -631,6 +665,7 @@ impl AppConfig {
         // Only the path is resolved here; whether it holds a built frontend is
         // the assets service's question, asked once at startup.
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
+        let registration = registration_mode(&lookup)?;
         let rate_limit = rate_limit_config(&lookup)?;
         let cors = cors_config(&lookup)?;
         let stripe = stripe_config(&lookup)?;
@@ -657,6 +692,7 @@ impl AppConfig {
             smtp,
             oauth,
             spa_dir,
+            registration,
             rate_limit,
             cors,
             stripe,
@@ -754,6 +790,78 @@ fn parse_origin(value: &str) -> Option<String> {
         Origin::Tuple(..) => Some(url.origin().ascii_serialization()),
         Origin::Opaque(_) => None,
     }
+}
+
+/// Resolves who may create an account, and which addresses may.
+///
+/// The two variables have to agree, and a disagreement stops startup rather
+/// than being reinterpreted: an allowlist naming no domains would lock
+/// everybody out, and domains named under any other mode do nothing at all,
+/// which reads as closed to whoever wrote them while the instance takes every
+/// address the internet sends.
+fn registration_mode(lookup: &impl Fn(&str) -> Option<String>) -> Result<RegistrationMode, Error> {
+    let mut domains: Vec<String> = Vec::new();
+    if let Some(raw) = non_empty(lookup(REGISTRATION_DOMAINS_VAR)) {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let domain = parse_domain(entry)
+                .ok_or_else(|| Error::invalid(REGISTRATION_DOMAINS_VAR, entry, DOMAIN_FORM))?;
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+    }
+
+    let Some(value) = non_empty(lookup(REGISTRATION_VAR)) else {
+        if !domains.is_empty() {
+            return Err(Error::missing(
+                REGISTRATION_VAR,
+                "domain_allowlist, the one mode that reads ANUBIS_REGISTRATION_DOMAINS; without \
+                 it registration stays open to every address",
+            ));
+        }
+        return Ok(RegistrationMode::default());
+    };
+
+    // Hyphens are accepted alongside underscores, because the value is typed
+    // by hand and both spellings are equally obvious to reach for.
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "open" | "invite_only" if !domains.is_empty() => Err(Error::invalid(
+            REGISTRATION_DOMAINS_VAR,
+            &domains.join(","),
+            "no domains unless ANUBIS_REGISTRATION is domain_allowlist, the one mode that reads \
+             them",
+        )),
+        "open" => Ok(RegistrationMode::Open),
+        "invite_only" => Ok(RegistrationMode::InviteOnly),
+        "domain_allowlist" if domains.is_empty() => {
+            Err(Error::missing(REGISTRATION_DOMAINS_VAR, DOMAIN_FORM))
+        }
+        "domain_allowlist" => Ok(RegistrationMode::DomainAllowlist(domains)),
+        _ => Err(Error::invalid(
+            REGISTRATION_VAR,
+            value.trim(),
+            REGISTRATION_FORM,
+        )),
+    }
+}
+
+/// Renders one allowlist entry as the domain an address is matched against.
+///
+/// A bare domain and nothing else. An entry carrying an `@`, a wildcard, a
+/// scheme, a port, or a path misreads what the list matches, which is the text
+/// to the right of an address's `@` and exactly that, and every one of those
+/// shapes would silently match nothing.
+fn parse_domain(value: &str) -> Option<String> {
+    let domain = value.trim().to_ascii_lowercase();
+    let is_bare = !domain.is_empty()
+        && !domain.contains(['@', '*', '/', '\\', ':'])
+        && !domain.contains(char::is_whitespace);
+
+    is_bare.then_some(domain)
 }
 
 /// Resolves the Stripe credentials, when the environment carries them.
@@ -995,6 +1103,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AppConfig, Environment};
+    use crate::auth::registration::RegistrationMode;
     use crate::auth::secret_box::SecretKey;
 
     /// A syntactically valid `ANUBIS_SECRET_KEY`, for tests that need one.
@@ -1292,6 +1401,112 @@ mod tests {
         let lookup = lookup_from(&[("SPA_DIR", " frontend/dist ")]);
         let set = AppConfig::from_lookup(lookup).expect("a path is fine");
         assert_eq!(set.spa_dir, Some(PathBuf::from("frontend/dist")));
+    }
+
+    #[test]
+    fn registration_is_open_until_a_deployment_closes_it() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(defaulted.registration, RegistrationMode::Open);
+
+        for value in ["invite_only", "INVITE-ONLY", " invite_only "] {
+            let lookup = lookup_from(&[("ANUBIS_REGISTRATION", value)]);
+            let config = AppConfig::from_lookup(lookup).expect("a mode must parse");
+            assert_eq!(
+                config.registration,
+                RegistrationMode::InviteOnly,
+                "for input {value:?}",
+            );
+        }
+
+        let lookup = lookup_from(&[("ANUBIS_REGISTRATION", "closed")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("unknown modes are rejected");
+        assert_eq!(error.variable(), "ANUBIS_REGISTRATION");
+        assert!(
+            error.to_string().contains("domain_allowlist"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn an_allowlist_is_normalized_deduplicated_and_never_empty() {
+        let lookup = lookup_from(&[
+            ("ANUBIS_REGISTRATION", "domain_allowlist"),
+            (
+                "ANUBIS_REGISTRATION_DOMAINS",
+                " Acme.com , acme.co.uk , ACME.COM ",
+            ),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("domains must parse");
+        assert_eq!(
+            config.registration,
+            RegistrationMode::DomainAllowlist(
+                vec!["acme.com".to_owned(), "acme.co.uk".to_owned(),]
+            ),
+            "entries are lowercased, in order, and deduplicated",
+        );
+
+        // An allowlist admitting nobody is a lockout nobody asked for, so it
+        // stops the boot instead of taking traffic.
+        for domains in [None, Some("   ")] {
+            let mut pairs = vec![("ANUBIS_REGISTRATION", "domain_allowlist")];
+            if let Some(domains) = domains {
+                pairs.push(("ANUBIS_REGISTRATION_DOMAINS", domains));
+            }
+            let error = AppConfig::from_lookup(lookup_from(&pairs))
+                .expect_err("an allowlist must name a domain");
+            assert_eq!(error.variable(), "ANUBIS_REGISTRATION_DOMAINS");
+            assert!(error.to_string().contains("is not set"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn an_allowlist_entry_that_is_not_a_bare_domain_is_rejected() {
+        for value in [
+            "*.acme.com",
+            "@acme.com",
+            "ada@acme.com",
+            "https://acme.com",
+            "acme.com/signup",
+            "acme com",
+        ] {
+            let lookup = lookup_from(&[
+                ("ANUBIS_REGISTRATION", "domain_allowlist"),
+                ("ANUBIS_REGISTRATION_DOMAINS", value),
+            ]);
+            let error = AppConfig::from_lookup(lookup).expect_err("only bare domains are accepted");
+            assert_eq!(
+                error.variable(),
+                "ANUBIS_REGISTRATION_DOMAINS",
+                "for input {value:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn domains_without_the_mode_that_reads_them_stop_the_boot() {
+        // The dangerous half: whoever wrote the list believes registration is
+        // restricted, and every address on the internet is admitted.
+        let lookup = lookup_from(&[("ANUBIS_REGISTRATION_DOMAINS", "acme.com")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("the mode is required");
+        assert_eq!(error.variable(), "ANUBIS_REGISTRATION");
+        assert!(
+            error.to_string().contains("domain_allowlist"),
+            "got: {error}"
+        );
+
+        // The same list under a mode that ignores it is just as misleading.
+        for mode in ["open", "invite_only"] {
+            let lookup = lookup_from(&[
+                ("ANUBIS_REGISTRATION", mode),
+                ("ANUBIS_REGISTRATION_DOMAINS", "acme.com"),
+            ]);
+            let error = AppConfig::from_lookup(lookup).expect_err("dead domains are rejected");
+            assert_eq!(
+                error.variable(),
+                "ANUBIS_REGISTRATION_DOMAINS",
+                "for mode {mode:?}",
+            );
+        }
     }
 
     #[test]

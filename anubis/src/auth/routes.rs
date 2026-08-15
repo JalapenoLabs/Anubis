@@ -5,6 +5,7 @@
 //!
 //! | Route | Effect |
 //! |---|---|
+//! | `GET /registration` | Report whether this deployment accepts new accounts |
 //! | `POST /register` | Create an account, send a verification email, sign in |
 //! | `POST /login` | Verify credentials, sign in |
 //! | `POST /logout` | Revoke the session server-side |
@@ -17,6 +18,12 @@
 //! Login and password-reset requests respond identically whether or not the
 //! email is registered, in both message and timing, so responses do not leak
 //! which emails exist.
+//!
+//! Registration is open to anybody unless the deployment says otherwise;
+//! `ANUBIS_REGISTRATION` is that switch, and [`crate::auth::registration`]
+//! documents it. A refused registration answers `403` before any password is
+//! hashed, and `GET /registration` is what a sign-up screen reads to know
+//! whether to draw its form at all.
 //!
 //! Every route above that an attacker can drive without credentials carries a
 //! per-client budget from [`crate::rate_limit`], declared beside the route.
@@ -39,9 +46,10 @@ use uuid::Uuid;
 
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
+use crate::auth::registration::RegistrationMode;
 use crate::auth::secret_box::SecretKey;
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{password, session, user_token};
+use crate::auth::{account_status, password, session, user_token};
 use crate::config::{AppConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
@@ -66,11 +74,13 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         app_url: config.app_url.clone(),
         secret_key: config.secret_key.clone(),
         oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
+        registration: config.registration.clone(),
         rate_limit: rate_limit.clone(),
         hasher: password::Hasher::new(config.password_hash_concurrency),
     };
 
     Router::new()
+        .route("/registration", get(registration_status))
         .route(
             "/register",
             post(register).layer(rate_limit.layer(Budget::Registration)),
@@ -111,6 +121,8 @@ pub(crate) struct AuthState {
     pub(crate) secret_key: SecretKey,
     /// The configured OpenID Connect providers and their discovery cache.
     pub(crate) oauth: crate::auth::oauth::Runtime,
+    /// Who may create an account here; see [`crate::auth::registration`].
+    pub(crate) registration: RegistrationMode,
     /// Budgets the handlers charge themselves, keyed by the target address.
     pub(crate) rate_limit: RateLimiter,
     /// The gate every argon2 computation passes through; see
@@ -150,11 +162,34 @@ struct MessageBody {
     message: &'static str,
 }
 
+#[derive(Serialize)]
+struct RegistrationBody {
+    open: bool,
+}
+
+/// Answers whether this deployment accepts new accounts.
+///
+/// Read signed out, by the screens that offer sign-up, so a deployment that
+/// takes none renders no form whose every submission is a `403`. The mode and
+/// any admitted domains stay server-side: what a screen needs is whether to
+/// draw the form, and an allowlist still draws one.
+async fn registration_status(State(state): State<AuthState>) -> Json<RegistrationBody> {
+    Json(RegistrationBody {
+        open: state.registration.accepts_registrations(),
+    })
+}
+
 async fn register(
     State(state): State<AuthState>,
     Json(body): Json<CredentialsBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let credentials = validate_credentials(body)?;
+
+    // Asked before the hash, so a closed deployment spends no argon2 budget on
+    // attempts it was always going to refuse.
+    if let Some(refusal) = state.registration.refusal(&credentials.email) {
+        return Err(ApiError::forbidden(refusal));
+    }
 
     let password_hash = state.hasher.hash(credentials.password).await?;
 
@@ -404,8 +439,13 @@ async fn confirm_password_reset(
 
     let password_hash = state.hasher.hash(body.password).await?;
 
+    // A reset is a password change, so it satisfies a demand for one: the
+    // account that was told to replace its credential just did.
     diesel::update(users::table.find(user_id))
-        .set((users::password_hash.eq(&password_hash),))
+        .set((
+            users::password_hash.eq(&password_hash),
+            users::password_change_required.eq(false),
+        ))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;
@@ -467,11 +507,22 @@ async fn deliver(mailer: &Mailer, email: Email) {
 }
 
 /// Creates a session for `user_id` and returns a jar carrying its cookie.
+///
+/// Every way into the application ends here (password, emailed code, passkey,
+/// second factor, OpenID Connect, and registration itself), which makes it the
+/// one place a disabled account has to be turned away for all of them.
+///
+/// # Errors
+/// Returns a `403` carrying [`account_status::ACCOUNT_DISABLED`] when an
+/// administrator has disabled the account, and a `500` when the session cannot
+/// be written.
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
     connection: &mut diesel_async::AsyncPgConnection,
     user_id: Uuid,
 ) -> Result<CookieJar, ApiError> {
+    account_status::require_enabled_to_sign_in(connection, user_id).await?;
+
     let token = session::create(connection, user_id)
         .await
         .map_err(log_internal)?;

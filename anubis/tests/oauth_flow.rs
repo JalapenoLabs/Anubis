@@ -638,3 +638,100 @@ async fn oauth_sign_in_creates_links_and_refuses() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), format!("{APP_URL}/"));
 }
+
+/// A closed deployment signs existing accounts in and creates none.
+///
+/// The button is the same door as the sign-up form, so the registration mode
+/// gates it identically: an address nobody owns is refused, and one that
+/// already has an account is linked and signed in as always.
+#[tokio::test]
+async fn oauth_sign_up_obeys_the_registration_mode() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping oauth_flow test: DATABASE_URL is not set");
+        return;
+    };
+
+    anubis::db::run_pending_migrations(&database_url)
+        .await
+        .expect("migrations must apply");
+    let pool = anubis::db::connect(&database_url)
+        .await
+        .expect("database must be reachable");
+
+    let (issuer, mock) = start_mock_provider().await;
+    let variables = move |name: &str| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        "APP_URL" => Some(APP_URL.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_ID" => Some(CLIENT_ID.to_owned()),
+        "GOOGLE_OAUTH_CLIENT_SECRET" => Some("mock-client-secret".to_owned()),
+        "GOOGLE_OAUTH_ISSUER" => Some(issuer.clone()),
+        _ => None,
+    };
+
+    // The deployment before it closed, which is where the account comes from.
+    let open = anubis::config::AppConfig::from_lookup(&variables).expect("test config must parse");
+    let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let open_router =
+        Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &open));
+
+    let member_email = format!("oauth-member-{}@example.com", Uuid::new_v4());
+    let credentials =
+        serde_json::json!({ "email": member_email, "password": "correct horse battery staple" });
+    let (status, _headers, body) = send(
+        &open_router,
+        "POST",
+        "/auth/register",
+        Some(&credentials),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let member_id = body["user"]["id"].clone();
+
+    let closed = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_REGISTRATION" => Some("invite_only".to_owned()),
+        other => variables(other),
+    })
+    .expect("test config must parse");
+    let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &closed));
+
+    // An address no account owns is a registration, and this deployment
+    // accepts none.
+    let stranger_email = format!("oauth-stranger-{}@example.com", Uuid::new_v4());
+    let (status, headers) = sign_in_with(
+        &router,
+        &mock,
+        "/auth/oauth/google/start",
+        Assertion {
+            subject: format!("subject-{}", Uuid::new_v4()),
+            email: stranger_email,
+            email_verified: true,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers),
+        format!("{APP_URL}/sign-in?error=oauth_registration_closed"),
+    );
+
+    // The account that already exists signs in, because linking an identity to
+    // it creates nothing.
+    let (status, headers) = sign_in_with(
+        &router,
+        &mock,
+        "/auth/oauth/google/start",
+        Assertion {
+            subject: format!("subject-{}", Uuid::new_v4()),
+            email: member_email,
+            email_verified: true,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = session_token(&headers);
+    let (status, _headers, body) = send(&router, "GET", "/auth/me", None, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["user"]["id"], member_id);
+}

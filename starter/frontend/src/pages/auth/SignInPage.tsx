@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useCurrentUser, useOauthProviders } from '@jalapenolabs/anubis'
+import { useCurrentUser, useOauthProviders, useRegistrationOpen } from '@jalapenolabs/anubis'
 
 // UI
 import { Button } from '@heroui/react'
@@ -36,6 +36,7 @@ const oauthErrorKeys: Record<string, string | undefined> = {
   oauth_expired: 'auth.oauth.errors.expired',
   oauth_email_unavailable: 'auth.oauth.errors.emailUnavailable',
   oauth_email_unverified: 'auth.oauth.errors.emailUnverified',
+  oauth_registration_closed: 'auth.oauth.errors.registrationClosed',
   oauth_failed: 'auth.oauth.errors.failed',
 }
 
@@ -56,6 +57,7 @@ export function SignInPage() {
   const { t } = useTranslation()
   const { refresh } = useCurrentUser()
   const { providers } = useOauthProviders()
+  const { isOpen: isRegistrationOpen } = useRegistrationOpen()
   const [ searchParams ] = useSearchParams()
   const [ step, setStep ] = useState<SignInStep>({ name: 'password' })
 
@@ -150,15 +152,19 @@ export function SignInPage() {
       >{
           t('auth.signIn.forgotPassword')
         }</Link>
-      <span>
-        <span className='opacity-70'>{
-            t('auth.signIn.noAccount')
-          }</span>
-        {' '}
-        <Link to={getUrlWithDestination(UrlTree.signUp, destination)} className='text-primary'>{
-            t('auth.signIn.goToSignUp')
-          }</Link>
-      </span>
+      {/* A deployment that registers nobody offers no way to try. */}
+      { isRegistrationOpen
+        ? <span>
+            <span className='opacity-70'>{
+                t('auth.signIn.noAccount')
+              }</span>
+            {' '}
+            <Link to={getUrlWithDestination(UrlTree.signUp, destination)} className='text-primary'>{
+                t('auth.signIn.goToSignUp')
+              }</Link>
+          </span>
+        : null
+      }
     </div>
   </AuthLayout>
 }

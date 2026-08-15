@@ -37,12 +37,17 @@
         "expired": "That sign-in took too long. Start again.",
         "emailUnavailable": "That provider shared no email address, so there is no account to sign in to.",
         "emailUnverified": "That provider has not verified your email address, so we cannot sign you in.",
-        "failed": "That sign-in could not be completed. Try again."
+        "failed": "That sign-in could not be completed. Try again.",
+        "registrationClosed": "That address has no account here, and this app is not taking new ones."
       }
     },
     "signUp": {
       "title": "Create your account",
       "subtitle": "A minute from now, you're in.",
+      "closed": {
+        "title": "Registration is closed",
+        "subtitle": "This app takes new members by invitation only."
+      },
       "action": "Create account",
       "haveAccount": "Already have an account?",
       "goToSignIn": "Sign in"
@@ -59,6 +64,13 @@
       "newPassword": "New password",
       "action": "Set new password",
       "missingToken": "This reset link is incomplete. Request a new one."
+    },
+    "forcedPasswordChange": {
+      "title": "Choose a new password",
+      "subtitle": "An administrator asked you to replace your password before you continue.",
+      "current": "Current password",
+      "new": "New password",
+      "action": "Change password and continue"
     },
     "verifyEmail": {
       "title": "Email verification",

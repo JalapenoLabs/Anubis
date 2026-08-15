@@ -19,6 +19,26 @@ User ─< TeamMembership >─ Team ─> Organization
 
 At signup, every user gets a personal Organization containing a default Team, so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
 
+## Who may register
+
+Registration is a deployment decision, not a product one, so it is configuration. `ANUBIS_REGISTRATION` names one of three modes and `ANUBIS_REGISTRATION_DOMAINS` carries the list the third one reads:
+
+| Mode | Who may create an account |
+|---|---|
+| `open` | Anybody. The default, and what an unset variable means |
+| `invite_only` | Nobody. An invitation to an account that already exists is the way in |
+| `domain_allowlist` | Addresses whose domain `ANUBIS_REGISTRATION_DOMAINS` names, as a comma-separated list of bare domains such as `acme.com,acme.co.uk` |
+
+Domains match exactly on the text to the right of the `@`, so `acme.com` admits `ada@acme.com` and not `ada@mail.acme.com`: a subdomain is a different domain, and a wildcard rule invented by the framework would make the list mean something nobody wrote. List every domain that should be admitted.
+
+Both variables are validated at configuration load, the way `CORS_ALLOWED_ORIGINS` is, and a disagreement stops the boot rather than being reinterpreted. An allowlist naming no domains would lock everybody out; domains named under any other mode do nothing at all, which reads as closed to whoever wrote them while the instance takes every address the internet sends. Both are silent failures, so neither is allowed to start.
+
+The mode gates account **creation** and nothing else. `POST /auth/register` refuses with `403` in the standard error shape, before hashing anything, so a closed deployment spends no argon2 budget on attempts it was always going to refuse. The OAuth callback asks the same question in the one case that creates an account, an address no account owns yet, and a refused flow lands on `/sign-in?error=oauth_registration_closed`; an OAuth identity linked to an account that already exists signs in as always. Signing in and claiming an invitation are untouched under every mode, because each is authorization this deployment already granted.
+
+`GET /auth/registration` answers `{"open": true}` or `{"open": false}` signed out, which is what the sign-in and sign-up screens read through `useRegistrationOpen` before rendering: a deployment that registers nobody offers no sign-up link and no form. An allowlist answers `true`, since its form is worth filling in and the address decides. The mode itself and the admitted domains stay server-side.
+
+Under `invite_only` the person being invited needs an account already, because a claim is made by a signed-in user. Registering with an invitation token in hand, which would let an invited stranger create the account the invitation is waiting for, is future work.
+
 ## Ownership chain
 
 Every scaffolded model declares its parent chain back to a Team, exactly like Bullet Train:
@@ -57,6 +77,9 @@ Tenancy is manageable from the API, not only at signup. The routes mount under `
 | `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
 | `GET /tenancy/organizations/{organization_id}/members` | org member | The organization roster, outstanding invitations included |
 | `DELETE /tenancy/organizations/{organization_id}/members/{membership_id}` | org admin | Remove another organization member |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/disable` | org admin | Disable a member's account, revoking its sessions |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/enable` | org admin | Return a disabled account to use |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/require-password-change` | org admin | Make a member choose a new password |
 | `POST /tenancy/organizations/{organization_id}/leave` | org member | Leave the organization |
 | `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke any pending invitation in the organization |
 | `PATCH /tenancy/teams/{team_id}` | team admin | Rename the team |
@@ -102,6 +125,22 @@ Deleting an account is terminal and must always succeed, so it settles what the 
 3. Keeps every surviving organization and team administrable. One that still has members but lost its last admin promotes its longest-standing remaining member. If a surviving organization has no organization memberships left at all, and lives on only through its teams, the longest-standing team member gains the organization membership as its admin.
 
 A surviving team with no members left is kept rather than deleted: it still owns application records, and an organization admin can delete it or invite people back into it. The invariant the interactive endpoints defend by refusing, this path defends by succeeding.
+
+### Account state
+
+An account carries two states an organization admin controls, so offboarding a person and re-issuing a credential are ordinary administration rather than deletion.
+
+**Disabled.** `users.disabled_at` is set, and the account authenticates against nothing: every sign-in path refuses with `403` and the code `account_disabled`, and the act of disabling deletes the account's sessions in the same transaction rather than letting them run out the clock. Everything the person wrote stays: their memberships, the resources assigned to them, and the records they authored are untouched, which is the whole reason this exists beside account deletion. Re-enabling is one request; the revoked sessions stay revoked, so the person signs in again.
+
+**Owing a password change.** `users.password_change_required` is true, which is what an administrator who provisioned a credential sets. The account may sign in and may change its password. Every other authenticated route refuses with `403` and the code `password_change_required`, and a successful change clears the flag as a side effect, because the demand is satisfied by the act. A password reset clears it too, for the same reason.
+
+Both are enforced in the `CurrentUser` extractor rather than in each handler, so a route added later cannot forget to ask, and in the one function every sign-in path funnels through to mint a session, so a sign-in method added later cannot either. The password change is the single exemption from the rotation demand, through a crate-private extractor an application cannot reach for; signing out is the other, and needs no extractor at all. A disabled account is refused at both.
+
+The three routes are refused against the caller's own account with `400`: administering accounts here means administering other people's, and an administrator's own is theirs to manage in settings. Disabling additionally runs under the organization lock and is refused with `409` when it would leave the organization with no admin who can sign in, which is the ordering that stops two administrators from disabling each other into an organization nobody can re-open.
+
+**Platform tokens are deliberately untouched by either state.** A platform application belongs to a team, not to a person, and its token acts as that team through `roles.yml`; there is no user behind it to disable. Silencing a team's integrations because one of its members was offboarded would be a surprise, so revoking them stays the team's own act in the Developers section. The same reasoning is why an organization that disables its last usable admin is a `409` rather than a state to recover from: the way back in is a person, not a token.
+
+The browser routes on the codes rather than on the messages. `useCurrentUser` reports `passwordChangeRequired` beside the user, and both auth gates send such an account to the forced-change screen; see [the identity screens](api.md#the-identity-screens).
 
 ## Billing
 

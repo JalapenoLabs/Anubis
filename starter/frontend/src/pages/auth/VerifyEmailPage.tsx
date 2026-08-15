@@ -61,7 +61,7 @@ export function VerifyEmailPage() {
           // scare: old links get clicked twice.
           const refreshed = await refresh()
           if (!cancelled) {
-            setState(refreshed?.emailVerified ? 'verified' : 'failed')
+            setState(refreshed?.user?.emailVerified ? 'verified' : 'failed')
           }
         })
     }

@@ -76,7 +76,23 @@ impl Harness {
     /// Panics when the database is unreachable or the test config, which is
     /// this file's own, does not parse.
     pub async fn boot(database: &TestDatabase) -> Self {
-        Self::boot_with(database, None).await
+        Self::boot_with(database, None, Self::config()).await
+    }
+
+    /// Composes the same routers under an application's own configuration.
+    ///
+    /// What a suite reaches for when the behavior under test is a
+    /// configuration switch, such as who may register. Build the config from
+    /// [`Harness::config_with`] so the test defaults stay in force around the
+    /// variable the suite is about.
+    ///
+    /// # Panics
+    /// Panics for the same reasons [`Harness::boot`] does.
+    pub async fn boot_with_config(
+        database: &TestDatabase,
+        config: anubis::config::AppConfig,
+    ) -> Self {
+        Self::boot_with(database, None, config).await
     }
 
     /// Composes the same routers with an application's plans in force.
@@ -88,13 +104,16 @@ impl Harness {
     /// # Panics
     /// Panics for the same reasons [`Harness::boot`] does.
     pub async fn boot_with_plans(database: &TestDatabase, plans: PlanSet) -> Self {
-        Self::boot_with(database, Some(plans)).await
+        Self::boot_with(database, Some(plans), Self::config()).await
     }
 
-    async fn boot_with(database: &TestDatabase, plans: Option<PlanSet>) -> Self {
+    async fn boot_with(
+        database: &TestDatabase,
+        plans: Option<PlanSet>,
+        config: anubis::config::AppConfig,
+    ) -> Self {
         let pool = database.pool().await;
 
-        let config = Self::config();
         let roles = RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
         let (mailer, outbox) = anubis::mail::Mailer::test();
         let channels = Channels::in_process();
@@ -141,16 +160,32 @@ impl Harness {
     /// `ANUBIS_ENV=test` always, and `RATE_LIMIT_DISABLED` passed through from
     /// the environment, which is how the login storm turns the limiter off
     /// without every other suite having to think about it. Nothing else is
-    /// read, so a developer's own `.env` cannot change what a test proves.
+    /// read, so a developer's own `.env` cannot change what a test proves; a
+    /// suite that needs one more variable names it with
+    /// [`Harness::config_with`].
     ///
     /// # Panics
     /// Panics when the config does not parse, which for this lookup is a
     /// framework bug rather than a test failure.
     pub fn config() -> anubis::config::AppConfig {
-        anubis::config::AppConfig::from_lookup(|name| match name {
-            "ANUBIS_ENV" => Some("test".to_owned()),
-            "RATE_LIMIT_DISABLED" => std::env::var(name).ok(),
-            _ => None,
+        Self::config_with(&[])
+    }
+
+    /// The same config with `variables` set, for a suite about a switch.
+    ///
+    /// # Panics
+    /// Panics when the config does not parse, which for a variable a test
+    /// chose is a mistake in that test.
+    pub fn config_with(variables: &[(&str, &str)]) -> anubis::config::AppConfig {
+        anubis::config::AppConfig::from_lookup(|name| {
+            variables
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == name).then(|| (*value).to_owned()))
+                .or_else(|| match name {
+                    "ANUBIS_ENV" => Some("test".to_owned()),
+                    "RATE_LIMIT_DISABLED" => std::env::var(name).ok(),
+                    _ => None,
+                })
         })
         .expect("the test config must parse")
     }

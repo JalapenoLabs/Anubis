@@ -37,6 +37,13 @@ pub struct User {
     pub time_zone: String,
     /// BCP 47 locale tag; defaults to en-US.
     pub locale: String,
+    /// When an administrator disabled the account, if it is disabled.
+    ///
+    /// A disabled account authenticates against nothing; see
+    /// [`crate::auth::account_status`].
+    pub disabled_at: Option<DateTime<Utc>>,
+    /// Whether the account owes a password change before anything else.
+    pub password_change_required: bool,
 }
 
 impl fmt::Debug for User {
@@ -52,6 +59,8 @@ impl fmt::Debug for User {
             .field("last_name", &self.last_name)
             .field("time_zone", &self.time_zone)
             .field("locale", &self.locale)
+            .field("disabled_at", &self.disabled_at)
+            .field("password_change_required", &self.password_change_required)
             .finish()
     }
 }
@@ -119,6 +128,8 @@ mod tests {
             last_name: None,
             time_zone: "UTC".to_owned(),
             locale: "en-US".to_owned(),
+            disabled_at: None,
+            password_change_required: false,
         }
     }
 

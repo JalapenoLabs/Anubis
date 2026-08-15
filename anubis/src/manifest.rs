@@ -67,7 +67,13 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/realtime",
         area: "realtime",
     },
-    // Registration and sessions.
+    // Registration and sessions. Discovery comes first because a sign-up
+    // screen reads it before it offers the form.
+    RouteEntry {
+        method: "GET",
+        path: "/auth/registration",
+        area: "auth",
+    },
     RouteEntry {
         method: "POST",
         path: "/auth/register",

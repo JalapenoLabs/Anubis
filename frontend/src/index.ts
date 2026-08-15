@@ -15,6 +15,7 @@ export type {
   Credentials,
   EmailChangeRequest,
   InviteMemberRequest,
+  MemberAccountStatus,
   MembershipOrganization,
   MembershipTeam,
   MembershipsOverview,
@@ -40,11 +41,13 @@ export type {
   WireCreationOptions,
   WireRequestOptions,
 } from './webauthn/ceremony'
+export type { ApiErrorCodeValue } from './api/errors'
 export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
 export type { OauthProvidersResult } from './react/useOauthProviders'
+export type { RegistrationOpenResult } from './react/useRegistrationOpen'
 export type { AnubisFieldProps, FieldOption } from './fields/types'
 export type { RealtimeListener } from './realtime/listeners'
 export type {
@@ -94,11 +97,12 @@ export { useChannel } from './react/useChannel'
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'
 export { createAnubisV1 } from './api/v1.generated'
-export { getApiErrorMessage } from './api/errors'
+export { ApiErrorCode, getApiErrorCode, getApiErrorMessage } from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
 export { useCurrentUser } from './react/useCurrentUser'
 export { useMemberships } from './react/useMemberships'
 export { useOauthProviders } from './react/useOauthProviders'
+export { useRegistrationOpen } from './react/useRegistrationOpen'
 
 /**
  * The version of the Anubis frontend package.

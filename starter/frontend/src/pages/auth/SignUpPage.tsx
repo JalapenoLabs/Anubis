@@ -5,7 +5,12 @@ import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
+import {
+  useAnubisApi,
+  useCurrentUser,
+  useRegistrationOpen,
+  getApiErrorMessage,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Input, Tooltip } from '@heroui/react'
@@ -30,6 +35,7 @@ export function SignUpPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const { refresh } = useCurrentUser()
+  const { isOpen } = useRegistrationOpen()
   const [ searchParams ] = useSearchParams()
   const [ formError, setFormError ] = useState<string | null>(null)
 
@@ -64,6 +70,27 @@ export function SignUpPage() {
       setFormError(message ?? t('common.somethingWentWrong'))
     }
   })
+
+  // A deployment that registers nobody would refuse every submission, so it
+  // gets the reason instead of a form. The way in is an invitation.
+  if (!isOpen) {
+    return <AuthLayout
+      title={t('auth.signUp.closed.title')}
+      subtitle={t('auth.signUp.closed.subtitle')}
+    >
+      <div className='level-right mt-4 text-sm'>
+        <span>
+          <span className='opacity-70'>{
+              t('auth.signUp.haveAccount')
+            }</span>
+          {' '}
+          <Link to={getUrlWithDestination(UrlTree.signIn, destination)} className='text-primary'>{
+              t('auth.signUp.goToSignIn')
+            }</Link>
+        </span>
+      </div>
+    </AuthLayout>
+  }
 
   const isValid = form.formState.isValid
 

@@ -14,6 +14,10 @@ describe('SignInPage', () => {
   it('should render one provider button per configured provider, keeping the destination', async () => {
     stubFetch({
       '/auth/me': { status: 401 },
+      '/auth/registration': {
+        status: 200,
+        body: { open: true },
+      },
       '/auth/oauth/providers': {
         status: 200,
         body: {
@@ -46,5 +50,26 @@ describe('SignInPage', () => {
       .toBe('/auth/oauth/entra/start?next=%2Fcreative-concepts')
 
     expect(screen.getAllByRole('button', { name: /^Continue with/ })).toHaveLength(2)
+  })
+
+  it('should offer sign-up only while the deployment accepts registrations', async () => {
+    stubFetch({
+      '/auth/me': { status: 401 },
+      '/auth/registration': {
+        status: 200,
+        body: { open: false },
+      },
+      '/auth/oauth/providers': {
+        status: 200,
+        body: { providers: []},
+      },
+    })
+
+    renderWithProviders(<SignInPage />, '/sign-in')
+
+    // Sign-in itself is unaffected, which is what makes the missing link a
+    // decision rather than a page that failed to render.
+    await screen.findByRole('button', { name: 'Sign in' })
+    expect(screen.queryByRole('link', { name: 'Create an account' })).toBeNull()
   })
 })

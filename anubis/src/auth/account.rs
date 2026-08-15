@@ -11,6 +11,10 @@
 //! | `GET /sessions` | List the user's sessions, marking the current one |
 //! | `DELETE /sessions/{session_id}` | Revoke one session |
 //! | `DELETE /account` | Delete the account (password-confirmed) |
+//!
+//! `POST /change-password` is the one route an account owing a password
+//! change may still reach, and the change clears that demand. See
+//! [`crate::auth::account_status`].
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,6 +29,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::extract::RotatingUser;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
 use crate::auth::user_token::TokenPurpose;
@@ -139,9 +144,16 @@ struct ChangePasswordBody {
     new_password: String,
 }
 
+/// Rotates the password, and clears any demand that it be rotated.
+///
+/// The one route [`RotatingUser`] exempts from that demand, because refusing
+/// it would leave a flagged account with nothing it could do. Clearing the
+/// flag is a side effect of the change rather than a call of its own: the
+/// demand is satisfied by the act, and a second endpoint could only disagree
+/// with it.
 async fn change_password(
     State(state): State<AuthState>,
-    CurrentUser(user): CurrentUser,
+    RotatingUser(user): RotatingUser,
     jar: CookieJar,
     Json(body): Json<ChangePasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -152,7 +164,10 @@ async fn change_password(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     diesel::update(users::table.find(user.id))
-        .set((users::password_hash.eq(&password_hash),))
+        .set((
+            users::password_hash.eq(&password_hash),
+            users::password_change_required.eq(false),
+        ))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;

@@ -7,6 +7,10 @@
 
 diesel::table! {
     /// Registered user accounts. See the auth design in `docs/api.md`.
+    ///
+    /// `disabled_at` and `password_change_required` are the two account states
+    /// an organization admin controls; [`crate::auth`] enforces both. See
+    /// `docs/tenancy.md`.
     users (id) {
         id -> Uuid,
         email -> Text,
@@ -18,6 +22,8 @@ diesel::table! {
         last_name -> Nullable<Text>,
         time_zone -> Text,
         locale -> Text,
+        disabled_at -> Nullable<Timestamptz>,
+        password_change_required -> Bool,
     }
 }
 

@@ -19,8 +19,8 @@ use std::time::Duration;
 use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
-    dead_jobs, jobs as jobs_table, sessions, team_memberships, teams, user_avatars,
-    webhook_deliveries, webhook_endpoints,
+    dead_jobs, jobs as jobs_table, organization_memberships, organizations, sessions,
+    team_memberships, teams, user_avatars, users, webhook_deliveries, webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -552,6 +552,182 @@ async fn simultaneous_demotions_keep_a_team_administrable() {
         .await
         .expect("count must run");
     assert_eq!(admins, 1, "the team is never left without an admin");
+}
+
+/// Disabling is refused against oneself, so no single request can take the
+/// last admin who is able to sign in. Two requests can: each administrator
+/// disables the other, each reads the other as the one still standing. The
+/// organization lock orders them and the count catches whichever arrives
+/// second, exactly as it does for demotion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_disables_keep_an_organization_administrable() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+
+    let first = register(&harness.router, "first-owner@example.com").await;
+    let organization_id = bootstrapped_organization(&harness, &first).await;
+    let second = register(&harness.router, "second-owner@example.com").await;
+
+    let invite = json!({
+        "email": "second-owner@example.com",
+        "organization_id": organization_id,
+        "roles": ["admin"],
+    });
+    let (status, _headers, body) = send(
+        &harness.router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&invite),
+        Some(&first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let token = invitation_token(&harness.outbox, "second-owner@example.com");
+    let (status, _headers, body) = send(
+        &harness.router,
+        "POST",
+        "/tenancy/invitations/claim",
+        Some(&json!({ "token": token })),
+        Some(&second),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Addressed by email rather than by position: each request has to name the
+    // *other* administrator, and one aimed at its own account is refused for a
+    // reason that has nothing to do with the race.
+    let first_membership =
+        organization_membership(&harness, &first, organization_id, "first-owner@example.com").await;
+    let second_membership = organization_membership(
+        &harness,
+        &first,
+        organization_id,
+        "second-owner@example.com",
+    )
+    .await;
+
+    // Both are made to arrive together by a third connection holding the very
+    // lock the handlers take; see the note in the demotion race above.
+    let mut blocker = harness.pool.get().await.expect("connection");
+    let racing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            organizations::table
+                .find(organization_id)
+                .select(organizations::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+
+            let one = disable_member(&harness, &first, organization_id, second_membership);
+            let other = disable_member(&harness, &second, organization_id, first_membership);
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok((one, other))
+        })
+        .await
+        .expect("holding the organization lock must succeed");
+    drop(blocker);
+
+    let (one, other) = racing;
+    let outcomes = [
+        one.await.expect("the disable task must not panic"),
+        other.await.expect("the disable task must not panic"),
+    ];
+    let accepted = outcomes.iter().filter(|status| status.is_success()).count();
+    assert_eq!(accepted, 1, "exactly one disable lands: {outcomes:?}");
+
+    // Three refusals are correct, and which one arrives says how far the loser
+    // got before the winner committed. `409` is the invariant firing, both
+    // requests already past their guards, which is what the lock above
+    // arranges. `403` is the extractor refusing an account the winner had
+    // already disabled. `401` is the same moment one step later: the winner
+    // deleted the loser's session with it, so there is nothing left to
+    // authenticate. Being served is the only wrong answer.
+    let refused = outcomes
+        .iter()
+        .find(|status| !status.is_success())
+        .expect("one disable is refused");
+    assert!(
+        matches!(
+            *refused,
+            StatusCode::CONFLICT | StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ),
+        "the losing disable is refused, not served: {refused}",
+    );
+
+    let mut connection = harness.pool.get().await.expect("connection");
+    let admins: i64 = organization_memberships::table
+        .inner_join(users::table)
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .filter(organization_memberships::roles.contains(vec![anubis::tenancy::ADMIN_ROLE]))
+        .filter(users::disabled_at.is_null())
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(
+        admins, 1,
+        "the organization always keeps an admin who can sign in",
+    );
+}
+
+/// The organization registration bootstrapped for `cookie`.
+async fn bootstrapped_organization(harness: &Harness, cookie: &str) -> Uuid {
+    let (status, _headers, body) = send(
+        &harness.router,
+        "GET",
+        "/tenancy/memberships",
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    body["organizations"][0]["id"]
+        .as_str()
+        .expect("registration bootstraps one organization")
+        .parse()
+        .expect("an organization id is a UUID")
+}
+
+/// The organization membership the roster lists for `email`.
+async fn organization_membership(
+    harness: &Harness,
+    cookie: &str,
+    organization_id: Uuid,
+    email: &str,
+) -> Uuid {
+    let path = format!("/tenancy/organizations/{organization_id}/members");
+    let (status, _headers, body) = send(&harness.router, "GET", &path, None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    body["members"]
+        .as_array()
+        .expect("the roster is an array")
+        .iter()
+        .find(|member| member["email"] == json!(email))
+        .and_then(|member| member["membership_id"].as_str())
+        .expect("the claimed membership must be on the roster")
+        .parse()
+        .expect("a membership id is a UUID")
+}
+
+/// Starts one account disable on its own task, without waiting for it.
+fn disable_member(
+    harness: &Harness,
+    cookie: &str,
+    organization_id: Uuid,
+    membership_id: Uuid,
+) -> JoinHandle<StatusCode> {
+    let router = harness.router.clone();
+    let cookie = cookie.to_owned();
+    tokio::spawn(async move {
+        let path =
+            format!("/tenancy/organizations/{organization_id}/members/{membership_id}/disable");
+        let (status, _headers, _body) = send(&router, "POST", &path, None, Some(&cookie)).await;
+        status
+    })
 }
 
 /// The claimed admin memberships of a team, in a stable order.

@@ -34,7 +34,10 @@
 //! token's signature, issuer, audience, and nonce, and hands the claims to
 //! the identity resolver, which links the account that already owns a
 //! verified address or creates one with the same bootstrap registration
-//! performs. The session cookie is issued exactly as password login issues it.
+//! performs. Creating one is registration, so it obeys the deployment's
+//! registration mode: an invite-only instance signs existing accounts in and
+//! refuses the rest with `oauth_registration_closed`. The session cookie is
+//! issued exactly as password login issues it.
 //!
 //! # Configuration
 //!
@@ -422,6 +425,7 @@ async fn finish_flow(
     let user = identity::sign_in(
         &mut connection,
         &state.hasher,
+        &state.registration,
         config.provider().key,
         &asserted,
     )
@@ -429,6 +433,7 @@ async fn finish_flow(
     .map_err(|error| match error {
         identity::LinkError::EmailUnavailable => Failure::EmailUnavailable,
         identity::LinkError::EmailUnverified => Failure::EmailUnverified,
+        identity::LinkError::RegistrationClosed => Failure::RegistrationClosed,
         identity::LinkError::Database(error) => internal(error),
         // A shed hash is load rather than a bug, so the sign-in page asks the
         // user to try again instead of reporting a failure they cannot act on.
@@ -585,6 +590,8 @@ enum Failure {
     EmailUnavailable,
     /// The provider would not vouch for the address it returned.
     EmailUnverified,
+    /// The address has no account here, and this deployment creates none.
+    RegistrationClosed,
     /// Anything else: the exchange, the ID token, or this application.
     Failed,
 }
@@ -598,6 +605,7 @@ impl Failure {
             Self::Expired => "oauth_expired",
             Self::EmailUnavailable => "oauth_email_unavailable",
             Self::EmailUnverified => "oauth_email_unverified",
+            Self::RegistrationClosed => "oauth_registration_closed",
             Self::Failed => "oauth_failed",
         }
     }
@@ -650,6 +658,7 @@ mod tests {
             Failure::Expired,
             Failure::EmailUnavailable,
             Failure::EmailUnverified,
+            Failure::RegistrationClosed,
             Failure::Failed,
         ];
 

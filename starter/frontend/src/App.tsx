@@ -19,6 +19,7 @@ import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
 import { SecuritySettingsPage } from './pages/settings/SecuritySettingsPage'
 import { ConfirmEmailChangePage } from './pages/auth/ConfirmEmailChangePage'
+import { ForcePasswordChangePage } from './pages/auth/ForcePasswordChangePage'
 import { ForgotPasswordPage } from './pages/auth/ForgotPasswordPage'
 import { ResetPasswordPage } from './pages/auth/ResetPasswordPage'
 import { SignInPage } from './pages/auth/SignInPage'
@@ -52,13 +53,20 @@ function CenteredSpinner() {
 /**
  * Renders children only when signed in; otherwise redirects to sign-in,
  * carrying the page the user asked for so they land there afterwards.
+ *
+ * An account owing a password change is signed in and can reach nothing else,
+ * so it goes to the forced-change screen instead of to sign-in.
  */
 function RequireAuth(props: GateProps) {
-  const { user, isLoading } = useCurrentUser()
+  const { user, passwordChangeRequired, isLoading } = useCurrentUser()
   const location = useLocation()
 
   if (isLoading) {
     return <CenteredSpinner />
+  }
+
+  if (passwordChangeRequired) {
+    return <Navigate to={UrlTree.forcedPasswordChange} replace />
   }
 
   if (!user) {
@@ -72,13 +80,20 @@ function RequireAuth(props: GateProps) {
 /**
  * Renders children only when signed out; the signed-in land on the destination
  * the guard preserved, or on the dashboard when there is none.
+ *
+ * Signing in again would land an account owing a password change right back
+ * here, so it is sent to the screen that ends the loop.
  */
 function RequireGuest(props: GateProps) {
-  const { user, isLoading } = useCurrentUser()
+  const { user, passwordChangeRequired, isLoading } = useCurrentUser()
   const [ searchParams ] = useSearchParams()
 
   if (isLoading) {
     return <CenteredSpinner />
+  }
+
+  if (passwordChangeRequired) {
+    return <Navigate to={UrlTree.forcedPasswordChange} replace />
   }
 
   if (user) {
@@ -87,6 +102,30 @@ function RequireGuest(props: GateProps) {
   }
 
   return props.children
+}
+
+/**
+ * Renders the forced password change only while the backend demands one.
+ *
+ * The screen is not a page a person navigates to: reaching it with nothing
+ * owed means the change already landed, or the visitor is signed out.
+ */
+function RequirePasswordChange(props: GateProps) {
+  const { user, passwordChangeRequired, isLoading } = useCurrentUser()
+
+  if (isLoading) {
+    return <CenteredSpinner />
+  }
+
+  if (passwordChangeRequired) {
+    return props.children
+  }
+
+  if (user) {
+    return <Navigate to={POST_SIGN_IN_REDIRECT_TO} replace />
+  }
+
+  return <Navigate to={UrlTree.signIn} replace />
 }
 
 /** Signed-in pages get the team context on top of the auth gate. */
@@ -212,6 +251,14 @@ export function App() {
     <Route
       path={UrlTree.resetPassword}
       element={<ResetPasswordPage />}
+    />
+    <Route
+      path={UrlTree.forcedPasswordChange}
+      element={
+        <RequirePasswordChange>
+          <ForcePasswordChangePage />
+        </RequirePasswordChange>
+      }
     />
     <Route
       path={UrlTree.verifyEmail}

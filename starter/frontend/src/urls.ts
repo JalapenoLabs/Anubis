@@ -7,6 +7,13 @@ export const UrlTree = {
   signUp: '/sign-up',
   forgotPassword: '/forgot-password',
   resetPassword: '/reset-password',
+  /**
+   * Where an account an administrator told to choose a new password lands.
+   *
+   * Every other route answers `password_change_required` until the change
+   * lands, so this is the only page such an account can render.
+   */
+  forcedPasswordChange: '/change-password',
   verifyEmail: '/verify-email',
   /** Where the emailed link confirming a new address lands. */
   confirmEmailChange: '/change-email',

@@ -43,6 +43,21 @@ type WireOauthProvider = {
  * two features and stay beside their login halves.
  */
 export function createAuthRoutes(client: KyInstance) {
+  /**
+   * Whether this deployment accepts new accounts.
+   *
+   * Reachable signed out, and read before a sign-up form is rendered: a
+   * deployment that takes no registrations refuses every submission with 403,
+   * so the form belongs off screen. A deployment that admits only certain
+   * email domains still answers `true`, because its form is worth filling in.
+   */
+  async function isRegistrationOpen(): Promise<boolean> {
+    const response = await client
+      .get('auth/registration')
+      .json<{ open: boolean }>()
+    return response.open
+  }
+
   async function register(credentials: Credentials): Promise<User> {
     const response = await client
       .post('auth/register', { json: credentials })
@@ -232,6 +247,7 @@ export function createAuthRoutes(client: KyInstance) {
   }
 
   return {
+    isRegistrationOpen,
     register,
     login,
     logout,

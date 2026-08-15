@@ -7,6 +7,10 @@
 //! the `429` that [`ApiError::too_many_requests`] adds a `Retry-After` header
 //! to.
 //!
+//! A refusal a client has to *act* on rather than merely show carries a
+//! `code` beside the message ([`ApiError::with_code`]), because branching on
+//! prose is branching on a string that translation is free to change.
+//!
 //! [`ListParams`] and [`Pagination`] carry the locked list-endpoint
 //! conventions from the repository's `docs/api.md`, so every scaffolded list
 //! endpoint pages, sorts, and answers in exactly one shape.
@@ -25,6 +29,8 @@ use utoipa::ToSchema;
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// A stable identifier for the refusal, rendered as `code` in the body.
+    code: Option<&'static str>,
     /// How long the caller should wait, rendered as a `Retry-After` header.
     retry_after: Option<Duration>,
 }
@@ -77,6 +83,7 @@ impl ApiError {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("Too many requests. Try again in {seconds} seconds."),
+            code: None,
             retry_after: Some(retry_after),
         }
     }
@@ -105,10 +112,29 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
+    /// Attaches a stable identifier for the refusal to the error.
+    ///
+    /// Two errors of the same status can demand different things of a client:
+    /// a disabled account is a dead end, while an account owing a password
+    /// change has one screen to go to. The code is what a client branches on,
+    /// so it never has to match on a message that translation may rewrite.
+    /// Codes are `snake_case` and permanent; see `docs/api.md`.
+    #[must_use]
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
     /// Returns the HTTP status code.
     #[must_use]
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// Returns the refusal's stable identifier, when it carries one.
+    #[must_use]
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
     }
 
     /// Returns the user-safe message.
@@ -127,6 +153,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
             retry_after: None,
         }
     }
@@ -165,12 +192,17 @@ impl From<diesel::result::Error> for ApiError {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     message: &'a str,
+    /// Absent from the body entirely when the refusal names no code, so the
+    /// shape every other error answers with stays exactly `{"message": ...}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorBody {
             message: &self.message,
+            code: self.code,
         });
 
         match self.retry_after {
@@ -318,7 +350,7 @@ mod tests {
     use axum::http::{StatusCode, Uri};
     use axum::response::IntoResponse;
 
-    use super::{ApiError, ListParams, Pagination};
+    use super::{ApiError, ErrorBody, ListParams, Pagination};
 
     /// Parses through the real extractor, so the serde attributes are covered.
     fn params(query: &str) -> ListParams {
@@ -421,6 +453,25 @@ mod tests {
         let error = ApiError::internal();
         assert!(!error.message().is_empty());
         assert!(!error.message().contains("error"), "keep the body generic");
+    }
+
+    #[test]
+    fn only_errors_that_name_a_code_carry_one_in_the_body() {
+        let plain = serde_json::to_string(&ErrorBody {
+            message: ApiError::forbidden("no").message(),
+            code: None,
+        })
+        .expect("serialization must succeed");
+        assert_eq!(plain, r#"{"message":"no"}"#);
+
+        let coded = ApiError::forbidden("no").with_code("account_disabled");
+        assert_eq!(coded.code(), Some("account_disabled"));
+        let rendered = serde_json::to_string(&ErrorBody {
+            message: coded.message(),
+            code: coded.code(),
+        })
+        .expect("serialization must succeed");
+        assert_eq!(rendered, r#"{"message":"no","code":"account_disabled"}"#);
     }
 
     #[test]

@@ -4,6 +4,7 @@ import type {
   ClaimedInvitation,
   CreatedOrganization,
   InviteMemberRequest,
+  MemberAccountStatus,
   MembershipsOverview,
   OrganizationRosterMember,
   TeamRosterMember,
@@ -26,6 +27,12 @@ type WireOrganizationRosterMember = {
   roles: string[]
   pending: boolean
   invitation_id: string | null
+}
+
+type WireAccountStatus = {
+  membership_id: string
+  disabled: boolean
+  password_change_required: boolean
 }
 
 type WireOrganization = {
@@ -148,6 +155,58 @@ export function createTenancyRoutes(client: KyInstance) {
     await client.delete(`tenancy/organizations/${organizationId}/invitations/${invitationId}`)
   }
 
+  /**
+   * Disables a member's account, revoking every session it holds.
+   *
+   * Offboarding that keeps what the person wrote. The backend refuses this
+   * aimed at your own account, and refuses one that would leave the
+   * organization with no admin able to sign in.
+   */
+  async function disableOrganizationMember(
+    organizationId: string,
+    membershipId: string,
+  ): Promise<MemberAccountStatus> {
+    const response = await client
+      .post(`tenancy/organizations/${organizationId}/members/${membershipId}/disable`)
+      .json<WireAccountStatus>()
+    return {
+      membershipId: response.membership_id,
+      disabled: response.disabled,
+      passwordChangeRequired: response.password_change_required,
+    }
+  }
+
+  /** Returns a disabled account to use; its revoked sessions stay revoked. */
+  async function enableOrganizationMember(
+    organizationId: string,
+    membershipId: string,
+  ): Promise<MemberAccountStatus> {
+    const response = await client
+      .post(`tenancy/organizations/${organizationId}/members/${membershipId}/enable`)
+      .json<WireAccountStatus>()
+    return {
+      membershipId: response.membership_id,
+      disabled: response.disabled,
+      passwordChangeRequired: response.password_change_required,
+    }
+  }
+
+  /** Makes a member choose a new password before they do anything else. */
+  async function requireOrganizationMemberPasswordChange(
+    organizationId: string,
+    membershipId: string,
+  ): Promise<MemberAccountStatus> {
+    const path = `tenancy/organizations/${organizationId}/members/${membershipId}`
+    const response = await client
+      .post(`${path}/require-password-change`)
+      .json<WireAccountStatus>()
+    return {
+      membershipId: response.membership_id,
+      disabled: response.disabled,
+      passwordChangeRequired: response.password_change_required,
+    }
+  }
+
   async function createTeam(organizationId: string, name: string): Promise<TenancyTeam> {
     const response = await client
       .post(`tenancy/organizations/${organizationId}/teams`, { json: { name }})
@@ -211,6 +270,9 @@ export function createTenancyRoutes(client: KyInstance) {
     leaveOrganization,
     removeOrganizationMember,
     revokeOrganizationInvitation,
+    disableOrganizationMember,
+    enableOrganizationMember,
+    requireOrganizationMemberPasswordChange,
     createTeam,
     deleteTeam,
     renameTeam,

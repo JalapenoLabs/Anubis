@@ -64,6 +64,12 @@ Every scaffolded list endpoint (web and API) follows one shape:
 
 The framework implements the convention once: handlers take `anubis::http::ListParams` as a query extractor beside their own filter struct, and answer with `anubis::http::Pagination`. Values that are out of range, or that do not parse at all, fall back to the convention, so a paging bug in a client degrades into a valid page instead of a 400.
 
+## Errors
+
+Every failure, on both surfaces, answers `{"message": "..."}` with a user-safe sentence and nothing internal; the cause is logged where it happened and the response's `x-request-id` is the thread back to that line.
+
+A refusal a client has to *act* on carries a second field, `code`, a permanent `snake_case` identifier: `{"message": "...", "code": "password_change_required"}`. Only such refusals carry one, because a client that branches on the message branches on a string translation is free to rewrite. Two exist today, both `403` and both from [account state](tenancy.md#account-state): `account_disabled` and `password_change_required`. `getApiErrorMessage` and `getApiErrorCode` read the two halves in the browser, and an unknown code reads as none, so a client older than its backend falls back to showing the message.
+
 ## Transport
 
 Every response, on every route, carries an `x-request-id` and the framework's security headers, and every request runs under a timeout. Cross-origin access is off until `CORS_ALLOWED_ORIGINS` names exact origins; the `/api/v1` bearer-token surface is what that exists for, since session cookies stay same-origin. [The server](server.md) covers the whole serve path, the headers, and the liveness and readiness probes.
@@ -84,6 +90,7 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 - **Sign-in methods**: password; passwordless emailed 6-digit codes (10-minute life, attempt-limited, enumeration-safe); and passkeys (WebAuthn discoverable credentials, password-manager-first, cross-platform authenticators welcome).
 - **Second factor**: TOTP (authenticator apps) with QR enrollment and single-use recovery codes. When confirmed, password and email-code login answer a 5-minute challenge instead of a session; a passkey is multi-factor by construction and bypasses the challenge.
 - **OAuth**: OpenID Connect providers, one line of setup each. See [OAuth sign-in](#oauth-sign-in) below.
+- **Registration**: open to anybody by default, and closable per deployment. `ANUBIS_REGISTRATION` takes `open`, `invite_only`, or `domain_allowlist`, `POST /auth/register` refuses a registration the mode does not admit with `403` before hashing anything, and `GET /auth/registration` reports whether the sign-up form is worth rendering. See [who may register](tenancy.md#who-may-register).
 - **Secrets at rest**: recovery codes hash like every other token. A TOTP seed must be read back to compute the expected code, so it is encrypted instead, with AES-256-GCM under the application key in `ANUBIS_SECRET_KEY` (base64 for exactly 32 bytes, required in production; development and test fall back to a public built-in key and warn at startup). Stored values are versioned and self-describing, `v1:<nonce>:<ciphertext>`, so a future scheme can be added without a migration. Mint a key with `anubis secret generate`. A seed that no longer decrypts, because the key rotated, is discarded: the account drops back to single-factor login and the user enrolls again. Rotating therefore un-enrolls every second factor at once, by design; see [key rotation](architecture.md#secrets-at-rest-and-key-rotation). The same `anubis::auth::secret_box` module covers any later secret that needs recoverable storage.
 - **Account management routes**: profile (names, time zone, locale), avatar upload/serve/delete, signed-in password and email change, session listing and revocation, and password-confirmed account deletion.
 - **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the admin role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch, and `ApiCaller::require` authorizes the token's roles the way `TeamMember::require` authorizes a member's. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; framework API serializers live in the version module (`TeamV1`) and freeze with it, and an application's live in each model's own module.
@@ -127,8 +134,11 @@ Every route above has a screen. The starter owns the pages; `@jalapenolabs/anubi
 | Security settings | `/settings/security` | change password, change email, MFA, passkeys, sessions, account deletion |
 | New address confirmation | `/change-email?token=` | `POST /auth/change-email/confirm` |
 | Sign in | `/sign-in` | password, `email-code/request` and `verify`, `mfa/verify`, the passkey login ceremony |
+| Forced password change | `/change-password` | `POST /auth/change-password` |
 
 Sign-in is one page with three methods and a shared second-factor step, rather than a route per method, because the preserved `?next=` destination has to survive every branch and a step of the same page keeps it in the URL for free.
+
+The forced password change is the screen an account owing one is sent to, by both auth gates, on the `password_change_required` code. `useCurrentUser` reports that state beside the user, because such an account is signed in and yet has no user to show: the route that would answer refuses like every other. Its only other way out is signing out, which is what the person who cannot produce their current password needs in order to reach the reset link.
 
 Avatar upload has no cropper. The server center-crops to a square, caps the longest edge at 512 px, flattens transparency, and re-encodes as JPEG, so a browser cropper would only be a second opinion the stored image ignores; the picker previews the file and posts the bytes.
 
@@ -162,7 +172,7 @@ The flow is authorization code with PKCE. `start` discovers the provider's endpo
 
 1. A `(provider, subject)` pair that is already linked signs that user in, whatever their address is today.
 2. A **verified** email that an account already uses links the identity to that account, so a password user starts using the button without a second account appearing.
-3. Anything else creates a user with the same bootstrap registration performs (personal organization, default team, admin memberships), verified because the provider vouched for the address.
+3. Anything else creates a user with the same bootstrap registration performs (personal organization, default team, admin memberships), verified because the provider vouched for the address. Creating one is registration, so it obeys the deployment's registration mode: an invite-only instance refuses here and signs existing accounts in as always. See [who may register](tenancy.md#who-may-register).
 
 An unverified email is never matched or created against, because the provider's assertion is the only proof of ownership in the flow. An OAuth-created account has no usable password until its owner sets one through the reset flow.
 
@@ -175,6 +185,7 @@ The session cookie is the one password login issues. Failures redirect to `/sign
 | `oauth_expired` | The state token was unknown, already used, or too old |
 | `oauth_email_unavailable` | The provider returned no email address |
 | `oauth_email_unverified` | The provider would not vouch for the address it returned |
+| `oauth_registration_closed` | The address has no account here, and this deployment creates none |
 | `oauth_failed` | The code exchange, the ID token, or this application failed |
 
 Providers are OpenID Connect only, because a discovery document and a signed ID token are what make an identity verifiable. Google ships in the registry; each provider reads `<PROVIDER>_OAUTH_CLIENT_ID`, `<PROVIDER>_OAUTH_CLIENT_SECRET`, and an optional `<PROVIDER>_OAUTH_ISSUER` override, and is enabled by the presence of the first two. Register `<APP_URL>/auth/oauth/<provider>/callback` as the redirect URI. GitHub publishes no discovery document and issues no ID token, so it needs a plain OAuth 2 path with a provider-specific profile fetch, which the framework does not have.
@@ -196,6 +207,9 @@ The framework mounts the tenancy surface under `/tenancy`. These are account (br
 | `POST /tenancy/organizations/{organization_id}/teams` | org admin | Create a team |
 | `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
 | `DELETE /tenancy/organizations/{organization_id}/members/{membership_id}` | org admin | Remove an organization member |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/disable` | org admin | Disable a member's account, revoking its sessions |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/enable` | org admin | Return a disabled account to use |
+| `POST /tenancy/organizations/{organization_id}/members/{membership_id}/require-password-change` | org admin | Make a member choose a new password |
 | `POST /tenancy/organizations/{organization_id}/leave` | org member | Leave the organization |
 | `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke a pending invitation in the organization |
 | `PATCH /tenancy/teams/{team_id}` | team admin | Rename the team |
@@ -204,7 +218,7 @@ The framework mounts the tenancy surface under `/tenancy`. These are account (br
 | `POST /tenancy/teams/{team_id}/leave` | team member | Leave the team |
 | `DELETE /tenancy/teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
 
-Guarded routes answer `401` when signed out, `404` when the caller is not a member of the named tenant, and `403` when a member lacks the role. A request that only the current state refuses, such as demoting a team's last admin, answers `409 Conflict`.
+Guarded routes answer `401` when signed out, `404` when the caller is not a member of the named tenant, and `403` when a member lacks the role. A request that only the current state refuses, such as demoting a team's last admin, answers `409 Conflict`. The three account routes are refused against the caller's own account with `400`, and are covered by [account state](tenancy.md#account-state).
 
 ### The tenancy screens
 

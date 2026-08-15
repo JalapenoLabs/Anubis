@@ -32,7 +32,7 @@ An application's component tests render through `frontend/src/testing/harness.ts
 - `renderWithProviders(ui, initialEntry)` mounts `ui` under the providers `main.tsx` mounts (router, HeroUI, the Anubis API client, i18n) at a chosen URL, with an SWR cache per render so one test's fetches never answer the next one's.
 - `stubFetch(responses)` answers `fetch` from a table keyed by path, so the component under test meets the real ky client, the real status handling, and the real wire shapes. A path nobody listed answers 404, which turns a forgotten route into a failed assertion instead of a timeout.
 
-Two tests establish the pattern, and both ship with `anubis new`: `App.test.tsx` proves the auth guard sends a signed-out visitor to `/sign-in` carrying the page they asked for, and `pages/auth/SignInPage.test.tsx` proves the page renders one OAuth button per provider `GET /auth/oauth/providers` reports.
+Three tests establish the pattern, and all of them ship with `anubis new`: `App.test.tsx` proves the auth guard sends a signed-out visitor to `/sign-in` carrying the page they asked for, `pages/auth/SignInPage.test.tsx` proves the page renders one OAuth button per provider `GET /auth/oauth/providers` reports and offers sign-up only while `GET /auth/registration` says the deployment takes any, and `pages/auth/SignUpPage.test.tsx` proves the closed deployment gets the reason instead of a form.
 
 ## End-to-end tests
 
