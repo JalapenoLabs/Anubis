@@ -23,14 +23,43 @@ same file `anubis new` stamps into every application.
 Emails (verification, password reset, invitations, sign-in codes) go to the
 backend log in development; the action links and codes are in the log lines.
 
-The vite dev server proxies `/auth`, `/tenancy`, `/account`, `/users`, and
-`/healthz` to the backend on port 3000, so the SPA and API stay same-origin in
-development, exactly as they are in production.
+The vite dev server proxies every path the backend claims (`/api`, `/auth`,
+`/tenancy`, `/billing`, `/account`, `/developers`, `/webhooks`, `/users`,
+`/realtime`, and the two probes) to port 3000, so the SPA and the API stay
+same-origin in development, exactly as they are in production. A framework test
+compares that list against the backend's reserved prefixes, so a new prefix
+cannot work in production and 404 here.
 
 ## Production
 
-One binary serves the API and the frontend. Build the SPA, then point
-`SPA_DIR` at the build output:
+One binary serves the API and the frontend, and `Dockerfile` builds the image
+that ships it. In this repository that file is the template `anubis new` stamps,
+not a buildable image: the starter here compiles against the framework crate in
+the parent workspace, which sits outside the build context. Stamp an
+application and it builds there, from the application root:
+
+```sh
+docker build -t acme-crm .
+
+docker run --rm -p 3000:3000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL=postgres://acme_crm:password@host.docker.internal:54321/acme_crm_development \
+  -e APP_URL=http://localhost:3000 \
+  -e ANUBIS_SECRET_KEY="$(anubis secret generate)" \
+  acme-crm
+```
+
+The image bakes `SPA_DIR`, binds `0.0.0.0:3000`, runs as a non-root user, and
+answers a container healthcheck on `/healthz`. What it does not bake is
+configuration: `DATABASE_URL`, `APP_URL`, and `ANUBIS_SECRET_KEY` are the
+deployment's, and production refuses to boot without them. Both build stages
+install from lockfiles, so commit `Cargo.lock` and `yarn.lock`.
+
+The `--add-host` line is what lets a container reach a database on the host, the
+compose Postgres above among them. A container on the same compose network
+reaches it by service name instead, with no extra flag.
+
+Without Docker, build the SPA and point `SPA_DIR` at the build output:
 
 ```sh
 yarn workspace anubis-starter-frontend build
@@ -49,6 +78,9 @@ immutable cache and `index.html` with `no-cache`, so a deploy is live on the
 next page load. An unmatched path under `/api`, `/auth`, `/tenancy`,
 `/developers`, `/users`, or `/account` answers a JSON `404` instead of the
 page.
+
+Responses are compressed on the way out, brotli or gzip by negotiation, the
+bundle and the API's JSON alike.
 
 Leaving `SPA_DIR` unset serves the API alone; production warns at startup when
 it does.

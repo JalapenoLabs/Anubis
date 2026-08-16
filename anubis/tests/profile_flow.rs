@@ -138,6 +138,11 @@ async fn profile_credentials_sessions_and_deletion() {
     assert_eq!(body["user"]["last_name"], json!("Navarro"));
     assert_eq!(body["user"]["time_zone"], json!("America/Denver"));
     assert_eq!(body["user"]["locale"], json!("en-US"), "default preserved");
+    assert_eq!(
+        body["user"]["avatar_version"],
+        Value::Null,
+        "an account with no picture carries no avatar version"
+    );
 
     let clear = json!({ "last_name": "" });
     let (status, _headers, body) = send(

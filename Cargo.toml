@@ -84,10 +84,19 @@ tokio = { version = "1", features = ["full"] }
 # axum's `ws` feature already builds on, so tests add no second copy of it.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 tower = { version = "0.5", features = ["util"] }
-# The serve path's middleware: filesystem services for the built SPA, request
-# tracing, and the opt-in CORS layer. Request ids, timeouts, and the security
-# headers are framework code, so no feature covers them.
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+# The serve path's middleware: filesystem services for the built SPA, response
+# compression, request tracing, and the opt-in CORS layer. Request ids,
+# timeouts, and the security headers are framework code, so no feature covers
+# them. Compression is gzip and brotli only: between them every browser in use
+# is covered, and deflate and zstd would each add an encoder to the binary for
+# clients that already accept one of these two.
+tower-http = { version = "0.6", features = [
+  "compression-br",
+  "compression-gzip",
+  "cors",
+  "fs",
+  "trace",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

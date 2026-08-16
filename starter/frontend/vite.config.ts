@@ -24,8 +24,15 @@ export default defineConfig({
         '**/test-results/**',
       ],
     },
+    // Every path the backend claims in production. In production one binary
+    // serves both halves, so a path missing here works when deployed and
+    // 404s in development, which is the worst way to find out. The list is
+    // the backend's reserved prefixes plus its probes, and a test in the
+    // framework fails when the two drift apart.
     proxy: {
-      // The backend serves the API; the SPA stays same-origin in production.
+      // The versioned public API, and the OpenAPI document and docs page under
+      // it.
+      '/api': 'http://127.0.0.1:3000',
       '/auth': 'http://127.0.0.1:3000',
       '/tenancy': 'http://127.0.0.1:3000',
       // The organization's plan, and the Stripe redirects that change it.
@@ -33,9 +40,13 @@ export default defineConfig({
       '/account': 'http://127.0.0.1:3000',
       // Platform applications and outgoing webhook subscriptions.
       '/developers': 'http://127.0.0.1:3000',
+      // Incoming webhooks, so a provider's test delivery can be pointed at a
+      // tunnel to the dev server.
+      '/webhooks': 'http://127.0.0.1:3000',
       // Avatars are served publicly, outside the authenticated prefixes.
       '/users': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',
+      '/readyz': 'http://127.0.0.1:3000',
       // The realtime channel socket, which needs an explicit upgrade.
       '/realtime': {
         target: 'ws://127.0.0.1:3000',

@@ -2,7 +2,7 @@
 
 import type { AnubisFieldProps } from '../types'
 import type { FieldValues } from 'react-hook-form'
-import type { HTMLInputTypeAttribute } from 'react'
+import type { HTMLInputTypeAttribute, ReactNode } from 'react'
 
 // User interface
 import { Input } from '@heroui/react'
@@ -15,6 +15,8 @@ type Props<Values extends FieldValues> = AnubisFieldProps<Values> & {
   type: HTMLInputTypeAttribute
   inputMode?: 'text' | 'email' | 'tel'
   autoComplete?: string
+  /** Rendered inside the input, at its trailing edge. */
+  endContent?: ReactNode
 }
 
 /**
@@ -51,6 +53,7 @@ export function TextualField<Values extends FieldValues>(props: Props<Values>) {
       isDisabled={props.isDisabled}
       isReadOnly={props.isReadOnly}
       isInvalid={isInvalid}
+      endContent={props.endContent}
       value={field.value == null ? '' : String(field.value)}
       onValueChange={field.onChange}
       onBlur={field.onBlur}

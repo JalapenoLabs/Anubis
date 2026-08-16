@@ -411,6 +411,33 @@ mod tests {
         }
     }
 
+    /// The other half of the guard above: development must reach what
+    /// production claims.
+    ///
+    /// One binary serves the SPA and the API in production, while development
+    /// runs two servers and Vite proxies the API half. A prefix mounted here
+    /// but missing from that proxy list works when deployed and answers the
+    /// dev server's own `404` locally, which is the worst way to find out. The
+    /// check is textual because the two sides are different languages, and the
+    /// starter's config is what `anubis new` stamps into every application, so
+    /// this covers them too.
+    #[test]
+    fn the_starters_dev_proxy_reaches_every_reserved_prefix() {
+        let config = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../starter/frontend/vite.config.ts"
+        ))
+        .expect("the starter's vite config is readable");
+
+        for path in RESERVED_PREFIXES.iter().chain(PROBES) {
+            assert!(
+                config.contains(&format!("'{path}':")),
+                "the starter's vite dev server does not proxy {path}: \
+                 add it to the proxy list in starter/frontend/vite.config.ts",
+            );
+        }
+    }
+
     #[test]
     fn a_reserved_prefix_is_rooted_and_unslashed() {
         assert_eq!(normalize_prefix("account"), "/account");

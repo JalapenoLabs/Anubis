@@ -213,7 +213,7 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 
 Every command in the table is implemented.
 
-Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`.
+Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`. Which of them the generator accepts today is the table below; the rest exist as components first, which is the order the two halves land in.
 
 The generator accepts the types the living templates prove. Each row knows its column, its Diesel schema type, its Rust type, its wire type, and its React control; a later issue extends the table rather than the code around it, and an unsupported type is refused by name with the supported list.
 
@@ -454,6 +454,8 @@ Every field composes `FieldWrapper`, which owns the label, the required marker, 
 
 Every field accepts `AnubisFieldProps`: `control` and `name` for react-hook-form, then `label`, `help`, `placeholder`, `error`, `isRequired`, `isDisabled`, `isReadOnly`, `autoFocus`, `id`, and `className`. `isReadOnly` is the `{readonly}` modifier. Choice fields add `options: FieldOption[]`.
 
+`SuperSelectField` also takes `onSearch` and `isLoading`, for an association too large to send in one response: the component reports the typed query, debounced at 250 ms, and the form refetches the options endpoint and passes the page back down. Leave `onSearch` out and the given options are filtered in the browser, which is the right answer for a list that fits in one response. Either way the component's contract is the same, which is what lets a five-row association and a directory-sized one render through one control.
+
 The prop names mirror the locale keys the scaffolder emits, so a generated form reads `label={t('tangibleThings.name')}` and `help={t('tangibleThings.nameHelp')}` straight from the model's locale file.
 
 ### react-hook-form and i18n
@@ -479,20 +481,50 @@ The library never imports i18next. The application owns translation and passes `
 | `date_field` | `DateField` | HeroUI Input, storing `YYYY-MM-DD` verbatim |
 | `date_and_time_field` | `DateAndTimeField` | HeroUI Input, storing UTC and editing local |
 | `color_picker` | `ColorPickerField` | HeroUI Input plus a native color swatch |
+| `emoji_field` | `EmojiField` | HeroUI Input holding one grapheme |
+| `rich_text` | `RichTextField` | Tiptap, behind a lazy import; `RichTextView` renders it |
+| `code_editor` | `CodeEditorField` | CodeMirror 6, behind a lazy import |
+| `file_field` | `FileField` | A picker and a link, uploading through the application |
+| `image` | `ImageField` | The same, showing a thumbnail |
 
 A boolean is a switch, not a checkbox: a boolean column is a setting that is on or off, and a switch says so at a glance. Checkboxes stay with selection lists, where "include this one" is the meaning.
 
 Dates carry no timezone, so `DateField` stores the calendar date exactly as typed. Timestamps do, so `DateAndTimeField` converts in both directions and the question is answered once, in the field, instead of in every generated form.
 
+`PasswordField` carries a reveal toggle, drawn as inline SVG. A framework that pulled a whole icon set into every application's dependency tree for two glyphs would have made a bad trade.
+
+### The heavy fields, and what they cost
+
+Three fields need an editor an application should not pay for unless it uses one, so each is reached through a dynamic import inside `React.lazy`. The package's own build keeps them external and keeps the import dynamic, so the application's bundler gives each one a chunk of its own:
+
+| Chunk | Loaded when |
+|---|---|
+| `RichTextEditor` | a form renders a `RichTextField` |
+| `CodeEditor` | a form renders a `CodeEditorField` |
+| `@codemirror/lang-<name>` | that editor's `language` prop names it |
+
+Nothing above is in the entry chunk, which is the whole point: an application that scaffolds no rich text ships no ProseMirror.
+
+**`rich_text` stores HTML.** Bullet Train's `trix_editor` does, and HTML is the representation every other consumer of a record already understands: an email body, an export, a webhook payload, and an `/api/v1` response carry markup without first agreeing on an editor's document model. An empty document is stored as `''`, so a nullable column ends up NULL when a user clears it.
+
+**Rendering that HTML is the consumer's problem, and the framework ships the answer.** Markup one user wrote and another user reads is a cross-site scripting hole unless something sanitizes it. `RichTextView` is that something: it runs DOMPurify and refuses to render at all on a platform DOMPurify cannot secure. Render a stored `rich_text` value with it, never with a bare `dangerouslySetInnerHTML`. Sanitizing in the browser is defense in depth rather than the whole defense: a value written through `/api/v1` by a bearer token never passes through this package, so an application that accepts rich text over its API should sanitize on write too.
+
+**`code_editor` is CodeMirror 6, not Bullet Train's Monaco.** Monaco is an IDE carrying a worker-based TypeScript service and weighs megabytes, which is a steep price for a control that edits a template or a snippet of configuration; CodeMirror 6 is tree-shakeable, ships each grammar as its own package, and works on touch devices. An application that genuinely wants IntelliSense ejects `CodeEditorField`.
+
+**`emoji_field` is one grapheme of text, with no picker.** Emoji Mart carries a 1.4 MB dataset, publishes types that omit its own data module's export, and pins React through a range narrower than this package's. Every platform this field is reached from already ships a complete, current picker on a keyboard shortcut (`Win` `.`, `Ctrl` `Cmd` `Space`, the emoji key on every touch keyboard), and the field holds a single character. So the control is a text input that keeps the last grapheme, which is what makes the column an ordinary `TEXT` that renders on a show page as itself. An application that wants the in-page picker ejects `EmojiField` and adds the dependency to its own tree.
+
+### `file_field` and `image`: controlled, and deliberately so
+
+Both fields hold a `FileReference` (a `url`, and the `name`, `size`, and `contentType` that make it readable) and take an `onUpload: (file: File) => Promise<FileReference>`. The field never talks to a server: it hands the chosen `File` to the application and stores what comes back.
+
+That is a decision, not a placeholder. The framework stores avatars as bytes in Postgres, and whether an application's attachments belong there, in S3, or behind a signed CDN URL is something it decides once and lives with. A field component that picked one would be wrong for most applications, and a framework attachments table would make that wrong answer the default. When the framework grows a generic attachments endpoint, it becomes one implementation of `onUpload` and changes nothing about these components.
+
 ### Deferred
 
-These field types have no component yet, and each waits on something specific:
-
-- `emoji_field`, `rich_text`, `code_editor`: each needs a heavy editor dependency (Emoji Mart, a rich text editor, Monaco). They belong behind a lazy import so applications that never scaffold one never ship one.
-- `file_field`, `image`: these need the upload endpoint and storage decision first. A picker with nowhere to put the bytes is not a field.
+- `rich_text`, `code_editor`, `emoji_field`, `file_field`, `image` are **components, not yet scaffolder field types**: `anubis scaffold field` still refuses them by name. `emoji_field` and `code_editor` are plain `TEXT` columns and need only a row in `FIELD_TYPES`. `rich_text` needs one more decision first, because a show page renders a column as text and rendering HTML as text shows the tags: either the generated show page gains an import anchor so it can render `RichTextView`, or the backend sanitizes on write and the page renders trusted markup. `file_field` and `image` wait on the storage decision above, since a generated column has to hold something and only an application knows whether that is a URL or a foreign key.
 - `address_field`: needs the country and region dataset, and dependent-select behavior, which is the same shape `phone_field` wants for country codes.
 - `phone_field` international formatting: the field ships as a telephone input today and stores the number as typed. Country selection and E.164 normalization arrive with the country dataset.
-- `super_select` incremental search: a generated association form fetches the whole option list once, from the join's options endpoint, and filters it in the browser. Fetching a page of options as the user types is what a directory-sized list will need, and it changes nothing about the component's contract.
+- Association list-query batching: a list endpoint runs one query per association. That is backend work and invisible from the field library.
 
 ### Styling
 
@@ -523,7 +555,7 @@ rewired:
 
 ### What is ejectable, and what is not
 
-The ejectable surface is the [field component library](#the-field-component-library): the thirteen field components, `FieldWrapper`, and `useFieldState`. `anubis eject --list` prints it with a line each.
+The ejectable surface is the [field component library](#the-field-component-library): the eighteen field components, `RichTextView`, `FieldWrapper`, and `useFieldState`. `anubis eject --list` prints it with a line each.
 
 Everything else the package ships stays framework-owned on purpose. The API client, the realtime client, the React hooks, and the WebAuthn helpers speak a protocol the backend keeps moving, so a copy of one would fork that contract rather than restyle a control, and the fork would be silent until an upgrade broke it. Bullet Train draws the same line: partials and locales eject, framework concerns are extended rather than copied. An application that wants different behavior composes those APIs in the pages it already owns, because the starter owns every page.
 
@@ -538,6 +570,8 @@ Each relative import inside a copied file takes one of three roads, decided by t
 - a dependency the package **exports** is read from the package (`import type { AnubisFieldProps } from '@jalapenolabs/anubis'`), so an ejected `TextField` still shares one `FieldWrapper` and one `useFieldState` with every field that was not ejected
 - a dependency the package **keeps to itself** rides along, reported as an extra file. `TextField`, `EmailField`, `PasswordField`, and `PhoneField` differ only in input type, and the control behind them (`internal/TextualField.tsx`) is not exported, so leaving it behind would leave an import that does not resolve
 - a dependency this application **already ejected** is reached where it lies, so ejecting `FieldWrapper` first and a field afterwards gives that field your wrapper, not the package's
+
+A **lazily** imported dependency takes the same three roads. `RichTextField` and `CodeEditorField` fetch their editors through `import(...)` inside a `lazy(...)` factory rather than through an import statement, so the walk reads both spellings; a copy that took the field and left the editor behind would work until the form was opened. A module reached only dynamically binds no names, which makes it internal by definition, so it always rides along.
 
 In the application's own files, only the ejected name moves. A shared import line splits, and the rest stays with the package:
 

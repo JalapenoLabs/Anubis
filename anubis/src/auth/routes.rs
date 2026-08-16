@@ -189,7 +189,9 @@ async fn register(
 
     let jar = signed_in_jar(&state, &mut connection, created.id).await?;
     let body = UserBody {
-        user: UserResponse::from(&created),
+        user: UserResponse::load(&mut connection, &created)
+            .await
+            .map_err(log_internal)?,
     };
     Ok((jar, (StatusCode::CREATED, Json(body))))
 }
@@ -258,7 +260,9 @@ async fn login(
 
     let jar = signed_in_jar(&state, &mut connection, user.id).await?;
     let body = UserBody {
-        user: UserResponse::from(&user),
+        user: UserResponse::load(&mut connection, &user)
+            .await
+            .map_err(log_internal)?,
     };
     Ok((jar, (StatusCode::OK, Json(body))).into_response())
 }
@@ -280,10 +284,17 @@ async fn logout(
     Ok((jar.remove(removal), StatusCode::NO_CONTENT))
 }
 
-async fn me(CurrentUser(user): CurrentUser) -> Json<UserBody> {
-    Json(UserBody {
-        user: UserResponse::from(&user),
-    })
+async fn me(
+    State(state): State<AuthState>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<UserBody>, ApiError> {
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+
+    Ok(Json(UserBody {
+        user: UserResponse::load(&mut connection, &user)
+            .await
+            .map_err(log_internal)?,
+    }))
 }
 
 async fn request_email_verification(
@@ -333,7 +344,9 @@ async fn confirm_email_verification(
         .map_err(log_internal)?;
 
     Ok(Json(UserBody {
-        user: UserResponse::from(&user),
+        user: UserResponse::load(&mut connection, &user)
+            .await
+            .map_err(log_internal)?,
     }))
 }
 

@@ -91,7 +91,9 @@ async fn update_profile(
         .map_err(log_internal)?;
 
     Ok(Json(UserBody {
-        user: UserResponse::from(&updated),
+        user: UserResponse::load(&mut connection, &updated)
+            .await
+            .map_err(log_internal)?,
     }))
 }
 
@@ -270,7 +272,9 @@ async fn confirm_email_change(
         })?;
 
     Ok(Json(UserBody {
-        user: UserResponse::from(&updated),
+        user: UserResponse::load(&mut connection, &updated)
+            .await
+            .map_err(log_internal)?,
     }))
 }
 

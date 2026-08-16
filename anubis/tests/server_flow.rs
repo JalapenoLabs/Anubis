@@ -18,19 +18,24 @@ use anubis::server;
 use axum::Router;
 use axum::body::Body;
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_SECURITY_POLICY, ORIGIN,
-    REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    ACCEPT_ENCODING, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD,
+    CONTENT_ENCODING, CONTENT_SECURITY_POLICY, ORIGIN, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
+    VARY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::get;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as ClientMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 /// The header the framework returns every request's id in.
@@ -89,6 +94,21 @@ impl Answer {
     }
 }
 
+/// One answer kept as the bytes that went over the wire.
+///
+/// The compression tests need those bytes: a compressed body is not JSON and
+/// not UTF-8, and its length is the whole point.
+struct RawAnswer {
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl RawAnswer {
+    fn header(&self, name: &axum::http::HeaderName) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+}
+
 async fn send(router: &Router, method: &str, path: &str, headers: &[(&str, &str)]) -> Answer {
     let mut builder = Request::builder().method(method).uri(path);
     for (name, value) in headers {
@@ -116,6 +136,31 @@ async fn send(router: &Router, method: &str, path: &str, headers: &[(&str, &str)
         headers,
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     }
+}
+
+async fn send_raw(router: &Router, path: &str, headers: &[(&str, &str)]) -> RawAnswer {
+    let mut builder = Request::builder().method("GET").uri(path);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::empty()).expect("request must build");
+
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router is infallible");
+
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body must collect")
+        .to_bytes()
+        .to_vec();
+
+    RawAnswer { headers, body }
 }
 
 #[tokio::test]
@@ -302,6 +347,154 @@ async fn a_preflight_from_a_configured_origin_is_answered() {
     );
 }
 
+/// What an API list endpoint answers with: repetitive JSON, large enough that
+/// compressing it is the difference a page load feels.
+fn a_list_endpoint() -> Router {
+    Router::new().route(
+        "/api/v1/things",
+        get(|| async {
+            let things: Vec<Value> = (0..200)
+                .map(|index| json!({ "id": index, "name": "a tangible thing", "state": "active" }))
+                .collect();
+            axum::Json(json!({ "things": things }))
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_client_that_accepts_compression_gets_it() {
+    let app = app(&config(&[]), a_list_endpoint());
+
+    let plain = send_raw(&app, "/api/v1/things", &[]).await;
+    let compressed = send_raw(&app, "/api/v1/things", &[("accept-encoding", "gzip")]).await;
+
+    assert_eq!(compressed.header(&CONTENT_ENCODING), Some("gzip"));
+    // The gzip magic number: the body really is the encoding it claims.
+    assert_eq!(
+        compressed.body.get(..2),
+        Some([0x1f, 0x8b].as_slice()),
+        "the body must start with the gzip header",
+    );
+    assert!(
+        compressed.body.len() * 4 < plain.body.len(),
+        "{} bytes compressed against {} plain is not worth the header",
+        compressed.body.len(),
+        plain.body.len(),
+    );
+    // Without it, a shared cache could hand these bytes to a client that never
+    // asked for an encoding.
+    assert_eq!(compressed.header(&VARY), Some("accept-encoding"));
+}
+
+#[tokio::test]
+async fn brotli_is_used_when_the_client_offers_it() {
+    let app = app(&config(&[]), a_list_endpoint());
+
+    let answer = send_raw(&app, "/api/v1/things", &[("accept-encoding", "br, gzip")]).await;
+
+    assert_eq!(answer.header(&CONTENT_ENCODING), Some("br"));
+}
+
+#[tokio::test]
+async fn a_client_that_asks_for_nothing_gets_the_bytes_as_they_are() {
+    let app = app(&config(&[]), a_list_endpoint());
+
+    let answer = send_raw(&app, "/api/v1/things", &[]).await;
+
+    assert_eq!(answer.header(&CONTENT_ENCODING), None);
+    let body: Value = serde_json::from_slice(&answer.body).expect("plain bodies stay JSON");
+    assert_eq!(body["things"].as_array().map(Vec::len), Some(200));
+}
+
+/// A handful of bytes costs more in headers than compressing them saves, so the
+/// probes answer as themselves however the client asks.
+#[tokio::test]
+async fn a_tiny_body_is_not_worth_compressing() {
+    let app = app(&config(&[]), Router::new());
+
+    let answer = send_raw(&app, "/healthz", &[("accept-encoding", "br, gzip")]).await;
+
+    assert_eq!(answer.header(&CONTENT_ENCODING), None);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&answer.body).expect("the probe answers JSON"),
+        json!({ "status": "ok" }),
+    );
+}
+
+/// The realtime socket runs through the same stack the compression layer is
+/// in, and a `101` carries no body to compress. Proven over a real connection,
+/// because an upgrade is one of the few things `oneshot` cannot show.
+#[tokio::test]
+async fn a_websocket_still_upgrades_through_the_hardened_stack() {
+    use axum::extract::ws::{Message as ServerMessage, WebSocket, WebSocketUpgrade};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port must be available");
+    let address = listener
+        .local_addr()
+        .expect("a bound listener has an address");
+
+    let sockets = Router::new().route(
+        "/realtime",
+        get(|upgrade: WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|mut socket: WebSocket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    if let ServerMessage::Text(text) = message {
+                        let _ignored = socket.send(ServerMessage::Text(text)).await;
+                    }
+                }
+            })
+        }),
+    );
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let app = app(&config(&[]), sockets);
+    let serving = tokio::spawn(server::serve_with_shutdown(listener, app, async {
+        let _stopped = stopped.await;
+    }));
+
+    let mut request = format!("ws://{address}/realtime")
+        .into_client_request()
+        .expect("the websocket URL must parse");
+    // The header that would tempt a compression layer to touch the upgrade.
+    request.headers_mut().insert(
+        ACCEPT_ENCODING,
+        axum::http::HeaderValue::from_static("br, gzip"),
+    );
+
+    let (mut socket, response) = connect_async(request)
+        .await
+        .expect("the upgrade must succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert!(
+        response.headers().get(CONTENT_ENCODING).is_none(),
+        "an upgrade must not be encoded",
+    );
+
+    socket
+        .send(ClientMessage::text("ping"))
+        .await
+        .expect("the socket must accept a frame");
+    let echoed = socket
+        .next()
+        .await
+        .expect("the echo must arrive")
+        .expect("the socket must stay open")
+        .into_text()
+        .expect("the echo is a text frame");
+    assert_eq!(echoed.as_str(), "ping");
+
+    let _closed = socket.close(None).await;
+    stop.send(()).expect("the server must still be listening");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the server must exit once the socket closes");
+    outcome
+        .expect("the serving task must not panic")
+        .expect("a drained shutdown is a clean exit");
+}
+
 /// The clock is paused, so tokio advances it to the timeout rather than
 /// spending thirty real seconds proving the constant.
 #[tokio::test(start_paused = true)]
@@ -343,12 +536,18 @@ async fn the_headers_reach_the_single_page_application_too() {
     // fallback, hardened around it. Merging the probes into a router that
     // already has a fallback must work, and the shell must carry the policy.
     let build = std::env::temp_dir().join(format!("anubis-server-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&build).expect("the build output must be creatable");
+    std::fs::create_dir_all(build.join("assets")).expect("the build output must be creatable");
     std::fs::write(
         build.join("index.html"),
         "<!doctype html><title>Anubis</title>",
     )
     .expect("index.html must be writable");
+    // A stand-in for the bundle, the largest thing a cold load pulls.
+    std::fs::write(
+        build.join("assets").join("index-a1b2c3.js"),
+        "console.log('anubis');\n".repeat(500),
+    )
+    .expect("the asset must be writable");
 
     let assets = anubis::spa::Assets::new(&build).expect("the build output must open");
     let app = app(
@@ -368,6 +567,25 @@ async fn the_headers_reach_the_single_page_application_too() {
     assert_eq!(
         send(&app, "GET", "/healthz", &[]).await.status,
         StatusCode::OK
+    );
+
+    // The bundle is what a cold load waits on, so it is what compression is
+    // for: the file service reads it off disk and the layer above encodes it.
+    let bundle = "/assets/index-a1b2c3.js";
+    let plain = send_raw(&app, bundle, &[]).await;
+    let compressed = send_raw(&app, bundle, &[("accept-encoding", "gzip")]).await;
+
+    assert_eq!(compressed.header(&CONTENT_ENCODING), Some("gzip"));
+    assert!(
+        compressed.body.len() * 10 < plain.body.len(),
+        "{} bytes compressed against {} plain",
+        compressed.body.len(),
+        plain.body.len(),
+    );
+    // Compression must not cost the asset its year-long cache entry.
+    assert_eq!(
+        compressed.header(&axum::http::header::CACHE_CONTROL),
+        Some("public, max-age=31536000, immutable"),
     );
 
     let _ignored = std::fs::remove_dir_all(&build);

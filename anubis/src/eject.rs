@@ -77,7 +77,7 @@ pub struct Component {
 /// sits above it, and which `HeroUI` component backs it are decisions an
 /// application's design has every right to make, and taking one file over
 /// costs nothing but that file's future improvements.
-pub const CATALOG: [Component; 15] = [
+pub const CATALOG: [Component; 21] = [
     Component {
         key: "BooleanField",
         source: "src/fields/BooleanField.tsx",
@@ -87,6 +87,11 @@ pub const CATALOG: [Component; 15] = [
         key: "ButtonsField",
         source: "src/fields/ButtonsField.tsx",
         summary: "the `buttons` field, a segmented single choice",
+    },
+    Component {
+        key: "CodeEditorField",
+        source: "src/fields/CodeEditorField.tsx",
+        summary: "the `code_editor` field, CodeMirror 6 behind a lazy import",
     },
     Component {
         key: "ColorPickerField",
@@ -109,9 +114,24 @@ pub const CATALOG: [Component; 15] = [
         summary: "the `email_field`, with the email keyboard and autofill",
     },
     Component {
+        key: "EmojiField",
+        source: "src/fields/EmojiField.tsx",
+        summary: "the `emoji_field`, one grapheme from the platform's keyboard",
+    },
+    Component {
         key: "FieldWrapper",
         source: "src/fields/FieldWrapper.tsx",
         summary: "the layout every field shares: label, control, help or error",
+    },
+    Component {
+        key: "FileField",
+        source: "src/fields/FileField.tsx",
+        summary: "the `file_field`, uploading through the application's endpoint",
+    },
+    Component {
+        key: "ImageField",
+        source: "src/fields/ImageField.tsx",
+        summary: "the `image` field, a file field showing what was chosen",
     },
     Component {
         key: "NumberField",
@@ -132,6 +152,16 @@ pub const CATALOG: [Component; 15] = [
         key: "PhoneField",
         source: "src/fields/PhoneField.tsx",
         summary: "the `phone_field`, with the dial keyboard",
+    },
+    Component {
+        key: "RichTextField",
+        source: "src/fields/RichTextField.tsx",
+        summary: "the `rich_text` field, Tiptap behind a lazy import",
+    },
+    Component {
+        key: "RichTextView",
+        source: "src/fields/RichTextView.tsx",
+        summary: "the sanitized render of a `rich_text` value on a page",
     },
     Component {
         key: "SuperSelectField",
@@ -215,16 +245,63 @@ fn exported(item: &str) -> &str {
     item.split_whitespace().next_back().unwrap_or(item)
 }
 
-/// Every relative import in a module, in source order.
+/// Every relative import in a module, static and dynamic, in source order.
 ///
 /// Relative imports are the ones an ejection has to decide about: an import of
 /// `react` or `@heroui/react` resolves the same from the application as it did
 /// from the package, so it is left exactly as it was.
+///
+/// The dynamic ones matter as much as the static ones, and are easier to miss:
+/// the heavy field components reach their editors through `import(...)` inside
+/// a `lazy(...)` factory, so a walk that only read `import` statements would
+/// copy `RichTextField.tsx` into an application and leave the editor it
+/// fetches at runtime behind. They bind no names, which is exactly right: a
+/// module reached only dynamically is never public API of the package, so it
+/// always rides along into the application rather than being read back out of
+/// the package.
 #[must_use]
 pub fn relative_imports(contents: &str) -> Vec<Statement> {
     let mut imports = parse(contents, "import ");
+    for specifier in dynamic_specifiers(contents) {
+        if imports.iter().all(|import| import.specifier != specifier) {
+            imports.push(Statement {
+                specifier,
+                names: Vec::new(),
+                is_type: false,
+                // A dynamic import is never rewritten: it names no exports, so
+                // it can never be read from the package, and these two are
+                // only ever consulted for a statement that is.
+                start: 0,
+                end: 0,
+            });
+        }
+    }
+
     imports.retain(|import| import.specifier.starts_with('.'));
     imports
+}
+
+/// The module specifier of every `import('...')` expression in a module.
+fn dynamic_specifiers(contents: &str) -> Vec<String> {
+    let mut specifiers = Vec::new();
+    let mut rest = contents;
+
+    while let Some(offset) = rest.find("import(") {
+        rest = &rest[offset + "import(".len()..];
+        // Only a plain quoted specifier is understood, which is the only kind
+        // a bundler can split anyway: `import(someVariable)` is skipped rather
+        // than guessed at.
+        let Some(quoted) = rest.strip_prefix('\'') else {
+            continue;
+        };
+        let Some(length) = quoted.find('\'') else {
+            continue;
+        };
+        specifiers.push(quoted[..length].to_owned());
+        rest = &quoted[length + 1..];
+    }
+
+    specifiers
 }
 
 /// The names the package's `index.ts` re-exports.
@@ -584,6 +661,44 @@ import { FieldWrapper, useFieldState } from '@jalapenolabs/anubis'
 
 export function BooleanField() {}
 ",
+            "{ejected}",
+        );
+    }
+
+    /// The heavy fields fetch their editors at runtime, and a copy that left
+    /// the editor behind would break the moment the form was opened.
+    #[test]
+    fn a_lazily_imported_module_is_found_too() {
+        let module = "\
+// Copyright © 2026 Jalapeno Labs
+
+// Core
+import { Suspense, lazy } from 'react'
+
+const RichTextEditor = lazy(async () => {
+  const editor = await import('./internal/RichTextEditor')
+  return { default: editor.RichTextEditor }
+})
+";
+        let imports = relative_imports(module);
+        assert_eq!(
+            imports
+                .iter()
+                .map(|import| import.specifier.as_str())
+                .collect::<Vec<_>>(),
+            ["./internal/RichTextEditor"],
+            "the react import is not relative, and the lazy one is",
+        );
+        assert!(
+            !imports[0].is_public(&root_exports("export { RichTextEditor } from './x'\n")),
+            "a module reached only dynamically always rides along",
+        );
+
+        // The statement is left exactly where it was: an ejected file fetches
+        // the copy beside it, not the package's own.
+        let ejected = eject_module(module, "// note\n", &[]);
+        assert!(
+            ejected.contains("await import('./internal/RichTextEditor')"),
             "{ejected}",
         );
     }

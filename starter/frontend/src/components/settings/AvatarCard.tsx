@@ -5,7 +5,7 @@ import type { User } from '@jalapenolabs/anubis'
 // Core
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi, getApiErrorMessage } from '@jalapenolabs/anubis'
+import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
 
 // UI
 import { Avatar, Button, Card, CardBody } from '@heroui/react'
@@ -26,18 +26,21 @@ type Props = {
  * resizes to 512 px, flattens transparency, and re-encodes as JPEG, so a
  * cropper in the browser would only be a second opinion the stored image
  * ignores.
+ *
+ * Every write refreshes the profile rather than busting the URL locally: the
+ * payload carries the avatar's version, so one refresh updates this card and
+ * the navbar together.
  */
 export function AvatarCard(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const { refresh } = useCurrentUser()
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [ selectedFile, setSelectedFile ] = useState<File | null>(null)
   const [ isSaving, setIsSaving ] = useState(false)
   const [ isRemoving, setIsRemoving ] = useState(false)
   const [ errorMessage, setErrorMessage ] = useState<string | null>(null)
-  // Bumped after every write so the browser re-fetches a URL that never changes.
-  const [ storedVersion, setStoredVersion ] = useState(() => Date.now())
 
   const previewUrl = useMemo(
     () => selectedFile && URL.createObjectURL(selectedFile),
@@ -80,7 +83,7 @@ export function AvatarCard(props: Props) {
     try {
       await api.uploadAvatar(selectedFile)
       setSelectedFile(null)
-      setStoredVersion(Date.now())
+      await refresh()
     }
     catch (error) {
       const message = getApiErrorMessage(error)
@@ -97,7 +100,7 @@ export function AvatarCard(props: Props) {
     try {
       await api.deleteAvatar()
       setSelectedFile(null)
-      setStoredVersion(Date.now())
+      await refresh()
     }
     catch (error) {
       const message = getApiErrorMessage(error)
@@ -120,7 +123,7 @@ export function AvatarCard(props: Props) {
           size='lg'
           showFallback
           className='h-24 w-24 shrink-0'
-          src={previewUrl ?? `${api.avatarUrl(props.user.id)}?v=${storedVersion}`}
+          src={previewUrl ?? api.avatarUrl(props.user)}
           name={props.user.email.slice(0, 2).toUpperCase()}
         />
         <div className='w-full'>

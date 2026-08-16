@@ -96,6 +96,20 @@ Paths under the framework's own prefixes (`/api`, `/auth`, `/billing`, `/develop
 
 Leaving `SPA_DIR` unset serves the API alone, which is both the development default (Vite owns the browser there) and a supported production shape for a frontend hosted on a CDN. Production logs a warning when it is unset. When it is set, the directory is validated at startup, so a deploy that shipped without a build fails immediately instead of at the first page load.
 
+Everything the server sends is compressed on the way out, brotli or gzip by negotiation: the bundle a cold load pulls and the JSON a running application answers with alike. See [server.md](server.md#compression).
+
+### The image
+
+Every application ships a `Dockerfile`, stamped alongside it by `anubis new`. Three stages: the Rust build, the frontend build, and a runtime that holds the binary, the bundle, and nothing else.
+
+That runtime is Debian slim, and it needs no libraries, because the binary needs none. Diesel speaks the Postgres wire protocol in Rust rather than through `libpq`, TLS is rustls with its root certificates compiled in rather than OpenSSL against a system trust store, and the migrations and `config/*.yml` are compiled into the binary too. What remains to copy is one executable and one directory of static files, run as a non-root user, with a healthcheck on `/healthz` and `SIGTERM` reaching the server as PID 1.
+
+The starter measures 122MB: 79MB of Debian, 29MB of binary, 14MB of curl for the healthcheck, and 1MB of frontend bundle. Distroless would take off perhaps 50MB along with the shell an incident wants and the only client a container healthcheck could run, which is the trade this base declines.
+
+The two build stages pin their toolchains to the versions the rest of the repository pins, and a test fails the build when a bump misses one. Both use BuildKit cache mounts, the Rust stage for the crate registry and the target directory, the Node stage for Yarn's global cache. A source-only change then recompiles one crate instead of the whole graph, and a dependency bump re-fetches one package instead of a thousand. A runner with a cold cache pays the full build, which is the honest trade against the dummy-crate trick and its stale fingerprints.
+
+The `docker build` and `docker run` lines are in the stamped application's README.
+
 ## Roadmap
 
 The scaffolder stamps out patterns, so the patterns are hand-built and stabilized first, then automated.

@@ -19,6 +19,13 @@ export type User = {
   /** BCP 47 locale tag, such as `en-US`. */
   locale: string
   createdAt: string
+  /**
+   * Version of the stored avatar; null when the account has none.
+   *
+   * It changes with the picture, which is what makes `avatarUrl` a new URL
+   * after an upload and every view of the account update at once.
+   */
+  avatarVersion: string | null
 }
 
 export type UserEnvelope = {
@@ -290,6 +297,7 @@ export type WireUser = {
   time_zone: string
   locale: string
   created_at: string
+  avatar_version: string | null
 }
 
 export type WireUserEnvelope = {
@@ -312,6 +320,9 @@ export function toUser(wire: WireUser): User {
     timeZone: wire.time_zone,
     locale: wire.locale,
     createdAt: wire.created_at,
+    // A payload from an older backend has no version at all, which reads the
+    // same as an account with no picture: the bare avatar URL.
+    avatarVersion: wire.avatar_version ?? null,
   }
 }
 

@@ -1,5 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
+import type { FileReference } from './types'
 import type { ReactNode } from 'react'
 import type { Control, UseFormReturn } from 'react-hook-form'
 
@@ -15,16 +16,21 @@ import { ColorPickerField } from './ColorPickerField'
 import { DateAndTimeField, toLocalDateTimeInput, toUtcTimestamp } from './DateAndTimeField'
 import { DateField } from './DateField'
 import { EmailField } from './EmailField'
+import { EmojiField, lastGrapheme } from './EmojiField'
+import { FileField } from './FileField'
+import { ImageField } from './ImageField'
 import { NumberField } from './NumberField'
 import { OptionsField } from './OptionsField'
 import { PasswordField } from './PasswordField'
 import { PhoneField } from './PhoneField'
+import { RichTextView } from './RichTextView'
 import { SuperSelectField } from './SuperSelectField'
 import { TextAreaField } from './TextAreaField'
 import { TextField } from './TextField'
+import { formatBytes } from './internal/UploadField'
 
 // Utility
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 type HarnessValues = {
@@ -36,6 +42,8 @@ type HarnessValues = {
   date: string | null
   timestamp: string | null
   color: string
+  emoji: string
+  attachment: FileReference | null
 }
 
 const defaultHarnessValues: HarnessValues = {
@@ -47,6 +55,8 @@ const defaultHarnessValues: HarnessValues = {
   date: null,
   timestamp: null,
   color: '',
+  emoji: '',
+  attachment: null,
 }
 
 const statusOptions = [
@@ -433,5 +443,177 @@ describe('ColorPickerField', () => {
 
     const swatch = container.querySelector('input[type="color"]')
     expect(swatch?.getAttribute('tabindex')).toBe('-1')
+  })
+})
+
+describe('PasswordField reveal toggle', () => {
+  it('should swap the input type, and say which state it is in', async () => {
+    const user = userEvent.setup()
+    renderField((control) => <PasswordField
+      control={control}
+      name='text'
+      label='Password'
+    />)
+
+    const input = screen.getByLabelText('Password')
+    expect(input.getAttribute('type')).toBe('password')
+
+    await user.click(screen.getByRole('button', { name: 'Show password' }))
+    expect(input.getAttribute('type')).toBe('text')
+
+    await user.click(screen.getByRole('button', { name: 'Hide password' }))
+    expect(input.getAttribute('type')).toBe('password')
+  })
+})
+
+describe('EmojiField', () => {
+  it('should keep only the last grapheme typed', async () => {
+    const user = userEvent.setup()
+    const formRef = renderField((control) => <EmojiField
+      control={control}
+      name='emoji'
+      label='Icon'
+    />)
+
+    await user.type(screen.getByLabelText('Icon'), 'ab')
+
+    expect(formRef.current?.getValues('emoji')).toBe('b')
+  })
+
+  it('should treat a multi-code-point emoji as one character', () => {
+    // A family is seven code points joined by zero-width joiners, and a flag
+    // is two regional indicators: neither survives `text[0]`.
+    expect(lastGrapheme('x👩‍👩‍👧‍👦')).toBe('👩‍👩‍👧‍👦')
+    expect(lastGrapheme('🇺🇸')).toBe('🇺🇸')
+    expect(lastGrapheme('')).toBe('')
+  })
+})
+
+describe('RichTextView', () => {
+  it('should render the markup the editor writes', () => {
+    const { container } = render(<RichTextView html='<p>Hello <strong>world</strong></p>' />)
+
+    expect(container.querySelector('strong')?.textContent).toBe('world')
+  })
+
+  it('should render nothing at all for an empty value', () => {
+    const { container } = render(<RichTextView html={null} />)
+
+    expect(container.firstChild).toBeNull()
+  })
+})
+
+describe('formatBytes', () => {
+  it('should count in the largest unit that leaves a whole number', () => {
+    expect(formatBytes(512)).toBe('512 B')
+    expect(formatBytes(2048)).toBe('2.0 KB')
+    expect(formatBytes(1_500_000)).toBe('1.4 MB')
+  })
+})
+
+describe('FileField', () => {
+  it('should store the reference the upload resolves', async () => {
+    const user = userEvent.setup()
+    const stored: FileReference = {
+      url: 'https://files.example.com/report.pdf',
+      name: 'report.pdf',
+      size: 2048,
+    }
+    const formRef = renderField((control) => <FileField
+      control={control}
+      name='attachment'
+      label='Attachment'
+      onUpload={() => Promise.resolve(stored)}
+    />)
+
+    await user.upload(
+      screen.getByLabelText<HTMLInputElement>('Attachment'),
+      new File([ 'a report' ], 'report.pdf', { type: 'application/pdf' }),
+    )
+
+    expect(formRef.current?.getValues('attachment')).toEqual(stored)
+    expect(await screen.findByText('report.pdf')).toBeTruthy()
+    expect(screen.getByText('2.0 KB')).toBeTruthy()
+  })
+
+  it('should refuse an oversized file before uploading it', async () => {
+    const user = userEvent.setup()
+    let uploads = 0
+    const formRef = renderField((control) => <FileField
+      control={control}
+      name='attachment'
+      label='Attachment'
+      maxBytes={4}
+      onUpload={() => {
+        uploads += 1
+        return Promise.resolve({ url: 'https://files.example.com/big.pdf' })
+      }}
+    />)
+
+    await user.upload(
+      screen.getByLabelText<HTMLInputElement>('Attachment'),
+      new File([ 'far too many bytes' ], 'big.pdf', { type: 'application/pdf' }),
+    )
+
+    expect(uploads).toBe(0)
+    expect(formRef.current?.getValues('attachment')).toBeNull()
+    expect(screen.getByRole('alert').textContent).toContain('4 B')
+  })
+
+  it('should clear the stored file', async () => {
+    const user = userEvent.setup()
+    const formRef = renderField(
+      (control) => <FileField
+        control={control}
+        name='attachment'
+        label='Attachment'
+        onUpload={() => Promise.resolve({ url: 'https://files.example.com/report.pdf' })}
+      />,
+      { attachment: { url: 'https://files.example.com/report.pdf', name: 'report.pdf' }},
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Remove' }))
+
+    expect(formRef.current?.getValues('attachment')).toBeNull()
+  })
+})
+
+describe('ImageField', () => {
+  it('should show the stored image rather than a link', () => {
+    const { container } = render(<FieldHarness
+      formRef={{ current: null }}
+      values={{ attachment: { url: 'https://files.example.com/logo.png', name: 'logo.png' }}}
+    >{
+        (control) => <ImageField
+          control={control}
+          name='attachment'
+          label='Logo'
+          onUpload={() => Promise.resolve({ url: 'https://files.example.com/logo.png' })}
+        />
+      }</FieldHarness>)
+
+    expect(container.querySelector('img')?.getAttribute('src'))
+      .toBe('https://files.example.com/logo.png')
+    expect(container.querySelector('a')).toBeNull()
+  })
+})
+
+describe('SuperSelectField incremental search', () => {
+  it('should report the typed query once the typing stops', async () => {
+    const user = userEvent.setup()
+    const queries: string[] = []
+    renderField((control) => <SuperSelectField
+      control={control}
+      name='choice'
+      label='Owner'
+      options={statusOptions}
+      onSearch={(query) => queries.push(query)}
+    />)
+
+    await user.type(screen.getByLabelText('Owner'), 'dra')
+
+    await waitFor(() => expect(queries.at(-1)).toBe('dra'))
+    // Three keystrokes are one search: the debounce is the whole feature.
+    expect(queries).toEqual([ 'dra' ])
   })
 })

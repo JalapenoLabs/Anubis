@@ -352,7 +352,9 @@ async fn login_finish(
     // A passkey is possession plus verification: strong auth, no TOTP step.
     let jar = signed_in_jar(&state, &mut connection, user.id).await?;
     let response_body = UserBody {
-        user: UserResponse::from(&user),
+        user: UserResponse::load(&mut connection, &user)
+            .await
+            .map_err(log_internal)?,
     };
     Ok((jar, (StatusCode::OK, Json(response_body))))
 }

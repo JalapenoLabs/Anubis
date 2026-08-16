@@ -20,6 +20,7 @@ Layers, outermost first. The order is the design:
 | Tracing | One event per completed request, inside a span naming the method, path, and id |
 | Security headers | The response policy below |
 | CORS | Only when `CORS_ALLOWED_ORIGINS` names origins; otherwise absent entirely |
+| Compression | Brotli or gzip, when the client accepts one |
 | Request timeout | 30 seconds, innermost |
 
 The request id is outermost so every later layer logs under it. The timeout is innermost so the response it produces still leaves with an id and the security headers on it.
@@ -33,6 +34,25 @@ Error bodies stay generic (`{"message": "Something went wrong on our side."}`), 
 ### Request logging
 
 One `INFO` event per completed request, `WARN` for a `5xx`, carrying the status and the duration, inside a span carrying the method, the path, and the id. Filtering follows `RUST_LOG` like the rest of [telemetry](architecture.md#backend): `debug` by default in development, `info` elsewhere.
+
+### Compression
+
+Every response is compressed when the client says it accepts one: brotli where it is offered, gzip otherwise, and the plain bytes for a client that offers neither. Text compresses by three to four times, and on a cold page load the bundle and the stylesheet are most of what the browser waits for.
+
+The choice is dynamic compression rather than precompressed files on disk. Precompressing hashed assets at build time is tempting, since the work is paid once and brotli can take its time, but it reaches only files. The JSON the API answers with is most of what a running application sends, and no build step can precompress that. One layer that compresses everything is one decision instead of two, one place to reason about `vary`, and no second artifact per file to go stale. It costs a few milliseconds of CPU on a response the browser then caches for a year. An application that measures a need for precompressed assets can still ship them: a response that arrives already encoded passes through the layer untouched.
+
+The layer sits below the security headers and CORS, so a compressed response leaves with the same headers and the same request id as any other, and above the timeout, so it covers every route including the single-page-application fallback.
+
+What it leaves alone is as deliberate as what it compresses:
+
+| Left alone | Why |
+|---|---|
+| Bodies under 32 bytes | The headers cost more than the body saves |
+| Images, and anything already encoded | Compressed twice is larger, not smaller |
+| `text/event-stream` | A stream must flush per event, not per buffer |
+| Websocket upgrades | A `101` carries no body at all, so the socket upgrades untouched |
+
+Compressed responses carry `vary: accept-encoding`, so a shared cache never hands brotli to a client that asked for none. `cache-control` is untouched: a hashed asset keeps its year.
 
 ### Timeouts
 

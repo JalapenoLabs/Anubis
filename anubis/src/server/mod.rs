@@ -34,8 +34,31 @@
 //! 3. **Security headers.** See [`headers`] for the policy and its reasoning.
 //! 4. **CORS**, only when `CORS_ALLOWED_ORIGINS` names origins. Unset means no
 //!    CORS headers at all, which is the strictest posture a browser honors.
-//! 5. **Request timeout**, innermost, so the response it produces still
+//! 5. **Compression.** Responses a client said it accepts compressed are
+//!    compressed, brotli or gzip; see below.
+//! 6. **Request timeout**, innermost, so the response it produces still
 //!    receives an id and the security headers on its way out.
+//!
+//! # Compression
+//!
+//! One layer covers everything the server sends: the JavaScript bundle and the
+//! stylesheet a cold page load pulls, `index.html`, and every JSON body the API
+//! answers with. Text compresses by roughly three to four times, and on the
+//! first load of an application that is most of what the browser waits for.
+//!
+//! The layer sits below CORS and the security headers, so a compressed response
+//! leaves with the same headers and the same request id as any other, and above
+//! the timeout, so it sees every route including the single-page-application
+//! fallback. Compression is negotiated, never assumed: a client that sends no
+//! `accept-encoding` gets the bytes as they were, and every compressed response
+//! carries `vary: accept-encoding` so a shared cache keeps the variants apart.
+//!
+//! What is left alone is as deliberate as what is not. Responses under 32
+//! bytes, where a compression header costs more than the body saves; images and
+//! anything else already compressed; server-sent event streams, which must
+//! flush per event; and websocket upgrades, whose `101` carries no body at all.
+//! A response that arrives already encoded, a precompressed file straight off
+//! disk among them, passes through untouched.
 //!
 //! # Shutdown
 //!
@@ -71,6 +94,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
 use uuid::Uuid;
@@ -249,7 +273,11 @@ pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
     // bottom to top to match it.
     let app = router
         .merge(health::router(pool))
-        .layer(axum::middleware::from_fn(enforce_timeout));
+        .layer(axum::middleware::from_fn(enforce_timeout))
+        // Above the timeout so it covers every route, including the SPA
+        // fallback, and below the header layers so a compressed response is
+        // stamped like any other. See the module docs for what it skips.
+        .layer(CompressionLayer::new());
     let app = headers::allow_cross_origin(app, config);
     let app = headers::secure(app, config);
 

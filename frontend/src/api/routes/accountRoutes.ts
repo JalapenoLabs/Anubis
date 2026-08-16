@@ -38,11 +38,14 @@ export function createAccountRoutes(client: KyInstance) {
   }
 
   /**
-   * Stores an avatar, answering with the URL that serves it.
+   * Stores an avatar, answering with the versioned URL that serves it.
    *
    * The image is the request body rather than a multipart part: there is one
    * file and no other field, and the server crops, resizes, and re-encodes it
    * anyway, so the browser has nothing useful to say about it.
+   *
+   * Refresh the current user after this: the profile payload carries the new
+   * version, which is what updates every other view of the account.
    */
   async function uploadAvatar(image: Blob): Promise<string> {
     const response = await client

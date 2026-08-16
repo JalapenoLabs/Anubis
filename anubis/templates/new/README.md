@@ -24,6 +24,40 @@ machine-specific values in `.env`, which is git-ignored.
 Emails (verification, password reset, invitations, sign-in codes) go to the
 backend log in development; the action links and codes are in the log lines.
 
+## Production
+
+One binary serves the API and the frontend, and `Dockerfile` builds the image
+that ships it, from this directory:
+
+```sh
+docker build -t anubis-starter .
+
+docker run --rm -p 3000:3000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e DATABASE_URL=postgres://user:password@host.docker.internal:54321/anubis_starter_development \
+  -e APP_URL=http://localhost:3000 \
+  -e ANUBIS_SECRET_KEY="$(anubis secret generate)" \
+  anubis-starter
+```
+
+Three stages build it and none of them ships: the Rust toolchain, the Node
+toolchain, and a runtime holding the binary, the frontend bundle, and nothing
+else. Migrations and `config/*.yml` are compiled into the binary, TLS roots
+come with it, and Postgres is spoken in Rust, so the image installs no
+libraries at all.
+
+The image bakes `SPA_DIR`, binds `0.0.0.0:3000`, runs as a non-root user, and
+answers a container healthcheck on `/healthz`. What it does not bake is
+configuration: `DATABASE_URL`, `APP_URL`, and `ANUBIS_SECRET_KEY` belong to the
+deployment, and production refuses to boot without them. `--add-host` is what
+lets the container reach a database on the host, the compose Postgres among
+them; a container on the same compose network reaches it by service name
+instead.
+
+Both build stages install from lockfiles, so `Cargo.lock` and `yarn.lock` have
+to be committed. The image tags are pinned; keep the `FROM rust:` line and
+`rust-toolchain.toml` in step when you bump either.
+
 ## Tests
 
 ```sh
@@ -45,6 +79,7 @@ directly.
 - `config/roles.yml`: the application's roles and permissions, compiled into
   both backend authorization and frontend affordances
 - `compose.yaml`: the development Postgres
+- `Dockerfile`: the production image, one binary serving the API and the SPA
 - `.env.example`: the development environment, copied to `.env` on first run
 - `.github/workflows/ci.yml`: format, lint, test, build, and the two drift
   checks that keep the generated files honest

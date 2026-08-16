@@ -18,6 +18,81 @@ export type FieldOption = {
 }
 
 /**
+ * The words on `RichTextField`'s toolbar, which a form overrides one by one.
+ *
+ * The package never imports i18next, so the defaults are English and a
+ * translated form passes its own. They are one object rather than eleven
+ * props because a form that translates one of them translates all of them.
+ */
+export type RichTextLabels = {
+  bold: string
+  italic: string
+  strike: string
+  heading: string
+  subheading: string
+  bulletList: string
+  orderedList: string
+  quote: string
+  code: string
+  undo: string
+  redo: string
+}
+
+/**
+ * The languages `CodeEditorField` highlights without an `extensions` prop.
+ *
+ * The list is the set of CodeMirror language packages the framework depends
+ * on, each reached through its own dynamic import, so a form that edits SQL
+ * downloads the SQL grammar and nothing else. Anything outside it is reached
+ * by passing CodeMirror extensions directly.
+ */
+export type CodeLanguage =
+  | 'css'
+  | 'html'
+  | 'javascript'
+  | 'json'
+  | 'jsx'
+  | 'markdown'
+  | 'sql'
+  | 'tsx'
+  | 'typescript'
+
+/**
+ * A stored file, as `FileField` and `ImageField` hold it in the form.
+ *
+ * The reference is what the application's own upload endpoint answers with:
+ * the field never speaks to a server itself, it calls the `onUpload` the form
+ * gives it and stores what comes back. `url` is the only member a control
+ * needs; the rest is what makes the chosen file readable to a person.
+ */
+export type FileReference = {
+  /** Where the stored file is served from. */
+  url: string
+  /** The original filename, shown beside the link. */
+  name?: string
+  /** The size in bytes, rendered beside the name when it is known. */
+  size?: number
+  /** The MIME type the upload reported. */
+  contentType?: string
+}
+
+/**
+ * The words `FileField` and `ImageField` put on screen.
+ *
+ * Same rule as the rest of the library: the package never imports i18next, so
+ * the defaults are English and a translated form passes its own.
+ */
+export type UploadLabels = {
+  choose: string
+  replace: string
+  remove: string
+  uploading: string
+  /** Shown with the limit substituted for `{max}`, e.g. `Larger than {max}.` */
+  tooLarge: string
+  failed: string
+}
+
+/**
  * The contract every Anubis field component honors.
  *
  * `control` and `name` bind the field to react-hook-form, so a scaffolded form

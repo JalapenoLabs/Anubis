@@ -1,5 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
+import type { User } from './types'
+
 // Utility
 import ky from 'ky'
 
@@ -38,9 +40,22 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     return `${prefix}auth/mfa/totp/qr.svg`
   }
 
-  /** The public URL serving a user's avatar, 404 until one is uploaded. */
-  function avatarUrl(userId: string): string {
-    return `${prefix}users/${userId}/avatar`
+  /**
+   * The public URL serving a user's avatar, 404 until one is uploaded.
+   *
+   * The user's `avatarVersion` rides along as `?v=`, so the URL changes with
+   * the picture: a fresh upload appears everywhere the moment the profile is
+   * refetched, and the image itself stays cacheable for a year. Accounts with
+   * no picture get the bare URL, which 404s into the initials fallback.
+   */
+  function avatarUrl(user: Pick<User, 'id' | 'avatarVersion'>): string {
+    const url = `${prefix}users/${user.id}/avatar`
+
+    if (!user.avatarVersion) {
+      return url
+    }
+
+    return `${url}?v=${user.avatarVersion}`
   }
 
   return {

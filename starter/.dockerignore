@@ -1,0 +1,17 @@
+# Nothing here is ever the input to a `COPY`: the Dockerfile names the paths it
+# needs one by one. This file exists so the daemon is not handed a build context
+# with a Cargo target directory and several node_modules trees in it.
+**/node_modules
+**/dist
+**/target
+**/coverage
+**/.vite
+**/playwright-report
+**/test-results
+
+.git
+.github
+.env
+.env.local
+compose.yaml
+Dockerfile

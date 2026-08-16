@@ -45,7 +45,15 @@ export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generat
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
 export type { OauthProvidersResult } from './react/useOauthProviders'
-export type { AnubisFieldProps, FieldOption } from './fields/types'
+export type {
+  AnubisFieldProps,
+  CodeLanguage,
+  FieldOption,
+  FileReference,
+  RichTextLabels,
+  UploadLabels,
+} from './fields/types'
+export type { UploadProps } from './fields/internal/UploadField'
 export type { RealtimeListener } from './realtime/listeners'
 export type {
   ClientFrame,
@@ -62,15 +70,21 @@ export type {
 // Fields
 export { BooleanField } from './fields/BooleanField'
 export { ButtonsField } from './fields/ButtonsField'
+export { CodeEditorField } from './fields/CodeEditorField'
 export { ColorPickerField } from './fields/ColorPickerField'
 export { DateAndTimeField } from './fields/DateAndTimeField'
 export { DateField } from './fields/DateField'
 export { EmailField } from './fields/EmailField'
+export { EmojiField } from './fields/EmojiField'
 export { FieldWrapper } from './fields/FieldWrapper'
+export { FileField } from './fields/FileField'
+export { ImageField } from './fields/ImageField'
 export { NumberField } from './fields/NumberField'
 export { OptionsField } from './fields/OptionsField'
 export { PasswordField } from './fields/PasswordField'
 export { PhoneField } from './fields/PhoneField'
+export { RichTextField } from './fields/RichTextField'
+export { RichTextView } from './fields/RichTextView'
 export { SuperSelectField } from './fields/SuperSelectField'
 export { TextAreaField } from './fields/TextAreaField'
 export { TextField } from './fields/TextField'

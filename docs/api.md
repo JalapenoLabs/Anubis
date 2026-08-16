@@ -132,6 +132,17 @@ Sign-in is one page with three methods and a shared second-factor step, rather t
 
 Avatar upload has no cropper. The server center-crops to a square, caps the longest edge at 512 px, flattens transparency, and re-encodes as JPEG, so a browser cropper would only be a second opinion the stored image ignores; the picker previews the file and posts the bytes.
 
+**Avatar URLs are versioned.** Every user payload carries `avatar_version`, a prefix of the stored image's content hash, or `null` for an account with no picture. Consumers render `GET /users/{user_id}/avatar?v={avatar_version}`; the package's `api.avatarUrl(user)` builds it, and `POST /auth/profile/avatar` answers with the same URL. The token is part of the cache key, which buys both halves of the problem at once:
+
+| Request | `Cache-Control` | Why |
+|---|---|---|
+| `?v=` naming the image served | `public, max-age=31536000, immutable` | The URL is content-addressed, so it can never mean anything else |
+| Bare URL, or a `?v=` that no longer matches | `public, max-age=3600, stale-while-revalidate=86400` | The URL names the account, not the image, so it revalidates by `ETag` |
+
+A new upload changes the version in the profile payload, so the next profile refetch changes the URL and every screen showing that account updates at once. That is why the settings card refreshes the profile after a write instead of appending a timestamp of its own, and why the navbar needs no cache-busting code at all. Both responses still carry the strong `ETag` and answer `304 Not Modified` to a matching `If-None-Match`.
+
+The bare URL is the one to hand to external consumers, email included: it names the account, stays valid forever, and costs one revalidation per hour.
+
 Recovery codes appear exactly once, on the step after a confirmed enrollment, with a copy affordance. The server stores only their hashes, so there is no second chance to show them and the screen says so.
 
 WebAuthn needs binary where JSON has none, so the package exports the conversion both ceremonies need: `toCredentialCreationOptions` and `toCredentialRequestOptions` decode a challenge into what `navigator.credentials` accepts, `serializeRegistrationCredential` and `serializeAuthenticationCredential` encode the authenticator's answer back, and `base64UrlToArrayBuffer` and `arrayBufferToBase64Url` are the pair underneath. The serializers take `unknown` and validate, because an authenticator's answer is as much a runtime boundary as an HTTP response.

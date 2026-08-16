@@ -274,6 +274,21 @@ mod tests {
         template
     }
 
+    /// The starter-template file at `path`, as the binary embeds it.
+    fn starter(path: &str) -> &'static str {
+        let bytes = embedded::STARTER_FILES
+            .iter()
+            .find_map(|(candidate, bytes)| (*candidate == path).then_some(*bytes))
+            .unwrap_or_else(|| panic!("the starter ships {path}"));
+        std::str::from_utf8(bytes).unwrap_or_else(|_| panic!("{path} is UTF-8"))
+    }
+
+    /// A file at the repository root, read at test time.
+    fn repository_file(relative: &str) -> String {
+        let path = format!("{}/../{relative}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path} is readable: {error}"))
+    }
+
     #[test]
     fn names_are_validated() {
         validate_name("acme").unwrap();
@@ -297,6 +312,9 @@ mod tests {
             "config/roles.yml",
             "config/billing.yml",
             "compose.yaml",
+            // The production image ships with every stamped app too.
+            "Dockerfile",
+            ".dockerignore",
             "frontend/package.json",
             "frontend/src/main.tsx",
             // The end-to-end suite ships with every stamped app.
@@ -342,9 +360,7 @@ mod tests {
     /// was tested with. Fails when a workspace bump forgets the template.
     #[test]
     fn overlay_dependency_versions_match_the_workspace() {
-        let workspace =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml"))
-                .expect("the workspace manifest is readable");
+        let workspace = repository_file("Cargo.toml");
         let backend_template = overlay("backend/Cargo.toml");
 
         for dependency in [
@@ -380,11 +396,7 @@ mod tests {
     /// own, so a bump here reaches every application stamped afterwards.
     #[test]
     fn the_ci_overlay_pins_the_same_tool_versions_as_the_framework_workflow() {
-        let workflow = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../.github/workflows/ci.yml"
-        ))
-        .expect("the framework workflow is readable");
+        let workflow = repository_file(".github/workflows/ci.yml");
         let template = overlay(".github/workflows/ci.yml");
 
         for pin in [
@@ -450,14 +462,49 @@ mod tests {
     /// must not drift.
     #[test]
     fn the_repository_env_example_matches_the_overlay() {
-        let repository =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env.example"))
-                .expect("the repository .env.example is readable");
-
         assert_eq!(
-            repository.replace("\r\n", "\n"),
+            repository_file(".env.example").replace("\r\n", "\n"),
             overlay(".env.example").replace("\r\n", "\n"),
             "the repository .env.example and the `anubis new` overlay have drifted",
+        );
+    }
+
+    /// The production image builds on the versions the rest of the repository
+    /// pins. A bump that misses the Dockerfile would ship applications built by
+    /// a compiler, a Node, or a Yarn that nothing else here ever ran.
+    #[test]
+    fn the_dockerfile_pins_what_the_rest_of_the_repository_pins() {
+        let dockerfile = starter("Dockerfile");
+        let toolchain = repository_file("rust-toolchain.toml");
+        let workflow = repository_file(".github/workflows/ci.yml");
+
+        let channel = toolchain
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("channel = "))
+            .expect("the toolchain file pins a channel")
+            .trim_matches('"');
+        assert!(
+            dockerfile.contains(&format!("FROM rust:{channel}-")),
+            "the Dockerfile does not build on rust {channel}",
+        );
+
+        let node = workflow
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("node-version: "))
+            .expect("the framework workflow pins a Node version");
+        assert!(
+            dockerfile.contains(&format!("FROM node:{node}-")),
+            "the Dockerfile does not build on node {node}",
+        );
+
+        let yarn = workflow
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("corepack prepare yarn@"))
+            .expect("the framework workflow pins a Yarn version");
+        assert!(
+            dockerfile.contains(yarn),
+            "the Dockerfile is missing the framework's pin `{yarn}`",
         );
     }
 
@@ -469,13 +516,7 @@ mod tests {
 
         for path in [".env.example", "compose.yaml", ".github/workflows/ci.yml"] {
             let template = match path {
-                "compose.yaml" => std::str::from_utf8(
-                    embedded::STARTER_FILES
-                        .iter()
-                        .find_map(|(candidate, bytes)| (*candidate == path).then_some(*bytes))
-                        .expect("the starter ships compose.yaml"),
-                )
-                .expect("compose.yaml is UTF-8"),
+                "compose.yaml" => starter(path),
                 _ => overlay(path),
             };
             assert!(

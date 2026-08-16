@@ -3,10 +3,13 @@
 use std::fmt::{self, Formatter};
 
 use chrono::{DateTime, Utc};
+use diesel::QueryResult;
 use diesel::prelude::{Insertable, Queryable, Selectable};
+use diesel_async::AsyncPgConnection;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::auth::avatar;
 use crate::schema::users;
 
 /// A registered user account.
@@ -83,10 +86,19 @@ pub struct UserResponse {
     pub locale: String,
     /// When the account was created.
     pub created_at: DateTime<Utc>,
+    /// Version of the stored avatar; `None` when the account has none.
+    ///
+    /// Consumers render `/users/{id}/avatar?v={avatar_version}`.
+    pub avatar_version: Option<String>,
 }
 
-impl From<&User> for UserResponse {
-    fn from(user: &User) -> Self {
+impl UserResponse {
+    /// Builds the response shape from a user and their avatar version.
+    ///
+    /// Prefer [`UserResponse::load`], which reads the version for you; this is
+    /// for callers that already know it.
+    #[must_use]
+    pub fn new(user: &User, avatar_version: Option<String>) -> Self {
         Self {
             id: user.id,
             email: user.email.clone(),
@@ -96,7 +108,21 @@ impl From<&User> for UserResponse {
             time_zone: user.time_zone.clone(),
             locale: user.locale.clone(),
             created_at: user.created_at,
+            avatar_version,
         }
+    }
+
+    /// Builds the response shape, reading the user's current avatar version.
+    ///
+    /// The version changes whenever the picture does, so every screen holding
+    /// this payload requests a URL nothing has cached and shows a fresh upload
+    /// at once, while the image itself stays cacheable for a year.
+    ///
+    /// # Errors
+    /// Returns the database error when the avatar lookup fails.
+    pub async fn load(connection: &mut AsyncPgConnection, user: &User) -> QueryResult<Self> {
+        let avatar_version = avatar::stored_version(connection, user.id).await?;
+        Ok(Self::new(user, avatar_version))
     }
 }
 
@@ -134,11 +160,23 @@ mod tests {
     #[test]
     fn responses_never_carry_the_password_hash() {
         let user = sample_user();
-        let response = UserResponse::from(&user);
+        let response = UserResponse::new(&user, None);
 
         let rendered = serde_json::to_string(&response).expect("serialization must succeed");
         assert!(rendered.contains("sample@example.com"), "got: {rendered}");
         assert!(!rendered.contains("super-secret-hash"), "got: {rendered}");
         assert!(!rendered.contains("password"), "got: {rendered}");
+    }
+
+    #[test]
+    fn responses_carry_the_avatar_version_consumers_bust_on() {
+        let user = sample_user();
+        let response = UserResponse::new(&user, Some("WFy7Qm1s3TkPq0aZ".to_owned()));
+
+        let rendered = serde_json::to_string(&response).expect("serialization must succeed");
+        assert!(
+            rendered.contains(r#""avatar_version":"WFy7Qm1s3TkPq0aZ""#),
+            "got: {rendered}"
+        );
     }
 }

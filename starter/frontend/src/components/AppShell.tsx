@@ -222,7 +222,7 @@ export function AppShell(props: Props) {
                 // name of its own: without one, the only control that reaches
                 // settings and sign-out is unaddressable to a screen reader.
                 aria-label={t('common.accountMenu')}
-                src={api.avatarUrl(props.user.id)}
+                src={api.avatarUrl(props.user)}
                 name={props.user.email.slice(0, 2).toUpperCase()}
                 className='transition-transform'
               />
