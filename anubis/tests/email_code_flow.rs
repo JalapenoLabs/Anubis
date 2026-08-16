@@ -102,7 +102,11 @@ async fn email_codes_sign_in_and_respect_limits() {
     })
     .expect("test config must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &config));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool, mailer, &config, &rate_limit),
+    );
 
     let email = format!("codes-{}@example.com", Uuid::new_v4());
     let credentials = json!({ "email": email, "password": "correct horse battery staple" });

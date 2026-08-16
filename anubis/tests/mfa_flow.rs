@@ -110,7 +110,11 @@ async fn totp_gates_login_and_recovery_codes_work() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &config));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool.clone(), mailer, &config, &rate_limit),
+    );
 
     let email = format!("mfa-{}@example.com", Uuid::new_v4());
     let password = "correct horse battery staple";

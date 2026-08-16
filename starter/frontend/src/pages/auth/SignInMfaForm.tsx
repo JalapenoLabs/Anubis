@@ -3,11 +3,17 @@
 // Core
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi, getApiErrorMessage } from '@jalapenolabs/anubis'
+import {
+  useAnubisApi,
+  useRetryCountdown,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button } from '@heroui/react'
 import { TextField } from '@jalapenolabs/anubis'
+import { RateLimitNotice } from '../../components/RateLimitNotice'
 
 // Utility
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -39,6 +45,7 @@ type Props = {
 export function SignInMfaForm(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const retry = useRetryCountdown()
 
   const form = useForm<ChallengeFormValues>({
     resolver,
@@ -55,6 +62,14 @@ export function SignInMfaForm(props: Props) {
       await props.onSignedIn()
     }
     catch (error) {
+      // A rate-limited refusal gets the live countdown instead of a static
+      // message, because the wait is the only thing the user can act on.
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       const message = getApiErrorMessage(error)
       form.setError('root', { message: message ?? t('common.somethingWentWrong') })
     }
@@ -79,11 +94,12 @@ export function SignInMfaForm(props: Props) {
         }</p>
       : null
     }
+    <RateLimitNotice remaining={retry.remaining} />
     <Button
       type='submit'
       color='primary'
       className='mt-6 w-full'
-      isDisabled={!form.formState.isValid || form.formState.isSubmitting}
+      isDisabled={!form.formState.isValid || form.formState.isSubmitting || !retry.done}
       isLoading={form.formState.isSubmitting}
     >
       <span>{

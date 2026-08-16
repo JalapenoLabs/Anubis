@@ -11,6 +11,10 @@
 //!
 //! The management routes, which create, rename, and dissolve tenants and move
 //! members between roles, live in [`super::management`] and merge in here.
+//!
+//! Inviting sends mail to an address the request names, so it charges the same
+//! per-recipient inbox budget the auth endpoints charge; see
+//! [`crate::rate_limit`].
 
 use std::collections::BTreeMap;
 
@@ -33,6 +37,7 @@ use crate::db::DbPool;
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
 use crate::mail::{Email, Mailer};
+use crate::rate_limit::RateLimiter;
 use crate::roles::RoleSet;
 use crate::schema::{
     invitations, organization_memberships, organizations, team_memberships, teams, users,
@@ -52,12 +57,18 @@ use crate::tenancy::model::{Organization, Team};
 /// membership change tells Stripe the new seat count. An application without a
 /// billing file passes `None`, which is the honest reading of "no plans, no
 /// limits" rather than a plan of unlimited everything invented here.
+///
+/// `rate_limit` is the same limiter [`crate::auth::router`] is given, so the
+/// per-recipient inbox budget an invitation charges is the one a password
+/// reset charges. Two limiters would be two budgets, and an inbox would take
+/// both.
 pub fn router(
     pool: DbPool,
     mailer: Mailer,
     roles: RoleSet,
     plans: Option<PlanSet>,
     config: &AppConfig,
+    rate_limit: &RateLimiter,
 ) -> Router {
     Router::new()
         .route("/memberships", get(list_memberships))
@@ -75,6 +86,7 @@ pub fn router(
             roles: roles.clone(),
             limits: plans.map(Limits::new),
             app_url: config.app_url.clone(),
+            rate_limit: rate_limit.clone(),
         })
         // CurrentUser and the guard extractors resolve their dependencies
         // from these request extensions.
@@ -89,6 +101,8 @@ pub(super) struct TenancyState {
     /// Absent for an application with no `config/billing.yml`.
     limits: Option<Limits>,
     app_url: String,
+    /// The inbox budget an invitation charges, shared with the auth surface.
+    rate_limit: RateLimiter,
 }
 
 impl TenancyState {
@@ -397,6 +411,13 @@ async fn list_organization_members(
 /// that creates the invitation, after locking the organization, so two admins
 /// inviting at the same instant are ordered rather than each seeing room for
 /// one more and both committing.
+///
+/// The address is also charged the per-recipient inbox budget, because this
+/// endpoint mails whoever it is pointed at. Unlike the auth endpoints, which
+/// charge before they look anything up, this one charges only after the
+/// inviter is shown to administer the target: charging first would let any
+/// signed-in account spend a stranger's inbox budget and so keep that stranger
+/// from receiving a password reset.
 async fn create_invitation(
     State(state): State<TenancyState>,
     CurrentUser(inviter): CurrentUser,
@@ -409,6 +430,7 @@ async fn create_invitation(
 
     let (target, target_name) =
         resolve_invitation_target(&mut connection, &body, inviter.id).await?;
+    state.rate_limit.check_recipient(&email)?;
     let organization_id = match target {
         InvitationTarget::Organization(organization_id)
         | InvitationTarget::Team {

@@ -54,11 +54,12 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
     .expect("test config must parse");
     let roles = RoleSet::from_yaml(anubis_starter::ROLES_YML).expect("roles.yml must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
     let router = Router::new()
         .nest(
             "/auth",
-            anubis::auth::router(pool.clone(), mailer.clone(), &config),
+            anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
         )
         .nest(
             "/tenancy",
@@ -70,6 +71,7 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
                 // seats limit a customer does.
                 Some(PlanSet::from_yaml(anubis_starter::BILLING_YML).expect("billing.yml parses")),
                 &config,
+                &rate_limit,
             ),
         )
         // Where a narrative mints the bearer token its `/api/v1` half uses,

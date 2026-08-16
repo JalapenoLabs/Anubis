@@ -5,7 +5,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
+use axum::http::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -105,21 +105,15 @@ fn invitation_token(email_body: &str) -> String {
         .to_owned()
 }
 
-#[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one linear end-to-end narrative over shared database state"
-)]
-async fn invitations_are_sent_claimed_and_guarded() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skipping invitations_flow test: DATABASE_URL is not set");
-        return;
-    };
-
-    anubis::db::run_pending_migrations(&database_url)
+/// Composes auth and tenancy over one database, as an application does.
+///
+/// Both routers get the same limiter, which is what makes the inbox budget one
+/// budget rather than one per surface.
+async fn boot(database_url: &str) -> (Router, anubis::db::DbPool, anubis::mail::TestOutbox) {
+    anubis::db::run_pending_migrations(database_url)
         .await
         .expect("migrations must apply");
-    let pool = anubis::db::connect(&database_url)
+    let pool = anubis::db::connect(database_url)
         .await
         .expect("database must be reachable");
 
@@ -130,16 +124,32 @@ async fn invitations_are_sent_claimed_and_guarded() {
     .expect("test config must parse");
     let roles = anubis::roles::RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
     let router = Router::new()
         .nest(
             "/auth",
-            anubis::auth::router(pool.clone(), mailer.clone(), &config),
+            anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
         )
         .nest(
             "/tenancy",
-            anubis::tenancy::router(pool.clone(), mailer, roles, None, &config),
+            anubis::tenancy::router(pool.clone(), mailer, roles, None, &config, &rate_limit),
         );
+
+    (router, pool, outbox)
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear end-to-end narrative over shared database state"
+)]
+async fn invitations_are_sent_claimed_and_guarded() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping invitations_flow test: DATABASE_URL is not set");
+        return;
+    };
+    let (router, pool, outbox) = boot(&database_url).await;
 
     let run = Uuid::new_v4();
     let admin_email = format!("admin-{run}@example.com");
@@ -408,4 +418,95 @@ async fn invitations_are_sent_claimed_and_guarded() {
     let (status, _headers, _body) =
         send(&router, "GET", &roster_path, None, Some(&biller_cookie)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Inviting is a way to send mail to any address, so it meets the inbox budget.
+///
+/// Re-inviting an address is deliberately allowed, which is what makes the
+/// endpoint a mail-bombing tool without a budget: nothing else in the handler
+/// stops an admin from pointing it at one stranger over and over.
+#[tokio::test]
+async fn invitations_spend_the_recipients_inbox_budget() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping invitations_flow test: DATABASE_URL is not set");
+        return;
+    };
+    let (router, _pool, _outbox) = boot(&database_url).await;
+
+    let run = Uuid::new_v4();
+    let admin_cookie = register(&router, &format!("inviter-{run}@example.com")).await;
+    let (status, _headers, body) = send(
+        &router,
+        "GET",
+        "/tenancy/memberships",
+        None,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let team_id = body["organizations"][0]["teams"][0]["id"]
+        .as_str()
+        .expect("registration bootstraps one team")
+        .to_owned();
+
+    let victim = format!("victim-{run}@example.com");
+    let invite = json!({ "email": victim, "team_id": team_id });
+    let quota = anubis::rate_limit::Budget::EmailPerRecipient.quota();
+
+    for attempt in 0..quota {
+        let (status, _headers, body) = send(
+            &router,
+            "POST",
+            "/tenancy/invitations",
+            Some(&invite),
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "attempt {attempt} is within the budget, body: {body}",
+        );
+    }
+
+    let (status, headers, body) = send(
+        &router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&invite),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+    assert!(
+        headers.contains_key(RETRY_AFTER),
+        "a 429 says when to retry",
+    );
+
+    // One budget across surfaces: the invitations spent the same balance a
+    // reset email would have drawn on, because both routers share one limiter.
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/auth/password-reset/request",
+        Some(&json!({ "email": victim })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+
+    // Another inbox is untouched, from the inviter who just spent that one.
+    let bystander = json!({
+        "email": format!("bystander-{run}@example.com"),
+        "team_id": team_id,
+    });
+    let (status, _headers, body) = send(
+        &router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&bystander),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
 }

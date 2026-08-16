@@ -69,8 +69,9 @@ async fn router(database_url: &str) -> Router {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
-    anubis::auth::router(pool, mailer, &config)
+    anubis::auth::router(pool, mailer, &config, &rate_limit)
 }
 
 #[tokio::test]

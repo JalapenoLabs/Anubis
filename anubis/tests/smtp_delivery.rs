@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use anubis::config::AppConfig;
 use anubis::mail::{Email, Mailer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -22,6 +23,9 @@ use tokio::net::tcp::OwnedWriteHalf;
 
 /// Bounds the test if the transport never completes the session.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The throwaway 2048-bit PKCS#1 key the signing case signs with.
+const DKIM_PRIVATE_KEY: &str = include_str!("support/dkim_test_key.pem");
 
 /// The command that opens the envelope, and prefixes the sender.
 const MAIL_FROM: &str = "MAIL FROM:";
@@ -101,8 +105,8 @@ async fn reply(writer: &mut OwnedWriteHalf, line: &str) {
         .expect("the mock relay must reply");
 }
 
-#[tokio::test]
-async fn a_message_travels_through_the_real_transport_to_the_relay() {
+/// Starts the mock relay, returning the port it answers on and its session.
+async fn start_relay() -> (u16, tokio::task::JoinHandle<Session>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("an ephemeral port must be available");
@@ -110,7 +114,21 @@ async fn a_message_travels_through_the_real_transport_to_the_relay() {
         .local_addr()
         .expect("the listener must have an address")
         .port();
-    let relay = tokio::spawn(serve_one_session(listener));
+
+    (port, tokio::spawn(serve_one_session(listener)))
+}
+
+/// Waits for the relay to finish and returns what it received.
+async fn received(relay: tokio::task::JoinHandle<Session>) -> Session {
+    tokio::time::timeout(SESSION_TIMEOUT, relay)
+        .await
+        .expect("the session must finish")
+        .expect("the mock relay must not panic")
+}
+
+#[tokio::test]
+async fn a_message_travels_through_the_real_transport_to_the_relay() {
+    let (port, relay) = start_relay().await;
 
     let mailer = Mailer::smtp(
         &format!("smtp://127.0.0.1:{port}"),
@@ -127,10 +145,7 @@ async fn a_message_travels_through_the_real_transport_to_the_relay() {
         .await
         .expect("the relay must accept the message");
 
-    let session = tokio::time::timeout(SESSION_TIMEOUT, relay)
-        .await
-        .expect("the session must finish")
-        .expect("the mock relay must not panic");
+    let session = received(relay).await;
 
     assert_eq!(session.mail_from, "<no-reply@anubis.test>");
     assert_eq!(session.recipients, ["<someone@example.com>"]);
@@ -154,11 +169,76 @@ async fn a_message_travels_through_the_real_transport_to_the_relay() {
         "got: {}",
         session.data
     );
+    assert!(
+        !session.data.contains("DKIM-Signature"),
+        "an unconfigured relay signs nothing: {}",
+        session.data
+    );
+}
+
+/// What the relay receives when `DKIM_*` is configured, end to end: the
+/// variables build the mailer, the mailer signs, and the signature arrives.
+///
+/// The assertions are on the header the relay saw and the fields a verifier
+/// looks the public key up by, not on the cryptography. Checking the signature
+/// itself would mean adding a DKIM verifier to the tree, and lettre's own suite
+/// already pins its signatures byte for byte against known keys; what belongs
+/// to Anubis is that a configured key reaches the wire under the right selector
+/// and domain.
+#[tokio::test]
+async fn a_configured_key_signs_every_message_the_relay_receives() {
+    let (port, relay) = start_relay().await;
+
+    let config = AppConfig::from_lookup(|name| match name {
+        "SMTP_URL" => Some(format!("smtp://127.0.0.1:{port}")),
+        "MAIL_FROM" => Some("Anubis <no-reply@anubis.test>".to_owned()),
+        "DKIM_PRIVATE_KEY" => Some(DKIM_PRIVATE_KEY.to_owned()),
+        "DKIM_SELECTOR" => Some("mail".to_owned()),
+        _ => None,
+    })
+    .expect("the signing configuration must parse");
+    let mailer = Mailer::from_config(&config).expect("the mailer must build");
+
+    mailer
+        .send(Email {
+            to: "someone@example.com".to_owned(),
+            subject: "Verify your email".to_owned(),
+            text_body: "Confirm with https://app.example.com/verify-email?token=abc".to_owned(),
+        })
+        .await
+        .expect("the relay must accept the message");
+
+    let session = received(relay).await;
+    // A signature is far longer than a line, so it arrives folded.
+    let data = session.data.replace("\n ", "");
+
+    assert!(
+        data.contains("DKIM-Signature: v=1; a=rsa-sha256;"),
+        "got: {data}",
+    );
+    assert!(
+        data.contains("d=anubis.test;"),
+        "the signature claims the sender's own domain: {data}",
+    );
+    assert!(
+        data.contains("s=mail;"),
+        "the selector names the DNS record: {data}",
+    );
+    assert!(
+        data.contains("h=From:Subject:To:Date;"),
+        "the covered headers are the ones every verifier expects: {data}",
+    );
+    assert!(data.contains("bh="), "a body hash is present: {data}");
+    assert!(
+        data.contains("verify-email?token=abc"),
+        "the body is delivered as written: {data}",
+    );
 }
 
 #[tokio::test]
 async fn a_relay_that_is_not_listening_surfaces_as_a_send_error() {
-    // Bind and drop, so the port is one nothing answers on.
+    // Bind and drop, so the port is one nothing answers on. The relay itself
+    // never starts here: the point is a socket that refuses the connection.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("an ephemeral port must be available");

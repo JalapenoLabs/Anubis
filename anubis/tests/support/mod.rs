@@ -1,9 +1,12 @@
 //! Shared plumbing for the adversarial and concurrency suites.
 //!
-//! Two pieces, and the split is the point: [`TestDatabase`] owns a Postgres
-//! database of the test's own, and [`Harness`] owns the composed application
-//! that runs against it. A suite that only needs a database (the migration
-//! race, for one) takes the first without the second.
+//! Three pieces, and the split is the point: [`TestDatabase`] owns a Postgres
+//! database of the test's own, [`Harness`] owns the composed application that
+//! runs against it, and [`SoftAuthenticator`] is the software passkey the
+//! ceremony suite signs with. A suite takes the parts its story needs: the
+//! migration race takes a database and no application, and the passkey
+//! ceremony takes a database and an authenticator and composes the one router
+//! it drives.
 //!
 //! Older narratives in this directory share one database and stay out of each
 //! other's way by generating random emails, which is enough for a linear story
@@ -21,7 +24,9 @@
 
 mod database;
 mod harness;
+mod passkey;
 pub mod socket;
 
 pub use database::TestDatabase;
 pub use harness::{Harness, PASSWORD, invitation_token, register, send, serve, session_token};
+pub use passkey::SoftAuthenticator;

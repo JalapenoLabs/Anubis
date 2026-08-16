@@ -98,15 +98,23 @@ impl Harness {
         let roles = RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
         let (mailer, outbox) = anubis::mail::Mailer::test();
         let channels = Channels::in_process();
+        let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
         let router = Router::new()
             .nest(
                 "/auth",
-                anubis::auth::router(pool.clone(), mailer.clone(), &config),
+                anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
             )
             .nest(
                 "/tenancy",
-                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), plans, &config),
+                anubis::tenancy::router(
+                    pool.clone(),
+                    mailer,
+                    roles.clone(),
+                    plans,
+                    &config,
+                    &rate_limit,
+                ),
             )
             .nest(
                 "/developers",

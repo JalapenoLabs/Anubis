@@ -4,11 +4,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useAnubisApi } from '@jalapenolabs/anubis'
+import { useAnubisApi, useRetryCountdown, getRetryAfterSeconds } from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Input } from '@heroui/react'
 import { AuthLayout } from '../../components/AuthLayout'
+import { RateLimitNotice } from '../../components/RateLimitNotice'
 
 // Misc
 import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
@@ -16,6 +17,7 @@ import { DESTINATION_PARAM, UrlTree, getUrlWithDestination } from '../../urls'
 export function ForgotPasswordPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const retry = useRetryCountdown()
   const [ searchParams ] = useSearchParams()
   const [ email, setEmail ] = useState('')
   const [ isSubmitting, setIsSubmitting ] = useState(false)
@@ -34,6 +36,14 @@ export function ForgotPasswordPage() {
       setSentMessage(response.message)
     }
     catch (error) {
+      // A rate-limited refusal keeps the form on screen with a live countdown:
+      // the address is fine, the timing is not.
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       console.debug('password reset request failed', error)
       setSentMessage(t('common.somethingWentWrong'))
     }
@@ -61,12 +71,13 @@ export function ForgotPasswordPage() {
               onChange={(event) => setEmail(event.currentTarget.value)}
             />
           </div>
+          <RateLimitNotice remaining={retry.remaining} />
           <div className='relaxed mt-6'>
             <Button
               type='submit'
               color='primary'
               className='w-full'
-              isDisabled={!email.trim() || isSubmitting}
+              isDisabled={!email.trim() || isSubmitting || !retry.done}
               isLoading={isSubmitting}
             >
               <span>{

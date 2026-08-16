@@ -67,16 +67,24 @@ impl TestServer {
         .expect("test config must parse");
         let roles = anubis::roles::RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
         let (mailer, _outbox) = anubis::mail::Mailer::test();
+        let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
         let router = Router::new()
             .merge(anubis::realtime::router(pool.clone(), channels.clone()))
             .nest(
                 "/auth",
-                anubis::auth::router(pool.clone(), mailer.clone(), &config),
+                anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
             )
             .nest(
                 "/tenancy",
-                anubis::tenancy::router(pool.clone(), mailer, roles.clone(), None, &config),
+                anubis::tenancy::router(
+                    pool.clone(),
+                    mailer,
+                    roles.clone(),
+                    None,
+                    &config,
+                    &rate_limit,
+                ),
             )
             .layer(anubis::guard::layer(pool.clone(), roles));
 

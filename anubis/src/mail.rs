@@ -42,16 +42,27 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # DKIM signing
+//!
+//! [`Mailer::smtp_signed`] signs every message it sends, from a key the
+//! deployment holds. It is the exception rather than the rule: relay providers
+//! sign for you once the sender domain is verified with them, and that
+//! signature is the one the world checks. Signing here is for the relay that
+//! does not, such as a company MTA or a sidecar, and signing twice is harmless.
+//! `DKIM_PRIVATE_KEY`, `DKIM_SELECTOR`, and `DKIM_DOMAIN` configure it; see
+//! [`crate::config`] and `docs/email.md` for the DNS record and rotation.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 use lettre::message::Mailbox;
+use lettre::message::dkim::{self, DkimSigningAlgorithm, DkimSigningKey, DkimSigningKeyError};
 use lettre::message::header::ContentType;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DkimConfig};
 
 /// A plain-text email ready for delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +126,30 @@ impl Mailer {
     /// the task that reaps idle connections. Applications build their mailer
     /// inside `#[tokio::main]`, where a runtime is always present.
     pub fn smtp(url: &str, from: &str) -> Result<Self, Error> {
+        Self::build_smtp(url, from, None)
+    }
+
+    /// A mailer that delivers through an SMTP relay and signs what it sends.
+    ///
+    /// Same as [`Mailer::smtp`], plus a DKIM signature on every message, from
+    /// the key, selector, and domain in `dkim`. Reach for it when the relay
+    /// does not sign for you: providers sign once the sender domain is verified
+    /// with them, and a second signature is harmless, so most deployments never
+    /// need this. See `docs/email.md` for the DNS record the selector needs.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when the URL or the sender address does not parse,
+    /// or when the signing key cannot be read. The key is read once, here,
+    /// rather than on every send.
+    ///
+    /// # Panics
+    /// Panics when called outside a tokio runtime; see [`Mailer::smtp`].
+    pub fn smtp_signed(url: &str, from: &str, dkim: &DkimConfig) -> Result<Self, Error> {
+        Self::build_smtp(url, from, Some(dkim))
+    }
+
+    /// Builds the SMTP backend, signing when the deployment configured a key.
+    fn build_smtp(url: &str, from: &str, dkim: Option<&DkimConfig>) -> Result<Self, Error> {
         let from = from.parse::<Mailbox>().map_err(|source| {
             Error::new("the sender address is not a valid email address", source)
         })?;
@@ -123,8 +158,14 @@ impl Mailer {
             .map_err(|source| Error::new("the SMTP relay URL could not be parsed", source))?
             .build();
 
+        let dkim = dkim.map(signer).transpose()?.map(Arc::new);
+
         Ok(Self {
-            backend: Backend::Smtp(Smtp { transport, from }),
+            backend: Backend::Smtp(Smtp {
+                transport,
+                from,
+                dkim,
+            }),
         })
     }
 
@@ -143,7 +184,7 @@ impl Mailer {
     /// [`Mailer::smtp`].
     pub fn from_config(config: &AppConfig) -> Result<Self, Error> {
         match &config.smtp {
-            Some(smtp) => Self::smtp(smtp.url(), smtp.from()),
+            Some(smtp) => Self::build_smtp(smtp.url(), smtp.from(), smtp.dkim()),
             None => Ok(Self::log()),
         }
     }
@@ -188,11 +229,16 @@ impl Mailer {
     }
 }
 
-/// An SMTP relay, and the sender address its messages carry.
+/// An SMTP relay, the sender address its messages carry, and how they are signed.
 #[derive(Clone)]
 struct Smtp {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
+    /// The signer, when the deployment signs its own mail.
+    ///
+    /// Shared rather than owned because a parsed signing key is not `Clone`,
+    /// and [`Mailer`] is: every clone signs with the one key read at startup.
+    dkim: Option<Arc<dkim::DkimConfig>>,
 }
 
 impl Smtp {
@@ -202,32 +248,86 @@ impl Smtp {
             Error::new("the recipient address is not a valid email address", source)
         })?;
 
-        Message::builder()
+        let mut message = Message::builder()
             .from(self.from.clone())
             .to(to)
             .subject(email.subject.clone())
             .header(ContentType::TEXT_PLAIN)
             .body(email.text_body.clone())
-            .map_err(|source| Error::new("the email could not be encoded as a message", source))
+            .map_err(|source| Error::new("the email could not be encoded as a message", source))?;
+
+        if let Some(dkim) = &self.dkim {
+            // Signed last, so the signature covers the headers the builder just
+            // wrote, `Date` included.
+            dkim::dkim_sign(&mut message, dkim);
+        }
+
+        Ok(message)
     }
 }
 
 impl fmt::Debug for Smtp {
-    /// The transport holds the relay credentials, so only the sender is shown.
+    /// The transport holds the relay credentials, and the signer holds the
+    /// signing key, so only the sender and whether mail is signed are shown.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Smtp")
             .field("from", &self.from.to_string())
+            .field("signed", &self.dkim.is_some())
             .finish_non_exhaustive()
     }
 }
 
-/// Returns `true` when `value` parses as an email address.
+/// Turns configured signing settings into a signer, reading the key once.
+///
+/// A key that cannot be read is a deployment mistake, so it surfaces where the
+/// mailer is built rather than on every send. The headers signed are lettre's
+/// default set, `From`, `Subject`, `To`, and `Date`, which is the minimum every
+/// verifier expects.
+fn signer(dkim: &DkimConfig) -> Result<dkim::DkimConfig, Error> {
+    let key = signing_key(dkim.private_key())
+        .map_err(|source| Error::new("the DKIM signing key could not be read", source))?;
+
+    Ok(dkim::DkimConfig::default_config(
+        dkim.selector().to_owned(),
+        dkim.domain().to_owned(),
+        key,
+    ))
+}
+
+/// Reads a signing key, choosing the algorithm from the value's shape.
+///
+/// RSA keys arrive as a PKCS#1 PEM and ed25519 keys as the base64 seed, so the
+/// `-----BEGIN` a PEM opens with tells the two apart and no variable has to
+/// name the algorithm.
+fn signing_key(value: &str) -> Result<DkimSigningKey, DkimSigningKeyError> {
+    let algorithm = if value.starts_with("-----BEGIN") {
+        DkimSigningAlgorithm::Rsa
+    } else {
+        DkimSigningAlgorithm::Ed25519
+    };
+
+    DkimSigningKey::new(value, algorithm)
+}
+
+/// Returns the domain of `value`, when it is a valid email address.
 ///
 /// A display name is allowed, as in `Acme <no-reply@acme.com>`. This is how
 /// [`crate::config`] rejects a malformed `MAIL_FROM` at startup instead of at
-/// the first send, without reaching for the mail transport itself.
-pub(crate) fn is_valid_address(value: &str) -> bool {
-    value.parse::<Mailbox>().is_ok()
+/// the first send, without reaching for the mail transport itself, and how a
+/// DKIM signature defaults to the sender's own domain.
+pub(crate) fn address_domain(value: &str) -> Option<String> {
+    value
+        .parse::<Mailbox>()
+        .ok()
+        .map(|mailbox| mailbox.email.domain().to_owned())
+}
+
+/// Returns `true` when `value` parses as a DKIM signing key.
+///
+/// This is how [`crate::config`] rejects a malformed `DKIM_PRIVATE_KEY` at
+/// startup instead of at the first send.
+pub(crate) fn is_valid_signing_key(value: &str) -> bool {
+    signing_key(value).is_ok()
 }
 
 /// Handle to the emails a [`Mailer::test`] mailer has sent.
@@ -292,10 +392,21 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Email, Mailer, Smtp, is_valid_address};
-    use crate::config::AppConfig;
+    use std::sync::Arc;
+
+    use super::{Email, Mailer, Smtp, address_domain, dkim, is_valid_signing_key, signing_key};
+    use crate::config::{AppConfig, DkimConfig};
     use lettre::message::Mailbox;
     use lettre::{AsyncSmtpTransport, Tokio1Executor};
+
+    /// A throwaway 2048-bit PKCS#1 key, shared with the mock-relay suite.
+    ///
+    /// It lives beside that suite's other fixtures so one key covers both, and
+    /// it signs nothing outside these tests.
+    const TEST_PRIVATE_KEY: &str = include_str!("../tests/support/dkim_test_key.pem");
+
+    /// A throwaway ed25519 seed: 32 bytes, base64, the form lettre reads.
+    const TEST_ED25519_SEED: &str = "urSx/qgLgH8LRgRC4LWmUspd20lyppax/7lmY0bhqTw=";
 
     fn sample_email() -> Email {
         Email {
@@ -319,7 +430,45 @@ mod tests {
             from: "Acme <no-reply@acme.com>"
                 .parse::<Mailbox>()
                 .expect("the sender must parse"),
+            dkim: None,
         }
+    }
+
+    /// The same backend, signing every message with the test key.
+    fn signing_smtp() -> Smtp {
+        let key = signing_key(TEST_PRIVATE_KEY).expect("the test key must be read");
+
+        Smtp {
+            dkim: Some(Arc::new(dkim::DkimConfig::default_config(
+                "mail".to_owned(),
+                "acme.com".to_owned(),
+                key,
+            ))),
+            ..offline_smtp()
+        }
+    }
+
+    /// The signing settings a `DKIM_*` environment produces.
+    ///
+    /// Built through [`AppConfig`] because that is the only way one exists:
+    /// the settings are validated at startup and never assembled by hand.
+    fn dkim_settings() -> DkimConfig {
+        AppConfig::from_lookup(|name| match name {
+            "SMTP_URL" => Some("smtp://127.0.0.1:2525".to_owned()),
+            "MAIL_FROM" => Some("Acme <no-reply@acme.com>".to_owned()),
+            "DKIM_PRIVATE_KEY" => Some(TEST_PRIVATE_KEY.to_owned()),
+            "DKIM_SELECTOR" => Some("mail".to_owned()),
+            _ => None,
+        })
+        .expect("the signing settings must parse")
+        .smtp
+        .and_then(|smtp| smtp.dkim().cloned())
+        .expect("a configured key must reach the relay settings")
+    }
+
+    /// Joins the continuation lines a long header is folded across.
+    fn unfold(rendered: &str) -> String {
+        rendered.replace("\r\n ", "")
     }
 
     /// A subject is assembled from application data (a team's name rides in
@@ -395,6 +544,69 @@ mod tests {
         assert!(rendered.contains("Subject: Hello"), "got: {rendered}");
         assert!(rendered.contains("text/plain"), "got: {rendered}");
         assert!(rendered.contains("token=abc"), "got: {rendered}");
+        assert!(
+            !rendered.contains("DKIM-Signature"),
+            "an unconfigured relay signs nothing: {rendered}",
+        );
+    }
+
+    /// The signature itself is lettre's; what belongs to Anubis is that a
+    /// configured key reaches it, with the selector and domain a verifier will
+    /// look the public key up under.
+    #[tokio::test]
+    async fn a_signed_message_names_the_selector_and_the_domain_it_signs_for() {
+        let message = signing_smtp()
+            .message(&sample_email())
+            .expect("the message must render");
+        let rendered = unfold(&String::from_utf8(message.formatted()).expect("messages are UTF-8"));
+
+        assert!(
+            rendered.contains("DKIM-Signature: v=1; a=rsa-sha256;"),
+            "got: {rendered}",
+        );
+        assert!(rendered.contains("d=acme.com;"), "got: {rendered}");
+        assert!(rendered.contains("s=mail;"), "got: {rendered}");
+        assert!(
+            rendered.contains("h=From:Subject:To:Date;"),
+            "the covered headers are the ones every verifier expects: {rendered}",
+        );
+        assert!(
+            rendered.contains("token=abc"),
+            "the body is delivered as written: {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signing_mailer_builds_from_settings_and_never_shows_the_key() {
+        let mailer = Mailer::smtp_signed(
+            "smtps://user:hunter2@smtp.example.com:465",
+            "Acme <no-reply@acme.com>",
+            &dkim_settings(),
+        )
+        .expect("the mailer must build");
+
+        let rendered = format!("{mailer:?}");
+        assert!(rendered.contains("signed: true"), "got: {rendered}");
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(
+            !rendered.contains("MII"),
+            "no part of the key may be printed: {rendered}",
+        );
+    }
+
+    #[test]
+    fn signing_keys_are_recognized_in_both_forms_lettre_reads() {
+        assert!(is_valid_signing_key(TEST_PRIVATE_KEY));
+        assert!(is_valid_signing_key(TEST_ED25519_SEED));
+
+        assert!(!is_valid_signing_key(""));
+        assert!(!is_valid_signing_key("hunter2"));
+        // A PKCS#8 PEM is the shape `openssl genrsa` writes by default, and the
+        // one mistake worth being sure about: it is refused, and the error
+        // names the `-traditional` flag that fixes it.
+        assert!(!is_valid_signing_key(
+            "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
+        ));
     }
 
     #[tokio::test]
@@ -436,11 +648,17 @@ mod tests {
     }
 
     #[test]
-    fn addresses_are_recognized_with_and_without_a_display_name() {
-        assert!(is_valid_address("no-reply@acme.com"));
-        assert!(is_valid_address("Acme <no-reply@acme.com>"));
-        assert!(!is_valid_address("no-reply"));
-        assert!(!is_valid_address(""));
+    fn the_domain_of_an_address_is_read_with_and_without_a_display_name() {
+        assert_eq!(
+            address_domain("no-reply@acme.com").as_deref(),
+            Some("acme.com"),
+        );
+        assert_eq!(
+            address_domain("Acme <no-reply@mail.acme.com>").as_deref(),
+            Some("mail.acme.com"),
+        );
+        assert!(address_domain("no-reply").is_none());
+        assert!(address_domain("").is_none());
     }
 
     #[tokio::test]
@@ -456,6 +674,22 @@ mod tests {
         })
         .expect("a configured relay must parse");
         let mailer = Mailer::from_config(&configured).expect("the relay must build");
-        assert!(format!("{mailer:?}").contains("Smtp"));
+        let rendered = format!("{mailer:?}");
+        assert!(rendered.contains("Smtp"), "got: {rendered}");
+        assert!(
+            rendered.contains("signed: false"),
+            "a relay signs nothing until a key is configured: {rendered}",
+        );
+
+        let signing = AppConfig::from_lookup(|name| match name {
+            "SMTP_URL" => Some("smtps://user:secret@smtp.example.com:465".to_owned()),
+            "MAIL_FROM" => Some("Acme <no-reply@acme.com>".to_owned()),
+            "DKIM_PRIVATE_KEY" => Some(TEST_PRIVATE_KEY.to_owned()),
+            "DKIM_SELECTOR" => Some("mail".to_owned()),
+            _ => None,
+        })
+        .expect("a configured key must parse");
+        let mailer = Mailer::from_config(&signing).expect("the signing relay must build");
+        assert!(format!("{mailer:?}").contains("signed: true"));
     }
 }

@@ -117,9 +117,13 @@ async fn platform_tokens_authenticate_the_v1_api() {
     .expect("test config must parse");
     let roles = anubis::roles::RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
 
     let router = Router::new()
-        .nest("/auth", anubis::auth::router(pool.clone(), mailer, &config))
+        .nest(
+            "/auth",
+            anubis::auth::router(pool.clone(), mailer, &config, &rate_limit),
+        )
         .nest(
             "/developers",
             anubis::api::management::router(pool.clone(), roles),

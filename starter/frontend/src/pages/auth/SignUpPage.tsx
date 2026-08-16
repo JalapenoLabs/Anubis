@@ -5,11 +5,18 @@ import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { Link, useSearchParams } from 'react-router'
-import { useAnubisApi, useCurrentUser, getApiErrorMessage } from '@jalapenolabs/anubis'
+import {
+  useAnubisApi,
+  useCurrentUser,
+  useRetryCountdown,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Input, Tooltip } from '@heroui/react'
 import { AuthLayout } from '../../components/AuthLayout'
+import { RateLimitNotice } from '../../components/RateLimitNotice'
 
 // Utility
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -30,6 +37,7 @@ export function SignUpPage() {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const { refresh } = useCurrentUser()
+  const retry = useRetryCountdown()
   const [ searchParams ] = useSearchParams()
   const [ formError, setFormError ] = useState<string | null>(null)
 
@@ -60,6 +68,14 @@ export function SignUpPage() {
       await refresh()
     }
     catch (error) {
+      // A rate-limited refusal gets the live countdown instead of a static
+      // message, because the wait is the only thing the user can act on.
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       const message = getApiErrorMessage(error)
       setFormError(message ?? t('common.somethingWentWrong'))
     }
@@ -110,6 +126,7 @@ export function SignUpPage() {
           }</p>
         : null
       }
+      <RateLimitNotice remaining={retry.remaining} />
       <Tooltip
         content={t('auth.validation.fillAllFields')}
         isDisabled={isValid}
@@ -120,7 +137,7 @@ export function SignUpPage() {
             type='submit'
             color='primary'
             className='w-full'
-            isDisabled={!isValid || form.formState.isSubmitting}
+            isDisabled={!isValid || form.formState.isSubmitting || !retry.done}
             isLoading={form.formState.isSubmitting}
           >
             <span>{

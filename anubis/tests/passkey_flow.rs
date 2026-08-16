@@ -1,8 +1,8 @@
 //! Passkey ceremony endpoints against a real Postgres database.
 //!
-//! A real authenticator cannot run in tests, so this covers everything up to
-//! the cryptographic finish: challenge issuance, state-token lifecycle,
-//! garbage rejection, and credential management.
+//! This is the surface around the ceremony: challenge issuance, state-token
+//! lifecycle, garbage rejection, and credential management. The ceremony
+//! itself, signed by a software authenticator, is `passkey_ceremony_flow`.
 //!
 //! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
 //! always provides one.
@@ -98,7 +98,11 @@ async fn passkey_ceremonies_issue_challenges_and_reject_garbage() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &config));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool, mailer, &config, &rate_limit),
+    );
 
     let email = format!("passkey-{}@example.com", Uuid::new_v4());
     let credentials = json!({ "email": email, "password": "correct horse battery staple" });

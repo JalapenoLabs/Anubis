@@ -19,6 +19,9 @@
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
 //! | `MAIL_FROM` | unset | Sender of outgoing email, e.g. `Acme <no-reply@acme.com>`. Required when `SMTP_URL` is set |
+//! | `DKIM_PRIVATE_KEY` | unset | Private key that signs outgoing email; setting it signs every message |
+//! | `DKIM_SELECTOR` | unset | Name the key is published under in DNS, e.g. `mail`. Required with `DKIM_PRIVATE_KEY` |
+//! | `DKIM_DOMAIN` | the `MAIL_FROM` domain | Domain the signature claims responsibility for |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
@@ -84,6 +87,30 @@
 //! anyway, with a startup warning from [`crate::telemetry::init`]: a first
 //! deploy that sends no email should not be blocked by mail configuration.
 //! See `docs/email.md`.
+//!
+//! ## DKIM signing
+//!
+//! Relay providers sign on your behalf once the sender domain is verified with
+//! them, so the three `DKIM_*` variables stay unset in most deployments. They
+//! exist for the relay that does not sign: a company MTA, a sidecar, an
+//! appliance. Setting them makes the framework sign every message itself,
+//! which is additive, so a message signed twice is fine.
+//!
+//! The three are a group. `DKIM_PRIVATE_KEY` and `DKIM_SELECTOR` are required
+//! together, and `DKIM_DOMAIN` defaults to the domain of the `MAIL_FROM`
+//! address, so most deployments set two variables. Setting a `DKIM_DOMAIN`
+//! that is neither the sender's domain nor one of its parents stops the boot:
+//! the signature would verify and DMARC would still fail it, which is the
+//! worst of both. Signing without `SMTP_URL` stops the boot too, because the
+//! log mailer delivers nothing to sign.
+//!
+//! `DKIM_PRIVATE_KEY` holds a PKCS#1 RSA key in PEM form, or the base64 seed
+//! of an ed25519 key; the leading `-----BEGIN` tells them apart. A PEM is
+//! multi-line and plenty of places a deployment stores secrets hold one line,
+//! so `\n` escapes are accepted and mean the same key. The key is a secret: it
+//! is parsed once when the mailer is built, and never echoed in errors, logs,
+//! or `Debug` output. `docs/email.md` carries the key generation, the DNS TXT
+//! record, and the rotation steps.
 //!
 //! # Serving the frontend
 //!
@@ -238,6 +265,30 @@ const MAIL_FROM_VAR: &str = "MAIL_FROM";
 /// What a valid `MAIL_FROM` looks like, quoted back in errors.
 const MAIL_FROM_FORM: &str =
     "an email address with an optional display name, e.g. `Acme <no-reply@acme.com>`";
+
+/// Private key that signs outgoing email.
+const DKIM_PRIVATE_KEY_VAR: &str = "DKIM_PRIVATE_KEY";
+
+/// What a valid `DKIM_PRIVATE_KEY` looks like, quoted back in errors.
+const DKIM_PRIVATE_KEY_FORM: &str = "a PKCS#1 RSA private key in PEM form, from `openssl genrsa -traditional -out dkim.pem \
+     2048`, with `\\n` escapes where the value must be one line, or the base64 seed of an \
+     ed25519 key";
+
+/// Name the signing key is published under in DNS.
+const DKIM_SELECTOR_VAR: &str = "DKIM_SELECTOR";
+
+/// What a valid `DKIM_SELECTOR` looks like, quoted back in errors.
+const DKIM_SELECTOR_FORM: &str = "the name the key is published under in DNS, e.g. `mail`";
+
+/// Domain the signature claims responsibility for.
+const DKIM_DOMAIN_VAR: &str = "DKIM_DOMAIN";
+
+/// What a valid `DKIM_DOMAIN` looks like, quoted back in errors.
+const DKIM_DOMAIN_FORM: &str =
+    "the MAIL_FROM domain or one of its parents, e.g. `acme.com` for `no-reply@mail.acme.com`";
+
+/// The variables that ask for DKIM signing, which is a group or nothing.
+const DKIM_VARS: [&str; 3] = [DKIM_PRIVATE_KEY_VAR, DKIM_SELECTOR_VAR, DKIM_DOMAIN_VAR];
 
 /// Directory of built frontend assets the server hands the browser.
 const SPA_DIR_VAR: &str = "SPA_DIR";
@@ -408,6 +459,7 @@ impl fmt::Debug for RedisConfig {
 pub struct SmtpConfig {
     url: String,
     from: String,
+    dkim: Option<DkimConfig>,
 }
 
 impl SmtpConfig {
@@ -422,12 +474,66 @@ impl SmtpConfig {
     pub fn from(&self) -> &str {
         &self.from
     }
+
+    /// Returns the signing settings, when the deployment signs its own mail.
+    ///
+    /// Absent, the relay's own signature is the only one, which is what a
+    /// verified sender domain at a relay provider gives you; see the module
+    /// docs and [`crate::mail::Mailer::smtp_signed`].
+    #[must_use]
+    pub fn dkim(&self) -> Option<&DkimConfig> {
+        self.dkim.as_ref()
+    }
 }
 
 impl fmt::Debug for SmtpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SmtpConfig")
             .field("from", &self.from)
+            .field("dkim", &self.dkim)
+            .finish_non_exhaustive()
+    }
+}
+
+/// DKIM signing settings for outgoing email.
+///
+/// The key is a secret, so this type never exposes it through `Debug`; read it
+/// deliberately with [`DkimConfig::private_key`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct DkimConfig {
+    private_key: String,
+    selector: String,
+    domain: String,
+}
+
+impl DkimConfig {
+    /// Returns the signing key: a PKCS#1 PEM, or a base64 ed25519 seed.
+    ///
+    /// Newline escapes are already resolved, so the value is exactly what the
+    /// key parser expects.
+    #[must_use]
+    pub fn private_key(&self) -> &str {
+        &self.private_key
+    }
+
+    /// Returns the selector the key is published under in DNS.
+    #[must_use]
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Returns the domain the signature claims responsibility for.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+}
+
+impl fmt::Debug for DkimConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DkimConfig")
+            .field("selector", &self.selector)
+            .field("domain", &self.domain)
             .finish_non_exhaustive()
     }
 }
@@ -844,6 +950,19 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// without `MAIL_FROM` stops startup rather than failing every send later.
 fn smtp_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<SmtpConfig>, Error> {
     let Some(url) = non_empty(lookup(SMTP_URL_VAR)) else {
+        if DKIM_VARS
+            .iter()
+            .any(|name| non_empty(lookup(name)).is_some())
+        {
+            // The log mailer delivers nothing, so a key configured beside it
+            // would sign nothing. Naming the relay is the fix either way:
+            // configure one, or drop the signing variables.
+            return Err(Error::missing(
+                SMTP_URL_VAR,
+                "a relay to sign for: DKIM signs messages on their way out, and the log mailer \
+                 sends none",
+            ));
+        }
         return Ok(None);
     };
     let url = url.trim().to_owned();
@@ -858,11 +977,117 @@ fn smtp_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<SmtpCo
     };
     let from = from.trim().to_owned();
 
-    if !crate::mail::is_valid_address(&from) {
+    // The sender's own domain is both the check that the address parses and the
+    // default the signature claims responsibility for.
+    let Some(from_domain) = crate::mail::address_domain(&from) else {
         return Err(Error::invalid(MAIL_FROM_VAR, &from, MAIL_FROM_FORM));
+    };
+
+    let dkim = dkim_config(lookup, &from_domain)?;
+
+    Ok(Some(SmtpConfig { url, from, dkim }))
+}
+
+/// Resolves DKIM signing, when the environment asks for it.
+///
+/// The three variables are one group: a key with no selector cannot be found in
+/// DNS, and a selector with no key signs nothing, so either mistake stops
+/// startup naming what is missing. `DKIM_DOMAIN` is the exception, defaulting to
+/// `from_domain`, which is what a deployment signing for its own sender wants.
+fn dkim_config(
+    lookup: &impl Fn(&str) -> Option<String>,
+    from_domain: &str,
+) -> Result<Option<DkimConfig>, Error> {
+    let private_key = non_empty(lookup(DKIM_PRIVATE_KEY_VAR))
+        .map(|key| unescape_newlines(&key).trim().to_owned());
+    let selector = non_empty(lookup(DKIM_SELECTOR_VAR));
+    let domain = non_empty(lookup(DKIM_DOMAIN_VAR));
+
+    let (private_key, selector) = match (private_key, selector) {
+        (None, None) if domain.is_none() => return Ok(None),
+        (None, None) => {
+            return Err(Error::missing(
+                DKIM_PRIVATE_KEY_VAR,
+                "a signing key and a DKIM_SELECTOR to publish it under; DKIM_DOMAIN alone signs \
+                 nothing",
+            ));
+        }
+        (None, Some(_selector)) => {
+            return Err(Error::missing(DKIM_PRIVATE_KEY_VAR, DKIM_PRIVATE_KEY_FORM));
+        }
+        (Some(_key), None) => return Err(Error::missing(DKIM_SELECTOR_VAR, DKIM_SELECTOR_FORM)),
+        (Some(private_key), Some(selector)) => (private_key, selector),
+    };
+
+    if !crate::mail::is_valid_signing_key(&private_key) {
+        // The key signs mail as this domain, so the bad value is never quoted
+        // back.
+        return Err(Error::invalid_secret(
+            DKIM_PRIVATE_KEY_VAR,
+            DKIM_PRIVATE_KEY_FORM,
+        ));
     }
 
-    Ok(Some(SmtpConfig { url, from }))
+    // Both ride in the DKIM-Signature header, where anything but a DNS name is
+    // either unresolvable or a header of somebody else's choosing.
+    let selector = selector.trim().to_owned();
+    if !is_dns_name(&selector) {
+        return Err(Error::invalid(
+            DKIM_SELECTOR_VAR,
+            &selector,
+            DKIM_SELECTOR_FORM,
+        ));
+    }
+
+    let domain = match domain {
+        None => from_domain.to_ascii_lowercase(),
+        Some(domain) => {
+            let domain = domain.trim().to_ascii_lowercase();
+            if !is_dns_name(&domain) || !domain_covers(&domain, from_domain) {
+                return Err(Error::invalid(DKIM_DOMAIN_VAR, &domain, DKIM_DOMAIN_FORM));
+            }
+            domain
+        }
+    };
+
+    Ok(Some(DkimConfig {
+        private_key,
+        selector,
+        domain,
+    }))
+}
+
+/// Restores the newlines a one-line PEM had to escape.
+///
+/// A PEM key is multi-line, and plenty of places a deployment keeps secrets (a
+/// `.env` file, a platform's config-var field) hold one line only. Writing the
+/// key with `\n` escapes is the convention those places grew, so both forms are
+/// accepted and mean the same key.
+fn unescape_newlines(value: &str) -> String {
+    value.replace("\\n", "\n")
+}
+
+/// Returns `true` when `value` is a dotted sequence of DNS labels.
+fn is_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+        })
+}
+
+/// Returns `true` when a signature for `domain` speaks for `from_domain`.
+///
+/// DMARC's relaxed alignment, the default, accepts a signing domain that is the
+/// sender's domain or one of its parents, which is what an organization signing
+/// `no-reply@mail.acme.com` with an `acme.com` key relies on. An unrelated
+/// domain is worth failing the boot over: the signature would verify and DMARC
+/// would still reject the message, so the mail looks signed and lands in spam.
+fn domain_covers(domain: &str, from_domain: &str) -> bool {
+    let from_domain = from_domain.to_ascii_lowercase();
+    from_domain == domain || from_domain.ends_with(&format!(".{domain}"))
 }
 
 /// Resolves every provider whose credentials the environment carries.
@@ -999,6 +1224,9 @@ mod tests {
 
     /// A syntactically valid `ANUBIS_SECRET_KEY`, for tests that need one.
     const SAMPLE_SECRET_KEY: &str = "bkVLZLd1zHBqxWvKGKp5gRTZKcTf9UvHT5vXbHvWJ0M=";
+
+    /// The throwaway DKIM key the mail suites sign with; see [`crate::mail`].
+    const TEST_PRIVATE_KEY: &str = include_str!("../tests/support/dkim_test_key.pem");
 
     fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
@@ -1265,6 +1493,183 @@ mod tests {
         assert!(rendered.contains("SmtpConfig"), "got: {rendered}");
         assert!(rendered.contains("no-reply@acme.com"), "got: {rendered}");
         assert!(!rendered.contains("hunter2"), "got: {rendered}");
+    }
+
+    #[test]
+    fn mail_is_unsigned_until_a_key_and_a_selector_are_set() {
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "Acme <no-reply@acme.com>"),
+        ]);
+        let unsigned = AppConfig::from_lookup(lookup).expect("a relay without a key is fine");
+        assert!(
+            unsigned
+                .smtp
+                .expect("smtp config must be present")
+                .dkim()
+                .is_none()
+        );
+
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "Acme <no-reply@acme.com>"),
+            ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+            ("DKIM_SELECTOR", " mail "),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a key and a selector must parse");
+        let smtp = config.smtp.expect("smtp config must be present");
+        let dkim = smtp.dkim().expect("dkim config must be present");
+        assert_eq!(dkim.selector(), "mail");
+        assert_eq!(
+            dkim.domain(),
+            "acme.com",
+            "the signature defaults to the sender's own domain",
+        );
+        assert_eq!(dkim.private_key(), TEST_PRIVATE_KEY.trim());
+    }
+
+    #[test]
+    fn a_one_line_key_written_with_escapes_is_the_same_key() {
+        let escaped = TEST_PRIVATE_KEY.trim().replace('\n', "\\n");
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "no-reply@acme.com"),
+            ("DKIM_PRIVATE_KEY", &escaped),
+            ("DKIM_SELECTOR", "mail"),
+        ]);
+
+        let config = AppConfig::from_lookup(lookup).expect("an escaped key must parse");
+
+        let smtp = config.smtp.expect("smtp config must be present");
+        let dkim = smtp.dkim().expect("dkim config must be present");
+        assert_eq!(dkim.private_key(), TEST_PRIVATE_KEY.trim());
+    }
+
+    #[test]
+    fn half_the_signing_group_stops_the_boot_naming_what_is_missing() {
+        let relay = [
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "no-reply@acme.com"),
+        ];
+
+        for (extra, missing) in [
+            (("DKIM_SELECTOR", "mail"), "DKIM_PRIVATE_KEY"),
+            (("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY), "DKIM_SELECTOR"),
+            (("DKIM_DOMAIN", "acme.com"), "DKIM_PRIVATE_KEY"),
+        ] {
+            let lookup = lookup_from(&[relay[0], relay[1], extra]);
+            let error = AppConfig::from_lookup(lookup).expect_err("half a group is a mistake");
+            assert_eq!(error.variable(), missing, "for {extra:?}");
+            assert!(error.to_string().contains("is not set"), "got: {error}");
+        }
+
+        // A lone domain names the selector it also needs, not just the key.
+        let lookup = lookup_from(&[relay[0], relay[1], ("DKIM_DOMAIN", "acme.com")]);
+        let error = AppConfig::from_lookup(lookup).expect_err("a lone domain is a mistake");
+        assert!(error.to_string().contains("DKIM_SELECTOR"), "got: {error}");
+    }
+
+    #[test]
+    fn signing_without_a_relay_stops_the_boot() {
+        for (name, value) in [
+            ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+            ("DKIM_SELECTOR", "mail"),
+            ("DKIM_DOMAIN", "acme.com"),
+        ] {
+            let lookup = lookup_from(&[("MAIL_FROM", "no-reply@acme.com"), (name, value)]);
+            let error =
+                AppConfig::from_lookup(lookup).expect_err("the log mailer sends nothing to sign");
+            assert_eq!(error.variable(), "SMTP_URL", "for {name}");
+        }
+    }
+
+    #[test]
+    fn the_signing_domain_may_be_the_senders_or_one_of_its_parents() {
+        for domain in ["acme.com", "ACME.COM", "mail.acme.com"] {
+            let lookup = lookup_from(&[
+                ("SMTP_URL", "smtps://smtp.example.com"),
+                ("MAIL_FROM", "Acme <no-reply@mail.acme.com>"),
+                ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+                ("DKIM_SELECTOR", "mail"),
+                ("DKIM_DOMAIN", domain),
+            ]);
+            let config = AppConfig::from_lookup(lookup).expect("an aligned domain must parse");
+            let smtp = config.smtp.expect("smtp config must be present");
+            assert_eq!(
+                smtp.dkim().map(super::DkimConfig::domain),
+                Some(domain.to_ascii_lowercase().as_str()),
+                "for {domain}",
+            );
+        }
+
+        // A signature DMARC cannot align is worse than no signature: it
+        // verifies, and the message is rejected anyway.
+        for domain in [
+            "example.com",
+            "notacme.com",
+            "sub.mail.acme.com",
+            "not a host",
+        ] {
+            let lookup = lookup_from(&[
+                ("SMTP_URL", "smtps://smtp.example.com"),
+                ("MAIL_FROM", "Acme <no-reply@mail.acme.com>"),
+                ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+                ("DKIM_SELECTOR", "mail"),
+                ("DKIM_DOMAIN", domain),
+            ]);
+            let error = AppConfig::from_lookup(lookup).expect_err("an unaligned domain is a bug");
+            assert_eq!(error.variable(), "DKIM_DOMAIN", "for {domain}");
+        }
+    }
+
+    #[test]
+    fn a_selector_that_is_not_a_dns_name_is_rejected() {
+        for selector in ["mail selector", "mail\r\nBcc: attacker@example.com", "."] {
+            let lookup = lookup_from(&[
+                ("SMTP_URL", "smtps://smtp.example.com"),
+                ("MAIL_FROM", "no-reply@acme.com"),
+                ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+                ("DKIM_SELECTOR", selector),
+            ]);
+            let error = AppConfig::from_lookup(lookup).expect_err("junk selectors are rejected");
+            assert_eq!(error.variable(), "DKIM_SELECTOR", "for {selector:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_that_cannot_sign_is_rejected_without_echoing_it() {
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "no-reply@acme.com"),
+            ("DKIM_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----hunter2"),
+            ("DKIM_SELECTOR", "mail"),
+        ]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("only real keys are accepted");
+
+        assert_eq!(error.variable(), "DKIM_PRIVATE_KEY");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+        assert!(rendered.contains("-traditional"), "got: {rendered}");
+    }
+
+    #[test]
+    fn dkim_debug_output_never_leaks_the_key() {
+        let lookup = lookup_from(&[
+            ("SMTP_URL", "smtps://smtp.example.com"),
+            ("MAIL_FROM", "no-reply@acme.com"),
+            ("DKIM_PRIVATE_KEY", TEST_PRIVATE_KEY),
+            ("DKIM_SELECTOR", "mail"),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("a key is fine");
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("DkimConfig"), "got: {rendered}");
+        assert!(rendered.contains("selector: \"mail\""), "got: {rendered}");
+        assert!(
+            !rendered.contains("MII"),
+            "no part of the key may be printed: {rendered}",
+        );
     }
 
     #[test]

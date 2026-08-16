@@ -57,8 +57,18 @@ const MAX_EMAIL_CHARS: usize = 320;
 /// The mailer delivers verification and reset email; the config supplies the
 /// environment (whether session cookies are `Secure`) and the public base URL
 /// embedded in email links.
-pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
-    let rate_limit = RateLimiter::new(&config.rate_limit);
+///
+/// The limiter is passed in rather than built here because a budget is only a
+/// budget when one balance covers every surface that spends it: the inbox
+/// budget an application charges from `/auth` is the same one
+/// [`crate::tenancy::router`] charges when it mails an invitation. Build one
+/// with `RateLimiter::new(&config.rate_limit)` and hand it to both.
+pub fn router(
+    pool: DbPool,
+    mailer: Mailer,
+    config: &AppConfig,
+    rate_limit: &RateLimiter,
+) -> Router {
     let state = AuthState {
         pool: pool.clone(),
         environment: config.environment,
@@ -92,8 +102,8 @@ pub fn router(pool: DbPool, mailer: Mailer, config: &AppConfig) -> Router {
         )
         .route("/password-reset/confirm", post(confirm_password_reset))
         .merge(crate::auth::account::router())
-        .merge(crate::auth::email_code::router(&rate_limit))
-        .merge(crate::auth::mfa::router(&rate_limit))
+        .merge(crate::auth::email_code::router(rate_limit))
+        .merge(crate::auth::mfa::router(rate_limit))
         .merge(crate::auth::oauth::router())
         .merge(crate::auth::passkey::router())
         .with_state(state)

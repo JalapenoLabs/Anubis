@@ -34,7 +34,8 @@ async fn registration_bootstraps_a_personal_organization() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = anubis::auth::router(pool.clone(), mailer, &config);
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = anubis::auth::router(pool.clone(), mailer, &config, &rate_limit);
 
     let local_part = format!("tenant-{}", uuid::Uuid::new_v4());
     let email = format!("{local_part}@example.com");

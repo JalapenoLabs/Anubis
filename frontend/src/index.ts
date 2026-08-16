@@ -45,6 +45,7 @@ export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generat
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
 export type { OauthProvidersResult } from './react/useOauthProviders'
+export type { RetryCountdown } from './react/useRetryCountdown'
 export type {
   AnubisFieldProps,
   CodeLanguage,
@@ -108,11 +109,12 @@ export { useChannel } from './react/useChannel'
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'
 export { createAnubisV1 } from './api/v1.generated'
-export { getApiErrorMessage } from './api/errors'
+export { getApiErrorMessage, getRetryAfterSeconds } from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
 export { useCurrentUser } from './react/useCurrentUser'
 export { useMemberships } from './react/useMemberships'
 export { useOauthProviders } from './react/useOauthProviders'
+export { useRetryCountdown } from './react/useRetryCountdown'
 
 /**
  * The version of the Anubis frontend package.

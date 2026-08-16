@@ -102,7 +102,9 @@
       "emailInvalid": "Enter a valid email address.",
       "passwordTooShort": "Passwords must be at least {{count}} characters.",
       "fillAllFields": "Fill in every field to continue."
-    }
+    },
+    "rateLimited_one": "Too many attempts. Try again in {{count}}s",
+    "rateLimited_other": "Too many attempts. Try again in {{count}}s"
   },
   "settings": {
     "navLink": "Settings",

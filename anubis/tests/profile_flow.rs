@@ -108,7 +108,11 @@ async fn profile_credentials_sessions_and_deletion() {
     })
     .expect("test config must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &config));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool.clone(), mailer, &config, &rate_limit),
+    );
 
     let run = Uuid::new_v4();
     let email = format!("profile-{run}@example.com");

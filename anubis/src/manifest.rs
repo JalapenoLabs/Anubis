@@ -486,6 +486,7 @@ plans:
         let config = AppConfig::from_lookup(|_| None).expect("defaults are valid");
         let roles = RoleSet::from_yaml(ROLES).expect("test roles are valid");
         let mailer = crate::mail::Mailer::log();
+        let rate_limit = crate::rate_limit::RateLimiter::new(&config.rate_limit);
 
         Router::new()
             .merge(crate::server::health_router(pool.clone()))
@@ -496,7 +497,7 @@ plans:
             ))
             .nest(
                 "/auth",
-                crate::auth::router(pool.clone(), mailer.clone(), &config),
+                crate::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
             )
             .nest(
                 "/tenancy",
@@ -506,6 +507,7 @@ plans:
                     roles.clone(),
                     Some(crate::billing::PlanSet::from_yaml(PLANS).expect("test plans are valid")),
                     &config,
+                    &rate_limit,
                 ),
             )
             .nest(

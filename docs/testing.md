@@ -99,7 +99,7 @@ Retries are off and there are no sleeps. Playwright's auto-waiting is the only s
 
 The reason is countability. A narrative that only reads rows it just wrote is safe on a shared database, and the older suites stay out of each other's way with random emails. A concurrency test is not: it asks how many admins a team has, how many deliveries a write produced, how many rows are left in the queue, and every one of those questions is only answerable when nothing else is writing.
 
-Adoption is per suite and mechanical: replace the `DATABASE_URL` skip-gate and the `run_pending_migrations` call with `TestDatabase::create`, then pass `database.url()` wherever the suite passed `database_url`. The concurrency, adversarial, and benchmark suites use it. The older narratives do not, and there is no urgency: what they cost by sharing is nothing they currently assert.
+Adoption is per suite and mechanical: replace the `DATABASE_URL` skip-gate and the `run_pending_migrations` call with `TestDatabase::create`, then pass `database.url()` wherever the suite passed `database_url`. The concurrency, adversarial, passkey-ceremony, and benchmark suites use it. The older narratives do not, and there is no urgency: what they cost by sharing is nothing they currently assert.
 
 Packages outside `anubis` cannot import that module, because an integration test's support module is private to its package. They rely instead on the migration lock below, which is what makes concurrent appliers against one shared database safe.
 
@@ -121,6 +121,27 @@ Three things make one worth having:
 1. **Real parallelism.** `#[tokio::test(flavor = "multi_thread")]` and `tokio::spawn`, not a sequence with an `await` between the steps.
 2. **A property, not a sequence.** Assert the invariant that has to survive ("the team keeps an admin", "no job is lost"), not the order the racers happened to finish in.
 3. **A race that actually runs.** A scheduler usually runs one request to completion before starting the next, which means the race the test is named after never happens. Where the outcome depends on both racers being in flight, hold the lock they contend for from the test itself, let both queue behind it, and release: `simultaneous_demotions_keep_a_team_administrable` does exactly that.
+
+## The passkey ceremony
+
+`passkey_ceremony_flow.rs` completes both WebAuthn ceremonies against the real router: registration attests a new credential, discoverable login asserts it, and the session cookie that comes back opens `GET /auth/me`. Every byte the relying party verifies is genuine, so the suite proves the cryptographic path rather than the shape of the JSON around it. `passkey_flow.rs` keeps the surface around it: challenge issuance, the state-token lifecycle, garbage rejection, and credential management.
+
+The signing is `SoftPasskey`, from `webauthn-authenticator-rs`. It is a dev-dependency pinned to the same `=0.6.1-dev` line as `webauthn-rs`, because both are built on `webauthn-rs-proto` and only identical versions agree on those types. The feature set is `softpasskey` alone: every transport (USB, NFC, Bluetooth, caBLE) stays off, so no native library enters the tree and the `cargo tree` gate on OpenSSL and native-tls still comes back empty.
+
+`tests/support/SoftAuthenticator` wraps it and adds the one thing that token does not keep, **resident credentials**: the user handle a credential was created for, the choice among its own credentials when a request names none, and the handle reported back so the relying party learns whose credential signed. None of that is signed data, which is precisely why a relying party treats the handle as a lookup hint and then verifies the signature against the key it finds. Anubis' login does exactly that.
+
+Four refusals carry as much as the round trip:
+
+- a `clientDataJSON` rewritten to name another origin, which fails because the origin is signed over and checked
+- one account's credential offered under another account's user handle, which fails because the signature has to hold against a key that account owns
+- a login finish replayed after its state token was spent, which fails because a state token is single-use
+- a registration finished by an account that did not start it, which fails because the state row names its owner
+
+The second of those is only worth its assertion because the same credential signs its own owner in one step earlier, which is what makes the refusal about the forged handle rather than about a broken ceremony.
+
+The suite names `APP_URL=http://localhost:3000` and composes the auth router itself instead of booting the `Harness`. The relying party id comes from `APP_URL`'s host, and a browser refuses a ceremony at a bare IP address, which is what the harness's default `APP_URL` is.
+
+What it does not prove is the browser wiring. `navigator.credentials` and the frontend's serializers are the layer above: their encoders have unit tests, and the click that joins them belongs to a person.
 
 ## The login-storm benchmark
 

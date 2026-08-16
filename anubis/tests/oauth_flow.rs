@@ -336,7 +336,11 @@ async fn provider_discovery_lists_what_the_environment_configured() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool.clone(), mailer, &bare));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&bare.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool.clone(), mailer, &bare, &rate_limit),
+    );
 
     let (status, _headers, body) = send(&router, "GET", "/auth/oauth/providers", None, None).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -352,7 +356,11 @@ async fn provider_discovery_lists_what_the_environment_configured() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &configured));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&configured.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool, mailer, &configured, &rate_limit),
+    );
 
     let (status, _headers, body) = send(&router, "GET", "/auth/oauth/providers", None, None).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -395,7 +403,11 @@ async fn oauth_sign_in_creates_links_and_refuses() {
     assert_eq!(config.oauth.len(), 1, "the provider must be enabled");
 
     let (mailer, _outbox) = anubis::mail::Mailer::test();
-    let router = Router::new().nest("/auth", anubis::auth::router(pool, mailer, &config));
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = Router::new().nest(
+        "/auth",
+        anubis::auth::router(pool, mailer, &config, &rate_limit),
+    );
 
     // ------------------------------------------------------------------
     // Start: the browser is sent to the provider with everything the spec

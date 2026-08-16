@@ -90,7 +90,8 @@ async fn register_login_and_session_round_trip() {
     })
     .expect("test config must parse");
     let (mailer, outbox) = anubis::mail::Mailer::test();
-    let router = anubis::auth::router(pool, mailer, &config);
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+    let router = anubis::auth::router(pool, mailer, &config, &rate_limit);
     let email = format!("it-{}@example.com", uuid::Uuid::new_v4());
     let password = "correct horse battery staple";
     let credentials = json!({ "email": email, "password": password });

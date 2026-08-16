@@ -22,6 +22,8 @@ import '../i18n'
 type StubbedResponse = {
   status: number
   body?: unknown
+  /** Response headers beyond `content-type`, such as `Retry-After` on a 429. */
+  headers?: Record<string, string>
 }
 
 /**
@@ -80,7 +82,10 @@ export function stubFetch(responses: Record<string, StubbedResponse>) {
 
     return new Response(JSON.stringify(stubbed.body ?? {}), {
       status: stubbed.status,
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...stubbed.headers,
+      },
     })
   })
 }

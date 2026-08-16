@@ -99,11 +99,15 @@ Tokens are attempt-limited individually, but the endpoints that accept them woul
 | `POST /auth/login`, `POST /auth/mfa/verify`, `POST /auth/email-code/verify` | 10 per minute | Client address |
 | `POST /auth/register` | 10 per hour | Client address |
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /auth/verify-email/request` | 20 per hour | Client address |
-| `POST /auth/password-reset/request`, `POST /auth/email-code/request` | 5 per hour | Target email address |
+| `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /tenancy/invitations` | 5 per hour | Target email address |
 
 Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on.
 
 The mail endpoints carry two budgets because the two abuses differ. A client hammering the endpoint is caught per address; a campaign rotating addresses to bomb one inbox is caught per recipient, which is why that budget is the tighter of the two. The recipient is charged before the account lookup and only its SHA-256 becomes a key, so no address sits in memory in the clear and the answer never depends on whether the address is registered.
+
+**One limiter, every surface.** The inbox budget is one balance per address, not one per endpoint, so an application builds a single `RateLimiter` and passes it to both `anubis::auth::router` and `anubis::tenancy::router`. Inviting is a way to send mail to any address a request names, and re-inviting is deliberately allowed, so `POST /tenancy/invitations` charges the same recipient budget a password reset does. It charges after the inviter is shown to administer the target rather than before: this endpoint is authenticated, and charging first would let any signed-in account spend a stranger's inbox budget and so keep that stranger from receiving a reset link.
+
+**In the browser.** `@jalapenolabs/anubis` reads the wait with `getRetryAfterSeconds(error)`, which answers the whole seconds of a `429`'s `Retry-After` header and null for everything else, so a caller tells a rate-limited refusal from every other one in the same call. `useRetryCountdown()` turns that number into a live countdown (`remaining`, `done`, `start`). The starter's auth forms (sign-in by password, by email code, and by second factor, plus sign-up and the password reset request) render the countdown through their `RateLimitNotice` and keep the submit disabled until it reaches zero, which is what stops a user from spending the next attempt before the balance has refilled.
 
 Rate limiting is not an enumeration oracle. Budgets count requests, never outcomes, so the same volume from the same client produces the same `429` whether the accounts involved exist or not. That is a property of counting volume rather than a check anyone has to remember to add.
 

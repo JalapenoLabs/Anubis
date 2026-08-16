@@ -89,6 +89,11 @@ async fn main() {
         .await
         .expect("REDIS_URL must name a reachable Redis");
 
+    // One limiter for the whole application: the inbox budget a password reset
+    // charges is the one an invitation charges, because two limiters would be
+    // two budgets and one inbox would take both.
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+
     let app = Router::new()
         // Public profile pictures at /users/{user_id}/avatar.
         .merge(anubis::auth::avatar_router(pool.clone()))
@@ -96,7 +101,7 @@ async fn main() {
         .merge(anubis::realtime::router(pool.clone(), channels))
         .nest(
             "/auth",
-            anubis::auth::router(pool.clone(), mailer.clone(), &config),
+            anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
         )
         // The plans reach tenancy because the `seats` limit is enforced where
         // people join: an invitation past the plan's seats is refused, and a
@@ -109,6 +114,7 @@ async fn main() {
                 roles.clone(),
                 Some(plans.clone()),
                 &config,
+                &rate_limit,
             ),
         )
         // The plan an organization is on, and the Stripe redirects that change

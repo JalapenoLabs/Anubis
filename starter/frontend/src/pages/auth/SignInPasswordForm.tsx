@@ -3,11 +3,17 @@
 // Core
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi, getApiErrorMessage } from '@jalapenolabs/anubis'
+import {
+  useAnubisApi,
+  useRetryCountdown,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Tooltip } from '@heroui/react'
 import { EmailField, PasswordField } from '@jalapenolabs/anubis'
+import { RateLimitNotice } from '../../components/RateLimitNotice'
 
 // Utility
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -32,6 +38,7 @@ type Props = {
 export function SignInPasswordForm(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  const retry = useRetryCountdown()
 
   const form = useForm<SignInFormValues>({
     resolver,
@@ -53,6 +60,14 @@ export function SignInPasswordForm(props: Props) {
       await props.onSignedIn()
     }
     catch (error) {
+      // A rate-limited refusal gets the live countdown instead of a static
+      // message, because the wait is the only thing the user can act on.
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       const message = getApiErrorMessage(error)
       form.setError('root', { message: message ?? t('common.somethingWentWrong') })
     }
@@ -82,6 +97,7 @@ export function SignInPasswordForm(props: Props) {
         }</p>
       : null
     }
+    <RateLimitNotice remaining={retry.remaining} />
     <Tooltip
       content={t('auth.validation.fillAllFields')}
       isDisabled={isValid}
@@ -92,7 +108,7 @@ export function SignInPasswordForm(props: Props) {
           type='submit'
           color='primary'
           className='w-full'
-          isDisabled={!isValid || form.formState.isSubmitting}
+          isDisabled={!isValid || form.formState.isSubmitting || !retry.done}
           isLoading={form.formState.isSubmitting}
         >
           <span>{

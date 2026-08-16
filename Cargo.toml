@@ -44,9 +44,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # SMTP delivery for the production mailer. The default feature set links
 # native-tls, so it stays off and the pinned set spells out the policy: the
 # tokio executor, rustls for both smtps:// and STARTTLS, pooled connections,
-# and the message builder. No OpenSSL enters the tree.
+# and the message builder. `dkim` adds first-party signing for relays that do
+# not sign, on the RustCrypto stack (rsa, ed25519-dalek, sha2). No OpenSSL
+# enters the tree.
 lettre = { version = "0.11", default-features = false, features = [
   "builder",
+  "dkim",
   "pool",
   "smtp-transport",
   "tokio1",
@@ -111,6 +114,17 @@ webauthn-rs = { version = "=0.6.1-dev", features = [
   # Username-less (discoverable) login, the password-manager passkey flow.
   "conditional-ui",
 ] }
+# The software authenticator the passkey ceremony test signs with, from the
+# same 0.6 line and pinned with it: both crates speak `webauthn-rs-proto`, and
+# only identical versions agree on those types. `softpasskey` is the in-memory
+# ES256 token and its RustCrypto stack; every transport feature (USB, NFC,
+# Bluetooth, caBLE) stays off, so no native library enters the tree.
+webauthn-authenticator-rs = { version = "=0.6.1-dev", default-features = false, features = [
+  "softpasskey",
+] }
+# The WebAuthn wire types both crates above are built on. Named here because
+# the test's authenticator implements a backend trait over them.
+webauthn-rs-proto = "=0.6.1-dev"
 # Clears key material from memory on drop. Already in the tree under aes-gcm;
 # named here because `anubis::auth::secret_box` uses it directly.
 zeroize = "1"

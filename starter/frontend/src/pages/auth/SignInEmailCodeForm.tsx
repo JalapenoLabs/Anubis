@@ -4,11 +4,17 @@
 import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi, getApiErrorMessage } from '@jalapenolabs/anubis'
+import {
+  useAnubisApi,
+  useRetryCountdown,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button } from '@heroui/react'
 import { EmailField, TextField } from '@jalapenolabs/anubis'
+import { RateLimitNotice } from '../../components/RateLimitNotice'
 
 // Utility
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -44,6 +50,9 @@ type Props = {
 export function SignInEmailCodeForm(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
+  // One countdown for both steps: only one of them is ever on screen, and a
+  // wait earned by asking for a code is a wait before entering one too.
+  const retry = useRetryCountdown()
   const [ sentToAddress, setSentToAddress ] = useState<string | null>(null)
 
   const requestForm = useForm<RequestFormValues>({
@@ -69,6 +78,12 @@ export function SignInEmailCodeForm(props: Props) {
       setSentToAddress(data.email.trim())
     }
     catch (error) {
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       const message = getApiErrorMessage(error)
       requestForm.setError('root', { message: message ?? t('common.somethingWentWrong') })
     }
@@ -90,6 +105,12 @@ export function SignInEmailCodeForm(props: Props) {
       await props.onSignedIn()
     }
     catch (error) {
+      const wait = getRetryAfterSeconds(error)
+      if (wait) {
+        retry.start(wait)
+        return
+      }
+
       const message = getApiErrorMessage(error)
       verifyForm.setError('root', { message: message ?? t('common.somethingWentWrong') })
     }
@@ -114,11 +135,14 @@ export function SignInEmailCodeForm(props: Props) {
           }</p>
         : null
       }
+      <RateLimitNotice remaining={retry.remaining} />
       <Button
         type='submit'
         color='primary'
         className='mt-6 w-full'
-        isDisabled={!requestForm.formState.isValid || requestForm.formState.isSubmitting}
+        isDisabled={
+          !requestForm.formState.isValid || requestForm.formState.isSubmitting || !retry.done
+        }
         isLoading={requestForm.formState.isSubmitting}
       >
         <span>{
@@ -146,11 +170,14 @@ export function SignInEmailCodeForm(props: Props) {
         }</p>
       : null
     }
+    <RateLimitNotice remaining={retry.remaining} />
     <Button
       type='submit'
       color='primary'
       className='mt-6 w-full'
-      isDisabled={!verifyForm.formState.isValid || verifyForm.formState.isSubmitting}
+      isDisabled={
+        !verifyForm.formState.isValid || verifyForm.formState.isSubmitting || !retry.done
+      }
       isLoading={verifyForm.formState.isSubmitting}
     >
       <span>{

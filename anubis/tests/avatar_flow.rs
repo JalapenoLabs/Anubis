@@ -62,9 +62,13 @@ async fn avatars_upload_serve_cache_and_delete() {
     })
     .expect("test config must parse");
     let (mailer, _outbox) = anubis::mail::Mailer::test();
+    let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
     let router = Router::new()
         .merge(anubis::auth::avatar_router(pool.clone()))
-        .nest("/auth", anubis::auth::router(pool, mailer, &config));
+        .nest(
+            "/auth",
+            anubis::auth::router(pool, mailer, &config, &rate_limit),
+        );
 
     let email = format!("avatar-{}@example.com", Uuid::new_v4());
     let register = Request::builder()
