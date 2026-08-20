@@ -149,25 +149,42 @@ jobs:
             --out starter/frontend/src/api/v1.generated.ts
           git diff --exit-code starter/frontend/src/api/v1.generated.ts
 
+      # The dirty check `--allow-dirty` waives below happens here instead,
+      # while the only possible dirt is real dirt: after this point the vendor
+      # step deliberately writes gitignored files that cargo would still count
+      # as uncommitted, because an `include` list packages them.
+      - name: Verify a clean tree before vendoring
+        run: |
+          status="$(git status --porcelain)"
+          if [ -n "$status" ]; then
+            echo "the release tree must be clean before vendoring:"
+            echo "$status"
+            exit 1
+          fi
+
       # `anubis new` stamps from a template embedded at build time, and a
       # published crate can only embed what lives under anubis/. The copy is
-      # gitignored, so it leaves the tree clean for `cargo publish` to check.
+      # gitignored, which keeps it out of history but not out of cargo's
+      # dirty check: gitignored files named by `include` are packaged, and
+      # packaged-but-uncommitted is exactly what that check refuses.
       - name: Vendor the starter template
         run: bash scripts/vendor-starter.sh
 
       # Builds the packaged crate from its own tarball, which is the proof that
       # the vendored template is complete and the package is self-contained.
       # The upload below reuses this verification rather than repeating it.
+      # `--allow-dirty` is safe because the clean-tree step above ran before
+      # the vendor step wrote the only uncommitted files present.
       # The crate publishes as `anubis-framework`; the binary it carries is
       # `anubis`, and so is the library. See docs/ci.md#releases.
       - name: Package the crate
-        run: cargo package -p anubis-framework
+        run: cargo package -p anubis-framework --allow-dirty
 
       - name: Publish the crate
         if: env.PUBLISHING == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p anubis-framework --no-verify
+        run: cargo publish -p anubis-framework --no-verify --allow-dirty
 
       # `yarn npm publish` runs prepack, applies publishConfig, and sends the
       # same tarball `yarn pack` writes, so packing first is a rehearsal of the
