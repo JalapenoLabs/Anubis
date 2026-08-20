@@ -5,6 +5,11 @@ the `@jalapenolabs/anubis` package. Upgrading an application is therefore
 bumping two version numbers and re-running the generators. There is no starter
 template to merge, and no upstream branch to reconcile.
 
+The crate publishes as `anubis-framework` and an application renames it back to
+`anubis` with Cargo's `package` key, so every line below writes `anubis` except
+the two that name a package to crates.io, `cargo install` and `cargo update`.
+[ci.md](ci.md#the-crate-name) has the reason.
+
 That is the whole design. Bullet Train's most-cited long-term cost is the
 upgrade: an application merges the upstream starter repository tag by tag,
 resolves conflicts in files it has been editing for a year, and hand-diffs
@@ -53,16 +58,19 @@ Three declarations in this repository state that version, and
 | `frontend/package.json`, `version` | The package's version |
 
 The release workflow runs that script before it publishes anything, so a
-release that disagrees with itself never reaches a registry. See
-[ci.md](ci.md#releases) for the release procedure.
+release that disagrees with itself never reaches a registry. The script also
+checks that the workspace entry still renames the package `anubis/Cargo.toml`
+declares: the crate publishes as `anubis-framework`, and an alias that drifts
+leaves a starter that resolves nothing. See [ci.md](ci.md#releases) for the
+release procedure and [the crate name](ci.md#the-crate-name) for the rename.
 
 ## Upgrading an application
 
 ```sh
 git switch -c upgrade-anubis-0.3.0
 
-cargo install anubis --version 0.3.0   # the CLI that will regenerate
-anubis upgrade                         # or: anubis upgrade --to 0.3.0
+cargo install anubis-framework --version 0.3.0   # the CLI that will regenerate
+anubis upgrade                                   # or: anubis upgrade --to 0.3.0
 
 cargo test --workspace
 yarn test
@@ -98,8 +106,9 @@ In order, one run:
 3. Rewrites both requirements, keeping each one's range operator: `^0.2.0`
    becomes `^0.3.0`, and a bare `0.2.0` stays bare. Everything else in both
    manifests is copied through byte for byte.
-4. Runs `cargo update -p anubis` and `yarn install`, which is what moves the
-   two lockfiles.
+4. Runs `cargo update -p anubis-framework` and `yarn install`, which is what
+   moves the two lockfiles. The package spec is the published crate name, not
+   the `anubis` the manifest writes.
 5. Re-runs every generator the application carries: the permissions module
    from `config/roles.yml`, the plan catalog from `config/billing.yml` when
    there is one, and the API client from the document the application's own
@@ -135,15 +144,16 @@ read an upgrade before taking it.
 ## Before the first release
 
 Until the crate and the package are published, applications track the framework
-from its git repository: `anubis = { git = ... }` in `backend/Cargo.toml` and a
-git URL in `frontend/package.json`, which is what `anubis new` stamps today.
+from its git repository: `anubis = { package = "anubis-framework", git = ... }`
+in `backend/Cargo.toml` and a git URL in `frontend/package.json`, which is what
+`anubis new` stamps today. Publishing changes the source, never the key.
 
 There is no version to bump in that arrangement, and `anubis upgrade` says so
 rather than inventing one. Moving a git-tracked application to the framework's
 latest commit is two commands:
 
 ```sh
-cargo update -p anubis
+cargo update -p anubis-framework
 yarn up @jalapenolabs/anubis
 ```
 
@@ -160,6 +170,7 @@ anubis client generate-ts --from openapi.json --out frontend/src/api/v1.generate
 Run `anubis upgrade` once both dependencies name a published version. The
 command verifies that the crate crates.io answers with is this framework, by
 the repository the crate declares, and refuses to move an application onto a
-crate that is not; the `anubis` name on crates.io is held by an unrelated
-project, so this is a real check rather than a theoretical one. See
-[ci.md](ci.md#releases).
+crate that is not. It refuses the same way at the other end: an `anubis` entry
+with no `package = "anubis-framework"` resolves the unrelated crate holding the
+plain name, so the command names the line to write instead of upgrading it. See
+[the crate name](ci.md#the-crate-name).

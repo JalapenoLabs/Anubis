@@ -57,8 +57,9 @@ jobs:
 
       # The drift checks below run the framework CLI, which is installed from
       # the framework repository until the crate is published to crates.io.
+      # The crate is `anubis-framework`; the binary it installs is `anubis`.
       - name: Install the Anubis CLI
-        run: cargo install anubis --git https://github.com/JalapenoLabs/Anubis.git --locked
+        run: cargo install anubis-framework --git https://github.com/JalapenoLabs/Anubis.git --locked
 
       # The generated TypeScript permissions module must match roles.yml.
       - name: Roles drift check

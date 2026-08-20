@@ -57,7 +57,7 @@ codegen time, and `cargo check` plus `tsc` are the proof.
 ## Quick start
 
 ```sh
-cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis
+cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis-framework
 anubis new acme-crm --license mit
 cd acme-crm && yarn install && yarn dev
 ```

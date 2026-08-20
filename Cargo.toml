@@ -17,7 +17,10 @@ repository = "https://github.com/JalapenoLabs/Anubis"
 # Pure-Rust AES-256-GCM for secrets that must be read back, such as TOTP seeds.
 # Default features add a second RNG stack; nonces come from `getrandom` instead.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-anubis = { path = "anubis", version = "0.1.0" }
+# The framework, under the name every application writes. The package publishes
+# as `anubis-framework` (the plain name is squatted on crates.io), and Cargo's
+# `package` key renames it back, so `use anubis::` is untouched everywhere.
+anubis = { path = "anubis", package = "anubis-framework", version = "0.1.0" }
 argon2 = { version = "0.5", features = ["std"] }
 # The `ws` feature carries the realtime channel endpoint; see `anubis::realtime`.
 axum = { version = "0.8", features = ["ws"] }

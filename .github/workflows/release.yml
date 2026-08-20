@@ -158,14 +158,16 @@ jobs:
       # Builds the packaged crate from its own tarball, which is the proof that
       # the vendored template is complete and the package is self-contained.
       # The upload below reuses this verification rather than repeating it.
+      # The crate publishes as `anubis-framework`; the binary it carries is
+      # `anubis`, and so is the library. See docs/ci.md#releases.
       - name: Package the crate
-        run: cargo package -p anubis
+        run: cargo package -p anubis-framework
 
       - name: Publish the crate
         if: env.PUBLISHING == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p anubis --no-verify
+        run: cargo publish -p anubis-framework --no-verify
 
       # `yarn npm publish` runs prepack, applies publishConfig, and sends the
       # same tarball `yarn pack` writes, so packing first is a rehearsal of the

@@ -1,14 +1,15 @@
 //! Reading and rewriting the framework dependency an application declares.
 //!
 //! An Anubis application depends on the framework twice, once per end: the
-//! `anubis` crate in `backend/Cargo.toml` and the `@jalapenolabs/anubis`
-//! package in `frontend/package.json`. The two ship as one release and carry
-//! one version (see `docs/upgrading.md`), so upgrading is rewriting both
-//! requirements and re-running the generators. This module is the pure half of
-//! `anubis upgrade`: it reads a declaration out of a manifest, classifies what
-//! kind of dependency it is, and renders the manifest again with the
-//! requirement pointing at another version. The CLI owns the filesystem, the
-//! registry call, and the subprocesses.
+//! `anubis` crate in `backend/Cargo.toml` (published as `anubis-framework` and
+//! renamed back with Cargo's `package` key, see [`CRATE`] and [`DEPENDENCY`])
+//! and the `@jalapenolabs/anubis` package in `frontend/package.json`. The two
+//! ship as one release and carry one version (see `docs/upgrading.md`), so
+//! upgrading is rewriting both requirements and re-running the generators.
+//! This module is the pure half of `anubis upgrade`: it reads a declaration out
+//! of a manifest, classifies what kind of dependency it is, and renders the
+//! manifest again with the requirement pointing at another version. The CLI
+//! owns the filesystem, the registry call, and the subprocesses.
 //!
 //! Rewriting is deliberate string surgery over the manifest the application
 //! owns, in the same spirit as [`crate::scaffold`]: the file comes back byte
@@ -20,12 +21,13 @@
 //! ```
 //! use anubis::upgrade::{Dependency, cargo_declaration};
 //!
-//! let manifest = "[dependencies]\nanubis = \"0.2.0\"\n";
+//! let manifest =
+//!     "[dependencies]\nanubis = { package = \"anubis-framework\", version = \"0.2.0\" }\n";
 //! let declaration = cargo_declaration(manifest).unwrap();
 //! assert!(matches!(declaration.dependency(), Dependency::Published(_)));
 //! assert_eq!(
 //!     declaration.upgraded(&"0.3.0".parse().unwrap()).unwrap(),
-//!     "[dependencies]\nanubis = \"0.3.0\"\n",
+//!     "[dependencies]\nanubis = { package = \"anubis-framework\", version = \"0.3.0\" }\n",
 //! );
 //! ```
 
@@ -37,15 +39,32 @@ use semver::Version;
 
 use crate::eject::PACKAGE;
 
-/// The crate an application's `backend/Cargo.toml` depends on.
-pub const CRATE: &str = "anubis";
+/// The package crates.io carries, which is what `cargo update -p` names.
+///
+/// The plain name `anubis` is held on crates.io by an unrelated crate, so the
+/// framework publishes under this one and applications rename it back with
+/// Cargo's `package` key. See [`DEPENDENCY`].
+pub const CRATE: &str = "anubis-framework";
 
-/// The crates.io endpoint that answers what the latest `anubis` release is.
+/// The key an application's `backend/Cargo.toml` writes the framework under.
+///
+/// Renaming [`CRATE`] back to this is what keeps every application reading
+/// `use anubis::`, and it is the one line of a manifest this module rewrites:
+///
+/// ```toml
+/// anubis = { package = "anubis-framework", version = "0.3.0" }
+/// ```
+///
+/// An application that writes [`CRATE`] as the key directly, without the
+/// rename, is read too: what matters is which package the entry resolves.
+pub const DEPENDENCY: &str = "anubis";
+
+/// The crates.io endpoint that answers what the latest release is.
 ///
 /// The API answers a JSON object whose `crate` member carries the version
 /// fields, and a crate it has never heard of comes back `404` with an `errors`
 /// member. [`latest_published`] reads both shapes.
-pub const REGISTRY_ENDPOINT: &str = "https://crates.io/api/v1/crates/anubis";
+pub const REGISTRY_ENDPOINT: &str = "https://crates.io/api/v1/crates/anubis-framework";
 
 /// Where the release workflow puts a version's notes, one tag per release.
 const RELEASES: &str = "https://github.com/JalapenoLabs/Anubis/releases/tag";
@@ -188,7 +207,7 @@ impl<'a> Declaration<'a> {
     }
 }
 
-/// Reads the `anubis` dependency out of an application's `backend/Cargo.toml`.
+/// Reads the framework dependency out of an application's `backend/Cargo.toml`.
 ///
 /// Three shapes are recognized under `[dependencies]`: a bare version string,
 /// an inline table carrying `version`, and an inline table carrying `git` or
@@ -196,49 +215,87 @@ impl<'a> Declaration<'a> {
 /// refused by name, because rewriting either would mean re-emitting TOML this
 /// command did not write.
 ///
+/// An entry written under the [`DEPENDENCY`] key must rename [`CRATE`] with
+/// Cargo's `package` key, and one that does not is refused rather than read: an
+/// unrelated crate holds the plain name on crates.io, and the difference
+/// between the two is not something a developer sees in a diff.
+///
 /// # Errors
-/// Returns an [`UpgradeError`] when the manifest declares no `anubis`
-/// dependency, or declares one in a shape this command will not rewrite.
+/// Returns an [`UpgradeError`] when the manifest declares no framework
+/// dependency, declares one that resolves another package, or declares one in a
+/// shape this command will not rewrite.
 pub fn cargo_declaration(manifest: &str) -> Result<Declaration<'_>, UpgradeError> {
     let entry = cargo_entry(manifest)?;
-    let value = &manifest[entry.clone()];
+    let value = &manifest[entry.span.clone()];
+    let key = entry.key;
 
     if value.starts_with('"') {
+        // A bare version string carries no `package` key, so under the aliased
+        // name it names the crate that holds the name rather than this one.
+        if key == DEPENDENCY {
+            return Err(renamed(value));
+        }
         let quoted = quoted_span(value).ok_or_else(|| {
             UpgradeError::new(format!(
-                "backend/Cargo.toml declares `{CRATE} = {value}`, which is not a closed string",
+                "backend/Cargo.toml declares `{key} = {value}`, which is not a closed string",
             ))
         })?;
-        return Declaration::parse(manifest, shift(quoted, entry.start));
+        return Declaration::parse(manifest, shift(quoted, entry.span.start));
     }
 
     if !value.starts_with('{') {
         return Err(UpgradeError::new(format!(
-            "backend/Cargo.toml declares `{CRATE} = {value}`, which is neither a version string \
-             nor an inline table. Write it as `{CRATE} = {{ version = \"0.1.0\" }}` and run this \
-             again.",
+            "backend/Cargo.toml declares `{key} = {value}`, which is neither a version string nor \
+             an inline table. Write it as `{DEPENDENCY} = {{ package = \"{CRATE}\", version = \
+             \"0.1.0\" }}` and run this again.",
         )));
     }
     if !value.ends_with('}') {
         return Err(UpgradeError::new(format!(
-            "backend/Cargo.toml spreads the `{CRATE}` dependency over more than one line. Put it \
-             on one line, or set the version by hand.",
+            "backend/Cargo.toml spreads the `{key}` dependency over more than one line. Put it on \
+             one line, or set the version by hand.",
         )));
+    }
+    // The shape guards above run first, so a table this command cannot rewrite
+    // is named for that rather than for a `package` key it may well carry on
+    // one of the lines the guard just refused.
+    if key == DEPENDENCY && !renames_the_crate(value) {
+        return Err(renamed(value));
     }
 
     if let Some(version) = assigned_string(value, "version") {
-        return Declaration::parse(manifest, shift(version, entry.start));
+        return Declaration::parse(manifest, shift(version, entry.span.start));
     }
-    for (key, dependency) in [("git", Dependency::Git), ("path", Dependency::Path)] {
-        if assigned_string(value, key).is_some() {
-            return Ok(Declaration::known(manifest, entry, dependency));
+    for (source, dependency) in [("git", Dependency::Git), ("path", Dependency::Path)] {
+        if assigned_string(value, source).is_some() {
+            return Ok(Declaration::known(manifest, entry.span, dependency));
         }
     }
 
     Err(UpgradeError::new(format!(
-        "backend/Cargo.toml declares `{CRATE} = {value}`, which names no version, git, or path \
+        "backend/Cargo.toml declares `{key} = {value}`, which names no version, git, or path \
          source.",
     )))
+}
+
+/// Whether an entry's value renames [`CRATE`] with Cargo's `package` key.
+fn renames_the_crate(value: &str) -> bool {
+    assigned_string(value, "package").is_some_and(|span| &value[span] == CRATE)
+}
+
+/// The refusal an entry that resolves the wrong package earns.
+///
+/// Written for the two ways it happens: an application stamped before the
+/// rename, and one that reached for the obvious `anubis = "0.3.0"`. Both
+/// resolve a stranger's crate, which is a failure worth naming in full.
+fn renamed(value: &str) -> UpgradeError {
+    UpgradeError::new(format!(
+        "backend/Cargo.toml declares `{DEPENDENCY} = {value}`, which does not rename `{CRATE}`. \
+         The framework publishes as `{CRATE}` because an unrelated crate holds the plain name on \
+         crates.io, so an entry without `package = \"{CRATE}\"` resolves that crate instead. \
+         Write it as `{DEPENDENCY} = {{ package = \"{CRATE}\", version = \"0.1.0\" }}`, keeping \
+         whatever source it already names, and run this again.",
+    ))
 }
 
 /// Reads the `@jalapenolabs/anubis` dependency out of a `package.json`.
@@ -304,11 +361,12 @@ pub fn crate_name(manifest: &str) -> Result<&str, UpgradeError> {
     ))
 }
 
-/// What crates.io has to say about the `anubis` name.
+/// What crates.io has to say about the [`CRATE`] name.
 ///
-/// The third answer is not hypothetical: the name is held on crates.io by an
-/// unrelated crate first published in 2019, so a version read from the
-/// registry has to be shown to be this framework's before an application is
+/// The third answer is why the framework publishes under a suffixed name at
+/// all: the plain `anubis` is held by an unrelated crate first published in
+/// 2019. A version read from the registry is therefore shown to be this
+/// framework's, by the repository the crate declares, before an application is
 /// moved to it. Upgrading an application onto a stranger's crate is not a
 /// mistake anyone recovers from by reading the diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,7 +439,7 @@ pub fn latest_published(body: &str) -> Result<Latest, UpgradeError> {
                 .get("newest_version")
                 .and_then(serde_json::Value::as_str)
         })
-        .ok_or_else(|| UpgradeError::new("crates.io named no version for anubis".to_owned()))?;
+        .ok_or_else(|| UpgradeError::new(format!("crates.io named no version for {CRATE}")))?;
 
     Version::parse(named)
         .map(Latest::Published)
@@ -427,8 +485,17 @@ fn classify(requirement: &str) -> Result<(Dependency, &str), UpgradeError> {
     Ok((Dependency::Published(version), operator))
 }
 
-/// The value assigned to `anubis` under `[dependencies]`, as a byte range.
-fn cargo_entry(manifest: &str) -> Result<Range<usize>, UpgradeError> {
+/// The framework's entry under `[dependencies]`: its key and its value's range.
+///
+/// Both keys the framework answers to are looked for, the aliased [`DEPENDENCY`]
+/// an application normally writes and the [`CRATE`] name itself.
+struct Entry<'a> {
+    key: &'a str,
+    span: Range<usize>,
+}
+
+/// The value the framework is assigned under `[dependencies]`, as a byte range.
+fn cargo_entry(manifest: &str) -> Result<Entry<'_>, UpgradeError> {
     let mut section = "";
     let mut offset = 0;
 
@@ -441,13 +508,12 @@ fn cargo_entry(manifest: &str) -> Result<Range<usize>, UpgradeError> {
             .strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
         {
-            if header == "dependencies.anubis" {
-                return Err(UpgradeError::new(
-                    "backend/Cargo.toml declares anubis as a `[dependencies.anubis]` table. Write \
-                     it as one `anubis = { version = \"0.1.0\" }` line under `[dependencies]`, or \
-                     set the version by hand."
-                        .to_owned(),
-                ));
+            if header == "dependencies.anubis" || header == "dependencies.anubis-framework" {
+                return Err(UpgradeError::new(format!(
+                    "backend/Cargo.toml declares the framework as a `[{header}]` table. Write it \
+                     as one `{DEPENDENCY} = {{ package = \"{CRATE}\", version = \"0.1.0\" }}` line \
+                     under `[dependencies]`, or set the version by hand.",
+                )));
             }
             section = header;
             continue;
@@ -456,14 +522,21 @@ fn cargo_entry(manifest: &str) -> Result<Range<usize>, UpgradeError> {
             continue;
         }
 
-        if let Some((at, value)) = assignment(line, CRATE) {
-            return Ok((start + at)..(start + at + value.len()));
+        // Both keys the framework answers to. `assignment` demands the `=`
+        // right after the key, so `anubis` never matches `anubis-framework`.
+        for key in [DEPENDENCY, CRATE] {
+            if let Some((at, value)) = assignment(line, key) {
+                return Ok(Entry {
+                    key,
+                    span: (start + at)..(start + at + value.len()),
+                });
+            }
         }
     }
 
     Err(UpgradeError::new(format!(
-        "backend/Cargo.toml declares no `{CRATE}` dependency under `[dependencies]`, so this is \
-         not an Anubis application's backend.",
+        "backend/Cargo.toml declares no `{DEPENDENCY}` dependency under `[dependencies]`, so this \
+         is not an Anubis application's backend.",
     )))
 }
 
@@ -578,22 +651,24 @@ mod tests {
         text.parse().expect("the test names a version")
     }
 
-    /// The three Cargo shapes a version can be written in, all rewritten in
-    /// place with everything around them untouched.
+    /// The shapes a version can be written in, all rewritten in place with
+    /// everything around them untouched: the aliased entry every application
+    /// carries, with the `package` key on either side of the version, and the
+    /// crate's own name written directly.
     #[test]
     fn a_cargo_version_is_rewritten_in_place() {
         for (manifest, expected) in [
             (
-                "[package]\nname = \"acme\"\n\n[dependencies]\n# a comment\nanubis = \"0.2.0\"\naxum = \"0.8\"\n",
-                "[package]\nname = \"acme\"\n\n[dependencies]\n# a comment\nanubis = \"0.3.0\"\naxum = \"0.8\"\n",
+                "[package]\nname = \"acme\"\n\n[dependencies]\n# a comment\nanubis = { package = \"anubis-framework\", version = \"0.2.0\" }\naxum = \"0.8\"\n",
+                "[package]\nname = \"acme\"\n\n[dependencies]\n# a comment\nanubis = { package = \"anubis-framework\", version = \"0.3.0\" }\naxum = \"0.8\"\n",
             ),
             (
-                "[dependencies]\nanubis = { version = \"^0.2.0\", features = [\"full\"] }\n",
-                "[dependencies]\nanubis = { version = \"^0.3.0\", features = [\"full\"] }\n",
+                "[dependencies]\nanubis = { version = \"^0.2.0\", package = \"anubis-framework\", features = [\"full\"] }\n",
+                "[dependencies]\nanubis = { version = \"^0.3.0\", package = \"anubis-framework\", features = [\"full\"] }\n",
             ),
             (
-                "[dependencies]\nanubis = \"=0.2.0\"\n",
-                "[dependencies]\nanubis = \"=0.3.0\"\n",
+                "[dependencies]\nanubis-framework = \"=0.2.0\"\n",
+                "[dependencies]\nanubis-framework = \"=0.3.0\"\n",
             ),
         ] {
             let declaration = cargo_declaration(manifest).expect("the shape is recognized");
@@ -609,9 +684,30 @@ mod tests {
     /// framework's.
     #[test]
     fn only_the_framework_dependency_is_read() {
-        let manifest =
-            "[dependencies]\nanubis-extra = \"9.9.9\"\n\n[dev-dependencies]\nanubis = \"0.2.0\"\n";
+        let manifest = "[dependencies]\nanubis-extra = \"9.9.9\"\n\n[dev-dependencies]\nanubis = \
+                        { package = \"anubis-framework\", version = \"0.2.0\" }\n";
         cargo_declaration(manifest).expect_err("the dependency is not under [dependencies]");
+    }
+
+    /// An `anubis` entry that renames nothing resolves the unrelated crate
+    /// holding the name on crates.io, so it is refused with the fix rather
+    /// than upgraded. This is what every application stamped before the
+    /// rename carries, and what `cargo add anubis` would write.
+    #[test]
+    fn an_entry_that_does_not_rename_the_crate_is_refused() {
+        for manifest in [
+            "[dependencies]\nanubis = \"0.2.0\"\n",
+            "[dependencies]\nanubis = { version = \"0.2.0\" }\n",
+            "[dependencies]\nanubis = { git = \"https://github.com/JalapenoLabs/Anubis.git\" }\n",
+            "[dependencies]\nanubis = { package = \"anubis\", version = \"0.2.0\" }\n",
+        ] {
+            let error = cargo_declaration(manifest).expect_err("the entry resolves another crate");
+            assert!(
+                error.message().contains("package = \"anubis-framework\""),
+                "the refusal names the fix: {}",
+                error.message(),
+            );
+        }
     }
 
     /// Shapes the command will not guess at are refused by name.
@@ -621,18 +717,20 @@ mod tests {
             // No dependency at all.
             "[dependencies]\naxum = \"0.8\"\n",
             // The multi-line table form.
-            "[dependencies]\nanubis = { version = \"0.2.0\",\n  features = [] }\n",
+            "[dependencies]\nanubis = { package = \"anubis-framework\", version = \"0.2.0\",\n  \
+             features = [] }\n",
             // The section form.
             "[dependencies.anubis]\nversion = \"0.2.0\"\n",
             // A source that is neither a version, a git repository, nor a path.
-            "[dependencies]\nanubis = { registry = \"internal\" }\n",
+            "[dependencies]\nanubis = { package = \"anubis-framework\", registry = \"internal\" }\n",
         ] {
             let error = cargo_declaration(manifest).expect_err("the shape is refused");
             assert!(!error.message().is_empty(), "the refusal names the shape");
         }
 
         // A range that is not one release: refused rather than guessed at.
-        let ranged = "[dependencies]\nanubis = \">=0.2, <0.4\"\n";
+        let ranged = "[dependencies]\nanubis = { package = \"anubis-framework\", version = \">=0.2, <0.4\" \
+             }\n";
         let error = cargo_declaration(ranged).expect_err("a range is refused");
         assert!(error.message().contains("range"), "{}", error.message());
     }
@@ -642,11 +740,11 @@ mod tests {
     fn a_git_or_path_source_names_no_version() {
         for (manifest, expected) in [
             (
-                "[dependencies]\nanubis = { git = \"https://github.com/JalapenoLabs/Anubis.git\" }\n",
+                "[dependencies]\nanubis = { package = \"anubis-framework\", git = \"https://github.com/JalapenoLabs/Anubis.git\" }\n",
                 Dependency::Git,
             ),
             (
-                "[dependencies]\nanubis = { path = \"../anubis\" }\n",
+                "[dependencies]\nanubis = { package = \"anubis-framework\", path = \"../anubis\" }\n",
                 Dependency::Path,
             ),
         ] {
@@ -709,7 +807,7 @@ mod tests {
     /// carry, and a body that is not what it documents.
     #[test]
     fn the_registry_answer_is_read() {
-        let published = r#"{"crate":{"id":"anubis",
+        let published = r#"{"crate":{"id":"anubis-framework",
             "repository":"https://github.com/JalapenoLabs/Anubis",
             "max_stable_version":"0.3.0","newest_version":"0.4.0-rc.1"}}"#;
         assert_eq!(
@@ -734,8 +832,9 @@ mod tests {
             "a crate the registry does not carry is not an error",
         );
 
-        // Today's reality: the name is held by an unrelated crate, and a name
-        // match alone must never move an application onto it.
+        // A name match alone must never move an application onto a crate: the
+        // plain `anubis` name is held by an unrelated project, which is why
+        // the framework publishes as `anubis-framework` in the first place.
         let foreign = r#"{"crate":{"id":"anubis","repository":"https://github.com/qhua948/anubis",
             "max_stable_version":"0.0.2","newest_version":"0.0.2"}}"#;
         assert_eq!(

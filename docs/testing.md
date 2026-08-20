@@ -151,7 +151,7 @@ Verifying a password is argon2id, which is CPU-bound and memory-hard on purpose.
 
 ```sh
 DATABASE_URL=... RATE_LIMIT_DISABLED=true \
-  cargo test --release -p anubis --test login_storm -- --ignored --nocapture
+  cargo test --release -p anubis-framework --test login_storm -- --ignored --nocapture
 ```
 
 `--release` matters most: argon2 in a debug build is orders of magnitude slower than the one production runs. `RATE_LIMIT_DISABLED=true` matters because in production the limiter is the first line, refusing the eleventh credential attempt from one client per minute with a `429`; what the benchmark measures is the layer behind it, which is what a burst distributed across many addresses meets.

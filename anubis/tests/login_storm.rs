@@ -28,7 +28,7 @@
 //! ```sh
 //! DATABASE_URL=postgres://app:app@localhost:54321/app_development \
 //! RATE_LIMIT_DISABLED=true \
-//!   cargo test --release -p anubis --test login_storm -- --ignored --nocapture
+//!   cargo test --release -p anubis-framework --test login_storm -- --ignored --nocapture
 //! ```
 //!
 //! `--release` matters more than anything else here: argon2 in a debug build

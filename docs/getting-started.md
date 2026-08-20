@@ -37,16 +37,21 @@ OpenSSL to install.
 Today, from git:
 
 ```sh
-cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis
+cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis-framework
 ```
 
 That is a release build of the framework, so it takes a couple of minutes once
 (96 seconds on the machine this page was written on).
 
-<!-- Published-crate swap: replace the command above with `cargo install anubis`
-     the day the crate is on crates.io. Nothing else on this page changes. -->
-Once the crate is published this becomes `cargo install anubis`, and nothing
-else on this page changes.
+The crate is `anubis-framework` because an unrelated crate holds the plain name
+on crates.io; the binary it installs is `anubis`, and so is the library your
+application imports. [ci.md](ci.md#the-crate-name) has the whole of it.
+
+<!-- Published-crate swap: replace the command above with
+     `cargo install anubis-framework` the day the crate is on crates.io.
+     Nothing else on this page changes. -->
+Once the crate is published this becomes `cargo install anubis-framework`, and
+nothing else on this page changes.
 
 Check it:
 
@@ -605,7 +610,7 @@ applications pay. Install the CLI for the version you are moving to, then run
 one command on a branch:
 
 ```sh
-cargo install anubis --version 0.3.0
+cargo install anubis-framework --version 0.3.0
 anubis upgrade --dry-run          # everything it would do, writing nothing
 anubis upgrade                    # or: anubis upgrade --to 0.3.0
 ```

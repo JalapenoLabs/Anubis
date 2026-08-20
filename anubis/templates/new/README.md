@@ -93,7 +93,7 @@ template to merge back in. Install the CLI for the version you are moving to,
 then run one command on a branch:
 
 ```sh
-cargo install anubis --version 0.3.0
+cargo install anubis-framework --version 0.3.0
 anubis upgrade --dry-run   # everything it would do, writing nothing
 anubis upgrade             # or: anubis upgrade --to 0.3.0
 ```

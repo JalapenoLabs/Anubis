@@ -26,7 +26,7 @@ use semver::Version;
 
 use super::{app_root, display, fail, read};
 
-/// The manifest declaring the `anubis` crate.
+/// The manifest declaring the framework crate, as `anubis`.
 const BACKEND_MANIFEST: &str = "backend/Cargo.toml";
 
 /// The manifest declaring the `@jalapenolabs/anubis` package.
@@ -462,14 +462,16 @@ fn latest_published() -> Result<Latest, String> {
 /// it. Naming it is the difference between "not released yet" and "released
 /// under a name somebody else owns", and only one of those is a surprise.
 fn not_published(held_by: Option<&str>) -> String {
+    let crate_name = upgrade::CRATE;
     let mut message = match held_by {
-        None => "crates.io carries no crate named `anubis`, so there is no published version to \
-                 upgrade to."
-            .to_owned(),
+        None => format!(
+            "crates.io carries no crate named `{crate_name}`, so there is no published version to \
+             upgrade to.",
+        ),
         Some(repository) => format!(
-            "crates.io carries a crate named `anubis`, but it is not this framework: it comes \
-             from {repository}. The framework has not been published, and this command will not \
-             move an application onto somebody else's crate.",
+            "crates.io carries a crate named `{crate_name}`, but it is not this framework: it \
+             comes from {repository}. The framework has not been published, and this command will \
+             not move an application onto somebody else's crate.",
         ),
     };
     message.push_str(
@@ -514,7 +516,8 @@ mod tests {
     use anubis::upgrade::{cargo_declaration, package_declaration};
     use semver::Version;
 
-    const CARGO: &str = "[package]\nname = \"acme\"\n\n[dependencies]\nanubis = \"0.2.0\"\n";
+    const CARGO: &str = "[package]\nname = \"acme\"\n\n[dependencies]\nanubis = { package = \
+                         \"anubis-framework\", version = \"0.2.0\" }\n";
     const PACKAGE: &str = "{ \"dependencies\": { \"@jalapenolabs/anubis\": \"^0.2.0\" } }";
 
     fn version(text: &str) -> Version {
@@ -540,7 +543,11 @@ mod tests {
         assert_eq!(paths, ["backend/Cargo.toml", "frontend/package.json"]);
         assert_eq!(plan.rewrites[0].to, "0.3.0");
         assert_eq!(plan.rewrites[1].to, "^0.3.0");
-        assert!(plan.rewrites[0].contents.contains("anubis = \"0.3.0\""));
+        assert!(
+            plan.rewrites[0]
+                .contents
+                .contains("anubis = { package = \"anubis-framework\", version = \"0.3.0\" }"),
+        );
         assert!(
             plan.rewrites[1]
                 .contents
@@ -553,7 +560,11 @@ mod tests {
             .flat_map(Step::commands)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(commands.contains("cargo update -p anubis"), "{commands}");
+        // The package spec is the published name, not the aliased key.
+        assert!(
+            commands.contains("cargo update -p anubis-framework"),
+            "{commands}"
+        );
         assert!(commands.contains("yarn install"), "{commands}");
         assert!(commands.contains("anubis roles generate-ts"), "{commands}");
         assert!(
@@ -598,7 +609,8 @@ mod tests {
     #[test]
     fn a_git_tracked_application_is_told_what_to_do() {
         let cargo = cargo_declaration(
-            "[dependencies]\nanubis = { git = \"https://github.com/JalapenoLabs/Anubis.git\" }\n",
+            "[dependencies]\nanubis = { package = \"anubis-framework\", git = \
+             \"https://github.com/JalapenoLabs/Anubis.git\" }\n",
         )
         .expect("the manifest is readable");
         let package = package_declaration(
@@ -619,7 +631,7 @@ mod tests {
     fn an_unpublished_framework_is_reported_for_the_right_reason() {
         let absent = not_published(None);
         assert!(
-            absent.contains("carries no crate named `anubis`"),
+            absent.contains("carries no crate named `anubis-framework`"),
             "{absent}"
         );
         assert!(absent.contains("--to"), "{absent}");

@@ -70,6 +70,12 @@ fn new_stamps_a_complete_renamed_application() {
     // starter token survives anywhere in the tree.
     let backend_manifest = read(&app.join("backend/Cargo.toml"));
     assert!(backend_manifest.contains("name = \"acme-crm\""));
+    // The framework publishes as `anubis-framework` and the manifest renames
+    // it back, which is what keeps every `use anubis::` in the app compiling.
+    assert!(
+        backend_manifest.contains("anubis = { package = \"anubis-framework\","),
+        "the backend manifest must rename the framework crate: {backend_manifest}"
+    );
     let frontend_manifest = read(&app.join("frontend/package.json"));
     assert!(frontend_manifest.contains("\"name\": \"acme-crm-frontend\""));
     assert!(frontend_manifest.contains("#workspace=@jalapenolabs/anubis"));
@@ -184,10 +190,13 @@ fn upgrade_plans_a_release_bump_and_refuses_a_git_tracked_application() {
     }
 
     // The arrangement every application has once the packages are published.
+    // The crate publishes as `anubis-framework`, so the `package` key that
+    // renames it back survives the move from git to a version.
     rewrite(
         &backend,
-        "anubis = { git = \"https://github.com/JalapenoLabs/Anubis.git\" }",
-        "anubis = \"0.1.0\"",
+        "anubis = { package = \"anubis-framework\", git = \
+         \"https://github.com/JalapenoLabs/Anubis.git\" }",
+        "anubis = { package = \"anubis-framework\", version = \"0.1.0\" }",
     );
     rewrite(
         &frontend,
@@ -210,7 +219,7 @@ fn upgrade_plans_a_release_bump_and_refuses_a_git_tracked_application() {
         "backend/Cargo.toml     0.1.0 -> 0.2.0",
         "frontend/package.json  ^0.1.0 -> ^0.2.0",
         // The two lockfiles, then every generator the application carries.
-        "cargo update -p anubis",
+        "cargo update -p anubis-framework",
         "yarn install",
         "anubis roles generate-ts",
         "anubis billing generate-ts",

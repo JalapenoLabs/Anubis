@@ -1,8 +1,15 @@
-# anubis
+# anubis-framework
 
 The Rust half of [Anubis](https://github.com/JalapenoLabs/Anubis), an open-source SaaS framework: the developer experience of [Bullet Train](https://bullettrain.co), rebuilt on a Rust backend and a React SPA frontend.
 
 This crate is both the framework library and the `anubis` CLI binary. Its React counterpart is the [`@jalapenolabs/anubis`](https://www.npmjs.com/package/@jalapenolabs/anubis) npm package, and the two move together: one version, one release.
+
+The crate is `anubis-framework` because an unrelated crate holds `anubis` on crates.io. Everything you type is still `anubis`: the library, the binary, and the dependency itself, through Cargo's dependency renaming.
+
+```toml
+[dependencies]
+anubis = { package = "anubis-framework", version = "0.1.0" }
+```
 
 ## What the library gives an application
 
@@ -19,7 +26,7 @@ This crate is both the framework library and the `anubis` CLI binary. Its React 
 ## The CLI
 
 ```sh
-cargo install anubis
+cargo install anubis-framework   # the crate is `anubis-framework`; the binary is `anubis`
 anubis new my-app          # stamp a complete application
 anubis scaffold model ...  # generate a model end to end: backend, frontend, tests, docs
 anubis doctor              # check the environment a deployment needs

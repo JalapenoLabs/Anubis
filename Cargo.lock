@@ -136,7 +136,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anubis"
+name = "anubis-framework"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -187,7 +187,7 @@ dependencies = [
 name = "anubis-starter"
 version = "0.1.0"
 dependencies = [
- "anubis",
+ "anubis-framework",
  "axum",
  "chrono",
  "diesel",

@@ -400,6 +400,51 @@ mod tests {
         }
     }
 
+    /// The stamped backend manifest renames the framework crate back to
+    /// `anubis`, and renames the package this repository actually publishes.
+    /// The library and the binary keep the plain name, which is what makes the
+    /// rename invisible: applications write `use anubis::` and run `anubis`.
+    #[test]
+    fn the_overlay_renames_the_published_framework_crate() {
+        let framework = repository_file("anubis/Cargo.toml");
+        let published = manifest_name(&framework, "[package]");
+
+        for (target, expected) in [("[lib]", "anubis"), ("[[bin]]", "anubis")] {
+            assert_eq!(
+                manifest_name(&framework, target),
+                expected,
+                "{target} carries the name every application types",
+            );
+        }
+
+        let rename = format!("anubis = {{ package = \"{published}\",");
+        assert!(
+            overlay("backend/Cargo.toml").contains(&rename),
+            "the backend overlay must declare `{rename} ... }}`",
+        );
+
+        // The stamped workflow installs the crate by its published name, and
+        // gets the `anubis` binary out of it.
+        let install = format!("cargo install {published} --git");
+        assert!(
+            overlay(".github/workflows/ci.yml").contains(&install),
+            "the CI overlay must install the CLI with `{install} ...`",
+        );
+    }
+
+    /// The value `name` takes in the manifest section `header` opens.
+    fn manifest_name(manifest: &str, header: &str) -> String {
+        manifest
+            .lines()
+            .skip_while(|line| line.trim() != header)
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| line.trim().strip_prefix("name = \""))
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("{header} names a target"))
+            .to_owned()
+    }
+
     /// The stamped CI workflow pins the same tool versions as the framework's
     /// own, so a bump here reaches every application stamped afterwards.
     #[test]

@@ -22,7 +22,7 @@ about ten seconds.
 Warm the machine before you record, exactly as any screencast does:
 
 ```sh
-cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis   # ~96s, once
+cargo install --git https://github.com/JalapenoLabs/Anubis.git anubis-framework   # ~96s, once
 anubis new warmup && cd warmup && yarn install && cargo build           # ~76s, once
 ```
 
@@ -320,7 +320,7 @@ machine, with a warm cargo cache. Yours will differ; the shape will not.
 | Backend rebuild after a scaffold (app crate only) | 8.2 s |
 | Backend boot, migrations applied, `/healthz` answering | 1.1 s |
 | First dependency build, cold target directory | 76 s |
-| `cargo install --git ... anubis`, cold | 96 s |
+| `cargo install --git ... anubis-framework`, cold | 96 s |
 
 And the request beats, against a debug build, so a release build is faster
 everywhere and much faster on sign-up:

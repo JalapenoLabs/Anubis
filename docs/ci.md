@@ -99,12 +99,24 @@ The Scaffold and E2E jobs are deliberately absent. Both already ran on the commi
 | Where | What |
 |---|---|
 | Repository secrets | `CARGO_REGISTRY_TOKEN`, a crates.io API token scoped to publish-update; `NPM_TOKEN`, an npm automation token that may publish under `@jalapenolabs` |
-| crates.io | A name to publish under, owned by the account the token belongs to. See the open question below |
+| crates.io | Nothing beyond the token: the crate publishes as `anubis-framework`, which is unclaimed. See the crate name below |
 | npm | The `@jalapenolabs` organization, with the token's account a member. The package is scoped, so every publish passes `--access public` |
 
 Until both secrets exist, a rehearsal still proves everything except the two uploads.
 
-**Open question: the crate name.** `anubis` on crates.io is held by an unrelated crate first published in 2019 (a game launcher, at `github.com/qhua948/anubis`), so the first publish cannot claim it. Registry names are first-come and are not reassigned on request except through crates.io's own policy for abandoned crates, which asks the current owner first. The first release therefore needs a decision: publish under another crate name, or pursue the name. Nothing else in the repository depends on the answer, because an application names the crate in exactly one line of `backend/Cargo.toml`. The npm side is unaffected: the package is scoped to `@jalapenolabs`. Until this is settled, `anubis upgrade` refuses to move an application onto the crate that holds the name, by checking the repository it declares; see [upgrading.md](upgrading.md).
+### The crate name
+
+`anubis` on crates.io is held by an unrelated crate first published in 2019 (a game launcher, at `github.com/qhua948/anubis`), and registry names are first-come. **The crate therefore publishes as `anubis-framework`, and every name a developer types stays `anubis`.** Cargo's dependency renaming is what buys that: `[lib] name` and `[[bin]] name` in `anubis/Cargo.toml` are both `anubis`, so the library is `use anubis::` and the CLI is `anubis`, and an application declares
+
+```toml
+anubis = { package = "anubis-framework", version = "0.3.0" }
+```
+
+which is the one line in `backend/Cargo.toml` that names the registry at all. The monorepo does the same through `[workspace.dependencies]`, so `starter/backend` writes `anubis = { workspace = true }` and knows nothing about the suffix. Two commands take the published name rather than the aliased one, because both name a package: `cargo install anubis-framework` and `cargo update -p anubis-framework`.
+
+An entry that names `anubis` without the `package` key resolves the other crate, so `anubis upgrade` refuses it and prints the line to write instead. The registry answer is checked the same way it always was, by the repository the crate declares; see [upgrading.md](upgrading.md). The npm side is unaffected: the package is scoped to `@jalapenolabs`.
+
+Pursuing the plain name through crates.io's policy for abandoned crates remains open, and taking it later costs one `package` key in the workspace manifest and the template.
 
 ### Vendoring the starter
 
@@ -118,7 +130,7 @@ Until both secrets exist, a rehearsal still proves everything except the two upl
 
 ```sh
 bash scripts/vendor-starter.sh
-cargo package -p anubis          # builds the packaged crate from its own tarball
+cargo package -p anubis-framework   # builds the packaged crate from its own tarball
 bash scripts/vendor-starter.sh --clean
 ```
 
@@ -127,7 +139,7 @@ bash scripts/vendor-starter.sh --clean
 `anubis new` stamps `.github/workflows/ci.yml` from `anubis/templates/new/github-ci.yml`, so an application arrives with the same bar the framework holds itself to. Two things differ, both because a stamped app is not on the Jalapeno Labs fleet:
 
 - `runs-on: ubuntu-latest`, with `Swatinem/rust-cache` standing in for the warm target dir a self-hosted runner keeps.
-- The drift checks run the `anubis` CLI, installed with `cargo install anubis --git https://github.com/JalapenoLabs/Anubis.git --locked`, because the CLI is a framework binary rather than one of the application's. It becomes `cargo install anubis --version <x>` once the crate is published.
+- The drift checks run the `anubis` CLI, installed with `cargo install anubis-framework --git https://github.com/JalapenoLabs/Anubis.git --locked`, because the CLI is a framework binary rather than one of the application's. `cargo install` takes the crate name and installs the binaries the crate declares, so the command names `anubis-framework` and the tool it puts on `PATH` is `anubis`. It becomes `cargo install anubis-framework --version <x>` once the crate is published.
 
 The application's drift checks are the three that belong to it: `frontend/src/roles.generated.ts` from its own `config/roles.yml`, `frontend/src/plans.generated.ts` from its own `config/billing.yml`, and `frontend/src/api/v1.generated.ts` from the document its binary exports. A test asserts the template runs every generator the framework's own workflow does, so a fourth one cannot be added here and forgotten there. Its Postgres service is named after the app and takes an ephemeral host port, exactly as the framework's does.
 

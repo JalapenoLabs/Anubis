@@ -7,8 +7,12 @@ rust-version = "1.96"
 publish = false
 
 [dependencies]
-# Anubis is installed from its repository until the crate is published.
-anubis = { git = "https://github.com/JalapenoLabs/Anubis.git" }
+# Anubis publishes as `anubis-framework`, because the plain name is held on
+# crates.io by an unrelated crate. The `package` key renames it back, so every
+# `use anubis::` in this application reads the way the docs write it. Keep the
+# key when the source below becomes a published version:
+#   anubis = { package = "anubis-framework", version = "0.3.0" }
+anubis = { package = "anubis-framework", git = "https://github.com/JalapenoLabs/Anubis.git" }
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 # The libpq-linked "postgres" feature stays off; connections go through

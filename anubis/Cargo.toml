@@ -1,5 +1,10 @@
 [package]
-name = "anubis"
+# The crates.io name. `anubis` is held by an unrelated crate first published in
+# 2019, so the registry name carries the `-framework` suffix while every name a
+# developer types stays `anubis`: the library below is `anubis`, the binary is
+# `anubis`, and an application declares `anubis = { package = "anubis-framework",
+# ... }`, which is Cargo's dependency renaming. See docs/ci.md#releases.
+name = "anubis-framework"
 description = "A Rust-first SaaS framework: teams, roles, auth, a versioned REST API, and full-stack scaffolding."
 version.workspace = true
 edition.workspace = true

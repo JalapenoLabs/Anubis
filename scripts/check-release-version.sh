@@ -13,6 +13,11 @@
 #   Cargo.toml            [workspace.dependencies]      what the starter resolves anubis to
 #   frontend/package.json version                       the npm package's version
 #
+# The crate publishes as `anubis-framework` and every application writes it as
+# `anubis` through Cargo's `package` key, so this also checks that the alias
+# still names the package anubis/Cargo.toml declares. An alias that drifts
+# leaves a starter that resolves nothing.
+#
 # .github/workflows/release.yml runs this before it publishes anything, so the
 # check that fails a release is the one a developer can run first.
 #
@@ -35,8 +40,17 @@ dependency_version="$(
 )"
 package_version="$(node -p "require('./frontend/package.json').version")"
 
-echo "crate            $crate_version"
-echo "crate dependency $dependency_version"
+crate_name="$(
+  sed -n '/^\[package\]/,/^\[/p' anubis/Cargo.toml |
+    sed -n 's/^name = "\([^"]*\)".*/\1/p' | head -1
+)"
+aliased_name="$(
+  sed -n '/^\[workspace.dependencies\]/,/^\[workspace.lints/p' Cargo.toml |
+    sed -n 's/^anubis = .*package = "\([^"]*\)".*/\1/p' | head -1
+)"
+
+echo "crate            $crate_name $crate_version"
+echo "crate dependency $aliased_name $dependency_version"
 echo "npm package      $package_version"
 
 failures=0
@@ -57,6 +71,12 @@ fi
 if [ "$package_version" != "$crate_version" ]; then
   fail "frontend/package.json is $package_version, not $crate_version"
 fi
+if [ -z "$crate_name" ]; then
+  fail "no package name under [package] in anubis/Cargo.toml"
+fi
+if [ "$aliased_name" != "$crate_name" ]; then
+  fail "the anubis workspace dependency renames $aliased_name, not $crate_name"
+fi
 
 if [ $# -gt 0 ]; then
   tag="$1"
@@ -71,7 +91,7 @@ if [ $# -gt 0 ]; then
 fi
 
 if [ "$failures" -gt 0 ]; then
-  echo "a release carries one version; bump all three together" >&2
+  echo "a release carries one version; bump all three together, and keep the alias on the package" >&2
   exit 1
 fi
 
