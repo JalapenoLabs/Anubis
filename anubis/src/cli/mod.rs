@@ -15,6 +15,7 @@ pub(crate) mod new;
 pub(crate) mod routes;
 pub(crate) mod scaffold;
 pub(crate) mod secret;
+pub(crate) mod upgrade;
 
 /// The application root the command was run in.
 ///

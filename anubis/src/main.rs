@@ -45,6 +45,19 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    /// Move this application to another framework release.
+    ///
+    /// Rewrites the `anubis` requirement in both manifests, realizes it in
+    /// both lockfiles, and re-runs every generator, so the generated files
+    /// match the framework that will compile them. See `docs/upgrading.md`.
+    Upgrade {
+        /// The version to move to. Defaults to the latest published release.
+        #[arg(long)]
+        to: Option<String>,
+        /// Print everything the upgrade would do, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Verify toolchain, database, and config health.
     Doctor,
     /// Print the framework route table.
@@ -219,6 +232,7 @@ fn main() -> ExitCode {
             command: ScaffoldCommand::Webhook { provider },
         } => cli::scaffold::webhook(&provider),
         Command::Eject { component, list } => cli::eject::run(component.as_deref(), list),
+        Command::Upgrade { to, dry_run } => cli::upgrade::run(to.as_deref(), dry_run),
         Command::Doctor => cli::doctor::run(),
         Command::Routes => cli::routes::run(),
         Command::Roles { command } => run_roles(command),

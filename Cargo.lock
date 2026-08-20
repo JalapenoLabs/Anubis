@@ -160,6 +160,7 @@ dependencies = [
  "qrcode",
  "redis",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_norway",

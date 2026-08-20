@@ -79,7 +79,7 @@ The Rust and Frontend jobs each end with a vulnerability audit: `cargo audit` ag
 
 ## Releases
 
-`.github/workflows/release.yml` publishes the crate to crates.io and the package to npm from one tag. The two ship as one release and carry one version: an application depends on both, and a version that names only half of a release is a version nobody can resolve. Pre-1.0 every release may break, and a minor bump signals it.
+`.github/workflows/release.yml` publishes the crate to crates.io and the package to npm from one tag. The two ship as one release and carry one version: an application depends on both, and a version that names only half of a release is a version nobody can resolve. Pre-1.0 every release may break, and a minor bump signals it. What that promise means on the other side, and how an application takes a release, is [upgrading.md](upgrading.md).
 
 ### Making one
 
@@ -99,10 +99,12 @@ The Scaffold and E2E jobs are deliberately absent. Both already ran on the commi
 | Where | What |
 |---|---|
 | Repository secrets | `CARGO_REGISTRY_TOKEN`, a crates.io API token scoped to publish-update; `NPM_TOKEN`, an npm automation token that may publish under `@jalapenolabs` |
-| crates.io | Ownership of the `anubis` name by the account the token belongs to. The first publish claims it |
+| crates.io | A name to publish under, owned by the account the token belongs to. See the open question below |
 | npm | The `@jalapenolabs` organization, with the token's account a member. The package is scoped, so every publish passes `--access public` |
 
 Until both secrets exist, a rehearsal still proves everything except the two uploads.
+
+**Open question: the crate name.** `anubis` on crates.io is held by an unrelated crate first published in 2019 (a game launcher, at `github.com/qhua948/anubis`), so the first publish cannot claim it. Registry names are first-come and are not reassigned on request except through crates.io's own policy for abandoned crates, which asks the current owner first. The first release therefore needs a decision: publish under another crate name, or pursue the name. Nothing else in the repository depends on the answer, because an application names the crate in exactly one line of `backend/Cargo.toml`. The npm side is unaffected: the package is scoped to `@jalapenolabs`. Until this is settled, `anubis upgrade` refuses to move an application onto the crate that holds the name, by checking the repository it declares; see [upgrading.md](upgrading.md).
 
 ### Vendoring the starter
 

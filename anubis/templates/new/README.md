@@ -84,12 +84,34 @@ directly.
 - `.github/workflows/ci.yml`: format, lint, test, build, and the three drift
   checks that keep the generated files honest
 
+## Upgrading Anubis
+
+Framework behavior lives in two versioned dependencies, the `anubis` crate in
+`backend/Cargo.toml` and `@jalapenolabs/anubis` in `frontend/package.json`, so
+upgrading is bumping two numbers and re-running the generators. There is no
+template to merge back in. Install the CLI for the version you are moving to,
+then run one command on a branch:
+
+```sh
+cargo install anubis --version 0.3.0
+anubis upgrade --dry-run   # everything it would do, writing nothing
+anubis upgrade             # or: anubis upgrade --to 0.3.0
+```
+
+It rewrites both requirements, moves `Cargo.lock` and `yarn.lock`, regenerates
+the three files CI checks for drift, and prints the release notes for the
+version it landed on. Read them: Anubis is pre-1.0, a minor release may break,
+and the notes are where a break and the steps it takes by hand are named. What
+an upgrade never touches is the files this repository was stamped with, the CI
+workflow and the Dockerfile among them: those are yours.
+
 ## Everyday commands
 
 ```sh
 anubis doctor            # verify toolchain, database, and config health
 anubis routes            # print the framework route table
 anubis roles check       # validate config/roles.yml
+anubis upgrade --dry-run # what moving to the latest release would do
 anubis secret generate   # mint an ANUBIS_SECRET_KEY
 ```
 

@@ -56,6 +56,7 @@ openidconnect = { workspace = true }
 qrcode = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }

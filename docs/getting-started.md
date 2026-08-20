@@ -63,6 +63,7 @@ Commands:
   new       Stamp a new application from the starter template
   scaffold  Generate application code from the living templates
   eject     Copy a framework frontend component into the application to own it
+  upgrade   Move this application to another framework release
   doctor    Verify toolchain, database, and config health
   routes    Print the framework route table
   roles     Validate and compile the application's roles.yml
@@ -594,6 +595,28 @@ library alone: the API client, the realtime client, and the hooks stay
 framework-owned, because a copy of those forks a wire protocol rather than a
 style.
 
+## Take a new release
+
+Framework behavior lives in two versioned dependencies, the `anubis` crate and
+the `@jalapenolabs/anubis` package, so upgrading is bumping two numbers and
+re-running the generators. There is no starter template to merge and no
+upstream branch to reconcile, which is the single biggest cost Bullet Train
+applications pay. Install the CLI for the version you are moving to, then run
+one command on a branch:
+
+```sh
+cargo install anubis --version 0.3.0
+anubis upgrade --dry-run          # everything it would do, writing nothing
+anubis upgrade                    # or: anubis upgrade --to 0.3.0
+```
+
+It rewrites both requirements, moves both lockfiles, re-runs all three
+generators, and prints the release notes for the version it landed on. Read
+them: pre-1.0 a minor release may break, and the notes are where a break and
+the steps it takes by hand are named. Until the packages are published,
+applications track the framework from git and the command says so; see
+[upgrading.md](upgrading.md).
+
 ## Everyday commands
 
 ```sh
@@ -601,6 +624,7 @@ anubis doctor            # toolchain, database, and config health
 anubis routes            # the framework's mounted route table
 anubis roles check       # validate config/roles.yml standalone
 anubis eject --list      # every component an application can own
+anubis upgrade --dry-run # what moving to the latest release would do
 anubis secret generate   # mint an ANUBIS_SECRET_KEY
 ```
 
@@ -681,6 +705,7 @@ enroll again. Treat a rotation as user communication, not just a deploy.
 - [REST API](api.md), the contract, authentication, and rate limits
 - [The server](server.md), what `anubis::server::serve` owns
 - [Background jobs](jobs.md), [Webhooks](webhooks.md), [Realtime](realtime.md), [Billing](billing.md), [Email](email.md)
+- [Upgrading](upgrading.md), the versioning policy and `anubis upgrade`
 - [Testing](testing.md) and [CI](ci.md)
 
 Bullet Train's method is worth stealing whole: write the scaffold commands in a

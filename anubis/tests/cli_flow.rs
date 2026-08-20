@@ -154,6 +154,105 @@ fn new_licenses_the_application_on_request() {
     remove(&licensed);
 }
 
+/// `anubis upgrade` from a stamped application: refused while the framework is
+/// tracked from git, then planning both rewrites and every generator once the
+/// two dependencies name published versions.
+///
+/// `--to` is what keeps this offline: a version named on the command line is
+/// the whole answer, so the registry is never reached.
+#[test]
+fn upgrade_plans_a_release_bump_and_refuses_a_git_tracked_application() {
+    let app = stamp("acme-parts", &[]);
+    let backend = app.join("backend/Cargo.toml");
+    let frontend = app.join("frontend/package.json");
+
+    // As stamped, both ends track the framework from git. There is no version
+    // to bump, and the command says so rather than inventing one.
+    let refused = upgrade(&app, &["--dry-run"]);
+    assert!(
+        !refused.status.success(),
+        "a git-tracked application has nothing to upgrade"
+    );
+    let reason = String::from_utf8_lossy(&refused.stderr);
+    for expected in [
+        "backend/Cargo.toml",
+        "frontend/package.json",
+        "git repository",
+        "docs/upgrading.md",
+    ] {
+        assert!(reason.contains(expected), "unexpected refusal: {reason}");
+    }
+
+    // The arrangement every application has once the packages are published.
+    rewrite(
+        &backend,
+        "anubis = { git = \"https://github.com/JalapenoLabs/Anubis.git\" }",
+        "anubis = \"0.1.0\"",
+    );
+    rewrite(
+        &frontend,
+        "\"@jalapenolabs/anubis\": \
+         \"https://github.com/JalapenoLabs/Anubis.git#workspace=@jalapenolabs/anubis\"",
+        "\"@jalapenolabs/anubis\": \"^0.1.0\"",
+    );
+    let before = (read(&backend), read(&frontend));
+
+    let planned = upgrade(&app, &["--to", "0.2.0", "--dry-run"]);
+    assert!(
+        planned.status.success(),
+        "upgrade --dry-run failed: {}",
+        String::from_utf8_lossy(&planned.stderr),
+    );
+    let plan = String::from_utf8_lossy(&planned.stdout);
+    for expected in [
+        "upgrade acme-parts to anubis 0.2.0",
+        // Both manifests, each keeping its own range operator.
+        "backend/Cargo.toml     0.1.0 -> 0.2.0",
+        "frontend/package.json  ^0.1.0 -> ^0.2.0",
+        // The two lockfiles, then every generator the application carries.
+        "cargo update -p anubis",
+        "yarn install",
+        "anubis roles generate-ts",
+        "anubis billing generate-ts",
+        "cargo run --quiet -p acme-parts -- openapi",
+        "anubis client generate-ts",
+        "--dry-run: nothing was written.",
+        "https://github.com/JalapenoLabs/Anubis/releases/tag/v0.2.0",
+    ] {
+        assert!(
+            plan.contains(expected),
+            "plan is missing `{expected}`: {plan}"
+        );
+    }
+
+    // A dry run writes nothing, the manifests least of all.
+    assert_eq!(before, (read(&backend), read(&frontend)));
+
+    remove(&app);
+}
+
+/// Runs `anubis upgrade` inside `app`.
+fn upgrade(app: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(ANUBIS)
+        .arg("upgrade")
+        .args(arguments)
+        .current_dir(app)
+        .output()
+        .expect("the anubis binary runs")
+}
+
+/// Replaces `from` with `to` in the file at `path`, which must contain it.
+fn rewrite(path: &Path, from: &str, to: &str) {
+    let contents = read(path);
+    assert!(
+        contents.contains(from),
+        "{} no longer contains `{from}`",
+        path.display(),
+    );
+    std::fs::write(path, contents.replace(from, to))
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+}
+
 #[test]
 fn secret_generate_prints_a_usable_key() {
     let output = Command::new(ANUBIS)

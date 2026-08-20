@@ -75,6 +75,9 @@ redis = { version = "1.5", default-features = false, features = [
 # spelled out and matches what `openidconnect` already builds on: rustls, no
 # OpenSSL, and no second copy of the client in the tree.
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "rustls-tls"] }
+# Version comparison for `anubis upgrade`, which orders releases and reads what
+# crates.io reports. Cargo's own semver implementation, and it pulls nothing in.
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"

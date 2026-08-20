@@ -29,6 +29,7 @@ pub mod server;
 pub mod spa;
 pub mod telemetry;
 pub mod tenancy;
+pub mod upgrade;
 pub mod webhooks;
 
 /// The version of the Anubis framework, matching the crate version.

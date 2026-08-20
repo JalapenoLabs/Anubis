@@ -130,6 +130,7 @@ feature categories are on the left.
 - [Realtime channels](docs/realtime.md)
 - [Billing](docs/billing.md)
 - [Email](docs/email.md)
+- [Upgrading](docs/upgrading.md)
 - [Testing](docs/testing.md)
 - [CI](docs/ci.md)
 
