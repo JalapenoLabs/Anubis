@@ -10,15 +10,74 @@
 //! | `X-Content-Type-Options` | `nosniff` | A browser never second-guesses a `Content-Type`, so an uploaded file cannot be coaxed into executing as script |
 //! | `Referrer-Policy` | `strict-origin-when-cross-origin` | A path carrying an invitation or reset token never leaves in a `Referer` to another site |
 //! | `X-Frame-Options` | `DENY` | No framing, so clickjacking has nothing to hang a transparent overlay on |
-//! | `Content-Security-Policy` | `frame-ancestors 'none'` | The same rule in the header that superseded `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
+//! | `Content-Security-Policy` | the policy below | What the page may load, and from where |
 //!
-//! The CSP is deliberately one directive. A real content policy for the SPA
-//! needs `script-src` and `style-src` tied to the hashes or nonces of a
-//! particular Vite build, which is a build-pipeline change rather than a header
-//! change: the server would have to learn what the bundler emitted. Shipping a
-//! guessed `default-src` instead would either break the application or be so
-//! permissive it proves nothing. `frame-ancestors` is the part that is honest
-//! today, and the rest is tracked as follow-up work.
+//! # The content security policy
+//!
+//! One policy, rendered once at startup and stamped on every response:
+//!
+//! ```text
+//! default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
+//! img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss://app.example.com;
+//! base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+//! ```
+//!
+//! It is grounded in what the frontend build actually emits and what the
+//! running application actually loads, directive by directive:
+//!
+//! | Directive | Value | Why |
+//! |---|---|---|
+//! | `default-src` | `'none'` | The base case is refusal, so a resource type nobody thought about is denied rather than inherited from a permissive default |
+//! | `script-src` | `'self'` | The Vite build emits no inline script at all: `index.html` carries one hashed module and one stylesheet, both same-origin, and the lazy chunks are same-origin imports. Nothing in the bundle compiles code at runtime, so no `'unsafe-eval'` either |
+//! | `style-src` | `'self' 'unsafe-inline'` | See below |
+//! | `img-src` | `'self' data: blob:` | Avatars and the TOTP QR code are served by this binary. The avatar picker previews the chosen file through `URL.createObjectURL`, which is a `blob:` URL. `data:` rides along because it is how a canvas or an inline SVG hands a browser an image, and because it names no origin, so configuration could not add it later |
+//! | `font-src` | `'self'` | The build self-hosts every face; nothing reaches a font CDN |
+//! | `connect-src` | `'self'` and the websocket origin | Every fetch goes to this server's own API, and the realtime channel is a websocket to it. CSP level 3 has `'self'` cover `ws:` on the same host, but browsers implemented that late and a realtime channel that dies silently in one of them is the worst kind of bug, so the origin of `APP_URL` is spelled out beside it |
+//! | `base-uri` | `'self'` | An injected `<base>` repoints every relative URL on the page, the ones the SPA fetches with included |
+//! | `form-action` | `'self'` | A form may only post back here. The directive does not fall back to `default-src`, so leaving it out would allow every destination |
+//! | `frame-ancestors` | `'none'` | The modern spelling of `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
+//!
+//! ## Why `'unsafe-inline'` is in `style-src`
+//!
+//! The component libraries write stylesheets into the document at runtime.
+//! React Aria adds a `touch-action` rule for every pressable element and an
+//! `overscroll-behavior` rule while a modal holds the scroll, and Motion
+//! inserts one to hold a leaving element in place while it animates out. Some
+//! of those honor a nonce and some, including a second copy of React Aria's
+//! press handling, set none at all. A nonce would therefore leave the
+//! unnonced ones broken, which is a policy that reports success while removing
+//! behavior, and hashes cannot cover rules whose text is computed from an
+//! element's measured position.
+//!
+//! This is the standard concession, and it is a small one: `style-src` is not
+//! a code execution boundary. `script-src 'self'` with no inline scripts and no
+//! `'unsafe-eval'` is where the protection lives, and it is intact.
+//!
+//! ## Extending the policy
+//!
+//! An application that adds an analytics endpoint, an error ingest, or an
+//! image CDN names those sources in `CSP_ALLOWED_SOURCES`, which is
+//! directive-qualified and validated at startup:
+//!
+//! ```sh
+//! CSP_ALLOWED_SOURCES="script-src https://plausible.io; connect-src https://plausible.io"
+//! ```
+//!
+//! Only the directives in [`extendable_directive`] take sources, and only
+//! sources naming a host. What is deliberately impossible from an environment
+//! variable: widening `default-src`, `base-uri`, `form-action`, or
+//! `frame-ancestors`, whose whole value is that they name nothing, and adding
+//! `'unsafe-eval'` or any other keyword, which would turn a configuration typo
+//! into an execution gate.
+//!
+//! ## The one response that carries its own
+//!
+//! A handler that sets a `Content-Security-Policy` itself keeps it: the layer
+//! fills the header in, it does not overwrite. Exactly one response in the
+//! framework does that, the API reference at `/api/v1/docs`, which renders
+//! through Scalar from a CDN and would otherwise be a blank page. It carries
+//! [`API_REFERENCE_CSP`], which widens what that page loads and keeps
+//! everything that protects the application around it.
 //!
 //! ## HSTS
 //!
@@ -51,6 +110,7 @@
 //! credentials with a permissive origin, because there are no credentials and
 //! no wildcard.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::Router;
@@ -60,6 +120,7 @@ use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use url::Url;
 
 use crate::config::AppConfig;
 
@@ -73,8 +134,46 @@ const REFERRER_POLICY: HeaderValue = HeaderValue::from_static("strict-origin-whe
 /// No framing at all, by anyone.
 const DENY: HeaderValue = HeaderValue::from_static("DENY");
 
-/// The modern spelling of the same rule; see the module docs on scope.
-const FRAME_ANCESTORS: HeaderValue = HeaderValue::from_static("frame-ancestors 'none'");
+/// The framework's policy, directive by directive, in the order it renders.
+///
+/// Every directive names its own sources, because `default-src 'none'` at the
+/// head means one left out inherits nothing rather than everything. The
+/// per-directive reasoning is in the module docs. `frame-src` and `media-src`
+/// carry no sources of their own and render only when an application adds
+/// some, an embedded payment widget or a video host being the cases that need
+/// them.
+const POLICY: &[(&str, &str)] = &[
+    ("default-src", "'none'"),
+    ("script-src", "'self'"),
+    ("style-src", "'self' 'unsafe-inline'"),
+    ("img-src", "'self' data: blob:"),
+    ("font-src", "'self'"),
+    ("connect-src", "'self'"),
+    ("frame-src", ""),
+    ("media-src", ""),
+    ("base-uri", "'self'"),
+    ("form-action", "'self'"),
+    ("frame-ancestors", "'none'"),
+];
+
+/// The directive the realtime websocket origin joins.
+const CONNECT_SRC: &str = "connect-src";
+
+/// The policy the API reference page carries instead of the framework's.
+///
+/// Scalar renders the OpenAPI document from a CDN bundle that styles itself as
+/// it runs, so the application's policy would leave a blank page. This one
+/// widens exactly that and keeps everything that protects the deployment
+/// around it: no framing, no plugins, no form posting elsewhere, and no
+/// `'unsafe-eval'`. The page takes no user input and renders a document this
+/// application generated, so what it may load is a smaller question than it is
+/// anywhere else.
+pub(crate) const API_REFERENCE_CSP: HeaderValue = HeaderValue::from_static(
+    "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; \
+     font-src 'self' data: https:; connect-src 'self'; base-uri 'self'; \
+     form-action 'self'; frame-ancestors 'none'",
+);
 
 /// A year of https, subdomains included.
 ///
@@ -103,6 +202,44 @@ pub struct CorsConfig {
     pub allowed_origins: Vec<String>,
 }
 
+/// The sources an application adds to the content security policy.
+///
+/// Built by [`crate::config::AppConfig`] from `CSP_ALLOWED_SOURCES`, which is
+/// where the parsing and validation live. Empty, the default, means the
+/// framework's policy is the whole policy; see the module docs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CspConfig {
+    /// Extra sources, keyed by the directive they join.
+    ///
+    /// Keys come from [`extendable_directive`], so they are always a directive
+    /// the policy knows how to render.
+    pub additional_sources: BTreeMap<&'static str, Vec<String>>,
+}
+
+/// Returns the canonical name of a directive configuration may extend.
+///
+/// The directives left out are the ones whose whole value is that they name
+/// nothing: `default-src`, `base-uri`, `form-action`, and `frame-ancestors`.
+/// Widening one of those from an environment variable would undo the policy
+/// rather than extend it, so it stays a code change with a reviewer attached.
+pub(crate) fn extendable_directive(name: &str) -> Option<&'static str> {
+    /// The fetch directives an application has a legitimate reason to widen.
+    const EXTENDABLE: &[&str] = &[
+        "script-src",
+        "style-src",
+        "img-src",
+        "font-src",
+        "connect-src",
+        "frame-src",
+        "media-src",
+    ];
+
+    EXTENDABLE
+        .iter()
+        .copied()
+        .find(|directive| directive.eq_ignore_ascii_case(name))
+}
+
 /// Adds the security headers to every response the router produces.
 pub(crate) fn secure(router: Router, config: &AppConfig) -> Router {
     router.layer(from_fn_with_state(Policy::new(config), apply))
@@ -116,13 +253,15 @@ pub(crate) fn allow_cross_origin(router: Router, config: &AppConfig) -> Router {
     }
 }
 
-/// Whether HSTS applies, decided once at startup and checked per request.
-#[derive(Debug, Clone, Copy)]
+/// The response policy, decided once at startup and applied per request.
+#[derive(Debug, Clone)]
 struct Policy {
     /// HSTS is a production-only header; see the module docs.
     production: bool,
     /// Whether the public base URL the application advertises is https.
     public_url_is_https: bool,
+    /// The content security policy, rendered from the configuration.
+    csp: HeaderValue,
 }
 
 impl Policy {
@@ -130,11 +269,12 @@ impl Policy {
         Self {
             production: config.environment.is_production(),
             public_url_is_https: config.app_url.starts_with("https://"),
+            csp: content_security_policy(config),
         }
     }
 
     /// Returns whether this request's response should carry HSTS.
-    fn sends_hsts(self, request: &Request) -> bool {
+    fn sends_hsts(&self, request: &Request) -> bool {
         self.production && (self.public_url_is_https || arrived_over_https(request))
     }
 }
@@ -145,18 +285,80 @@ async fn apply(State(policy): State<Policy>, request: Request, next: Next) -> Re
 
     let mut response = next.run(request).await;
 
-    // Insert rather than append: the policy is the framework's to decide, and
-    // a duplicate header is a policy two parties disagree about.
+    // Insert rather than append: these are the framework's to decide, and a
+    // duplicate header is a policy two parties disagree about.
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF);
     headers.insert(header::REFERRER_POLICY, REFERRER_POLICY);
     headers.insert(header::X_FRAME_OPTIONS, DENY);
-    headers.insert(header::CONTENT_SECURITY_POLICY, FRAME_ANCESTORS);
+    // The content policy is the exception: a handler that set one made a
+    // narrower decision about its own response, and two policies would be
+    // intersected into something neither party intended.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert_with(|| policy.csp.clone());
     if hsts {
         headers.insert(header::STRICT_TRANSPORT_SECURITY, HSTS);
     }
 
     response
+}
+
+/// Renders the content security policy this deployment sends.
+///
+/// Called once at startup: the policy depends only on configuration, and a
+/// header value assembled per request would be the same string every time.
+fn content_security_policy(config: &AppConfig) -> HeaderValue {
+    let websocket_origin = websocket_origin(&config.app_url);
+    let mut rendered = String::new();
+
+    for (directive, base) in POLICY {
+        let mut sources: Vec<&str> = base.split_whitespace().collect();
+        if *directive == CONNECT_SRC
+            && let Some(origin) = websocket_origin.as_deref()
+        {
+            sources.push(origin);
+        }
+        if let Some(additional) = config.csp.additional_sources.get(directive) {
+            sources.extend(additional.iter().map(String::as_str));
+        }
+        if sources.is_empty() {
+            continue;
+        }
+
+        if !rendered.is_empty() {
+            rendered.push_str("; ");
+        }
+        rendered.push_str(directive);
+        for source in sources {
+            rendered.push(' ');
+            rendered.push_str(source);
+        }
+    }
+
+    HeaderValue::from_str(&rendered)
+        .expect("configuration accepts only sources that are valid header values")
+}
+
+/// Returns the websocket origin of the application's public URL.
+///
+/// `http` becomes `ws` and `https` becomes `wss`, which is the origin the
+/// browser opens the realtime channel on. `None` when `APP_URL` is neither, in
+/// which case `connect-src 'self'` is the whole answer; see the module docs on
+/// why the origin is named at all.
+fn websocket_origin(app_url: &str) -> Option<String> {
+    let url = Url::parse(app_url).ok()?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => return None,
+    };
+    let host = url.host_str()?;
+
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
 }
 
 /// Returns whether the request reached the deployment over https.
@@ -215,8 +417,12 @@ fn cors_layer(config: &CorsConfig) -> Option<CorsLayer> {
 mod tests {
     use axum::body::Body;
     use axum::extract::Request;
+    use axum::http::HeaderValue;
 
-    use super::{CorsConfig, Policy, arrived_over_https, cors_layer};
+    use super::{
+        CorsConfig, Policy, arrived_over_https, cors_layer, extendable_directive, websocket_origin,
+    };
+    use crate::config::AppConfig;
 
     fn request(forwarded_proto: Option<&str>) -> Request {
         let mut builder = Request::builder().uri("/api/v1/team");
@@ -230,7 +436,28 @@ mod tests {
         Policy {
             production,
             public_url_is_https,
+            csp: HeaderValue::from_static("default-src 'none'"),
         }
+    }
+
+    /// The policy a deployment with these variables set would send.
+    fn rendered_policy(variables: &[(&str, &str)]) -> String {
+        let owned: Vec<(String, String)> = variables
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let config = AppConfig::from_lookup(move |name| {
+            owned
+                .iter()
+                .find(|(variable, _value)| variable == name)
+                .map(|(_variable, value)| value.clone())
+        })
+        .expect("test configuration must parse");
+
+        super::content_security_policy(&config)
+            .to_str()
+            .expect("the policy renders as ASCII")
+            .to_owned()
     }
 
     #[test]
@@ -259,6 +486,120 @@ mod tests {
         let plain = policy(true, false);
         assert!(plain.sends_hsts(&request(Some("https"))));
         assert!(!plain.sends_hsts(&request(None)));
+    }
+
+    #[test]
+    fn the_policy_names_every_directive_the_frontend_needs() {
+        let policy = rendered_policy(&[("APP_URL", "https://app.example.com")]);
+
+        // The base case is refusal, so a resource type nobody named is denied.
+        assert!(policy.starts_with("default-src 'none'; "), "got: {policy}");
+        // The build emits no inline script and compiles nothing at runtime.
+        assert!(policy.contains("script-src 'self';"), "got: {policy}");
+        assert!(!policy.contains("'unsafe-eval'"), "got: {policy}");
+        // Runtime-injected stylesheets, some of which carry no nonce at all.
+        assert!(
+            policy.contains("style-src 'self' 'unsafe-inline';"),
+            "got: {policy}",
+        );
+        // The avatar picker previews a chosen file through a blob: URL.
+        assert!(
+            policy.contains("img-src 'self' data: blob:;"),
+            "got: {policy}"
+        );
+        // The realtime channel, named rather than left to `'self'` matching.
+        assert!(
+            policy.contains("connect-src 'self' wss://app.example.com;"),
+            "got: {policy}",
+        );
+        assert!(policy.contains("base-uri 'self';"), "got: {policy}");
+        assert!(policy.contains("form-action 'self';"), "got: {policy}");
+        assert!(policy.ends_with("frame-ancestors 'none'"), "got: {policy}");
+        // Directives with nothing to allow stay out: `default-src 'none'`
+        // already refuses what they would have named.
+        assert!(!policy.contains("frame-src"), "got: {policy}");
+        assert!(!policy.contains("media-src"), "got: {policy}");
+    }
+
+    #[test]
+    fn configured_sources_join_the_directives_they_name() {
+        let policy = rendered_policy(&[
+            ("APP_URL", "http://localhost:3000"),
+            (
+                "CSP_ALLOWED_SOURCES",
+                "script-src https://plausible.io; connect-src https://plausible.io; \
+                 frame-src https://js.stripe.com",
+            ),
+        ]);
+
+        assert!(
+            policy.contains("script-src 'self' https://plausible.io;"),
+            "got: {policy}",
+        );
+        // Beside the framework's own sources, never instead of them.
+        assert!(
+            policy.contains("connect-src 'self' ws://localhost:3000 https://plausible.io;"),
+            "got: {policy}",
+        );
+        // A directive with no framework sources renders exactly what was asked.
+        assert!(
+            policy.contains("frame-src https://js.stripe.com;"),
+            "got: {policy}",
+        );
+    }
+
+    #[test]
+    fn the_websocket_origin_follows_the_public_url() {
+        assert_eq!(
+            websocket_origin("https://app.example.com").as_deref(),
+            Some("wss://app.example.com"),
+        );
+        assert_eq!(
+            websocket_origin("http://localhost:5173").as_deref(),
+            Some("ws://localhost:5173"),
+        );
+        // A default port is not part of an origin, and CSP compares origins.
+        assert_eq!(
+            websocket_origin("https://app.example.com:443").as_deref(),
+            Some("wss://app.example.com"),
+        );
+        assert_eq!(websocket_origin("not a url"), None);
+    }
+
+    /// The guard against a directive configuration accepts and rendering drops.
+    #[test]
+    fn every_extendable_directive_is_one_the_policy_renders() {
+        for name in [
+            "script-src",
+            "style-src",
+            "img-src",
+            "font-src",
+            "connect-src",
+            "frame-src",
+            "media-src",
+        ] {
+            assert_eq!(extendable_directive(name), Some(name));
+            assert!(
+                super::POLICY
+                    .iter()
+                    .any(|(directive, _base)| *directive == name),
+                "{name} can be configured but the policy would never render it",
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_fetch_directives_can_be_extended() {
+        assert_eq!(extendable_directive("script-src"), Some("script-src"));
+        assert_eq!(extendable_directive("CONNECT-SRC"), Some("connect-src"));
+
+        // Widening one of these from an environment variable would undo the
+        // policy rather than extend it.
+        assert_eq!(extendable_directive("default-src"), None);
+        assert_eq!(extendable_directive("base-uri"), None);
+        assert_eq!(extendable_directive("form-action"), None);
+        assert_eq!(extendable_directive("frame-ancestors"), None);
+        assert_eq!(extendable_directive("nonsense"), None);
     }
 
     #[test]

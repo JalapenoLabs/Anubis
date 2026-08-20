@@ -2,6 +2,8 @@
 
 Scaffolding is the crown jewel of Anubis, a 1:1 match of Bullet Train's Super Scaffolding philosophy: one command produces a production-ready, permission-scoped, API-backed, fully tested CRUD feature across the entire stack.
 
+This page is the full statement of the design. [getting-started.md](getting-started.md) is the newcomer's path through the same commands, and [demo.md](demo.md) is the nine-minute script.
+
 ## Philosophy: living templates
 
 Templates are real, functional, compiling code, not a DSL. The generator transforms template files into your model's names and namespaces, and the output is standard Rust and standard React that you own and edit freely.

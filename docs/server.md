@@ -88,13 +88,80 @@ Every response, in every environment:
 | `X-Content-Type-Options` | `nosniff` | A browser never second-guesses a `Content-Type`, so an uploaded file cannot be coaxed into executing as script |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | A path carrying an invitation or reset token never leaves in a `Referer` to another site |
 | `X-Frame-Options` | `DENY` | No framing, so clickjacking has nothing to hang an overlay on |
-| `Content-Security-Policy` | `frame-ancestors 'none'` | The same rule in the header that superseded `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
-
-The CSP is deliberately one directive. A real content policy for the SPA needs `script-src` and `style-src` tied to the hashes or nonces of a particular Vite build, which is a build-pipeline change rather than a header change: the server would have to learn what the bundler emitted. A guessed `default-src` would either break the application or be so permissive it proves nothing. `frame-ancestors` is the part that is honest today; the rest is tracked as follow-up work.
+| `Content-Security-Policy` | the policy below | What the page may load, and from where |
 
 **HSTS** (`Strict-Transport-Security: max-age=31536000; includeSubDomains`) is sent only in production, and only when the request arrived over https or `APP_URL` is an https URL. Both conditions matter. A browser that receives HSTS for `localhost` refuses plain http to `localhost` for a year, across every project on that machine, and the only cure is clearing browser state by hand: a development environment broken by a production header. In production, either the deployment terminates TLS (so `APP_URL` says https) or a proxy names the hop it accepted in `x-forwarded-proto`.
 
 Preload is deliberately absent. Submitting a domain to the preload list is close to irreversible and is the operator's decision, not the framework's.
+
+## The content security policy
+
+One policy, rendered once at startup and sent with every response:
+
+```
+default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss://app.example.com;
+base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+```
+
+It is derived from what the Vite build emits and what the running application loads, not from what a policy generator suggests:
+
+| Directive | Value | Why |
+|---|---|---|
+| `default-src` | `'none'` | The base case is refusal, so a resource type nobody thought about is denied rather than inherited from a permissive default |
+| `script-src` | `'self'` | The build emits no inline script at all: `index.html` carries one hashed module and one stylesheet, both same-origin, and the lazy chunks are same-origin imports. Nothing in the bundle compiles code at runtime, so there is no `'unsafe-eval'` either |
+| `style-src` | `'self' 'unsafe-inline'` | See below |
+| `img-src` | `'self' data: blob:` | Avatars and the TOTP QR code are served by this binary. The avatar picker previews the chosen file through `URL.createObjectURL`, which is a `blob:` URL. `data:` rides along because it is how a canvas or an inline SVG hands a browser an image, and because it names no origin, so configuration could not add it later |
+| `font-src` | `'self'` | The build self-hosts every face; nothing reaches a font CDN |
+| `connect-src` | `'self'` and the websocket origin of `APP_URL` | Every fetch goes to this server's own API, and the realtime channel is a websocket to it. CSP level 3 has `'self'` cover `ws:` on the same host, but browsers implemented that late, and a realtime channel that dies silently in one of them is the worst kind of bug |
+| `base-uri` | `'self'` | An injected `<base>` repoints every relative URL on the page, the ones the SPA fetches with included |
+| `form-action` | `'self'` | A form may only post back here. The directive does not fall back to `default-src`, so leaving it out would allow every destination |
+| `frame-ancestors` | `'none'` | The modern spelling of `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
+
+`frame-src` and `media-src` name nothing, because `default-src 'none'` already refuses them and the frontend embeds neither.
+
+### Why `'unsafe-inline'` is in `style-src`
+
+The component libraries write stylesheets into the document while they run. React Aria adds a `touch-action` rule for every pressable element and an `overscroll-behavior` rule while a modal holds the scroll; Motion inserts one to hold a leaving element in place while it animates out. Some of those honor a nonce and some, including a second copy of React Aria's press handling in the same bundle, set none at all.
+
+A nonce would therefore leave the unnonced ones broken: a policy that reports success while quietly removing behavior. Hashes cannot cover them either, since the rule text is computed from an element's measured position at the moment it leaves.
+
+This is measured rather than assumed: intersect a nonce-only `style-src` over the running application and both injections are refused as `style-src-elem`, React Aria's stylesheet never applying and Motion's positioning silently going missing, because Motion guards on the sheet it was denied.
+
+It is also the standard concession, and a small one. `style-src` is not a code execution boundary; `script-src 'self'` with no inline script and no `'unsafe-eval'` is where the protection lives, and that half is intact.
+
+### Extending it
+
+An application that adds an analytics endpoint, an error ingest, or an image CDN names those sources in `CSP_ALLOWED_SOURCES`, written the way CSP itself is, one group per directive:
+
+```sh
+CSP_ALLOWED_SOURCES="script-src https://plausible.io; connect-src https://plausible.io"
+```
+
+The sources join the framework's rather than replacing them, so the example above sends `script-src 'self' https://plausible.io`. Seven directives take sources: `script-src`, `style-src`, `img-src`, `font-src`, `connect-src`, `frame-src`, and `media-src`. A source must name a host, optionally wildcarded one label deep (`https://*.example.com`, which CSP does match, unlike CORS).
+
+What is deliberately impossible from an environment variable: widening `default-src`, `base-uri`, `form-action`, or `frame-ancestors`, whose whole value is that they name nothing, and adding `'unsafe-eval'`, a bare scheme like `https:`, or any other keyword, which would turn a configuration typo into an execution gate. Everything is validated at startup, so a rejected value stops the boot instead of disappearing into a policy nobody reads until a widget is blank.
+
+### The one response that carries its own
+
+A handler that sets a `Content-Security-Policy` keeps it: the layer fills the header in, it does not overwrite. Exactly one response in the framework does that, the API reference at `/api/v1/docs`, which renders through Scalar from a CDN and would otherwise be a blank page. Its policy widens `script-src` to that CDN and leaves everything that protects the deployment in place: no framing, no plugins, no form posting elsewhere, and no `'unsafe-eval'`.
+
+### In development
+
+Vite serves the SPA in development and sends no policy of its own; the backend answers only API calls there. A policy on a JSON response restricts nothing, because a policy governs the document that fetched the resource rather than the resource itself, so `yarn dev` behaves exactly as it did. The policy becomes real the moment one binary serves both halves, which is what `SPA_DIR` turns on.
+
+That is the one divergence to know about: an inline `<script>` pasted into `index.html`, or a widget pulled from a CDN, works in `yarn dev` and is refused in production. Run the application the way it deploys before believing a third-party snippet works:
+
+```sh
+yarn workspace anubis-starter-frontend build
+SPA_DIR=starter/frontend/dist cargo run -p anubis-starter
+```
+
+The end-to-end suite runs against that shape too, which is how a change to the policy is proven:
+
+```sh
+E2E_BASE_URL=http://localhost:3000 yarn workspace anubis-starter-frontend test:e2e
+```
 
 ## CORS
 
@@ -120,6 +187,7 @@ Allowed requests may carry `Authorization` and `Content-Type`, and use the stand
 | `PORT` | `3000` | Port the server binds to |
 | `APP_URL` | `http://<host>:<port>` | Public base URL; an https value is one of the two triggers for HSTS |
 | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser |
+| `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive |
 | `TRUSTED_PROXY_HEADER` | unset | Forwarding header naming the client address; see [rate limiting](api.md#rate-limiting) |
 | `SPA_DIR` | unset | Directory of built frontend assets; see [architecture](architecture.md#deployment) |
 

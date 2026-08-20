@@ -29,8 +29,16 @@ mod embedded {
 ///
 /// Templates use the same `anubis-starter` vocabulary as the starter itself,
 /// so one replacement pass stamps everything.
+///
+/// Both manifests are stored under prefixed names rather than as `Cargo.toml`.
+/// Cargo's packager prunes any directory holding a `Cargo.toml`, taking it for
+/// a nested package, and a pruned `templates/new` would ship a crate whose
+/// `anubis new` cannot stamp anything.
 const OVERLAY_FILES: [(&str, &str); 10] = [
-    ("Cargo.toml", include_str!("../../templates/new/Cargo.toml")),
+    (
+        "Cargo.toml",
+        include_str!("../../templates/new/workspace-Cargo.toml"),
+    ),
     (
         "backend/Cargo.toml",
         include_str!("../../templates/new/backend-Cargo.toml"),

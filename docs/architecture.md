@@ -65,6 +65,8 @@ One Rust crate, one npm package, one monorepo.
 - `starter/` is the template that `anubis new <name>` stamps out. It is deliberately thin: config, composition, and the application's own domain code. Framework behavior lives in the crate and the npm package so upgrades are version bumps, not template merges. The starter doubles as the host app that keeps the scaffolding templates compiling in CI.
 - `docs/` holds one document per decision category.
 
+The crate and the npm package are published, not consumed from git, and they ship together from one tag under one version. A stamped application therefore pins `anubis` and `@jalapenolabs/anubis` at that one version, and upgrades by bumping them. The starter is vendored into the crate at publish time, because `anubis new` stamps from a template embedded in the binary and `cargo package` reaches nothing above `anubis/`. See [ci.md](ci.md#releases).
+
 Bullet Train's most-cited long-term cost is merging upstream starter changes after customization. Anubis avoids that cost structurally by keeping the starter thin and shipping everything else as versioned dependencies.
 
 ## The contract pipeline
@@ -118,4 +120,6 @@ The scaffolder stamps out patterns, so the patterns are hand-built and stabilize
 - **M2 Tenancy**: Organizations, Teams, Memberships, Invitations, Roles, the `roles.yml` compiler, ownership-chain guards, org/team switcher UI. See [tenancy.md](tenancy.md).
 - **M3 API layer**: `/api/v1` structure, platform applications and bearer tokens, OpenAPI generation, the TypeScript client pipeline. See [api.md](api.md).
 - **M4 Scaffolding**: the `anubis` CLI generators, the field component library, `scaffold model` and `scaffold field` end to end with generated tests. See [scaffolding.md](scaffolding.md).
-- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)) and both halves of webhooks (see [webhooks.md](webhooks.md)). Billing ships its purchase and lifecycle halves: plans in configuration, the Stripe client, subscriptions on the organization, the checkout and portal endpoints, and the Stripe receiver that keeps subscriptions current (see [billing.md](billing.md)); limit enforcement and the billing UI follow.
+- **M5 Ecosystem**: outgoing and incoming webhooks, background jobs, realtime channels, billing, i18n polish, eject tooling. The job queue ships (see [jobs.md](jobs.md)), and so do realtime channels (see [realtime.md](realtime.md)), both halves of webhooks (see [webhooks.md](webhooks.md)), and the eject command (see [scaffolding.md](scaffolding.md#anubis-eject-the-ownership-escape-hatch)). Billing ships whole: plans in configuration, the Stripe client, subscriptions on the organization, the checkout and portal endpoints, the Stripe receiver and reconciliation that keep subscriptions current, hard and soft limits with per-seat pricing, and the billing screen (see [billing.md](billing.md)).
+
+The newcomer path across all of it is [getting-started.md](getting-started.md), and [demo.md](demo.md) is the same ground at demo speed.

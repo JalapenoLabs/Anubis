@@ -104,7 +104,19 @@ use crate::db::DbPool;
 use crate::http::ApiError;
 
 #[doc(inline)]
-pub use headers::CorsConfig;
+pub use headers::{CorsConfig, CspConfig};
+
+/// The directive vocabulary `CSP_ALLOWED_SOURCES` is validated against.
+///
+/// Configuration is the only caller; applications name directives in that
+/// variable rather than in code.
+pub(crate) use headers::extendable_directive;
+
+/// The policy the API reference page sends instead of the application's.
+///
+/// The one response in the framework that overrides the policy; see
+/// [`headers`] for why, and what it widens.
+pub(crate) use headers::API_REFERENCE_CSP;
 
 /// The probe routes, for the manifest test that keeps the route table honest.
 ///

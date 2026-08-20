@@ -385,7 +385,7 @@ async fn platform_tokens_authenticate_the_v1_api() {
     );
     assert!(body["paths"].get("/api/v1/team").is_some(), "body: {body}");
 
-    let (status, _headers, _body) = send(
+    let (status, headers, _body) = send(
         &router,
         TestRequest {
             method: "GET",
@@ -397,4 +397,19 @@ async fn platform_tokens_authenticate_the_v1_api() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // The reference renders through Scalar from a CDN, so it is the one page
+    // that carries a policy of its own rather than the application's strict
+    // one, which would leave it blank.
+    let policy = headers
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .expect("the reference carries a policy");
+    assert!(
+        policy.contains("script-src 'self' https://cdn.jsdelivr.net"),
+        "got: {policy}",
+    );
+    // Everything that protects the deployment around it still holds.
+    assert!(policy.contains("frame-ancestors 'none'"), "got: {policy}");
+    assert!(policy.contains("form-action 'self'"), "got: {policy}");
+    assert!(!policy.contains("'unsafe-eval'"), "got: {policy}");
 }

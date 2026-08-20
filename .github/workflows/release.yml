@@ -1,0 +1,204 @@
+name: Release
+
+# A release is a tag. Pushing `v<version>` verifies the tree, publishes the
+# crate to crates.io and the package to npm, and cuts a GitHub Release from the
+# tag. Running the workflow by hand rehearses all of that and publishes
+# nothing, which is how a release is tried before it is made.
+#
+# The two registry credentials are repository secrets the user configures once:
+# CARGO_REGISTRY_TOKEN and NPM_TOKEN. Without them a dispatch still rehearses
+# every gate; only the two upload steps need them. See docs/ci.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload to crates.io and npm. Off by default: a dispatch is a rehearsal."
+        type: boolean
+        default: false
+
+# Two releases at once would race for the same versions in both registries.
+# Never cancelled: a half-finished publish is worse than a queued one.
+concurrency:
+  group: anubis-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    # The same fleet CI runs on. The registry tokens are repository-scoped
+    # secrets on a private fleet, which is the trust boundary CI already has,
+    # and the warm target dir keeps a release from recompiling the world.
+    runs-on: [self-hosted, rocky9, earthly, docker]
+    permissions:
+      # For `gh release create`.
+      contents: write
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: anubis
+          POSTGRES_PASSWORD: anubis
+          POSTGRES_DB: anubis_release
+        ports:
+          # Ephemeral host port, for the same reason CI uses one.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U anubis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4.10-alpine
+        ports:
+          - 6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # True only for a tag push, or a dispatch that asked for it. Every step
+      # that touches a registry or the releases page reads this.
+      PUBLISHING: ${{ github.event_name == 'push' || inputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Pin Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.17.0 --activate
+
+      # First, because a version mismatch is the one failure that is cheap to
+      # catch and expensive to discover afterwards: neither registry lets a
+      # version be republished. On a dispatch there is no tag to compare to,
+      # so the three declared versions are only checked against each other.
+      - name: Check the release version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+          else
+            bash scripts/check-release-version.sh
+          fi
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        env:
+          DATABASE_URL: postgres://anubis:anubis@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anubis_release
+          REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports['6379'] }}
+        run: cargo test --workspace
+
+      - name: Install
+        run: yarn install --immutable
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Frontend tests
+        run: yarn test
+
+      - name: Build
+        run: yarn build
+
+      # The four generated files must match their sources at the tag, exactly
+      # as they must on every push. A release that ships a stale client is a
+      # release nobody can regenerate their way out of.
+      - name: Roles drift check
+        run: |
+          cargo run --quiet --bin anubis -- roles generate-ts \
+            --file starter/config/roles.yml \
+            --out starter/frontend/src/roles.generated.ts
+          git diff --exit-code starter/frontend/src/roles.generated.ts
+
+      - name: Plans drift check
+        run: |
+          cargo run --quiet --bin anubis -- billing generate-ts \
+            --file starter/config/billing.yml \
+            --out starter/frontend/src/plans.generated.ts
+          git diff --exit-code starter/frontend/src/plans.generated.ts
+
+      - name: Client drift check
+        run: |
+          cargo run --quiet --bin anubis -- client generate-ts \
+            --out frontend/src/api/v1.generated.ts
+          git diff --exit-code frontend/src/api/v1.generated.ts
+
+      - name: Application client drift check
+        run: |
+          exported="$(mktemp)"
+          cargo run --quiet -p anubis-starter -- openapi > "$exported"
+          cargo run --quiet --bin anubis -- client generate-ts \
+            --from "$exported" \
+            --out starter/frontend/src/api/v1.generated.ts
+          git diff --exit-code starter/frontend/src/api/v1.generated.ts
+
+      # `anubis new` stamps from a template embedded at build time, and a
+      # published crate can only embed what lives under anubis/. The copy is
+      # gitignored, so it leaves the tree clean for `cargo publish` to check.
+      - name: Vendor the starter template
+        run: bash scripts/vendor-starter.sh
+
+      # Builds the packaged crate from its own tarball, which is the proof that
+      # the vendored template is complete and the package is self-contained.
+      # The upload below reuses this verification rather than repeating it.
+      - name: Package the crate
+        run: cargo package -p anubis
+
+      - name: Publish the crate
+        if: env.PUBLISHING == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p anubis --no-verify
+
+      # `yarn npm publish` runs prepack, applies publishConfig, and sends the
+      # same tarball `yarn pack` writes, so packing first is a rehearsal of the
+      # exact artifact. The package is scoped, so it needs `--access public`.
+      - name: Pack the npm package
+        run: yarn workspace @jalapenolabs/anubis pack --out /tmp/anubis-npm.tgz
+
+      - name: Publish the npm package
+        if: env.PUBLISHING == 'true'
+        env:
+          YARN_NPM_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: yarn workspace @jalapenolabs/anubis npm publish --access public
+
+      # Both registries carry the version by now, so the release names one
+      # version. The REST API rather than the `gh` CLI, which a self-hosted
+      # runner is not guaranteed to carry; the notes are GitHub's own, drawn
+      # from the commits since the previous tag.
+      - name: Create the GitHub Release
+        if: env.PUBLISHING == 'true' && github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: process.env.GITHUB_REF_NAME,
+              name: process.env.GITHUB_REF_NAME,
+              generate_release_notes: true,
+            })
+
+      # The runners share a workspace between workflows. Checkout cleans it,
+      # but a build that found a stale copy would embed a stale template, so
+      # the copy never outlives the job that made it, however the job ended.
+      - name: Clean up the vendored template
+        if: always()
+        run: bash scripts/vendor-starter.sh --clean

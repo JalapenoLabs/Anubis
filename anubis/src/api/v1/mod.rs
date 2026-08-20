@@ -24,19 +24,20 @@ mod serializers;
 
 use axum::Router;
 use axum::extract::FromRequestParts;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{self, AUTHORIZATION};
 use axum::http::request::Parts;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Extension, Json};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi};
-use utoipa_scalar::{Scalar, Servable};
+use utoipa_scalar::Scalar;
 
 use crate::api::platform::{self, PlatformApplication};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::roles::{Action, RoleSet};
+use crate::server::API_REFERENCE_CSP;
 use crate::tenancy::Team;
 
 #[doc(inline)]
@@ -69,17 +70,26 @@ pub fn router_with(
     application: Router,
     document: utoipa::openapi::OpenApi,
 ) -> Router {
+    // Rendered once: the page is the same bytes for every reader, and the
+    // document it embeds is fixed when the application composes it.
+    let reference = Scalar::new(document.clone()).to_html();
+
     Router::new()
         .route("/team", get(show_team))
         .merge(application)
+        .route("/openapi.json", get(async move || Json(document)))
+        // Scalar is loaded from a CDN and styles itself as it runs, so this is
+        // the one response in the framework that carries a policy of its own
+        // instead of the application's; see [`crate::server`].
         .route(
-            "/openapi.json",
-            get({
-                let document = document.clone();
-                async move || Json(document)
+            "/docs",
+            get(async move || {
+                (
+                    [(header::CONTENT_SECURITY_POLICY, API_REFERENCE_CSP)],
+                    Html(reference.clone()),
+                )
             }),
         )
-        .merge(Scalar::with_url("/docs", document))
         // ApiCaller resolves its pool from request extensions, and so do the
         // application's handlers when they take one.
         .layer(Extension(pool))

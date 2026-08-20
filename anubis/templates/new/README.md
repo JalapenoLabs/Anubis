@@ -81,7 +81,7 @@ directly.
 - `compose.yaml`: the development Postgres
 - `Dockerfile`: the production image, one binary serving the API and the SPA
 - `.env.example`: the development environment, copied to `.env` on first run
-- `.github/workflows/ci.yml`: format, lint, test, build, and the two drift
+- `.github/workflows/ci.yml`: format, lint, test, build, and the three drift
   checks that keep the generated files honest
 
 ## Everyday commands

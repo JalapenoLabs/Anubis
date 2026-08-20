@@ -7,9 +7,25 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-readme = "../README.md"
+readme = "README.md"
 keywords = ["saas", "framework", "web", "scaffolding"]
 categories = ["web-programming", "development-tools"]
+# Publishing is a whitelist, for two reasons. The starter template is a build
+# artifact here (`scripts/vendor-starter.sh` copies it in, and `.gitignore`
+# hides it), and cargo skips gitignored files unless an `include` list makes it
+# walk the filesystem instead of asking git. And `starter/backend` is a package
+# of its own, which the walk would otherwise prune as a nested package.
+# `tests/` is deliberately absent: those tests drive the monorepo's layout and
+# a real Postgres, so shipping them would ship tests that cannot pass.
+include = [
+  "build.rs",
+  "LICENSE",
+  "migrations/**",
+  "README.md",
+  "src/**",
+  "starter/**",
+  "templates/**",
+]
 
 [lib]
 name = "anubis"

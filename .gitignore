@@ -15,6 +15,10 @@ test-results/
 .yarn/*
 .pnp.*
 
+# The starter template, vendored into the crate for publishing by
+# scripts/vendor-starter.sh. Source lives in starter/; this is a copy.
+/anubis/starter/
+
 # Environment
 .env
 .env.local

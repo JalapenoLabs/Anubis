@@ -77,6 +77,49 @@ The Rust and Frontend jobs each end with a vulnerability audit: `cargo audit` ag
 
 `cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The runners keep `~/.cargo/bin` between runs, so only the first run on a fresh runner pays the few minutes it takes to compile.
 
+## Releases
+
+`.github/workflows/release.yml` publishes the crate to crates.io and the package to npm from one tag. The two ship as one release and carry one version: an application depends on both, and a version that names only half of a release is a version nobody can resolve. Pre-1.0 every release may break, and a minor bump signals it.
+
+### Making one
+
+1. Bump the version in the three places `scripts/check-release-version.sh` cross-checks: `[workspace.package] version` and the `anubis` entry under `[workspace.dependencies]` in `Cargo.toml`, and `version` in `frontend/package.json`.
+2. Commit the bump to `develop`, then promote `develop` to `main`.
+3. Rehearse. Run the Release workflow by hand from the Actions tab with `publish` left off: it runs every gate and both packaging steps and uploads nothing.
+4. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The tag push runs the same job with the uploads switched on: the version check first, then fmt, clippy, the workspace tests, the frontend gates, all four drift checks, the vendoring step, `cargo package` (which builds the packaged crate from its own tarball), `cargo publish`, `yarn npm publish`, and a GitHub Release carrying generated notes.
+
+Neither registry lets a version be republished, so a half-finished release is not retried: bump the patch version and release again. The uploads run crate first, then npm, and the GitHub Release last, so the releases page never names a version only one registry carries.
+
+The Scaffold and E2E jobs are deliberately absent. Both already ran on the commit being tagged, and the scaffold proof dirties its own workspace, which `cargo publish` would then refuse to package from.
+
+### What the user configures once
+
+| Where | What |
+|---|---|
+| Repository secrets | `CARGO_REGISTRY_TOKEN`, a crates.io API token scoped to publish-update; `NPM_TOKEN`, an npm automation token that may publish under `@jalapenolabs` |
+| crates.io | Ownership of the `anubis` name by the account the token belongs to. The first publish claims it |
+| npm | The `@jalapenolabs` organization, with the token's account a member. The package is scoped, so every publish passes `--access public` |
+
+Until both secrets exist, a rehearsal still proves everything except the two uploads.
+
+### Vendoring the starter
+
+`anubis new` stamps from a template embedded in the binary at build time, and `cargo package` reaches nothing above `anubis/`. `scripts/vendor-starter.sh` copies the committed `starter/` tree to `anubis/starter/` before packaging, and `build.rs` prefers that copy while falling back to `../starter` in the monorepo, so both builds stamp the same tree. Three details make it work, and each fails silently if undone:
+
+- `anubis/starter/` is gitignored, so the copy never commits and `cargo publish` still sees a clean tree.
+- `include` in `anubis/Cargo.toml` is what puts the copy in the crate at all. An `include` list makes cargo walk the filesystem instead of asking git, and git reports a gitignored path as nothing.
+- Cargo prunes any directory holding a `Cargo.toml`, taking it for a nested package. The vendored `backend/Cargo.toml` therefore travels as `backend/Cargo.toml.vendored`, which `build.rs` strips back off, and the stamp overlays keep theirs under prefixed names (`workspace-Cargo.toml`, `backend-Cargo.toml`).
+
+`anubis/tests/packaging.rs` fails if a directory under `anubis/` is not named by `include`, or if one that is would be pruned. Inspect what a release would ship with:
+
+```sh
+bash scripts/vendor-starter.sh
+cargo package -p anubis          # builds the packaged crate from its own tarball
+bash scripts/vendor-starter.sh --clean
+```
+
 ## CI for stamped applications
 
 `anubis new` stamps `.github/workflows/ci.yml` from `anubis/templates/new/github-ci.yml`, so an application arrives with the same bar the framework holds itself to. Two things differ, both because a stamped app is not on the Jalapeno Labs fleet:

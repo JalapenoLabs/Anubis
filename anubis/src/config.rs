@@ -27,6 +27,7 @@
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
+//! | `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive, e.g. `script-src https://plausible.io; connect-src https://plausible.io` |
 //! | `STRIPE_SECRET_KEY` | unset | Stripe secret key, e.g. `sk_live_...`; setting it enables billing |
 //! | `STRIPE_WEBHOOK_SECRET` | unset | Secret Stripe signs billing events with, e.g. `whsec_...`; setting it enables the billing receiver |
 //! | `STRIPE_API_BASE` | `https://api.stripe.com` | Where Stripe's API lives; overridden only by tests and mocks |
@@ -174,6 +175,23 @@
 //! wildcard, and is normalized at startup, so a typo fails the boot rather than
 //! the first cross-origin call. See [`crate::server`] and `docs/server.md`.
 //!
+//! # The content security policy
+//!
+//! The framework sends a policy built for the frontend it ships, and
+//! `CSP_ALLOWED_SOURCES` is how an application adds what its own third parties
+//! need. It is written the way CSP is, one group per directive:
+//!
+//! ```sh
+//! CSP_ALLOWED_SOURCES="script-src https://plausible.io; connect-src https://plausible.io"
+//! ```
+//!
+//! Only the fetch directives take sources, and only sources naming a host, so a
+//! misconfiguration cannot widen `default-src` or smuggle `'unsafe-eval'` into
+//! `script-src`. Everything is validated at startup: a directive the framework
+//! keeps, or a source that is not an origin, stops the boot rather than
+//! disappearing quietly into a policy nobody reads until a widget is blank. See
+//! [`crate::server`] and `docs/server.md`.
+//!
 //! # Billing
 //!
 //! `STRIPE_SECRET_KEY` is the switch. Set it and an organization can buy a
@@ -210,6 +228,7 @@
 //! needed. `anubis scaffold oauth <provider>` prints both steps.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZero;
@@ -222,7 +241,7 @@ use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::password;
 use crate::auth::secret_box::SecretKey;
 use crate::rate_limit::RateLimitConfig;
-use crate::server::CorsConfig;
+use crate::server::{self, CorsConfig, CspConfig};
 
 /// Selects the runtime environment.
 const ENV_VAR: &str = "ANUBIS_ENV";
@@ -312,6 +331,21 @@ const CORS_ALLOWED_ORIGINS_VAR: &str = "CORS_ALLOWED_ORIGINS";
 /// What a valid `CORS_ALLOWED_ORIGINS` entry looks like, quoted back in errors.
 const ORIGIN_FORM: &str =
     "comma-separated exact origins with no path and no wildcard, e.g. `https://app.example.com`";
+
+/// Adds sources to the content security policy the framework sends.
+const CSP_ALLOWED_SOURCES_VAR: &str = "CSP_ALLOWED_SOURCES";
+
+/// What a valid `CSP_ALLOWED_SOURCES` group looks like, quoted back in errors.
+const CSP_GROUP_FORM: &str = "semicolon-separated groups of a directive and its sources, e.g. \
+     `script-src https://plausible.io; connect-src https://plausible.io`";
+
+/// Which directives `CSP_ALLOWED_SOURCES` may name, quoted back in errors.
+const CSP_DIRECTIVE_FORM: &str = "one of script-src, style-src, img-src, font-src, connect-src, frame-src, media-src; \
+     default-src, base-uri, form-action, and frame-ancestors are the framework's";
+
+/// What a valid `CSP_ALLOWED_SOURCES` source looks like, quoted back in errors.
+const CSP_SOURCE_FORM: &str = "an http, https, ws, or wss origin, optionally wildcarded one label \
+     deep, e.g. `https://plausible.io` or `https://*.example.com`";
 
 /// The Stripe secret key that enables billing.
 const STRIPE_SECRET_KEY_VAR: &str = "STRIPE_SECRET_KEY";
@@ -630,6 +664,11 @@ pub struct AppConfig {
     /// Empty by default, which sends no CORS headers at all; see the module
     /// docs and [`crate::server`].
     pub cors: CorsConfig,
+    /// What the application adds to the content security policy.
+    ///
+    /// Empty by default, which sends the framework's policy unchanged; see the
+    /// module docs and [`crate::server`].
+    pub csp: CspConfig,
     /// Stripe credentials, when `STRIPE_SECRET_KEY` is set.
     ///
     /// Present enables checkout and the customer portal, absent leaves every
@@ -739,6 +778,7 @@ impl AppConfig {
         let spa_dir = non_empty(lookup(SPA_DIR_VAR)).map(|dir| PathBuf::from(dir.trim()));
         let rate_limit = rate_limit_config(&lookup)?;
         let cors = cors_config(&lookup)?;
+        let csp = csp_config(&lookup)?;
         let stripe = stripe_config(&lookup)?;
         let password_hash_concurrency = match non_empty(lookup(PASSWORD_HASH_CONCURRENCY_VAR)) {
             None => password::DEFAULT_CONCURRENCY,
@@ -765,6 +805,7 @@ impl AppConfig {
             spa_dir,
             rate_limit,
             cors,
+            csp,
             stripe,
             password_hash_concurrency,
         })
@@ -860,6 +901,106 @@ fn parse_origin(value: &str) -> Option<String> {
         Origin::Tuple(..) => Some(url.origin().ascii_serialization()),
         Origin::Opaque(_) => None,
     }
+}
+
+/// Resolves what the application adds to the content security policy.
+///
+/// The value is written the way CSP itself is, one group per directive:
+/// `script-src https://plausible.io; connect-src https://plausible.io`. A
+/// directive the framework will not widen, or a source that is not a host,
+/// stops startup rather than being dropped, because a policy quietly missing
+/// the source it was given is a blank widget nobody connects to this variable.
+fn csp_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<CspConfig, Error> {
+    let Some(raw) = non_empty(lookup(CSP_ALLOWED_SOURCES_VAR)) else {
+        return Ok(CspConfig::default());
+    };
+
+    let mut additional_sources: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for group in raw.split(';') {
+        let group = group.trim();
+        if group.is_empty() {
+            continue;
+        }
+
+        let (name, listed) = group
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| Error::invalid(CSP_ALLOWED_SOURCES_VAR, group, CSP_GROUP_FORM))?;
+        let directive = server::extendable_directive(name)
+            .ok_or_else(|| Error::invalid(CSP_ALLOWED_SOURCES_VAR, name, CSP_DIRECTIVE_FORM))?;
+
+        let sources = additional_sources.entry(directive).or_default();
+        for entry in listed.split([',', ' ', '\t']) {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let source = parse_csp_source(entry)
+                .ok_or_else(|| Error::invalid(CSP_ALLOWED_SOURCES_VAR, entry, CSP_SOURCE_FORM))?;
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+
+        if sources.is_empty() {
+            return Err(Error::invalid(
+                CSP_ALLOWED_SOURCES_VAR,
+                group,
+                CSP_GROUP_FORM,
+            ));
+        }
+    }
+
+    Ok(CspConfig { additional_sources })
+}
+
+/// Renders one entry as the source expression CSP will read, or `None`.
+///
+/// Only host sources are accepted. Every real reason to extend the policy names
+/// a host: an analytics endpoint, an error ingest, a CDN, a payment widget. A
+/// form that names none either widens a directive wholesale (`https:`) or
+/// reopens what the framework closed on purpose (`'unsafe-eval'`, `data:` under
+/// `script-src`), and that belongs in a code review rather than in an
+/// environment variable.
+///
+/// A single leading `*.` label is kept, because CSP does match subdomains and
+/// `https://*.example.com` means exactly what people expect it to.
+fn parse_csp_source(value: &str) -> Option<String> {
+    // The wildcard is stripped before parsing and put back after: it is CSP
+    // syntax rather than URL syntax, so no URL parser owes us an opinion on it.
+    let (scheme, rest) = value.split_once("://")?;
+    let (wildcard, host_and_port) = match rest.strip_prefix("*.") {
+        Some(remainder) => (true, remainder),
+        None => (false, rest),
+    };
+
+    let url = Url::parse(&format!("{scheme}://{host_and_port}")).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    if !matches!(url.path(), "" | "/") {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.contains('*') {
+        return None;
+    }
+
+    let mut rendered = format!("{}://", url.scheme());
+    if wildcard {
+        rendered.push_str("*.");
+    }
+    rendered.push_str(host);
+    if let Some(port) = url.port() {
+        rendered.push(':');
+        rendered.push_str(&port.to_string());
+    }
+    Some(rendered)
 }
 
 /// Resolves the Stripe credentials, when the environment carries them.
@@ -1820,6 +1961,78 @@ mod tests {
                 "http://local.example.com".to_owned(),
             ],
         );
+    }
+
+    #[test]
+    fn the_content_policy_takes_extra_sources_per_directive() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert!(defaulted.csp.additional_sources.is_empty());
+
+        let lookup = lookup_from(&[(
+            "CSP_ALLOWED_SOURCES",
+            " script-src https://plausible.io ; connect-src https://plausible.io, \
+             https://*.ingest.sentry.io https://plausible.io ",
+        )]);
+        let config = AppConfig::from_lookup(lookup).expect("sources must parse");
+
+        assert_eq!(
+            config.csp.additional_sources.get("script-src"),
+            Some(&vec!["https://plausible.io".to_owned()]),
+        );
+        assert_eq!(
+            config.csp.additional_sources.get("connect-src"),
+            Some(&vec![
+                "https://plausible.io".to_owned(),
+                // A wildcard label is CSP's own syntax, and is kept.
+                "https://*.ingest.sentry.io".to_owned(),
+            ]),
+            "sources are deduplicated, in order",
+        );
+    }
+
+    #[test]
+    fn a_directive_the_framework_keeps_is_refused() {
+        for value in [
+            "default-src https://anything.example.com",
+            "base-uri https://anything.example.com",
+            "form-action https://anything.example.com",
+            "frame-ancestors https://anything.example.com",
+            "sandbox allow-scripts",
+        ] {
+            let lookup = lookup_from(&[("CSP_ALLOWED_SOURCES", value)]);
+            match AppConfig::from_lookup(lookup) {
+                Ok(config) => panic!("{value:?} must be rejected, got {:?}", config.csp),
+                Err(error) => assert_eq!(error.variable(), "CSP_ALLOWED_SOURCES", "for {value:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_that_is_not_a_host_is_refused() {
+        for value in [
+            // The keywords are the whole point of the policy, so none of them
+            // arrives from an environment variable.
+            "script-src 'unsafe-eval'",
+            "script-src 'unsafe-inline'",
+            "script-src *",
+            // A bare scheme widens a directive wholesale.
+            "script-src https:",
+            "img-src data:",
+            // And the shapes that are simply not origins.
+            "script-src https://cdn.example.com/bundle.js",
+            "script-src https://user:hunter2@cdn.example.com",
+            "script-src cdn.example.com",
+            "script-src ftp://files.example.com",
+            "script-src https://*.*.example.com",
+            // A directive naming nothing asks for something it cannot get.
+            "script-src",
+        ] {
+            let lookup = lookup_from(&[("CSP_ALLOWED_SOURCES", value)]);
+            match AppConfig::from_lookup(lookup) {
+                Ok(config) => panic!("{value:?} must be rejected, got {:?}", config.csp),
+                Err(error) => assert_eq!(error.variable(), "CSP_ALLOWED_SOURCES", "for {value:?}"),
+            }
+        }
     }
 
     #[test]

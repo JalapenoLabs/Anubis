@@ -207,8 +207,101 @@ async fn every_response_carries_the_security_headers() {
     assert_eq!(answer.header(X_FRAME_OPTIONS.as_str()), Some("DENY"));
     assert_eq!(
         answer.header(CONTENT_SECURITY_POLICY.as_str()),
-        Some("frame-ancestors 'none'"),
+        Some(
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: blob:; font-src 'self'; \
+             connect-src 'self' ws://127.0.0.1:3000; base-uri 'self'; form-action 'self'; \
+             frame-ancestors 'none'"
+        ),
     );
+}
+
+/// The policy is what the browser is handed with the application shell, so the
+/// document response is where it has to be right.
+#[tokio::test]
+async fn the_single_page_application_shell_carries_the_whole_policy() {
+    let build = temporary_build();
+    let assets = anubis::spa::Assets::new(&build).expect("the build output must open");
+    let app = app(
+        &config(&[("APP_URL", "https://app.example.com")]),
+        Router::new().fallback_service(assets.into_service()),
+    );
+
+    let answer = send(&app, "GET", "/settings/profile", &[]).await;
+    let policy = answer
+        .header(CONTENT_SECURITY_POLICY.as_str())
+        .expect("the shell carries a policy");
+
+    // The shell loads one hashed module and one stylesheet, both same-origin.
+    assert!(policy.contains("script-src 'self';"), "got: {policy}");
+    assert!(!policy.contains("'unsafe-eval'"), "got: {policy}");
+    // The component libraries write stylesheets into the document as they run.
+    assert!(
+        policy.contains("style-src 'self' 'unsafe-inline';"),
+        "got: {policy}",
+    );
+    // The avatar picker previews a chosen file through a blob: URL.
+    assert!(
+        policy.contains("img-src 'self' data: blob:;"),
+        "got: {policy}"
+    );
+    // The realtime channel, named rather than left to `'self'` matching.
+    assert!(
+        policy.contains("connect-src 'self' wss://app.example.com;"),
+        "got: {policy}",
+    );
+    assert!(policy.contains("default-src 'none';"), "got: {policy}");
+    assert!(policy.contains("base-uri 'self';"), "got: {policy}");
+    assert!(policy.contains("form-action 'self';"), "got: {policy}");
+    assert!(policy.contains("frame-ancestors 'none'"), "got: {policy}");
+
+    let _ignored = std::fs::remove_dir_all(&build);
+}
+
+#[tokio::test]
+async fn an_application_adds_its_own_sources_without_losing_the_frameworks() {
+    let app = app(
+        &config(&[
+            ("APP_URL", "https://app.example.com"),
+            (
+                "CSP_ALLOWED_SOURCES",
+                "script-src https://plausible.io; connect-src https://plausible.io",
+            ),
+        ]),
+        Router::new(),
+    );
+
+    let answer = send(&app, "GET", "/healthz", &[]).await;
+    let policy = answer
+        .header(CONTENT_SECURITY_POLICY.as_str())
+        .expect("every response carries a policy");
+
+    assert!(
+        policy.contains("script-src 'self' https://plausible.io;"),
+        "got: {policy}",
+    );
+    assert!(
+        policy.contains("connect-src 'self' wss://app.example.com https://plausible.io;"),
+        "got: {policy}",
+    );
+}
+
+/// A configuration that would widen the policy silently stops the boot instead.
+#[test]
+fn a_policy_a_deployment_cannot_have_is_refused_at_startup() {
+    for value in [
+        "default-src https://anything.example.com",
+        "script-src 'unsafe-eval'",
+        "script-src https:",
+    ] {
+        let owned = value.to_owned();
+        let loaded = AppConfig::from_lookup(move |name| {
+            (name == "CSP_ALLOWED_SOURCES").then(|| owned.clone())
+        });
+
+        let error = loaded.expect_err("a policy the framework will not send must stop the boot");
+        assert_eq!(error.variable(), "CSP_ALLOWED_SOURCES", "for {value:?}");
+    }
 }
 
 #[tokio::test]
@@ -530,11 +623,11 @@ async fn a_request_that_never_finishes_is_abandoned() {
     );
 }
 
-#[tokio::test]
-async fn the_headers_reach_the_single_page_application_too() {
-    // The composition a production deployment runs: the SPA as the router's
-    // fallback, hardened around it. Merging the probes into a router that
-    // already has a fallback must work, and the shell must carry the policy.
+/// A directory shaped like a frontend build: a shell and one hashed asset.
+///
+/// The caller removes it; every test that takes one drives a real
+/// `anubis::spa::Assets` over it.
+fn temporary_build() -> std::path::PathBuf {
     let build = std::env::temp_dir().join(format!("anubis-server-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(build.join("assets")).expect("the build output must be creatable");
     std::fs::write(
@@ -548,6 +641,16 @@ async fn the_headers_reach_the_single_page_application_too() {
         "console.log('anubis');\n".repeat(500),
     )
     .expect("the asset must be writable");
+
+    build
+}
+
+#[tokio::test]
+async fn the_headers_reach_the_single_page_application_too() {
+    // The composition a production deployment runs: the SPA as the router's
+    // fallback, hardened around it. Merging the probes into a router that
+    // already has a fallback must work, and the shell must carry the policy.
+    let build = temporary_build();
 
     let assets = anubis::spa::Assets::new(&build).expect("the build output must open");
     let app = app(
