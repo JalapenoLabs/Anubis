@@ -59,6 +59,7 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
             "/creative-concepts/{creative_concept_id}",
             get(show).patch(update).delete(destroy),
         )
+        // 🐺 anubis:account-routes
         .with_state(CreativeConceptState {
             pool: pool.clone(),
             roles: roles.clone(),
@@ -327,9 +328,10 @@ async fn apply_changes(
     // A blank description clears the column, which is what the form submits
     // when the user empties the field.
     let description = optional_text(body.description.as_deref());
-    // 🐺 anubis:update-normalize
-
+    // A scaffolded association validates its submitted id here, so the team is
+    // in scope before the anchor rather than after it.
     let team_id = record.team_id;
+    // 🐺 anubis:update-normalize
 
     connection
         .transaction::<CreativeConceptView, ApiError, _>(async |connection| {
@@ -461,6 +463,8 @@ async fn destroy(
     delete_record(&mut connection, creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+// 🐺 anubis:handlers
 
 // ---------------------------------------------------------------------------
 // API handlers: a platform application's bearer token, acting as its team.

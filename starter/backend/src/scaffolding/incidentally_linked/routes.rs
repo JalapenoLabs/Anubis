@@ -16,7 +16,7 @@
 use anubis::auth::CurrentUser;
 use anubis::db::DbPool;
 use anubis::guard::TeamMember;
-use anubis::http::ApiError;
+use anubis::http::{ApiError, FieldOption, FieldOptions};
 use anubis::roles::{Action, RoleSet};
 use anubis::tenancy::TeamMembership;
 use axum::extract::{Path, State};
@@ -59,19 +59,6 @@ struct IncidentalLinkageState {
     roles: RoleSet,
 }
 
-/// One option a `super_select` field may offer, already shaped like the field
-/// component library's `FieldOption`.
-#[derive(Serialize)]
-struct IncidentalLinkageOption {
-    value: Uuid,
-    label: String,
-}
-
-#[derive(Serialize)]
-struct IncidentalLinkageOptionsBody {
-    options: Vec<IncidentalLinkageOption>,
-}
-
 #[derive(Serialize)]
 struct AttachedPeripheralNotionsBody {
     peripheral_notions: Vec<PeripheralNotion>,
@@ -94,10 +81,10 @@ async fn options(
         .await
         .map_err(log_internal)?;
 
-    Ok(Json(IncidentalLinkageOptionsBody {
+    Ok(Json(FieldOptions {
         options: valid
             .into_iter()
-            .map(|peripheral_notion| IncidentalLinkageOption {
+            .map(|peripheral_notion| FieldOption {
                 value: peripheral_notion.id,
                 label: peripheral_notion.name,
             })

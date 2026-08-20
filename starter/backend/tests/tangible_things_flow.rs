@@ -192,6 +192,8 @@ async fn the_tangible_thing_slice_serves_full_crud() {
     );
     // 🐺 anubis:test-updated
 
+    // 🐺 anubis:test-associations
+
     // A parent from another team is refused by the valid_* scoping method.
     let outsider_team = bootstrapped_team(&router, &outsider_cookie).await;
     let foreign_parent_id =

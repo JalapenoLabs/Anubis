@@ -55,6 +55,13 @@ function toFormValues(
 
 type Props = {
   creativeConceptId: string
+  /**
+   * The owning team, for the options a scaffolded association offers.
+   *
+   * Both forms carry it, whatever their ownership depth, so one field
+   * scaffold serves both.
+   */
+  teamId: string
   /** The tangible thing being edited, or null to create a new one. */
   editing: TangibleThing | null
   /** Called after a successful write, and when an edit is abandoned. */

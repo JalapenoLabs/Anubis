@@ -156,4 +156,6 @@ impl CreativeConcept {
             .await
             .optional()
     }
+
+    // 🐺 anubis:model-methods
 }

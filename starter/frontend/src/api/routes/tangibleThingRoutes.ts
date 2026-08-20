@@ -84,3 +84,5 @@ export function updateTangibleThing(
 export function deleteTangibleThing(tangibleThingId: string) {
   return appClient.delete(`tangible-things/${tangibleThingId}`)
 }
+
+// 🐺 anubis:route-functions

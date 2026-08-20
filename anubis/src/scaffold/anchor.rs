@@ -88,6 +88,13 @@ pub const CHILD_IMPORTS: &str = "🐺 anubis:child-imports";
 /// A show page: the section elements of the models it owns.
 pub const CHILDREN: &str = "🐺 anubis:children";
 
+/// A model's `model.rs`: the inherent methods an association adds.
+///
+/// A `belongs_to` needs two of them, its `valid_*` scoping method and the label
+/// lookup a page of records is serialized through, so the model's own `impl`
+/// block carries an insertion point the way its struct definitions do.
+pub const MODEL_METHODS: &str = "🐺 anubis:model-methods";
+
 /// A model's `model.rs`: the record struct's columns.
 pub const RECORD_FIELDS: &str = "🐺 anubis:record-fields";
 
@@ -99,6 +106,15 @@ pub const CHANGESET_FIELDS: &str = "🐺 anubis:changeset-fields";
 
 /// A model's `model.rs`: the changeset's "was anything submitted" test.
 pub const CHANGESET_EMPTY: &str = "🐺 anubis:changeset-empty";
+
+/// A model's `routes.rs`: the account routes an association mounts.
+///
+/// It sits between the model's own `.route(...)` calls and `.with_state(...)`,
+/// so an inserted mount joins the builder chain already formatted.
+pub const ACCOUNT_ROUTES: &str = "🐺 anubis:account-routes";
+
+/// A model's `routes.rs`: the handlers an association's routes dispatch to.
+pub const HANDLERS: &str = "🐺 anubis:handlers";
 
 /// A model's `routes.rs`: the create request body's members.
 pub const CREATE_BODY: &str = "🐺 anubis:create-body";
@@ -145,8 +161,18 @@ pub const TEST_UPDATE: &str = "🐺 anubis:test-update";
 /// A model's integration test: the assertions on the updated record.
 pub const TEST_UPDATED: &str = "🐺 anubis:test-updated";
 
+/// A model's integration test: the narrative an association adds.
+///
+/// The four anchors above extend a request that already exists; an
+/// association's options endpoint and its assignment are requests of their
+/// own, so they need statement position rather than a payload member.
+pub const TEST_ASSOCIATIONS: &str = "🐺 anubis:test-associations";
+
 /// A model's route module: the wire type's members.
 pub const WIRE_FIELDS: &str = "🐺 anubis:wire-fields";
+
+/// A model's route module: the request functions an association adds.
+pub const ROUTE_FUNCTIONS: &str = "🐺 anubis:route-functions";
 
 /// A model's route module: the create request type's members.
 pub const CREATE_REQUEST: &str = "🐺 anubis:create-request";

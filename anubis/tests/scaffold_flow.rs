@@ -254,7 +254,7 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
     // and the template's own child is not carried along with it.
     let page = read(&app.join("frontend/src/pages/ProjectPage.tsx"));
     assert!(
-        page.contains("<GoalsSection projectId={projectId} />"),
+        page.contains("<GoalsSection projectId={projectId} teamId={teamId} />"),
         "{page}"
     );
     assert!(!page.contains("🐺 anubis:template-only"), "{page}");
@@ -838,19 +838,173 @@ fn join_and_association_arguments_are_rejected_with_a_reason() {
         stderr(&unjoined),
     );
 
-    // And `scaffold model` refuses one outright: the join cannot exist yet.
-    let at_model_time = scaffold(
-        &app,
-        &["Ticket", "Team", "tag_ids:super_select{class_name=Tag}"],
-    );
-    assert!(!at_model_time.status.success());
-    assert!(
-        stderr(&at_model_time).contains("anubis scaffold join"),
-        "unexpected error: {}",
-        stderr(&at_model_time),
-    );
+    // And `scaffold model` refuses either association outright: both reach a
+    // model that cannot exist yet.
+    for argument in [
+        "tag_ids:super_select{class_name=Tag}",
+        "lead_id:super_select{class_name=TeamMembership}",
+    ] {
+        let at_model_time = scaffold(&app, &["Ticket", "Team", argument]);
+        assert!(!at_model_time.status.success());
+        assert!(
+            stderr(&at_model_time).contains("anubis scaffold field"),
+            "unexpected error: {}",
+            stderr(&at_model_time),
+        );
+    }
 
     assert!(!app.join("backend/src/applied_tags").exists());
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
+/// Bullet Train's signature assignment, and its application-model twin.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one field, and every artifact it reaches, read in one place"
+)]
+fn a_belongs_to_assigns_one_record_through_a_foreign_key() {
+    let app = copy_starter("belongs-to");
+
+    let output = scaffold(&app, &["Project", "Team", "name:text_field"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = scaffold(&app, &["Tag", "Team", "name:text_field"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let output = scaffold_field(
+        &app,
+        &["Project", "lead_id:super_select{class_name=TeamMembership}"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // A real column: nullable, indexed, and cleared rather than blocking when
+    // the membership it points at goes.
+    let added = migration(&app, "_add_lead_id_to_projects");
+    let up = read(&added.join("up.sql"));
+    assert!(
+        up.contains("ADD COLUMN lead_id UUID REFERENCES team_memberships (id) ON DELETE SET NULL;"),
+        "up.sql: {up}",
+    );
+    assert!(up.contains("CREATE INDEX projects_lead_id_index ON projects (lead_id);"));
+    assert_eq!(
+        read(&added.join("down.sql")).trim(),
+        "ALTER TABLE projects DROP COLUMN lead_id;",
+    );
+
+    let schema = read(&app.join("backend/src/schema.rs"));
+    assert!(schema.contains("lead_id -> Nullable<Uuid>,"), "{schema}");
+
+    // The model owns the scope and the labels, through the framework's roster
+    // rather than through a Diesel join no application crate may declare.
+    let model = read(&app.join("backend/src/projects/model.rs"));
+    assert!(model.contains("pub lead_id: Option<Uuid>,"), "{model}");
+    assert!(model.contains("pub lead_id: Option<Option<Uuid>>,"));
+    assert!(model.contains("pub async fn valid_leads("));
+    assert!(model.contains("TeamMembership::valid_for_team(connection, team_id)"));
+    assert!(model.contains("pub async fn lead_labels("));
+    assert_anchored(
+        &model,
+        "🐺 anubis:model-methods",
+        "pub async fn lead_labels(",
+    );
+
+    // The options endpoint, the check both writes run, and the joined label.
+    let routes = read(&app.join("backend/src/projects/routes.rs"));
+    assert!(
+        routes.contains("\"/teams/{team_id}/projects/options/lead\""),
+        "{routes}",
+    );
+    assert!(routes.contains("async fn lead_options("));
+    assert!(routes.contains("async fn require_valid_lead("));
+    assert!(routes.contains("deserialize_with = \"anubis::http::absent_or_null\""));
+    assert!(routes.contains("lead_label: Option<String>,"));
+    assert!(routes.contains("Project::lead_labels("));
+    assert_anchored(
+        &routes,
+        "🐺 anubis:handlers",
+        "async fn require_valid_lead(",
+    );
+
+    // The narrative proves the whole assignment against a real Postgres.
+    let narrative = read(&app.join("backend/tests/projects_flow.rs"));
+    assert!(
+        narrative.contains("/account/teams/{team_id}/projects/options/lead"),
+        "{narrative}",
+    );
+    assert!(narrative.contains("assert_eq!(body[\"project\"][\"lead_id\"], json!(null));"));
+    assert!(narrative.contains("assert_eq!(status, StatusCode::BAD_REQUEST);"));
+
+    // The frontend reads the label and writes the id.
+    let wire = read(&app.join("frontend/src/api/routes/projectRoutes.ts"));
+    assert!(wire.contains("lead_id: string | null"), "{wire}");
+    assert!(wire.contains("lead_label: string | null"));
+    assert!(wire.contains("export function listProjectLeadOptions(teamId: string) {"));
+    assert!(wire.contains("teams/${teamId}/projects/options/lead"));
+
+    let form = read(&app.join("frontend/src/components/ProjectForm.tsx"));
+    assert!(form.contains("  useFieldOptions,\n"), "{form}");
+    assert!(form.contains("const leadOptions = useFieldOptions("));
+    assert!(form.contains("name='lead_id'"));
+    assert!(!form.contains("isMultiple"), "a belongs_to is one record");
+
+    let locale = read(&app.join("frontend/src/locales/models/projects.en-US.json"));
+    assert!(locale.contains("\"leadId\": \"Lead\""), "{locale}");
+
+    // The same field against an application model reads that model's table,
+    // and offering its records is a read on it.
+    let output = scaffold_field(
+        &app,
+        &[
+            "Project",
+            "owner_id:super_select{\"class_name=Tag,source=team.tags\"}",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let model = read(&app.join("backend/src/projects/model.rs"));
+    assert!(model.contains("use crate::schema::tags;"), "{model}");
+    assert!(model.contains("tags::team_id.eq(team_id)"));
+    let routes = read(&app.join("backend/src/projects/routes.rs"));
+    assert!(routes.contains("member.require(Action::Read, crate::tags::MODEL)?;"));
+
+    // A target this application does not own names the command that makes it.
+    let missing = scaffold_field(
+        &app,
+        &["Project", "sponsor_id:super_select{class_name=Sponsor}"],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing).contains("anubis scaffold model Sponsor Team"),
+        "unexpected error: {}",
+        stderr(&missing),
+    );
+
+    // A source the generator cannot write a query for is refused by name.
+    let unknown = scaffold_field(
+        &app,
+        &[
+            "Project",
+            "owner_id:super_select{\"class_name=Tag,source=Tag.all\"}",
+        ],
+    );
+    assert!(!unknown.status.success());
+    assert!(
+        stderr(&unknown).contains("source=team.tags"),
+        "unexpected error: {}",
+        stderr(&unknown),
+    );
+
+    // And a column the model already carries is never redefined.
+    let repeat = scaffold_field(
+        &app,
+        &["Project", "lead_id:super_select{class_name=TeamMembership}"],
+    );
+    assert!(!repeat.status.success());
+    assert!(
+        stderr(&repeat).contains("already has a `lead_id` column"),
+        "unexpected error: {}",
+        stderr(&repeat),
+    );
+
     std::fs::remove_dir_all(&app).expect("scratch directories are removable");
 }
 

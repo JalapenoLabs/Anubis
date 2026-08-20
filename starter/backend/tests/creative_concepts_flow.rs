@@ -216,6 +216,8 @@ async fn the_creative_concept_slice_serves_full_crud() {
     );
     // 🐺 anubis:test-updated
 
+    // 🐺 anubis:test-associations
+
     // Destroy, and the record is gone for good.
     let (status, _body) = send(&router, "DELETE", &member_path, None, Some(&owner_cookie)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);

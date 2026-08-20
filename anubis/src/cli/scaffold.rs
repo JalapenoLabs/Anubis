@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anubis::scaffold::{
-    Artifact, Field, FieldScaffold, JoinScaffold, LOCALE_FIELDS, ModelScaffold, ModelTemplate,
-    Names, OauthScaffold, Replacements, WebhookScaffold, anchor, insert_above_anchor,
-    insert_json_entries, line_containing, locale_file, model_artifacts, table_block,
+    Artifact, BelongsTo, Field, FieldScaffold, JoinScaffold, LOCALE_FIELDS, ModelScaffold,
+    ModelTemplate, Names, OauthScaffold, Replacements, Source, WebhookScaffold, anchor,
+    insert_above_anchor, insert_json_entries, line_containing, locale_file, model_artifacts,
+    table_block,
 };
 
 use super::{app_root, display, fail, read};
@@ -648,7 +649,7 @@ pub(crate) fn field(model: &str, argument: &str) -> ExitCode {
         Err(reason) => return fail(&reason),
     };
 
-    // An association reads and writes through a join model, and only the
+    // A has-many-through reads and writes through a join model, and only the
     // application knows which one links the pair.
     let parsed = match parsed.association() {
         None => parsed,
@@ -657,6 +658,13 @@ pub(crate) fn field(model: &str, argument: &str) -> ExitCode {
             Err(reason) => return fail(&reason),
         },
     };
+    // A belongs_to points at a model this application must already own, unless
+    // it points at the framework's own roster.
+    if let Some(key) = parsed.belongs_to()
+        && let Err(reason) = require_assignable(&root, key)
+    {
+        return fail(&reason);
+    }
     let scaffold = FieldScaffold::new(names.clone(), parsed);
 
     let plan = match plan_field(&root, &names, &scaffold) {
@@ -694,11 +702,12 @@ fn plan_field(root: &Path, names: &Names, scaffold: &FieldScaffold) -> Result<Fi
         ));
     }
 
-    // An association adds no column to this model's table: its values are rows
-    // in the join table, so the run writes no migration and touches no schema.
+    // A has-many-through adds no column to this model's table: its values are
+    // rows in the join table, so the run writes no migration and touches no
+    // schema. A belongs_to is a column like any other.
     let mut created = Vec::new();
     let mut updated = Vec::new();
-    if scaffold.field().field_type().is_some() {
+    if scaffold.field().schema_column().is_some() {
         updated.push(update_schema_column(root, &table, scaffold)?);
         created = migration_for_field(root, &table, scaffold)?;
     } else {
@@ -794,6 +803,38 @@ fn resolve_join(root: &Path, model: &Names, target: &Names) -> Result<Names, Str
             target.pascal(),
         )),
     }
+}
+
+/// Refuses a `belongs_to` whose target this application cannot scope to a team.
+///
+/// The roster is the framework's own table and is always assignable. Every
+/// other target is an application model, and it has to reach a team in one
+/// step, for the same reason both sides of a join do: one comparison decides
+/// whether a submitted id is this tenant's.
+fn require_assignable(root: &Path, key: &BelongsTo) -> Result<(), String> {
+    if key.source() == Source::TeamMemberships {
+        return Ok(());
+    }
+
+    let names = key.target();
+    let relative = format!("backend/src/{}/model.rs", key.target_table());
+    if !root.join(&relative).is_file() {
+        return Err(format!(
+            "no model named `{}` in this application: {relative} does not exist. Generate it \
+             first with `anubis scaffold model {} Team`.",
+            names.pascal(),
+            names.pascal(),
+        ));
+    }
+    if !read(&root.join(&relative))?.contains("pub team_id: Uuid,") {
+        return Err(format!(
+            "`{}` is not owned directly by a team. A belongs_to points at a team-owned model \
+             today, so one comparison decides whether a submitted id is this tenant's; deeper \
+             chains are on the roadmap.",
+            names.pascal(),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses an association the model already carries.
@@ -954,16 +995,28 @@ fn report_field(names: &Names, scaffold: &FieldScaffold, plan: &FieldPlan) {
                  already holds stay valid."
             );
         }
-        None => {
-            println!(
-                "The association adds no column: its values are rows in the join table, which \
-                 already exists, so this run writes no migration."
-            );
-        }
+        None => match scaffold.field().belongs_to() {
+            Some(key) => {
+                println!(
+                    "The column is a nullable foreign key into {}, indexed, and cleared rather \
+                     than blocking when the record it points at is deleted. Options and writes \
+                     both read the generated `{}` method, so a form can only ever offer, and a \
+                     request only ever store, a record of the caller's own team.",
+                    key.target_table(),
+                    key.valid_method(),
+                );
+            }
+            None => {
+                println!(
+                    "The association adds no column: its values are rows in the join table, \
+                     which already exists, so this run writes no migration."
+                );
+            }
+        },
     }
     println!();
     println!("Next steps:");
-    if scaffold.field().field_type().is_some() {
+    if scaffold.field().schema_column().is_some() {
         println!("  boot the app to apply the migration");
     }
     println!("  cargo test");

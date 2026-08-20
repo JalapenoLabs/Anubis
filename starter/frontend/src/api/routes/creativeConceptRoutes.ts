@@ -80,3 +80,5 @@ export function updateCreativeConcept(
 export function deleteCreativeConcept(creativeConceptId: string) {
   return appClient.delete(`creative-concepts/${creativeConceptId}`)
 }
+
+// 🐺 anubis:route-functions

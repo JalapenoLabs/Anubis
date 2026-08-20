@@ -183,4 +183,6 @@ impl TangibleThing {
             .await
             .optional()
     }
+
+    // 🐺 anubis:model-methods
 }

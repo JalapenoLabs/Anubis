@@ -35,6 +35,8 @@ const PAGE_LIMIT = 10
 
 type Props = {
   creativeConceptId: string
+  /** The owning team, for the options a scaffolded association offers. */
+  teamId: string
 }
 
 /**
@@ -175,6 +177,7 @@ export function TangibleThingsSection(props: Props) {
           <CardBody>
             <TangibleThingForm
               creativeConceptId={props.creativeConceptId}
+              teamId={props.teamId}
               editing={editing}
               onDone={() => {
                 setEditing(null)

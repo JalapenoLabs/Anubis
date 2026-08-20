@@ -183,6 +183,60 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// One choice a select field offers: the id stored, and the label shown.
+///
+/// It is the wire shape of the field library's `FieldOption`, so an options
+/// endpoint answers with exactly what a generated form passes to its control.
+/// Both association scaffolds serialize it: the join model's options endpoint
+/// and the `belongs_to` options endpoint a `<name>_id:super_select` field adds
+/// to the model that points at the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(description = "One choice a select field offers.")]
+pub struct FieldOption {
+    /// The id a record stores when this option is chosen.
+    pub value: uuid::Uuid,
+    /// The text a person recognizes the option by.
+    pub label: String,
+}
+
+/// The envelope an options endpoint answers with.
+///
+/// One declaration for every association, so a generated options handler
+/// contributes a query and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(description = "The choices a select field may offer.")]
+pub struct FieldOptions {
+    /// The choices, already ordered for display.
+    pub options: Vec<FieldOption>,
+}
+
+/// Deserializes a field that tells an absent value apart from an explicit null.
+///
+/// `serde` folds both onto `None` for a plain `Option<T>`, which is right for
+/// a column a blank string can clear and wrong for one only `null` can. A
+/// changeset column reached through this reads `None` when the request left it
+/// out, `Some(None)` when the request sent `null`, and `Some(Some(value))`
+/// otherwise, which is exactly Diesel's changeset shape for a nullable column.
+///
+/// ```ignore
+/// #[derive(Deserialize)]
+/// struct UpdateProjectBody {
+///     #[serde(default, deserialize_with = "anubis::http::absent_or_null")]
+///     lead_id: Option<Option<Uuid>>,
+/// }
+/// ```
+///
+/// # Errors
+/// Returns the deserializer's own error when the value is present but is not
+/// of the expected type.
+pub fn absent_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// The list-endpoint query conventions: `?page=`, `?limit=`, `?sort=`.
 ///
 /// `page` is 1-based and defaults to 1; `limit` defaults to

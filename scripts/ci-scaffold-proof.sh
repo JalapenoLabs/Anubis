@@ -88,8 +88,9 @@ echo "== scaffolding a domain into starter/ =="
 # One domain, covering every scaffolder and every shape they generate: a
 # team-owned model with extra fields, a field added afterwards, the field types
 # the templates prove, a nested model attaching itself to its parent's page, a
-# join and the association field that reads through it, a sign-in provider, and
-# an incoming webhook receiver.
+# join and the has-many-through field that reads through it, both flavours of
+# belongs_to on both ownership depths, a sign-in provider, and an incoming
+# webhook receiver.
 scaffold model Project Team name:text_field description:text_area
 scaffold field Project priority:text_field
 scaffold model Ticket Team title:text_field urgency:number_field open:boolean due_date:date_field
@@ -97,6 +98,13 @@ scaffold model Goal Project,Team name:text_field
 scaffold model Tag Team name:text_field
 scaffold join AppliedTag "project_id{class_name=Project}" "tag_id{class_name=Tag}"
 scaffold field Project "tag_ids:super_select{class_name=Tag}"
+# Bullet Train's signature assignment, on a team-owned model and on a nested
+# one, then the same field pointed at an application model with `source` spelled
+# out. The membership narratives assign a real person; the model-backed one
+# proves the scoping a fresh team sees.
+scaffold field Project "lead_id:super_select{class_name=TeamMembership}"
+scaffold field Goal "owner_id:super_select{class_name=TeamMembership}"
+scaffold field Ticket 'reviewer_id:super_select{"class_name=Tag,source=team.tags"}'
 scaffold oauth google
 scaffold webhook Stripe
 

@@ -444,8 +444,10 @@ impl ModelScaffold {
             page: format!("frontend/src/pages/{}Page.tsx", parent.pascal()),
             import: format!("import {{ {section} }} from '../components/{section}'"),
             // The parent page reads its own id out of the route, under the
-            // name the parent's own scaffold gave it.
-            element: format!("<{section} {parent_id}={{{parent_id}}} />"),
+            // name the parent's own scaffold gave it, and hands down the team
+            // a scaffolded association's options are scoped to. Wrapped the
+            // way a long model name would need, exactly as the link factory is.
+            element: section_element(&section, &parent_id),
         })
     }
 
@@ -538,6 +540,23 @@ pub struct ChildAttachment {
     pub element: String,
 }
 
+/// The section element a nested model's scaffold inserts into its parent page.
+///
+/// Emitted on one line when it fits the frontend's `max-len`, and split the way
+/// a reviewer would split it when a long model name pushes it past.
+fn section_element(section: &str, parent_id: &str) -> String {
+    // The page reads its own indentation onto every inserted line, so the
+    // width has to allow for it.
+    const PAGE_INDENT: usize = 4;
+
+    let single = format!("<{section} {parent_id}={{{parent_id}}} teamId={{teamId}} />");
+    if single.len() + PAGE_INDENT <= TS_MAX_WIDTH {
+        single
+    } else {
+        format!("<{section}\n  {parent_id}={{{parent_id}}}\n  teamId={{teamId}}\n/>")
+    }
+}
+
 /// One `<Route>` element, wrapped in the workspace gate like every app page.
 fn route_element(path: &str, page: &str) -> String {
     format!(
@@ -606,14 +625,14 @@ fn validate_fields(fields: &[Field], parent: Option<&Names>) -> Result<(), Scaff
                 field.name()
             )));
         }
-        // An association reads through a join model, which cannot exist before
-        // the model this run is generating. Bullet Train splits the two
-        // commands for the same reason.
-        if field.association().is_some() {
+        // An association points at something that has to exist already: a join
+        // model for a has-many-through, a team-owned model for a belongs_to.
+        // Bullet Train splits the commands for the same reason.
+        if field.is_association() {
             return Err(ScaffoldError::new(format!(
-                "field `{}` is a has-many-through association, and an association needs a join \
-                 model that already exists. Generate this model first, then run \
-                 `anubis scaffold join` and `anubis scaffold field`.",
+                "field `{}` is an association, and an association reaches a model that already \
+                 exists. Generate this model first, then add the field with \
+                 `anubis scaffold field`.",
                 field.name(),
             )));
         }
@@ -854,7 +873,10 @@ mod tests {
             attachment.import,
             "import { GoalsSection } from '../components/GoalsSection'",
         );
-        assert_eq!(attachment.element, "<GoalsSection projectId={projectId} />");
+        assert_eq!(
+            attachment.element, "<GoalsSection projectId={projectId} teamId={teamId} />",
+            "a section is handed its parent's id and the team its options are scoped to",
+        );
 
         let replacements = scaffold.replacements();
         assert_eq!(

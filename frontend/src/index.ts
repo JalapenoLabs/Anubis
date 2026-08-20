@@ -89,6 +89,7 @@ export { RichTextView } from './fields/RichTextView'
 export { SuperSelectField } from './fields/SuperSelectField'
 export { TextAreaField } from './fields/TextAreaField'
 export { TextField } from './fields/TextField'
+export { useFieldOptions } from './fields/useFieldOptions'
 export { useFieldState } from './fields/useFieldState'
 
 // WebAuthn

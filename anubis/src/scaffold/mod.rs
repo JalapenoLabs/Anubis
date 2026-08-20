@@ -61,7 +61,8 @@ pub use error::ScaffoldError;
 pub use extract::{line_containing, table_block};
 #[doc(inline)]
 pub use field::{
-    Artifact, Association, FIELD_TYPES, Field, FieldScaffold, FieldType, LOCALE_FIELDS,
+    Artifact, Association, BelongsTo, FIELD_TYPES, Field, FieldScaffold, FieldType, LOCALE_FIELDS,
+    Source, TEAM_MEMBERSHIP,
 };
 #[doc(inline)]
 pub use inflect::{NameError, Names, pluralize};

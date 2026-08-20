@@ -71,10 +71,13 @@ Each one closes a list of columns. A model's artifacts carry them wherever a fie
 
 | Anchor | File | Insertion point |
 |---|---|---|
+| `// 🐺 anubis:model-methods` | `backend/src/<models>/model.rs` | the inherent methods an association adds |
 | `// 🐺 anubis:record-fields` | `backend/src/<models>/model.rs` | the record struct's columns |
 | `// 🐺 anubis:insert-fields` | `backend/src/<models>/model.rs` | the insertable struct's columns |
 | `// 🐺 anubis:changeset-fields` | `backend/src/<models>/model.rs` | the changeset struct's columns |
 | `// 🐺 anubis:changeset-empty` | `backend/src/<models>/model.rs` | `<Model>Changes::is_empty` |
+| `// 🐺 anubis:account-routes` | `backend/src/<models>/routes.rs` | the account routes an association mounts |
+| `// 🐺 anubis:handlers` | `backend/src/<models>/routes.rs` | the handlers those routes dispatch to |
 | `// 🐺 anubis:create-body` | `backend/src/<models>/routes.rs` | the create request body |
 | `// 🐺 anubis:update-body` | `backend/src/<models>/routes.rs` | the update request body |
 | `// 🐺 anubis:create-normalize` | `backend/src/<models>/routes.rs` | the create handler's bindings |
@@ -90,7 +93,9 @@ Each one closes a list of columns. A model's artifacts carry them wherever a fie
 | `// 🐺 anubis:test-created` | `backend/tests/<models>_flow.rs` | the assertions on the created record |
 | `// 🐺 anubis:test-update` | `backend/tests/<models>_flow.rs` | the update request's payload |
 | `// 🐺 anubis:test-updated` | `backend/tests/<models>_flow.rs` | the assertions on the updated record |
+| `// 🐺 anubis:test-associations` | `backend/tests/<models>_flow.rs` | the requests an association proves itself with |
 | `// 🐺 anubis:wire-fields` | `frontend/src/api/routes/<model>Routes.ts` | the wire type |
+| `// 🐺 anubis:route-functions` | `frontend/src/api/routes/<model>Routes.ts` | the request functions an association adds |
 | `// 🐺 anubis:create-request` | `frontend/src/api/routes/<model>Routes.ts` | the create request type |
 | `// 🐺 anubis:update-request` | `frontend/src/api/routes/<model>Routes.ts` | the update request type |
 | `// 🐺 anubis:field-imports` | `frontend/src/components/<Model>Form.tsx` | the field components imported |
@@ -105,6 +110,8 @@ Each one closes a list of columns. A model's artifacts carry them wherever a fie
 | `{/* 🐺 anubis:show-fields */}` | `frontend/src/pages/<Model>Page.tsx` | the record's attribute list |
 
 Two lists carry no anchor, because they repeat inside one file and an anchor spelling may not. A `diesel::table!` block's columns are found structurally, by the block that names the model's table, and the column joins them above `created_at`. A locale file is JSON and cannot hold a comment at all: the strings are merged into the model's own object, described below.
+
+Four of them exist because an association is more than a column. A `valid_*` method and a label lookup are items, not struct members, so `model-methods` gives them statement position; an options endpoint is a route and a handler, so `account-routes` and `handlers` give them theirs; and proving an assignment takes requests of its own, so `test-associations` gives the narrative a place to make them. An insertion that spans a blank line is not detected as already present, which costs nothing: both commands refuse a field the model already carries before they plan anything.
 
 The form's four anchors follow from one rule. The template builds its values in a single `toFormValues` function and its payload in a single object, so the initial values, the reset when the edited record changes, the reset after a create, and both write calls all read one list. A field is added to the form in four places rather than seven.
 
@@ -213,7 +220,7 @@ What a `scaffold model` run adds beyond the account slice is two lines in `lib.r
 
 Every command in the table is implemented.
 
-Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{readonly}`, `{multiple}`, `{class_name=...}`, `{source=...}`. Which of them the generator accepts today is the table below; the rest exist as components first, which is the order the two halves land in.
+Field types map to the [field component library](#the-field-component-library): `text_field`, `text_area`, `number_field`, `email_field`, `phone_field`, `password_field`, `boolean`, `buttons`, `options`, `super_select`, `date_field`, `date_and_time_field`, `color_picker`, `emoji_field`, `rich_text`, `code_editor`, `file_field`, `image`, `address_field`. Modifiers follow Bullet Train: `{class_name=...}` and `{source=...}` are implemented on `super_select`, and `{readonly}` and `{multiple}` are still component props rather than scaffolder modifiers. Which field types the generator accepts today is the table below; the rest exist as components first, which is the order the two halves land in.
 
 The generator accepts the types the living templates prove. Each row knows its column, its Diesel schema type, its Rust type, its wire type, and its React control; a later issue extends the table rather than the code around it, and an unsupported type is refused by name with the supported list.
 
@@ -224,9 +231,10 @@ The generator accepts the types the living templates prove. Each row knows its c
 | `number_field` | `INTEGER` | `Int4` | `Option<i32>` | `number \| null` | `NumberField` |
 | `boolean` | `BOOLEAN NOT NULL DEFAULT false` | `Bool` | `bool` | `boolean` | `BooleanField` |
 | `date_field` | `DATE` | `Date` | `Option<chrono::NaiveDate>` | `string \| null` | `DateField` |
-| `super_select{class_name=<Other>}` | none, the join table holds it | none | `Vec<Uuid>` | `string[]` | `SuperSelectField` |
+| `<other>_ids:super_select{class_name=<Other>}` | none, the join table holds it | none | `Vec<Uuid>` | `string[]` | `SuperSelectField` |
+| `<name>_id:super_select{class_name=<Other>}` | `UUID REFERENCES <others> (id) ON DELETE SET NULL` | `Nullable<Uuid>` | `Option<Uuid>` | `string \| null` | `SuperSelectField` |
 
-`super_select` is the one type in the table that declares no column, because a has-many-through association's values are rows in a join table. [Association fields](#association-fields-has-many-through) describe it in full.
+`super_select` is the one type that spells two different things, and the suffix decides which, exactly as it does in Bullet Train. The plural `_ids` is a has-many-through and declares no column at all, because its values are rows in a join table; the singular `_id` is a belongs_to and declares a real foreign key on this model. [Association fields](#association-fields-has-many-through) and [belongs_to](#belongs_to-one-record-one-foreign-key) describe them in full.
 
 #### Nullable, or defaulted
 
@@ -245,7 +253,7 @@ anubis scaffold model Goal Project,Team name:text_field description:text_area
 
 The command runs inside an application, which is a directory holding `backend/`, `frontend/`, and `config/roles.yml`; the search walks up from the working directory, so it works from anywhere inside one, and inside this repository it finds `starter/`. Anywhere else it stops and says so.
 
-The ownership chain ends in `Team`, because every application record reaches a team. `Team` selects the team-owned template and `<Parent>,Team` the nested one. Deeper chains are refused with a pointer at the roadmap rather than generated half-right.
+The ownership chain ends in `Team`, because every application record reaches a team. `Team` selects the team-owned template and `<Parent>,Team` the nested one. Deeper chains are refused by name; [what a third level would take](#deferred-a-third-level-of-ownership) is the design, written down rather than half-shipped.
 
 One run produces, on the backend:
 
@@ -286,6 +294,17 @@ anubis scaffold field Ticket urgency:number_field
 leave the application in the same state, apart from a second migration. One set of insertions serves both commands, which is why a field declared on day one and a field added in month six read identically.
 
 Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`. On the frontend the generator pre-wraps the one construct a long model name can push past the 120-column lint limit, the link factory.
+
+### Deferred: a third level of ownership
+
+`anubis scaffold model Task Goal,Project,Team` is refused, and the two-level limit is load-bearing rather than arbitrary. Four things assume it, and three of them are cheap:
+
+- **Routes are already fine.** A collection hangs off its immediate parent (`/account/goals/{goal_id}/tasks`), which is the same shape at any depth. Nothing changes.
+- **Chain resolution grows a hop.** `load_for_member` joins the model to its parent and then asks `TeamMembership::for_user` about the parent's `team_id`; at depth three it joins twice and asks about the root's. Diesel writes that happily. What it cannot do is arrive by renaming: the template is a two-table join, and a name-for-name transform cannot add a third table, so depth three needs a **third living template** rather than a wider one.
+- **The `team_id` a handler needs is the real cost.** Every generated handler reads it off the immediate parent (`creative_concept.team_id`), which exists only because that parent is team-owned. At depth three the immediate parent has no such column. Two ways out: select the chain root alongside the parent in every query, which keeps one source of truth and widens every select; or give every generated table its own `team_id`, maintained by a trigger, which makes all depths identical and adds a trigger per table. The first is the one to take, because a denormalized tenant column that drifts is the worst bug this framework could ship.
+- **The frontend embedding is the blocker.** A team-owned model owns a list page and a show page; a nested model owns a section its parent's show page renders, and no page of its own. A grandchild therefore has **nothing to attach to**, and `scaffold model` already refuses a nested model whose parent has no show page. Depth three means nested models gain a show page, which pulls in `UrlTree` entries, `App.tsx` routes, a link factory, and breadcrumbs for every nested model that exists, and changes what a two-level scaffold generates.
+
+That last point is why this is deferred rather than attempted: it is a restructuring of the whole template family, and the family is what every other scaffolder is proven against. `scaffold join` and `belongs_to` both require team-owned sides for the same one-comparison reason, so both would need the same chain walk on the same day.
 
 ## `anubis scaffold field`: one column, everywhere
 
@@ -328,7 +347,7 @@ anubis scaffold join AppliedTag project_id{class_name=Project} tag_id{class_name
 
 Bullet Train splits a has-many-through into two commands, and so does Anubis, for the same reason: an association reads through a join model, and a join model links two models that both already exist. The join is generated first, the association field second. A `scaffold field` run that finds no join refuses and prints the `scaffold join` command that would create one, rather than guessing a name for a model the developer has to live with.
 
-Both sides must be **team-owned**, which is what lets one comparison decide whether a pair is tenant-safe. A side owned through a parent is refused by name, with deeper chains pointed at the roadmap. A side that does not exist is refused with the `scaffold model` command that would create it, and a pair that some join already links is refused with that join's name: one join model per pair.
+Both sides must be **team-owned**, which is what lets one comparison decide whether a pair is tenant-safe. A side owned through a parent is refused by name; a belongs_to refuses its target for the same reason, and [a third ownership level](#deferred-a-third-level-of-ownership) is what would lift both. A side that does not exist is refused with the `scaffold model` command that would create it, and a pair that some join already links is refused with that join's name: one join model per pair.
 
 Each side is written `<model>_id{class_name=<Model>}`, exactly as Bullet Train writes it (`class` is accepted as a spelling of `class_name`). The attribute must be the class's own `<model>_id`, because a generated join reaches its sides by that name everywhere; a differently named foreign key is refused with the expected spelling.
 
@@ -389,9 +408,85 @@ The model's narrative test gains the wire shape through the create request and i
 
 Every scaffolded model's `routes.rs` carries a `<Model>View`, a `serde(flatten)` wrapper around the record. With no associations it serializes exactly as the table does, so it costs nothing; an association adds its ids to it. That is what makes one form able to read and write the same shape, and it is the serializer all three consumers share: the account UI, `/api/v1`, and the payload of every [outgoing webhook](webhooks.md) the model emits.
 
-### Deferred: `super_select` without `_ids`
+## belongs_to: one record, one foreign key
 
-`super_select{class_name=<Other>}` on a singular name is a belongs_to association, and it does not fall out of this machinery: it needs a real nullable `<other>_id` column on the model, a foreign key, and a `valid_*` method inserted into a model module that carries no anchor for methods. It is refused by name today, with the plural spelling shown. The ownership-chain parent a nested model carries is a belongs_to already, and `scaffold model` generates it, including its `valid_*` scoping method and its cross-tenant refusal; what is missing is a second, non-owning one.
+```
+anubis scaffold field Project lead_id:super_select{class_name=TeamMembership}
+anubis scaffold field Project owner_id:super_select{class_name=Tag}
+```
+
+The suffix is `_id` singular and the name is the attribute's own, exactly as Rails and Bullet Train spell a `belongs_to`. The field is named for the role it plays rather than for the class it reaches, so one model may point at the same target twice: `lead_id` and `reviewer_id` can both name `TeamMembership` and never collide.
+
+**The first form is Bullet Train's signature pattern**, and it is deliberate advice rather than a technicality: a record is assigned to a **team membership**, not to a user, so a teammate who has been invited but has not signed up yet can already be assigned work. [tenancy.md](tenancy.md) states the model.
+
+### The column
+
+A belongs_to declares a real column, and it follows the nullable-or-defaulted rule like every other one:
+
+```sql
+ALTER TABLE projects ADD COLUMN lead_id UUID REFERENCES team_memberships (id) ON DELETE SET NULL;
+CREATE INDEX projects_lead_id_index ON projects (lead_id);
+```
+
+`ON DELETE SET NULL` rather than `RESTRICT`, because an assignment is a pointer and not a dependency. Under `RESTRICT`, removing somebody from a team would fail for as long as one record still named them, and the person removing them would have no way to know which record was in the way; under `SET NULL` the membership goes and the assignment empties, which is what "this record no longer has a lead" means. Postgres indexes a primary key and never the foreign keys pointing at it, so the run adds the index the label lookup and the delete both read.
+
+The foreign key crosses into the framework's own `team_memberships` table, which is legal: SQL constraints know nothing about crates. Only Diesel's `joinable!` and `allow_tables_to_appear_in_same_query!` are barred across a crate boundary, which is why the label is fetched rather than joined.
+
+### `{source=...}`: where `valid_*` reads from
+
+Bullet Train's `source` modifier names the collection behind the generated `valid_leads` method, and it means the same thing here. Rails takes any expression because it interpolates it into Ruby; a statically typed stack takes the two collections it can write a query for, and refuses the rest by name rather than emitting Rust that does not compile:
+
+| `source` | Reads | Default for |
+|---|---|---|
+| `team.memberships` | The team's roster, through `anubis::tenancy::TeamMembership::valid_for_team` | `class_name=TeamMembership` |
+| `team.<others>` | The target model's own team-owned records, ordered by name | every other class |
+
+Bullet Train writes the roster scope out in full as `team.memberships.current_and_invited`, and that spelling is accepted too: Anubis deletes a membership when a person leaves, so its roster is already current and invited. A `source` naming anything else is refused with both spellings shown. `source` on a has-many-through is refused as well, because there the join model owns `valid_*`, being the one artifact that knows both sides.
+
+The two sources are also each other's boundary. `class_name=TeamMembership` cannot read `team.team_memberships`, because an application crate cannot query a framework table in its own right; and `source=team.memberships` cannot go with any other class, because the roster is not that class's records. Both refusals name the spelling that works.
+
+### What one run produces
+
+Backend:
+
+- the migration above, and the column in the model's `diesel::table!` block
+- `lead_id` in the record, insertable, and changeset structs, and in the changeset's emptiness test
+- **two methods on the model**, above the `model-methods` anchor: `valid_leads`, which both fills the options endpoint and validates a submitted id, and `lead_labels`, which reads the labels of a whole page of records in one query
+- the options endpoint and the check both writes run, above the `account-routes` and `handlers` anchors
+- `lead_id` in both request bodies, validated against `valid_leads` before the insert rather than after it, so an id from another tenant answers `400` instead of tripping the foreign key into a `500`
+- `lead_label` on the view, loaded for a whole page at a time
+
+Frontend:
+
+- the wire type gains `lead_id: string | null` and `lead_label: string | null`, and both request types gain `lead_id`
+- the model's route module gains `listProjectLeadOptions`, above the `route-functions` anchor
+- the form gains a `SuperSelectField` in **single** mode, its options from `useFieldOptions`, which is the field library's own SWR hook for an options endpoint
+- the table and the show page render `lead_label`, so a screen shows a name and never a uuid
+- the locale file gains the label and help text, named after the attribute (`leadId` reads "Lead", not "Lead id")
+
+The narrative proves the whole thing against a real Postgres, through the `test-associations` anchor. A membership assignment needs no fixture, because the account the narrative registers is already a member of its own team: it reads the options, assigns the first one, asserts the label comes back, clears the assignment with `null`, and is refused a uuid the team does not own. A model-backed assignment cannot create its far side from this test, so what it proves is the scoping: a fresh team is offered exactly nothing, and a record it does not own is refused on write.
+
+### Where the options endpoint is mounted
+
+```
+GET /account/teams/{team_id}/<owners>/options/<attribute>
+```
+
+`GET /account/teams/{team_id}/projects/options/lead`, and a second assignment on the same model is `.../options/reviewer`. The key is the **owner and the attribute**, for the reason the join's options endpoint is keyed by the join rather than by the target: two associations reaching the same model must never collide on a route. It answers `{ "options": [{ "value": ..., "label": ... }] }`, the field library's `FieldOption` exactly, so a generated form hands the response straight to its control. `anubis::http::FieldOption` and `FieldOptions` are that shape in Rust, and the join's own options endpoint answers with them too.
+
+Authorization differs by source, and each answer follows an existing rule. A roster is every member's to read, which the framework's own `/tenancy/teams/{id}/members` already says, so a membership picker asks for `read` on the model that carries the assignment. An application model has a permission key of its own, so offering its records is a `read` on **that** model, exactly as a join's options endpoint is.
+
+### How the display name reaches the screen
+
+The wire carries `<name>_label` beside `<name>_id`, and the view fills it with one query per page.
+
+A join would have been the obvious alternative and it is not available: the roster lives in a framework table, and no `joinable!` may cross that boundary. Fetching by id serves both sources through one shape, costs one indexed query for a whole page (never one per row), and leaves the column itself untouched, so `/api/v1` and every outgoing webhook payload carry the id **and** the name without a second serializer. The cost is honest: the label is a projection of another record, so a record whose target is renamed reads the new name on the next request, and a stale client shows the old one until it refetches.
+
+### What a belongs_to still refuses
+
+- **A target that is not team-owned**, for the reason both sides of a join must be: one comparison decides whether a submitted id is this tenant's. A model owned through a parent is refused by name.
+- **A belongs_to at `scaffold model` time**, like a has-many-through: an association reaches a model that has to exist already, so the field is added afterwards.
+- **`class_name=User`**, implicitly: it is not `TeamMembership` and not an application model, so it is refused as a model this application does not own. Assign to the membership, which is the point of the pattern.
 
 ## `anubis scaffold oauth`: one provider, one command
 
@@ -557,7 +652,7 @@ rewired:
 
 The ejectable surface is the [field component library](#the-field-component-library): the eighteen field components, `RichTextView`, `FieldWrapper`, and `useFieldState`. `anubis eject --list` prints it with a line each.
 
-Everything else the package ships stays framework-owned on purpose. The API client, the realtime client, the React hooks, and the WebAuthn helpers speak a protocol the backend keeps moving, so a copy of one would fork that contract rather than restyle a control, and the fork would be silent until an upgrade broke it. Bullet Train draws the same line: partials and locales eject, framework concerns are extended rather than copied. An application that wants different behavior composes those APIs in the pages it already owns, because the starter owns every page.
+Everything else the package ships stays framework-owned on purpose. The API client, the realtime client, the React hooks (`useFieldOptions` among them, because it reads an options endpoint's envelope), and the WebAuthn helpers speak a protocol the backend keeps moving, so a copy of one would fork that contract rather than restyle a control, and the fork would be silent until an upgrade broke it. Bullet Train draws the same line: partials and locales eject, framework concerns are extended rather than copied. An application that wants different behavior composes those APIs in the pages it already owns, because the starter owns every page.
 
 An unknown name is refused with the catalog rather than guessed at.
 
@@ -667,17 +762,21 @@ Still to come:
 
 `scaffold field` propagates a new attribute through every one of those artifacts, which is the feature that makes the framework compound over time.
 
-Still deferred for `scaffold field`: one field per run (run it twice for two).
+Still deferred for `scaffold field`:
+
+- **One field per run** (run it twice for two).
+- **Extending a model's sortable and filterable whitelists.** A scaffolded column reaches the record, both request bodies, the view, and the screens, but `SORTABLE` and the filter struct are still the model's own to edit. Which columns a list endpoint should let a caller order and search by is a product decision with a cost attached (each one is an index question), and a generator that added every column to both would answer it wrongly by default.
+- **Fixed, translatable option lists** (`status:buttons`, `status:options`). `ButtonsField` and `OptionsField` ship, and Bullet Train's flow is to scaffold the field and then edit the option list in the model's locale file. What the two need here is a row in the field-type table plus an `options` array in the locale file the control reads, and a decision on whether the column is constrained by a `CHECK` or only by the form. This is a separate item from `{source=...}`, which names where a `super_select` reads its records from and is [implemented](#source-where-valid_-reads-from).
 
 ## Locked conventions the generator stamps
 
 - **List endpoints** follow the page/limit, sort, and filter conventions in [api.md](api.md); the scaffolder maintains each model's sortable and filterable whitelists. `anubis::http::ListParams` and `anubis::http::Pagination` implement the convention once, so every generated endpoint pages and sorts identically.
-- **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method, `valid_<associations>(connection, team_id) -> QueryResult<Vec<_>>`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on write, so a form can never smuggle in another tenant's record. One definition, both duties. For an ownership-chain parent it lives on the model that points at it; for a has-many-through it lives on the join model, which is the only artifact that knows both sides and is generated once for every association that uses it.
+- **Scoping methods** (`valid_*`): for every association, the scaffolder generates an inherent method, `valid_<associations>(connection, team_id)`, returning the team's own records ordered by name. The same method populates the select options endpoint and validates submitted ids on write, so a form can never smuggle in another tenant's record. One definition, both duties. For an ownership-chain parent it lives on the model that points at it, returning that parent's records; for a belongs_to it lives on the model carrying the foreign key, named after the attribute (`lead_id` gives `valid_leads`) and returning `anubis::http::FieldOption`, which is the one shape an application model and the framework's roster can both produce; for a has-many-through it lives on the join model, which is the only artifact that knows both sides and is generated once for every association that uses it.
 - **Timestamps**: `created_at`/`updated_at` come from the database. `updated_at` is maintained by the shared `set_updated_at()` trigger, attached to every generated table; application code never sets either.
 
 ## Proving the generators
 
-A generator is only as good as its last run, so the proof is continuous rather than ceremonial. `scripts/ci-scaffold-proof.sh` runs the whole family against the real `starter/` tree, in one sequence that covers every shape a template takes: a team-owned model with extra fields, a field added afterwards, every field type the templates prove, a nested model attaching itself to its parent's page, a join with the association field that reads through it, a sign-in provider, and an incoming webhook receiver. It then holds the output to the bar the hand-written code is held to: `cargo fmt --check` on untouched generated Rust, clippy with warnings denied, the generated narratives against a real Postgres, and the frontend typecheck, lint, test, and production build over the generated TypeScript.
+A generator is only as good as its last run, so the proof is continuous rather than ceremonial. `scripts/ci-scaffold-proof.sh` runs the whole family against the real `starter/` tree, in one sequence that covers every shape a template takes: a team-owned model with extra fields, a field added afterwards, every field type the templates prove, a nested model attaching itself to its parent's page, a join with the has-many-through field that reads through it, a membership assignment on each ownership depth, a model-backed assignment with `source` spelled out, a sign-in provider, and an incoming webhook receiver. It then holds the output to the bar the hand-written code is held to: `cargo fmt --check` on untouched generated Rust, clippy with warnings denied, the generated narratives against a real Postgres, and the frontend typecheck, lint, test, and production build over the generated TypeScript.
 
 CI runs it on every push and pull request, and the job is blocking. Run it yourself before touching a living template, with `yarn dev` stopped so nothing else writes to the database it uses:
 

@@ -60,6 +60,7 @@ pub fn router(pool: DbPool, roles: RoleSet) -> Router {
             "/tangible-things/{tangible_thing_id}",
             get(show).patch(update).delete(destroy),
         )
+        // 🐺 anubis:account-routes
         .with_state(TangibleThingState {
             pool: pool.clone(),
             roles: roles.clone(),
@@ -287,13 +288,15 @@ async fn insert_record(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    // A scaffolded association validates its submitted id here, so the team is
+    // in scope before the anchor rather than after it.
+    let team_id = creative_concept.team_id;
     // 🐺 anubis:create-normalize
 
     // The record, its associations, and the event they produce share one
     // transaction, so a webhook is exactly as durable as the row that caused
     // it: a rollback sends nothing, and a commit never loses its event. That
     // is what a queue in Postgres buys, and why emission takes a connection.
-    let team_id = creative_concept.team_id;
     connection
         .transaction::<TangibleThingView, ApiError, _>(async |connection| {
             let record: TangibleThing = diesel::insert_into(tangible_things::table)
@@ -334,9 +337,10 @@ async fn apply_changes(
     // A blank description clears the column, which is what the form submits
     // when the user empties the field.
     let description = optional_text(body.description.as_deref());
-    // 🐺 anubis:update-normalize
-
+    // A scaffolded association validates its submitted id here, so the team is
+    // in scope before the anchor rather than after it.
     let team_id = creative_concept.team_id;
+    // 🐺 anubis:update-normalize
 
     connection
         .transaction::<TangibleThingView, ApiError, _>(async |connection| {
@@ -493,6 +497,8 @@ async fn destroy(
     delete_record(&mut connection, tangible_thing, &creative_concept).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+// 🐺 anubis:handlers
 
 // ---------------------------------------------------------------------------
 // API handlers: a platform application's bearer token, acting as its team.

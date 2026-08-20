@@ -52,6 +52,9 @@ export function CreativeConceptPage() {
   }
 
   const record = creativeConcept.data?.creative_concept ?? null
+  // Read once: the form writes into this team, and a scaffolded child's
+  // association options are scoped to it.
+  const teamId = record?.team_id ?? ''
   const heldRoles = current?.team.roles ?? []
   const mayUpdate = can(heldRoles, 'update', CREATIVE_CONCEPT_MODEL)
   const mayDestroy = can(heldRoles, 'destroy', CREATIVE_CONCEPT_MODEL)
@@ -110,7 +113,7 @@ export function CreativeConceptPage() {
       ? <Card className='relaxed p-2'>
           <CardBody>
             <CreativeConceptForm
-              teamId={record.team_id}
+              teamId={teamId}
               editing={record}
               onDone={() => {
                 void creativeConcept.mutate()
@@ -120,7 +123,7 @@ export function CreativeConceptPage() {
         </Card>
       : null
     }
-    <TangibleThingsSection creativeConceptId={creativeConceptId} /> {/* 🐺 anubis:template-only */}
+    <TangibleThingsSection creativeConceptId={creativeConceptId} teamId={teamId} /> {/* 🐺 anubis:template-only */}
     {/* 🐺 anubis:children */}
   </AppShell>
 }
