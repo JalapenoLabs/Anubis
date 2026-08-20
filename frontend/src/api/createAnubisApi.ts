@@ -41,21 +41,24 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
   }
 
   /**
-   * The public URL serving a user's avatar, 404 until one is uploaded.
+   * The public URL serving a user's avatar, or `undefined` when there is none.
    *
    * The user's `avatarVersion` rides along as `?v=`, so the URL changes with
    * the picture: a fresh upload appears everywhere the moment the profile is
-   * refetched, and the image itself stays cacheable for a year. Accounts with
-   * no picture get the bare URL, which 404s into the initials fallback.
+   * refetched, and the image itself stays cacheable for a year.
+   *
+   * An account with no picture has no URL rather than one that 404s. Handing an
+   * `<img>` a URL that fails paints the browser's broken-image glyph over the
+   * initials the fallback just drew, and costs a guaranteed 404 on every page
+   * that renders the account. `undefined` leaves the element without a source,
+   * which is what makes the fallback the only thing on screen.
    */
-  function avatarUrl(user: Pick<User, 'id' | 'avatarVersion'>): string {
-    const url = `${prefix}users/${user.id}/avatar`
-
+  function avatarUrl(user: Pick<User, 'id' | 'avatarVersion'>): string | undefined {
     if (!user.avatarVersion) {
-      return url
+      return undefined
     }
 
-    return `${url}?v=${user.avatarVersion}`
+    return `${prefix}users/${user.id}/avatar?v=${user.avatarVersion}`
   }
 
   return {

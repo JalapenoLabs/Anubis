@@ -205,10 +205,13 @@ export function WebhookEndpointsCard(props: Props) {
                     />
                   </TableCell>
                   <TableCell>
-                    <div className='level-left'>
+                    <div className='level-left gap-2'>
+                      {/* `flat` rather than `light`: a neutral row action with
+                          no background and no color is indistinguishable from
+                          the cell text beside it. */}
                       <Button
                         size='sm'
-                        variant='light'
+                        variant='flat'
                         onPress={() => setInspecting(endpoint)}
                       >
                         <span>{

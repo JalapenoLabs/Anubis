@@ -97,7 +97,12 @@ export function CreativeConceptPage() {
           : null
         }
       </div>
-      <dl className='level-left mt-4 items-start gap-8'>
+      {/* A grid rather than a row, because the list grows: `scaffold field`
+          adds an attribute above the anchor below, and a flex row would squash
+          them all together and then overflow. Each attribute gets a cell of
+          its own, wraps inside it, and folds to one column when the viewport
+          is narrow. */}
+      <dl className='mt-4 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 lg:grid-cols-3'>
         <div>
           <dt className='text-sm opacity-60'>{
               t('creativeConcepts.fields.description')

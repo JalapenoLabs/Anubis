@@ -19,10 +19,12 @@ describe('avatarUrl', () => {
     expect(second).not.toBe(first)
   })
 
-  it('should serve the bare URL for an account with no picture', () => {
+  it('should serve no URL at all for an account with no picture', () => {
     const api = createAnubisApi()
 
-    expect(api.avatarUrl({ id: USER_ID, avatarVersion: null })).toBe(`/users/${USER_ID}/avatar`)
+    // A URL that is known to 404 would paint the broken-image glyph over the
+    // initials the fallback draws, so an account with no picture has none.
+    expect(api.avatarUrl({ id: USER_ID, avatarVersion: null })).toBeUndefined()
   })
 
   it('should honor the prefix the application mounted the framework under', () => {

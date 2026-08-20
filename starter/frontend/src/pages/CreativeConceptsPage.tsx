@@ -108,62 +108,75 @@ export function CreativeConceptsPage() {
             }}
           />
         </div>
-        <Table
-          removeWrapper
-          aria-label={t('creativeConcepts.title')}
-        >
-          <TableHeader>
-            <TableColumn>{
-                t('creativeConcepts.fields.name')
-              }</TableColumn>
-            <TableColumn>{
-                t('creativeConcepts.fields.description')
-              }</TableColumn>
-            {/* 🐺 anubis:list-columns */}
-            <TableColumn>{
-                t('creativeConcepts.created')
-              }</TableColumn>
-            <TableColumn>{
-                t('common.actions')
-              }</TableColumn>
-          </TableHeader>
-          <TableBody
-            items={creativeConcepts.data?.creative_concepts ?? []}
-            isLoading={creativeConcepts.isLoading}
-            emptyContent={
-              creativeConcepts.isLoading
-                ? t('common.loading')
-                : t('creativeConcepts.empty')
-            }
+        {/* `removeWrapper` drops HeroUI's own scroll container along with its
+            card chrome, so the table needs one of its own: without it a narrow
+            viewport clips the last columns against the card's edge, and the row
+            actions in them cannot be reached at all. */}
+        <div className='overflow-x-auto'>
+          <Table
+            removeWrapper
+            aria-label={t('creativeConcepts.title')}
           >
-            {
-              (creativeConcept: CreativeConcept) => (
-                <TableRow key={creativeConcept.id}>
-                  <TableCell>{
-                      creativeConcept.name
-                    }</TableCell>
-                  <TableCell>
-                    <span className={creativeConcept.description ? undefined : 'opacity-50'}>{
-                        creativeConcept.description ?? t('creativeConcepts.noDescription')
-                      }</span>
-                  </TableCell>
-                  {/* 🐺 anubis:list-cells */}
-                  <TableCell>{
-                      new Date(creativeConcept.created_at).toLocaleDateString()
-                    }</TableCell>
-                  <TableCell>
-                    <Link
-                      to={getCreativeConceptUrl(creativeConcept.id)}
-                      className='text-primary'
-                    >{
-                        t('creativeConcepts.open')
-                      }</Link>
-                  </TableCell>
-                </TableRow>
-              )
-            }
-          </TableBody>
-        </Table>
+            <TableHeader>
+              <TableColumn>{
+                  t('creativeConcepts.fields.name')
+                }</TableColumn>
+              <TableColumn>{
+                  t('creativeConcepts.fields.description')
+                }</TableColumn>
+              {/* 🐺 anubis:list-columns */}
+              <TableColumn>{
+                  t('creativeConcepts.created')
+                }</TableColumn>
+              <TableColumn>{
+                  t('common.actions')
+                }</TableColumn>
+            </TableHeader>
+            <TableBody
+              items={creativeConcepts.data?.creative_concepts ?? []}
+              isLoading={creativeConcepts.isLoading}
+              emptyContent={
+                creativeConcepts.isLoading
+                  ? t('common.loading')
+                  : t('creativeConcepts.empty')
+              }
+            >
+              {
+                (creativeConcept: CreativeConcept) => (
+                  <TableRow key={creativeConcept.id}>
+                    <TableCell>{
+                        creativeConcept.name
+                      }</TableCell>
+                    <TableCell>
+                      {/* Two lines of prose, then an ellipsis: a description
+                          written at length would otherwise set the height of
+                          every row around it. */}
+                      <span className={
+                        creativeConcept.description
+                          ? 'line-clamp-2'
+                          : 'opacity-50'
+                      }>{
+                          creativeConcept.description ?? t('creativeConcepts.noDescription')
+                        }</span>
+                    </TableCell>
+                    {/* 🐺 anubis:list-cells */}
+                    <TableCell>{
+                        new Date(creativeConcept.created_at).toLocaleDateString()
+                      }</TableCell>
+                    <TableCell>
+                      <Link
+                        to={getCreativeConceptUrl(creativeConcept.id)}
+                        className='text-primary'
+                      >{
+                          t('creativeConcepts.open')
+                        }</Link>
+                    </TableCell>
+                  </TableRow>
+                )
+              }
+            </TableBody>
+          </Table>
+        </div>
         { pagination && pagination.total_pages > 1
           ? <div className='level-center mt-4'>
               <Pagination

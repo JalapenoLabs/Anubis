@@ -204,7 +204,7 @@ export function WebhookDeliveriesModal(props: Props) {
             />
           : <span />
         }
-        <Button variant='light' onPress={props.onClose}>
+        <Button variant='flat' onPress={props.onClose}>
           <span>{
               t('developers.webhooks.deliveries.close')
             }</span>

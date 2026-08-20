@@ -157,17 +157,22 @@ export function AvatarCard(props: Props) {
                   t('settings.profile.avatarSave')
                 }</span>
             </Button>
-            <Button
-              variant='light'
-              color='danger'
-              isDisabled={isBusy}
-              isLoading={isRemoving}
-              onPress={onRemove}
-            >
-              <span>{
-                  t('settings.profile.avatarRemove')
-                }</span>
-            </Button>
+            {/* Only an account that has a picture can be offered the way to
+                take it away. */}
+            { props.user.avatarVersion
+              ? <Button
+                  variant='light'
+                  color='danger'
+                  isDisabled={isBusy}
+                  isLoading={isRemoving}
+                  onPress={onRemove}
+                >
+                  <span>{
+                      t('settings.profile.avatarRemove')
+                    }</span>
+                </Button>
+              : null
+            }
           </div>
           { selectedFile
             ? <p className='mt-2 opacity-70'>{

@@ -11,46 +11,62 @@
 @source '../../../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
 @custom-variant dark (&:is(.dark *));
 
-/* Vertical rhythm helpers: put the class on each item needing a gap below it.
-   compact spaces form inputs; relaxed spaces larger components/sections. */
-.relaxed:not(:last-child) {
-  margin-bottom: 1.5rem;
-}
+/* The layout helpers live in the components layer so that a Tailwind utility
+   set beside one wins. Outside a layer they would be plain author CSS, which
+   outranks every layered utility: `level items-start` would still center, and
+   `level-left gap-2` would still be the helper's own gap. Both are silent,
+   which is the worst kind of wrong. Inside @layer components, Tailwind's own
+   ordering puts utilities last and the override lands. */
+@layer components {
+  /* Vertical rhythm helpers: put the class on each item needing a gap below it.
+     compact spaces form inputs; relaxed spaces larger components/sections. */
+  .relaxed:not(:last-child) {
+    margin-bottom: 1.5rem;
+  }
 
-.compact:not(:last-child) {
-  margin-bottom: 0.75rem;
-}
+  .compact:not(:last-child) {
+    margin-bottom: 0.75rem;
+  }
 
-/* Bulma-style horizontal layout helpers. */
-.level {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
+  /* Bulma-style horizontal layout helpers. */
+  .level {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
 
-.level-left {
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 1rem;
-}
+  .level-left {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 1rem;
+  }
 
-.level-center {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1rem;
-}
+  .level-center {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+  }
 
-.level-right {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 1rem;
-}
+  .level-right {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 1rem;
+  }
 
-.title {
-  font-size: 1.5rem;
-  font-weight: 700;
+  /* A page's own heading, and the heading of a section inside one. Keeping the
+     two a step apart is what stops a scaffolded child section from reading as
+     loud as the page that hosts it. */
+  .title {
+    font-size: 1.5rem;
+    font-weight: 700;
+  }
+
+  .subtitle {
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
 }

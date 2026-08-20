@@ -146,7 +146,7 @@ export function SignInPage() {
     <div className='level mt-4 text-sm'>
       <Link
         to={getUrlWithDestination(UrlTree.forgotPassword, destination)}
-        className='opacity-70 hover:opacity-100'
+        className='text-primary'
       >{
           t('auth.signIn.forgotPassword')
         }</Link>

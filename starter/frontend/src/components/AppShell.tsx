@@ -115,7 +115,11 @@ export function AppShell(props: Props) {
   }
 
   return <div className='min-h-screen'>
-    <Navbar isBordered maxWidth='xl'>
+    {/* `lg` is 1024px, which is `max-w-5xl` on the content below, and both
+        carry the same 24px of inner padding. The brand and the page heading
+        therefore share one left edge; a wider bar would hang the navigation
+        outside the column every page is written in. */}
+    <Navbar isBordered maxWidth='lg'>
       <NavbarBrand className='gap-4'>
         <Link to={UrlTree.root} className='text-lg font-bold'>{
             t('app.title')
