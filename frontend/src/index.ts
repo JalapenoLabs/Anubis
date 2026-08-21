@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 export type {
+  AppNotification,
   AuthSession,
   BillingCheckoutRequest,
   BillingEnforcement,
@@ -20,6 +21,7 @@ export type {
   MembershipsOverview,
   MessageEnvelope,
   MfaStatus,
+  NotificationsPage,
   OauthProvider,
   OrganizationRosterMember,
   Passkey,
@@ -44,6 +46,8 @@ export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { MembershipsResult } from './react/useMemberships'
+export type { NotificationBellLabels } from './react/NotificationBell'
+export type { NotificationsResult } from './react/useNotifications'
 export type { OauthProvidersResult } from './react/useOauthProviders'
 export type { RetryCountdown } from './react/useRetryCountdown'
 export type {
@@ -104,8 +108,12 @@ export {
 
 // Realtime
 export { REALTIME_PATH, RealtimeClient } from './realtime/RealtimeClient'
-export { RealtimeProvider, useRealtime } from './react/RealtimeProvider'
+export { RealtimeProvider, useOptionalRealtime, useRealtime } from './react/RealtimeProvider'
 export { useChannel } from './react/useChannel'
+
+// Notifications
+export { NotificationBell } from './react/NotificationBell'
+export { NOTIFICATIONS_PAGE_SIZE, useNotifications } from './react/useNotifications'
 
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'

@@ -21,6 +21,8 @@ export const UrlTree = {
    * a client route under it would answer JSON on a cold load.
    */
   teamDevelopers: '/teams/:teamId/developers',
+  /** The team's audit log: who did what, admin-gated on both ends. */
+  teamAuditLog: '/teams/:teamId/audit-log',
   organizationSettings: '/organizations/:organizationId/settings',
   /**
    * The organization's billing screen, and where Stripe returns the browser.
@@ -33,6 +35,14 @@ export const UrlTree = {
   claimInvitation: '/claim-invitation',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
+  /**
+   * A nested model owns a show page but no list page.
+   *
+   * Its table lives on its parent's show page, and this route is what the
+   * depth below it attaches its own table to.
+   */
+  tangibleThing: '/tangible-things/:tangibleThingId',
+  granularDetail: '/granular-details/:granularDetailId',
   // 🐺 anubis:urls
 } as const
 export type UrlValue = typeof UrlTree[keyof typeof UrlTree]
@@ -131,6 +141,10 @@ export function getTeamDevelopersUrl(teamId: string): string {
   return UrlTree.teamDevelopers.replace(':teamId', teamId)
 }
 
+export function getTeamAuditLogUrl(teamId: string): string {
+  return UrlTree.teamAuditLog.replace(':teamId', teamId)
+}
+
 export function getOrganizationSettingsUrl(organizationId: string): string {
   return UrlTree.organizationSettings.replace(':organizationId', organizationId)
 }
@@ -141,6 +155,14 @@ export function getOrganizationBillingUrl(organizationId: string): string {
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {
   return UrlTree.creativeConcept.replace(':creativeConceptId', creativeConceptId)
+}
+
+export function getTangibleThingUrl(tangibleThingId: string): string {
+  return UrlTree.tangibleThing.replace(':tangibleThingId', tangibleThingId)
+}
+
+export function getGranularDetailUrl(granularDetailId: string): string {
+  return UrlTree.granularDetail.replace(':granularDetailId', granularDetailId)
 }
 
 // 🐺 anubis:url-factories

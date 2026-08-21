@@ -29,6 +29,7 @@ use webauthn_rs::prelude::{
     RequestChallengeResponse, Webauthn, WebauthnBuilder,
 };
 
+use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, signed_in_jar};
 use crate::auth::{CurrentUser, token};
@@ -117,21 +118,37 @@ async fn list_passkeys(
 async fn remove_passkey(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Path(passkey_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let deleted = diesel::delete(
+    // The name comes back with the delete, because the audit event has to say
+    // which key was removed and afterwards there is nothing left to ask.
+    let removed: Option<String> = diesel::delete(
         user_passkeys::table
             .filter(user_passkeys::id.eq(passkey_id))
             .filter(user_passkeys::user_id.eq(user.id)),
     )
-    .execute(&mut connection)
+    .returning(user_passkeys::name)
+    .get_result(&mut connection)
+    .await
+    .optional()
+    .map_err(log_internal)?;
+
+    let Some(name) = removed else {
+        return Err(ApiError::not_found());
+    };
+
+    audit::record(
+        &mut connection,
+        &context.by(&user),
+        &audit::Event::new(audit::PASSKEY_REMOVED, "Passkey")
+            .subject(passkey_id)
+            .label(&name),
+    )
     .await
     .map_err(log_internal)?;
 
-    if deleted == 0 {
-        return Err(ApiError::not_found());
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -194,6 +211,7 @@ struct RegisterFinishBody {
 async fn register_finish(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Json(body): Json<RegisterFinishBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let webauthn = relying_party(&state)?;
@@ -236,6 +254,18 @@ async fn register_finish(
         .get_result(&mut connection)
         .await
         .map_err(log_internal)?;
+
+    // The credential itself is a public key and still stays out of the log:
+    // what an auditor needs is that a new way into this account now exists.
+    audit::record(
+        &mut connection,
+        &context.by(&user),
+        &audit::Event::new(audit::PASSKEY_ADDED, "Passkey")
+            .subject(created.0)
+            .label(&name),
+    )
+    .await
+    .map_err(log_internal)?;
 
     Ok((
         StatusCode::CREATED,

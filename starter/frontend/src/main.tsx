@@ -10,10 +10,15 @@ import { HeroUIProvider } from '@heroui/react'
 import { App } from './App'
 
 // Misc
-import { AnubisProvider } from '@jalapenolabs/anubis'
+import { AnubisProvider, RealtimeClient, RealtimeProvider } from '@jalapenolabs/anubis'
 import { api } from './api'
 import './i18n'
 import './styles.css'
+
+// One connection for the whole application, opened lazily: nothing connects
+// until a component subscribes, so a signed-out page costs no socket. The
+// notification bell is the first subscriber the starter ships.
+const realtime = new RealtimeClient()
 
 const rootElement = document.getElementById('root')
 if (!rootElement) {
@@ -25,7 +30,9 @@ createRoot(rootElement).render(
     <BrowserRouter>
       <HeroUIProvider>
         <AnubisProvider api={api}>
-          <App />
+          <RealtimeProvider client={realtime}>
+            <App />
+          </RealtimeProvider>
         </AnubisProvider>
       </HeroUIProvider>
     </BrowserRouter>

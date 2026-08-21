@@ -97,24 +97,26 @@ feature categories are on the left.
 | **OAuth / SSO** | Ships | OpenID Connect with PKCE. Google in the registry; a provider is two environment variables, and `anubis scaffold oauth <provider>` prints them |
 | **Multi-tenancy** | Ships | User, TeamMembership, Team, Organization, OrganizationMembership, and Invitation. A personal organization and default team at signup. Team and organization settings screens, rosters, and the switcher |
 | **Roles and permissions** | Ships | One `config/roles.yml`, compiled to a Rust authorization module and a TypeScript affordances module, drift-gated in CI |
-| **Scaffolding** | Ships | `scaffold model`, `field`, `join`, `oauth`, `webhook`. Six field spellings today (`text_field`, `text_area`, `number_field`, `boolean`, `date_field`, and `super_select` for both association shapes). Two levels of ownership |
+| **Scaffolding** | Ships | `scaffold model`, `field`, `join`, `oauth`, `webhook`. Six field spellings today (`text_field`, `text_area`, `number_field`, `boolean`, `date_field`, and `super_select` for both association shapes). Three levels of ownership |
 | **Field components** | Ships | Eighteen React controls in `@jalapenolabs/anubis`, including rich text, a code editor, and file and image pickers. The generator's table is the subset the living templates prove |
 | **REST API** | Ships | Versioned `/api/v1`, per-team platform applications with bearer tokens, OpenAPI 3.1, Scalar docs, and a generated TypeScript client, all drift-gated |
 | **Outgoing webhooks** | Ships | Per-team subscriptions, HMAC-SHA256 signatures, at-least-once delivery on the job queue, a delivery log with redelivery, and a debugging screen |
 | **Incoming webhooks** | Ships | `anubis scaffold webhook <Provider>` generates the table, the store-then-process endpoint, the signature check, the job, and the test |
 | **Background jobs** | Ships | A durable Postgres queue. Enqueue rides the caller's transaction, at-least-once delivery, widening retry backoff, then a `dead_jobs` table |
 | **Realtime** | Ships | One session-authenticated websocket, team- and user-scoped channels, in-process fanout by default and Redis across instances |
+| **Notifications** | Ships | A framework-owned inbox, one `notify` call that commits with the write that caused it, a realtime bell with an unread badge, and the framework's own notices for invitations, roles, and failing endpoints |
 | **Billing** | Ships | Plans in `config/billing.yml`, Stripe Checkout and the customer portal, the subscription projection kept current by Stripe's events, reconciliation, hard and soft limits, per-seat pricing, and the billing screen |
+| **Audit log** | Ships | An append-only record that commits with the write that caused it, framework surfaces recording themselves, every scaffolded model audited with no per-model code, and an admin-gated team screen |
 | **Email** | Ships | One `Mailer` with log, test, and SMTP backends, plus optional DKIM signing |
 | **Abuse limits** | Ships | Per-client and per-recipient budgets on the auth endpoints, answering `429` with `Retry-After`, and a bounded gate in front of every argon2 computation |
 | **Production server** | Ships | Liveness and readiness probes, request ids, request logging, security headers, opt-in CORS, compression, a per-request timeout, and a bounded drain on `SIGTERM` |
 | **Eject** | Ships | `anubis eject <Component>` copies a field component into your application, stamps its provenance, and rewires the imports |
 | **Testing** | Ships | Unit tests, narrative integration suites against real Postgres, concurrency and adversarial suites, Vitest on both packages, and Playwright end to end |
 | **i18n** | Partial | i18next throughout and per-model locale files emitted by the scaffolder. English is the only bundled locale |
-| **Three-level ownership** | Deferred | `Task Goal,Project,Team` is refused by name. [The design is written down](docs/scaffolding.md#deferred-a-third-level-of-ownership) |
+| **Three-level ownership** | Ships | `Task Goal,Project,Team` generates. Handlers authorize every hop of the chain, the team is read off the chain's root rather than copied onto the row, and a nested model owns the show page its own children attach to. A fourth link is refused by name |
 | **Themes, dark mode, mobile navigation** | Not yet | One Tailwind and HeroUI look, a desktop navbar, no theme engine |
 | **Admin panel, impersonation, onboarding wizard** | Not yet | No equivalent of Bullet Train's Avo integration or "become user" |
-| **Notifications, conversations, audit log** | Not yet | Tracked for after M5 |
+| **Conversations** | Not yet | Tracked for after M5 |
 | **Published packages** | Not yet | Applications depend on the framework from git until the crate and the npm package publish |
 
 ## Documentation
@@ -128,6 +130,8 @@ feature categories are on the left.
 - [Background jobs](docs/jobs.md)
 - [Webhooks](docs/webhooks.md)
 - [Realtime channels](docs/realtime.md)
+- [Notifications](docs/notifications.md)
+- [Audit log](docs/audit.md)
 - [Billing](docs/billing.md)
 - [Email](docs/email.md)
 - [Upgrading](docs/upgrading.md)

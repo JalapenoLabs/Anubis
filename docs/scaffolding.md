@@ -10,15 +10,15 @@ Templates are real, functional, compiling code, not a DSL. The generator transfo
 
 Generated files contain magic anchor comments (`// 🐺 anubis:record-fields`, `{/* 🐺 anubis:nav */}`) that later scaffold commands use as insertion targets. Do not delete them. This is exactly Bullet Train's magic-comment mechanism, and it is what makes `scaffold field` able to keep editing files you have customized.
 
-The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (parent) and `scaffolding::completely_concrete::TangibleThing` (child) carry enough namespacing fidelity to transform into any real-world combination of parent and child namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot. `scaffolding::incidentally_linked::IncidentalLinkage` is the third, the join model, and `scaffolding::merely_peripheral::PeripheralNotion` is the second team-owned model it links. `scaffolding::hypothetically_remote::HypotheticalSenderWebhook` is the fourth, the incoming webhook receiver, named for a sender the application will never meet.
+The template models mirror Bullet Train's naming for the same reason Bullet Train chose it: `scaffolding::absolutely_abstract::CreativeConcept` (root), `scaffolding::completely_concrete::TangibleThing` (child), and `scaffolding::exceedingly_granular::GranularDetail` (grandchild) carry enough namespacing fidelity to transform into any real-world chain of namespaces. They live in the starter host app as compiling, CI-tested code, so the templates can never rot. `scaffolding::incidentally_linked::IncidentalLinkage` is the fourth, the join model, and `scaffolding::merely_peripheral::PeripheralNotion` is the second team-owned model it links. `scaffolding::hypothetically_remote::HypotheticalSenderWebhook` is the last, the incoming webhook receiver, named for a sender the application will never meet.
 
 ## The template host app
 
-The templates are ordinary application code in `starter/`. `CreativeConcept` belongs to a Team; `TangibleThing` belongs to a `CreativeConcept`. Both carry a required `name` and a nullable `description`, so the two ownership depths differ only in ownership. Between them they cover every artifact one `scaffold model` run produces, which is what makes them a specification rather than a demo.
+The templates are ordinary application code in `starter/`. `CreativeConcept` belongs to a Team; `TangibleThing` belongs to a `CreativeConcept`; `GranularDetail` belongs to a `TangibleThing`. All three carry a required `name` and a nullable `description`, so the three ownership depths differ only in ownership. Between them they cover every artifact one `scaffold model` run produces, which is what makes them a specification rather than a demo.
 
-The frontend halves mirror the same split. A team-owned model owns a list page, a show page, a form component, a route module, and a locale file. A nested model owns a form component, a route module, a locale file, and one section component (`TangibleThingsSection`) holding its table and its form, which the parent's show page renders. Reducing a child's whole slice to one element is what lets a later scaffold attach a child to a page an earlier scaffold wrote, by inserting a single line.
+The frontend halves mirror the same split. Every model owns a show page, a form component, a route module, and a locale file. A team-owned model owns a list page on top of that; a nested model owns one section component (`TangibleThingsSection`) holding its table and its form, which its parent's show page renders. Reducing a child's whole slice to one element is what lets a later scaffold attach a child to a page an earlier scaffold wrote, by inserting a single line, and a nested model owning a show page is what gives the depth below it something to attach to.
 
-Each depth has its own narrative test, `starter/backend/tests/creative_concepts_flow.rs` and `starter/backend/tests/tangible_things_flow.rs`, running against a real Postgres. They are templates too: one scaffold stamps the matching narrative for the generated model, so a new model arrives with the same proof its template carries. The plumbing they share (booting the router, registering an account, inviting a teammate) lives in `starter/backend/tests/support/mod.rs`, which is application code the scaffolder never rewrites.
+Each depth has its own narrative test, `starter/backend/tests/creative_concepts_flow.rs`, `tangible_things_flow.rs`, and `granular_details_flow.rs`, running against a real Postgres. They are templates too: one scaffold stamps the matching narrative for the generated model, so a new model arrives with the same proof its template carries. The plumbing they share (booting the router, registering an account, inviting a teammate) lives in `starter/backend/tests/support/mod.rs`, which is application code the scaffolder never rewrites.
 
 ### The join template
 
@@ -121,7 +121,7 @@ Each `roles.yml` anchor names its role: grants differ per role, and one insertio
 
 `anubis:routes` appears in two files, `backend/src/lib.rs` and `frontend/src/App.tsx`, spelled in each one's comment syntax. The rule is one spelling per file, not one per repository.
 
-The two show-page anchors are what make a scaffolded page a host for later scaffolds: `scaffold model Goal Project,Team` inserts `import { GoalsSection } ...` and `<GoalsSection projectId={projectId} />` into `ProjectPage.tsx`, which `scaffold model Project Team` wrote. A nested model whose parent has no page is refused by name rather than generated half-wired.
+The two show-page anchors are what make a scaffolded page a host for later scaffolds: `scaffold model Goal Project,Team` inserts `import { GoalsSection } ...` and `<GoalsSection projectId={projectId} teamId={teamId} />` into `ProjectPage.tsx`, which `scaffold model Project Team` wrote, and `scaffold model Task Goal,Project,Team` does the same to `GoalPage.tsx`. Every show page carries both anchors, whatever its depth, which is what makes the attachment one rule rather than one per level. A nested model whose parent has no page is refused by name rather than generated half-wired.
 
 `account_router` mounts one router per statement rather than one long method chain, so an inserted line is already `rustfmt`-clean.
 
@@ -149,7 +149,7 @@ Application migrations live in `starter/backend/migrations/`, are embedded with 
 
 ### Authorization in generated handlers
 
-Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts`) and use the `TeamMember` guard directly. Member routes are shallow (`/account/creative-concepts/{id}`, `/account/tangible-things/{id}`), so they resolve the chain with the model's own `load_for_member`, then authorize against the compiled `RoleSet` held in router state. Both paths answer `404` for records the caller cannot reach, so an id probe cannot tell a missing record from another tenant's.
+Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts`) and use the `TeamMember` guard directly. Member routes are shallow (`/account/creative-concepts/{id}`, `/account/tangible-things/{id}`, `/account/granular-details/{id}`), so they resolve the chain with the model's own `load_for_member`, then authorize against the compiled `RoleSet` held in router state. Both paths answer `404` for records the caller cannot reach, so an id probe cannot tell a missing record from another tenant's.
 
 The `/api/v1` handlers answer the same questions with a bearer token instead of a session: `ApiCaller` resolves the token to its team, `load_for_team` walks the chain in one comparison, and `ApiCaller::require` authorizes against the same `RoleSet`. [api.md](api.md#application-models) states what a token's roles are and why.
 
@@ -175,6 +175,12 @@ Every generated model publishes its lifecycle. `routes.rs` declares three event 
 Each of those functions wraps its write, its association reconciliation, and its emission in one transaction, which is what makes the event exactly as durable as the row: a rollback sends nothing, and a commit never loses its webhook. `anubis::webhooks::emit` takes the connection for that reason.
 
 `scaffold field` needs no new anchor for any of this, because the emission sits inside functions the field anchors already live in, and the payload is the `<Model>View` a field joins anyway. The generated narrative subscribes an endpoint, writes the record, and asserts the delivery rows land with the right event types and payload; it stops there, because a real HTTP delivery would need a listener, and `anubis/tests/webhooks_flow.rs` proves that half against one.
+
+### The audit log
+
+The same three shared functions record what they did, one `anubis::audit::record` call beside each emission, inside the same transaction. So every generated model is in its team's audit log with no per-model code and no anchor of its own: the handler hands down an `audit::Context`, the account surface attributes it to the signed-in user and the API surface to the platform application, and the subject label is the record's `name`.
+
+On an update the change set is `Changes::between` over the Diesel record itself, which is why a column `scaffold field` adds is audited the moment it exists, and why an update that only reconciled an association records an empty change set. [Audit log](audit.md) covers the rest.
 
 ### The two surfaces of a generated model
 
@@ -255,12 +261,16 @@ anubis scaffold model Goal Project,Team name:text_field description:text_area
 
 The command runs inside an application, which is a directory holding `backend/`, `frontend/`, and `config/roles.yml`; the search walks up from the working directory, so it works from anywhere inside one, and inside this repository it finds `starter/`. Anywhere else it stops and says so.
 
-The ownership chain ends in `Team`, because every application record reaches a team. `Team` selects the team-owned template and `<Parent>,Team` the nested one. Deeper chains are refused by name; [what a third level would take](#deferred-a-third-level-of-ownership) is the design, written down rather than half-shipped.
+```
+anubis scaffold model Task Goal,Project,Team name:text_field
+```
+
+The ownership chain ends in `Team`, because every application record reaches a team. Its length selects the living template: `Team` the team-owned one, `<Parent>,Team` the nested one, `<Parent>,<GrandParent>,Team` the deepest. A fourth level is refused by name, because [a depth is a template](#three-levels-of-ownership) rather than a flag. Every link must already exist, and no link may repeat.
 
 One run produces, on the backend:
 
 - a timestamped migration (`up.sql` and `down.sql`) with the table, its ownership index, and the shared `set_updated_at()` trigger
-- a `diesel::table!` block in `backend/src/schema.rs`, plus the `joinable!` and `allow_tables_to_appear_in_same_query!` declarations for a nested model
+- a `diesel::table!` block in `backend/src/schema.rs`, plus, for a nested model, the `joinable!` declaration and one `allow_tables_to_appear_in_same_query!` pair per link in its chain
 - the model's module (`mod.rs`, `model.rs`, `routes.rs`) under `backend/src/<models>/`, carrying the ownership chain, the list conventions, the `valid_*` scoping methods, account CRUD handlers, and the `/api/v1` handlers with their OpenAPI registrations
 - the module declaration, both router mounts, and the document merge in `backend/src/lib.rs`
 - `read` and `manage` grants in `config/roles.yml`, and a regenerated `frontend/src/roles.generated.ts`
@@ -271,8 +281,9 @@ and on the frontend:
 - the ky route module (`frontend/src/api/routes/<model>Routes.ts`) with the wire type, the permission model key, and one function per endpoint
 - the form component (`frontend/src/components/<Model>Form.tsx`), one field component per attribute, creating or editing
 - the model's locale file (`frontend/src/locales/models/<models>.en-US.json`), and its import and spread in `i18n.ts`
-- for a team-owned model: the list page and the show page under `frontend/src/pages/`, the `UrlTree` entries and link factory in `urls.ts`, the page imports and `<Route>` elements in `App.tsx`, and the navigation entry in `AppShell.tsx`
-- for a nested model: the section component (`frontend/src/components/<Models>Section.tsx`) holding its table and form, plus its import and element inside the parent's show page
+- the show page (`frontend/src/pages/<Model>Page.tsx`), its `UrlTree` entry and link factory in `urls.ts`, and its import and `<Route>` element in `App.tsx`
+- for a team-owned model: the list page (`frontend/src/pages/<Models>Page.tsx`) beside it, a second `UrlTree` entry and route, and the navigation entry in `AppShell.tsx`
+- for a nested model, at either depth: the section component (`frontend/src/components/<Models>Section.tsx`) holding its table and form, plus its import and element inside the parent's show page
 
 Every artifact is a transformation of the application's own files: the migration comes from the migration that created the template's table, the schema block from the template's `table!` block, the module from the template module, the test from the template's narrative, the pages from the template model's pages. Improving a template improves every later scaffold.
 
@@ -297,16 +308,18 @@ leave the application in the same state, apart from a second migration. One set 
 
 Cosmetic limitation: prose in doc comments is transformed word for word, not rewrapped, so a much shorter or much longer model name leaves a ragged comment line. Comments never affect `cargo fmt --check`. On the frontend the generator pre-wraps the one construct a long model name can push past the 120-column lint limit, the link factory.
 
-### Deferred: a third level of ownership
+### Three levels of ownership
 
-`anubis scaffold model Task Goal,Project,Team` is refused, and the two-level limit is load-bearing rather than arbitrary. Four things assume it, and three of them are cheap:
+`anubis scaffold model Task Goal,Project,Team` generates a model owned through a model that is itself owned through a model. Four things decide what that costs, and the answers are what the depth is made of:
 
-- **Routes are already fine.** A collection hangs off its immediate parent (`/account/goals/{goal_id}/tasks`), which is the same shape at any depth. Nothing changes.
-- **Chain resolution grows a hop.** `load_for_member` joins the model to its parent and then asks `TeamMembership::for_user` about the parent's `team_id`; at depth three it joins twice and asks about the root's. Diesel writes that happily. What it cannot do is arrive by renaming: the template is a two-table join, and a name-for-name transform cannot add a third table, so depth three needs a **third living template** rather than a wider one.
-- **The `team_id` a handler needs is the real cost.** Every generated handler reads it off the immediate parent (`creative_concept.team_id`), which exists only because that parent is team-owned. At depth three the immediate parent has no such column. Two ways out: select the chain root alongside the parent in every query, which keeps one source of truth and widens every select; or give every generated table its own `team_id`, maintained by a trigger, which makes all depths identical and adds a trigger per table. The first is the one to take, because a denormalized tenant column that drifts is the worst bug this framework could ship.
-- **The frontend embedding is the blocker.** A team-owned model owns a list page and a show page; a nested model owns a section its parent's show page renders, and no page of its own. A grandchild therefore has **nothing to attach to**, and `scaffold model` already refuses a nested model whose parent has no show page. Depth three means nested models gain a show page, which pulls in `UrlTree` entries, `App.tsx` routes, a link factory, and breadcrumbs for every nested model that exists, and changes what a two-level scaffold generates.
+- **Routes are the same shape at any depth.** A collection hangs off its immediate parent (`/account/goals/{goal_id}/tasks`), a member route off the record (`/account/tasks/{task_id}`). Nothing about a path says how deep it sits.
+- **Chain resolution grows a hop.** `load_for_member` at depth two joins the model to its parent and asks `TeamMembership::for_user` about the parent's `team_id`. At depth three it joins twice, `tasks -> goals -> projects`, and asks about the root's. Diesel writes that happily. What it cannot do is arrive by renaming: a name-for-name transform of a two-table query never produces a three-table one, so **a depth is a living template**, not a flag. There are three, and a fourth chain link is refused by name because there is no fourth template to prove it.
+- **The team is read off the chain's root, never copied onto the row.** Every generated handler needs a `team_id`: to authorize, to scope a `valid_*` lookup, and to address a webhook. A grandchild's immediate parent has no such column, so the root is selected alongside the parent in the same query (`load_for_member` returns the record, its parent, its grandparent, and the membership). The alternative, a `team_id` on every generated table kept by a trigger, would make all depths identical and is exactly the bug worth avoiding: a denormalized tenant column that drifts is the worst thing this framework could ship. Cross-tenant refusal therefore happens at every hop, because every hop is a join rather than a trusted id, and a crafted path answers `404` at the first link it cannot reach.
+- **A nested model owns a show page, which is what a grandchild attaches to.** A team-owned model owns a list page and a show page; a nested model owns a section component its parent's show page renders, and a show page of its own. It gets no list page (its table is that section) and no navigation entry (it is opened from the record that owns it), but it does get a `UrlTree` entry, a link factory, an `App.tsx` route, and breadcrumbs that walk its chain back to the root. That page is the attachment point the depth below it needs, which is why the two-level scaffold generates it whether or not a third level is ever used.
 
-That last point is why this is deferred rather than attempted: it is a restructuring of the whole template family, and the family is what every other scaffolder is proven against. `scaffold join` and `belongs_to` both require team-owned sides for the same one-comparison reason, so both would need the same chain walk on the same day.
+The scoping rules `scaffold join` and `belongs_to` enforce are unchanged: both still require **team-owned** sides, so one comparison decides whether a submitted id is this tenant's. A model owned through a parent is refused by name on either. Lifting that is a separate piece of work, because a join whose sides sit at different depths needs a scope query per side rather than a shared one.
+
+The living templates are `CreativeConcept` (team-owned), `TangibleThing` (nested), and `GranularDetail` (nested twice), and the depth-three narrative in `backend/tests/granular_details_flow.rs` proves the whole chain against a real Postgres, refusal by refusal.
 
 ## `anubis scaffold field`: one column, everywhere
 
@@ -335,7 +348,7 @@ One run produces:
 - an attribute row on the model's show page, if it has one
 - the label and the help text in the model's locale file
 
-Artifacts a model does not have are named in the report rather than skipped quietly: a nested model has a section component and no pages, and a developer may have deleted a file the scaffold wrote. The whole run is planned before it writes, so a missing anchor, a column that already exists, or a model that does not, stops the command with the application untouched.
+Artifacts a model does not have are named in the report rather than skipped quietly: a nested model has a section component and no list page, and a developer may have deleted a file the scaffold wrote. The whole run is planned before it writes, so a missing anchor, a column that already exists, or a model that does not, stops the command with the application untouched.
 
 ### The generated test grows with the model
 
@@ -349,7 +362,7 @@ anubis scaffold join AppliedTag project_id{class_name=Project} tag_id{class_name
 
 Bullet Train splits a has-many-through into two commands, and so does Anubis, for the same reason: an association reads through a join model, and a join model links two models that both already exist. The join is generated first, the association field second. A `scaffold field` run that finds no join refuses and prints the `scaffold join` command that would create one, rather than guessing a name for a model the developer has to live with.
 
-Both sides must be **team-owned**, which is what lets one comparison decide whether a pair is tenant-safe. A side owned through a parent is refused by name; a belongs_to refuses its target for the same reason, and [a third ownership level](#deferred-a-third-level-of-ownership) is what would lift both. A side that does not exist is refused with the `scaffold model` command that would create it, and a pair that some join already links is refused with that join's name: one join model per pair.
+Both sides must be **team-owned**, which is what lets one comparison decide whether a pair is tenant-safe. A side owned through a parent is refused by name, whatever its depth, and a belongs_to refuses its target for the same reason. A side that does not exist is refused with the `scaffold model` command that would create it, and a pair that some join already links is refused with that join's name: one join model per pair.
 
 Each side is written `<model>_id{class_name=<Model>}`, exactly as Bullet Train writes it (`class` is accepted as a spelling of `class_name`). The attribute must be the class's own `<model>_id`, because a generated join reaches its sides by that name everywhere; a differently named foreign key is refused with the expected spelling.
 
@@ -751,10 +764,10 @@ Backend, implemented today:
 Frontend, implemented today:
 
 - ky route module per model, with the wire type and the permission model key
-- List page (table, search, pagination), show page, and the form component built from field components
-- Navigation entry, `UrlTree` entries and link factory, routes, and breadcrumbs
+- Show page and form component at every depth, plus a list page (table, search, pagination) for a team-owned model
+- `UrlTree` entries and link factory, routes, breadcrumbs that walk the chain back to its root, and, for a team-owned model, a navigation entry
 - Per-model i18next locale file (labels, headings, help text), imported and merged in `i18n.ts`
-- A nested model's section component, attached to its parent's show page
+- A nested model's section component, attached to its parent's show page, at either nested depth
 
 Still to come:
 
@@ -778,7 +791,7 @@ Still deferred for `scaffold field`:
 
 ## Proving the generators
 
-A generator is only as good as its last run, so the proof is continuous rather than ceremonial. `scripts/ci-scaffold-proof.sh` runs the whole family against the real `starter/` tree, in one sequence that covers every shape a template takes: a team-owned model with extra fields, a field added afterwards, every field type the templates prove, a nested model attaching itself to its parent's page, a join with the has-many-through field that reads through it, a membership assignment on each ownership depth, a model-backed assignment with `source` spelled out, a sign-in provider, and an incoming webhook receiver. It then holds the output to the bar the hand-written code is held to: `cargo fmt --check` on untouched generated Rust, clippy with warnings denied, the generated narratives against a real Postgres, and the frontend typecheck, lint, test, and production build over the generated TypeScript.
+A generator is only as good as its last run, so the proof is continuous rather than ceremonial. `scripts/ci-scaffold-proof.sh` runs the whole family against the real `starter/` tree, in one sequence that covers every shape a template takes: a team-owned model with extra fields, a field added afterwards, every field type the templates prove, all three ownership depths with each nested model attaching itself to its parent's page, a field added at the deepest one, a join with the has-many-through field that reads through it, a membership assignment on two ownership depths, a model-backed assignment with `source` spelled out, a sign-in provider, and an incoming webhook receiver. It then holds the output to the bar the hand-written code is held to: `cargo fmt --check` on untouched generated Rust, clippy with warnings denied, the generated narratives against a real Postgres, and the frontend typecheck, lint, test, and production build over the generated TypeScript.
 
 CI runs it on every push and pull request, and the job is blocking. Run it yourself before touching a living template, with `yarn dev` stopped so nothing else writes to the database it uses:
 

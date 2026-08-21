@@ -46,6 +46,10 @@ pub fn account_router(pool: &DbPool, roles: &RoleSet) -> Router {
         pool.clone(),
         roles.clone(),
     ));
+    router = router.merge(scaffolding::exceedingly_granular::router(
+        pool.clone(),
+        roles.clone(),
+    ));
     router = router.merge(scaffolding::merely_peripheral::router(
         pool.clone(),
         roles.clone(),
@@ -70,6 +74,10 @@ pub fn api_v1_router(pool: &DbPool, roles: &RoleSet) -> Router {
         roles.clone(),
     ));
     router = router.merge(scaffolding::completely_concrete::api_router(
+        pool.clone(),
+        roles.clone(),
+    ));
+    router = router.merge(scaffolding::exceedingly_granular::api_router(
         pool.clone(),
         roles.clone(),
     ));
@@ -138,6 +146,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     document.merge(anubis::api::v1::openapi());
     document.merge(scaffolding::absolutely_abstract::openapi());
     document.merge(scaffolding::completely_concrete::openapi());
+    document.merge(scaffolding::exceedingly_granular::openapi());
     // 🐺 anubis:api-docs
     document
 }
@@ -166,13 +175,20 @@ mod tests {
             "/api/v1/creative-concepts/{creative_concept_id}",
             "/api/v1/creative-concepts/{creative_concept_id}/tangible-things",
             "/api/v1/tangible-things/{tangible_thing_id}",
+            "/api/v1/tangible-things/{tangible_thing_id}/granular-details",
+            "/api/v1/granular-details/{granular_detail_id}",
         ] {
             assert!(
                 document["paths"][path].is_object(),
                 "{path} must be documented: {document}",
             );
         }
-        for schema in ["CreativeConceptView", "TangibleThingView", "ErrorV1"] {
+        for schema in [
+            "CreativeConceptView",
+            "TangibleThingView",
+            "GranularDetailView",
+            "ErrorV1",
+        ] {
             assert!(
                 document["components"]["schemas"][schema].is_object(),
                 "{schema} must be registered: {document}",
@@ -213,7 +229,12 @@ mod tests {
         let set = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml must be valid");
         let editor = set.grants("editor").expect("editor must be defined");
 
-        for model in ["CreativeConcept", "TangibleThing", "PeripheralNotion"] {
+        for model in [
+            "CreativeConcept",
+            "TangibleThing",
+            "GranularDetail",
+            "PeripheralNotion",
+        ] {
             assert!(
                 editor.contains_key(model),
                 "{model} must be granted to editors in config/roles.yml",

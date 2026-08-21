@@ -290,11 +290,11 @@ fn stamp_migration(
 
 /// Stamps the template model's frontend files into the application.
 ///
-/// A team-owned model gets its route module, its form, its locale file, and
-/// its two pages; a nested model gets its route module, its form, its locale
-/// file, and the section component its parent's page renders. Template-only
-/// lines are dropped: the template's parent page renders the template's own
-/// child, which belongs to no other model.
+/// Every model gets its route module, its form, its locale file, and its show
+/// page. A team-owned model gets a list page on top of that; a nested model at
+/// any depth gets the section component its parent's page renders instead.
+/// Template-only lines are dropped: a template's show page renders the
+/// template's own child, which belongs to no other model.
 fn stamp_frontend(
     root: &Path,
     template: ModelTemplate,
@@ -340,22 +340,40 @@ fn drop_template_only(contents: &str) -> String {
 
 /// Wires the model's frontend slice into the files the application shares.
 ///
-/// Every model registers its locale file. Beyond that the two depths differ:
-/// a team-owned model owns urls, routes, and a navigation entry, while a
-/// nested model attaches a section to the show page its parent's scaffold
-/// generated.
+/// Every model registers its locale file, its show page's url, and that page's
+/// route. Beyond that the depths differ: a team-owned model also owns a list
+/// page and the navigation entry that reaches it, while a nested model at any
+/// depth attaches a section to the show page its parent's scaffold generated.
 fn update_frontend(
     root: &Path,
     scaffold: &ModelScaffold,
 ) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut updated = vec![update_anchors(
-        root,
-        "frontend/src/i18n.ts",
-        &[
-            (anchor::LOCALE_IMPORTS, scaffold.locale_import()),
-            (anchor::LOCALES, scaffold.locale_spread()),
-        ],
-    )?];
+    let mut updated = vec![
+        update_anchors(
+            root,
+            "frontend/src/i18n.ts",
+            &[
+                (anchor::LOCALE_IMPORTS, scaffold.locale_import()),
+                (anchor::LOCALES, scaffold.locale_spread()),
+            ],
+        )?,
+        update_anchors(
+            root,
+            "frontend/src/urls.ts",
+            &[
+                (anchor::URLS, scaffold.url_entries()),
+                (anchor::URL_FACTORIES, scaffold.url_factory()),
+            ],
+        )?,
+        update_anchors(
+            root,
+            "frontend/src/App.tsx",
+            &[
+                (anchor::PAGE_IMPORTS, scaffold.page_imports()),
+                (anchor::ROUTES, scaffold.route_elements()),
+            ],
+        )?,
+    ];
 
     if let Some(attachment) = scaffold.child_attachment() {
         if !root.join(&attachment.page).is_file() {
@@ -376,22 +394,8 @@ fn update_frontend(
         return Ok(updated);
     }
 
-    updated.push(update_anchors(
-        root,
-        "frontend/src/urls.ts",
-        &[
-            (anchor::URLS, scaffold.url_entries()),
-            (anchor::URL_FACTORIES, scaffold.url_factory()),
-        ],
-    )?);
-    updated.push(update_anchors(
-        root,
-        "frontend/src/App.tsx",
-        &[
-            (anchor::PAGE_IMPORTS, scaffold.page_imports()),
-            (anchor::ROUTES, scaffold.route_elements()),
-        ],
-    )?);
+    // Only the chain's root earns a place in the navigation: everything below
+    // it is reached by opening the record that owns it.
     updated.push(update_anchors(
         root,
         "frontend/src/components/AppShell.tsx",
@@ -490,32 +494,70 @@ fn update_schema(
     let mut updated = insert_above_anchor(&schema, anchor::TABLES, &format!("{block}\n\n"))
         .map_err(|error| format!("{}: {error}", display(&relative)))?;
 
-    // A nested model joins its parent, and the two may share a query. A
-    // team-owned model has neither: the framework's `teams` table lives in
-    // another crate, which Rust's orphan rules keep out of these macros.
-    if scaffold.parent().is_some() {
-        for (needle, anchor) in [
-            (
-                format!("diesel::joinable!({}", template.table()),
-                anchor::JOINS,
-            ),
-            (
-                "diesel::allow_tables_to_appear_in_same_query!(".to_owned(),
-                anchor::SAME_QUERY,
-            ),
-        ] {
-            let line = line_containing(&schema, &needle).ok_or_else(|| {
+    // A nested model joins its parent, and every pair of tables its chain
+    // walks may share a query: one pair at depth two, two at depth three,
+    // because Diesel wants each pair in a join declared. A team-owned model
+    // has neither, since the framework's `teams` table lives in another crate
+    // that Rust's orphan rules keep out of these macros.
+    if !scaffold.ancestors().is_empty() {
+        let table = template.table();
+        let needle = format!("diesel::joinable!({table} -> ");
+        let mut declarations = vec![(
+            anchor::JOINS,
+            line_containing(&schema, &needle).ok_or_else(|| {
                 format!(
                     "{} holds no `{needle}` declaration to transform",
                     display(&relative),
                 )
+            })?,
+        )];
+
+        let ancestors = template.ancestor_tables();
+        for ancestor in &ancestors {
+            let pair = same_query_pair(&schema, &table, ancestor).ok_or_else(|| {
+                format!(
+                    "{} declares no `allow_tables_to_appear_in_same_query!` pair for \
+                     `{table}` and `{ancestor}`; a scaffolded model needs one pair per link \
+                     in its chain so its ownership query compiles",
+                    display(&relative),
+                )
             })?;
+            declarations.push((anchor::SAME_QUERY, pair));
+        }
+
+        for (anchor, line) in declarations {
             updated = insert_above_anchor(&updated, anchor, &replacements.apply(&line))
                 .map_err(|error| format!("{}: {error}", display(&relative)))?;
         }
     }
 
     Ok((relative, updated))
+}
+
+/// The `allow_tables_to_appear_in_same_query!` line declaring exactly one pair.
+///
+/// Diesel wants every pair of tables a query joins declared, so a model needs
+/// one line per link in its chain: a nested model shares a query with its
+/// parent, a grandchild with its parent and its grandparent. The lookup is by
+/// pair rather than by table, because a template's table appears in the pairs
+/// of the depth below it as well as its own, and only one of those transforms
+/// into this model's declarations.
+fn same_query_pair(schema: &str, table: &str, other: &str) -> Option<String> {
+    const DECLARATION: &str = "diesel::allow_tables_to_appear_in_same_query!(";
+
+    schema
+        .lines()
+        .filter(|line| line.trim_start().starts_with(DECLARATION))
+        .find(|line| {
+            let arguments = line
+                .split_once('(')
+                .and_then(|(_macro, rest)| rest.split_once(')'))
+                .map(|(arguments, _tail)| arguments)
+                .unwrap_or_default();
+            let named = arguments.split(',').map(str::trim).collect::<Vec<_>>();
+            named.len() == 2 && named.contains(&table) && named.contains(&other)
+        })
+        .map(str::to_owned)
 }
 
 /// Declares the model's module and mounts both of its routers in `lib.rs`.
@@ -591,10 +633,16 @@ fn format_rust_files(root: &Path, plan: &Plan) {
 
 /// Prints what was generated, and what still needs a hand.
 fn report(scaffold: &ModelScaffold, plan: &Plan) {
-    let ownership = scaffold.parent().map_or_else(
-        || "owned by a team".to_owned(),
-        |parent| format!("owned through {}", parent.pascal()),
-    );
+    let chain = scaffold
+        .ancestors()
+        .iter()
+        .map(Names::pascal)
+        .collect::<Vec<_>>();
+    let ownership = if chain.is_empty() {
+        "owned by a team".to_owned()
+    } else {
+        format!("owned through {}", chain.join(", then "))
+    };
     println!("scaffolded {} ({ownership})", scaffold.model().pascal());
 
     println!();

@@ -31,6 +31,16 @@ const TEMPLATE_TOKENS: [&str; 11] = [
     "completely_concrete",
 ];
 
+/// The names the deepest template adds, which must not survive either.
+const DEEP_TEMPLATE_TOKENS: [&str; 6] = [
+    "GranularDetail",
+    "granularDetail",
+    "granular_detail",
+    "GRANULAR_DETAIL",
+    "granular-detail",
+    "exceedingly_granular",
+];
+
 /// The names the join template adds, which must not survive either.
 const JOIN_TEMPLATE_TOKENS: [&str; 8] = [
     "IncidentalLinkage",
@@ -93,12 +103,15 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
         "frontend/src/api/routes/goalRoutes.ts",
         "frontend/src/components/GoalForm.tsx",
         "frontend/src/components/GoalsSection.tsx",
+        "frontend/src/pages/GoalPage.tsx",
         "frontend/src/locales/models/goals.en-US.json",
     ] {
         assert!(app.join(expected).is_file(), "missing {expected}");
     }
-    // A nested model owns no pages of its own.
-    assert!(!app.join("frontend/src/pages/GoalPage.tsx").exists());
+    // A nested model owns a show page, which is what the depth below it
+    // attaches to, and no list page: its table is the section above.
+    assert!(app.join("frontend/src/pages/GoalPage.tsx").is_file());
+    assert!(!app.join("frontend/src/pages/GoalsPage.tsx").exists());
     let project_migration = migration(&app, "_create_projects");
     assert!(project_migration.join("up.sql").is_file());
     assert!(project_migration.join("down.sql").is_file());
@@ -140,6 +153,7 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
         "frontend/src/components/GoalsSection.tsx",
         "frontend/src/pages/ProjectPage.tsx",
         "frontend/src/pages/ProjectsPage.tsx",
+        "frontend/src/pages/GoalPage.tsx",
         "frontend/src/locales/models/projects.en-US.json",
         "frontend/src/locales/models/goals.en-US.json",
     ] {
@@ -216,11 +230,15 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
     assert!(generated_roles.contains("Project"), "{generated_roles}");
     assert!(generated_roles.contains("Goal"));
 
-    // A team-owned model owns its urls, its routes, and a navigation entry.
+    // A team-owned model owns its urls, its routes, and a navigation entry;
+    // a nested one owns the url and route of its show page alone.
     let urls = read(&app.join("frontend/src/urls.ts"));
     assert!(urls.contains("projects: '/projects',"), "{urls}");
     assert!(urls.contains("project: '/projects/:projectId',"));
+    assert!(urls.contains("goal: '/goals/:goalId',"));
+    assert!(!urls.contains("goals: '/goals',"), "{urls}");
     assert!(urls.contains("export function getProjectUrl(projectId: string): string {"));
+    assert!(urls.contains("export function getGoalUrl(goalId: string): string {"));
     assert_anchored(&urls, "🐺 anubis:urls", "projects: '/projects',");
     assert_anchored(&urls, "🐺 anubis:url-factories", "getProjectUrl");
 
@@ -230,11 +248,16 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
         "{application}",
     );
     assert!(application.contains("path={UrlTree.project}"));
+    assert!(application.contains("<GoalPage />"));
+    assert!(!application.contains("<GoalsPage />"));
     assert_anchored(&application, "🐺 anubis:page-imports", "ProjectsPage }");
     assert_anchored(&application, "🐺 anubis:routes", "<ProjectsPage />");
 
+    // Only the chain's root reaches the navigation: a nested model is opened
+    // from the record that owns it.
     let shell = read(&app.join("frontend/src/components/AppShell.tsx"));
     assert!(shell.contains("t('projects.navLink')"), "{shell}");
+    assert!(!shell.contains("t('goals.navLink')"), "{shell}");
     assert_anchored(&shell, "🐺 anubis:nav", "UrlTree.projects");
 
     let i18n = read(&app.join("frontend/src/i18n.ts"));
@@ -275,6 +298,131 @@ fn scaffolding_two_models_writes_a_full_stack_slice() {
             .count(),
         1,
         "a refused run must not touch the shared files",
+    );
+
+    std::fs::remove_dir_all(&app).expect("scratch directories are removable");
+}
+
+/// Three levels of ownership: the chain, the pages, and the team's whereabouts.
+///
+/// Depth three is where the ownership rules stop being a rename and start
+/// being a design, so this reads the generated code for the three things the
+/// design turns on: the chain query joins twice, the team is read off the
+/// chain's root rather than off a column, and the grandchild attaches to a
+/// page its nested parent's own scaffold wrote.
+#[test]
+fn a_grandchild_scaffolds_through_two_parents() {
+    let app = copy_starter("three-levels");
+
+    for (model, ownership) in [
+        ("Project", "Team"),
+        ("Goal", "Project,Team"),
+        ("Task", "Goal,Project,Team"),
+    ] {
+        let output = scaffold(&app, &[model, ownership, "name:text_field"]);
+        assert!(
+            output.status.success(),
+            "scaffolding {model} failed: {}",
+            stderr(&output),
+        );
+    }
+
+    for expected in [
+        "backend/src/tasks/model.rs",
+        "backend/src/tasks/routes.rs",
+        "backend/tests/tasks_flow.rs",
+        "frontend/src/api/routes/taskRoutes.ts",
+        "frontend/src/components/TaskForm.tsx",
+        "frontend/src/components/TasksSection.tsx",
+        "frontend/src/pages/TaskPage.tsx",
+        "frontend/src/locales/models/tasks.en-US.json",
+    ] {
+        assert!(app.join(expected).is_file(), "missing {expected}");
+    }
+    // A grandchild is listed on its parent's page, so it owns no list page.
+    assert!(!app.join("frontend/src/pages/TasksPage.tsx").exists());
+
+    // The table hangs off its immediate parent and carries no tenant column:
+    // the team is a join away, and a copy of it is what could drift.
+    let up = read(&migration(&app, "_create_tasks").join("up.sql"));
+    assert!(
+        up.contains("goal_id UUID NOT NULL REFERENCES goals(id) ON DELETE CASCADE"),
+        "{up}",
+    );
+    assert!(!up.contains("team_id"), "a grandchild stores no team: {up}");
+
+    // Diesel needs every pair of tables the chain query joins declared.
+    let schema = read(&app.join("backend/src/schema.rs"));
+    assert!(
+        schema.contains("diesel::joinable!(tasks -> goals (goal_id));"),
+        "{schema}",
+    );
+    assert!(schema.contains("diesel::allow_tables_to_appear_in_same_query!(goals, tasks);"));
+    assert!(schema.contains("diesel::allow_tables_to_appear_in_same_query!(projects, tasks);"));
+
+    // The model walks the whole chain in one query, and reaches its team
+    // through the root rather than through a column of its own.
+    let model = read(&app.join("backend/src/tasks/model.rs"));
+    assert!(model.contains("use crate::goals::Goal;"), "{model}");
+    assert!(model.contains("use crate::projects::Project;"));
+    assert!(model.contains(".inner_join(goals::table.inner_join(projects::table))"));
+    assert!(model.contains("projects::team_id.eq(team_id)"));
+    assert!(model.contains("pub async fn valid_goals("));
+    assert!(model.contains("pub goal_id: Uuid,"));
+    assert!(!model.contains("pub team_id: Uuid,"));
+
+    // Both surfaces authorize through the parent's own loader, so a crafted
+    // path is refused at the first hop as well as the last.
+    let routes = read(&app.join("backend/src/tasks/routes.rs"));
+    assert!(
+        routes.contains("path = \"/api/v1/goals/{goal_id}/tasks\","),
+        "{routes}",
+    );
+    assert!(routes.contains("Goal::load_for_member(connection, user_id, goal_id)"));
+    assert!(routes.contains("Goal::load_for_team(connection, caller.team.id, goal_id)"));
+    assert!(routes.contains("let team_id = project.team_id;"));
+
+    // No template name survives, at any of the three depths.
+    for generated in [
+        "backend/src/tasks/model.rs",
+        "backend/src/tasks/routes.rs",
+        "backend/tests/tasks_flow.rs",
+        "frontend/src/api/routes/taskRoutes.ts",
+        "frontend/src/components/TasksSection.tsx",
+        "frontend/src/pages/TaskPage.tsx",
+        "frontend/src/locales/models/tasks.en-US.json",
+    ] {
+        let contents = read(&app.join(generated));
+        for token in TEMPLATE_TOKENS.into_iter().chain(DEEP_TEMPLATE_TOKENS) {
+            assert!(
+                !contents.contains(token),
+                "{generated} still contains `{token}`",
+            );
+        }
+    }
+
+    // The grandchild attaches to the page its nested parent's scaffold wrote,
+    // which is the whole reason a nested model gained one.
+    let page = read(&app.join("frontend/src/pages/GoalPage.tsx"));
+    assert!(
+        page.contains("<TasksSection goalId={goalId} teamId={teamId} />"),
+        "{page}",
+    );
+    assert_anchored(&page, "🐺 anubis:children", "<TasksSection");
+    assert_anchored(&page, "🐺 anubis:child-imports", "import { TasksSection }");
+
+    // And a field added afterwards reaches the grandchild's own artifacts.
+    let output = scaffold_field(&app, &["Task", "effort:number_field"]);
+    assert!(
+        output.status.success(),
+        "scaffolding a field at depth three failed: {}",
+        stderr(&output),
+    );
+    assert!(read(&app.join("backend/src/tasks/model.rs")).contains("pub effort: Option<i32>,"));
+    assert!(read(&app.join("frontend/src/components/TasksSection.tsx")).contains("task.effort"));
+    assert!(read(&app.join("frontend/src/pages/TaskPage.tsx")).contains("record?.effort"));
+    assert!(
+        read(&app.join("frontend/src/locales/models/tasks.en-US.json")).contains("\"effort\":"),
     );
 
     std::fs::remove_dir_all(&app).expect("scratch directories are removable");
@@ -347,13 +495,18 @@ fn a_stamped_application_scaffolds_the_same_way() {
 fn arguments_and_locations_are_rejected_with_a_reason() {
     let app = copy_starter("rejections");
 
-    let deep = scaffold(&app, &["Task", "Goal,Project,Team"]);
+    // Three parents is one more than the living templates prove.
+    let deep = scaffold(&app, &["Task", "Note,Goal,Project,Team"]);
     assert!(!deep.status.success());
     assert!(
-        stderr(&deep).contains("roadmap"),
-        "deeper chains must point at the roadmap: {}",
+        stderr(&deep).contains("<GrandParent>,Team"),
+        "a fourth level must name the depths that exist: {}",
         stderr(&deep),
     );
+
+    let repeated = scaffold(&app, &["Task", "Goal,Goal,Team"]);
+    assert!(!repeated.status.success());
+    assert!(stderr(&repeated).contains("appears twice"));
 
     let unowned = scaffold(&app, &["Task", "Project"]);
     assert!(!unowned.status.success());

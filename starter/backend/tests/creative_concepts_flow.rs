@@ -403,3 +403,87 @@ async fn writing_a_creative_concept_queues_a_webhook_delivery() {
         "the destroy carries the record as it last stood: {body}",
     );
 }
+
+/// Every write records what it did in the team's audit log.
+///
+/// The recording rides the same shared functions the webhook emission does, and
+/// inside the same transaction, so no generated model carries a line of audit
+/// code. See `docs/audit.md`.
+#[tokio::test]
+async fn writing_a_creative_concept_records_an_audit_event() {
+    let Some((router, _outbox)) = boot().await else {
+        eprintln!("skipping creative_concepts_flow audit test: DATABASE_URL is not set");
+        return;
+    };
+
+    let run = Uuid::new_v4();
+    let owner_cookie = register(
+        &router,
+        &format!("creative-concept-audit-{run}@example.com"),
+    )
+    .await;
+    let team_id = bootstrapped_team(&router, &owner_cookie).await;
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        &format!("/account/teams/{team_id}/creative-concepts"),
+        Some(&json!({ "name": "Cairn" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let creative_concept_id = body["creative_concept"]["id"]
+        .as_str()
+        .expect("the response carries the record")
+        .to_owned();
+    let member_path = format!("/account/creative-concepts/{creative_concept_id}");
+
+    let (status, _body) = send(
+        &router,
+        "PATCH",
+        &member_path,
+        Some(&json!({ "name": "Cairn mark II" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _body) = send(&router, "DELETE", &member_path, None, Some(&owner_cookie)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Newest first, filtered to this model so another narrative's rows in the
+    // shared database cannot answer for it.
+    let (status, body) = send(
+        &router,
+        "GET",
+        &format!("/account/teams/{team_id}/audit-events?subject_type=CreativeConcept"),
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let recorded = body["audit_events"]
+        .as_array()
+        .expect("the plural key carries the events");
+    let actions: Vec<&str> = recorded
+        .iter()
+        .filter_map(|event| event["action"].as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        vec!["destroyed", "updated", "created"],
+        "every write records what it did: {body}",
+    );
+
+    // The label is how a reader recognizes the record, copied at the moment of
+    // the act rather than joined afterwards, which is why the destroy still
+    // names it.
+    assert_eq!(recorded[0]["subject_label"], json!("Cairn mark II"));
+    assert_eq!(recorded[0]["subject_id"], json!(creative_concept_id));
+    // The update's change set is the diff of the record's own columns.
+    assert_eq!(
+        recorded[1]["changes"]["name"],
+        json!({ "old": "Cairn", "new": "Cairn mark II" }),
+        "an update records what moved: {body}",
+    );
+}

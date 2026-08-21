@@ -303,6 +303,29 @@
     "unverifiedBanner": "Confirm your email address to secure your account. Check your inbox for the link.",
     "resendVerification": "Re-send verification email"
   },
+  "notifications": {
+    "bell": "Notifications",
+    "heading": "Notifications",
+    "empty": "Nothing here yet.",
+    "markAllRead": "Mark all read"
+  },
+  "auditLog": {
+    "navLink": "Audit log",
+    "title": "Audit log",
+    "pageSubtitle": "Everything recorded in {{team}}, newest first.",
+    "subtitle": "Append-only. Every act the framework and this app performed on the team’s records, as it happened.",
+    "adminOnly": "Only a team admin can read the audit log.",
+    "actor": "Who",
+    "action": "Did what",
+    "subject": "To what",
+    "when": "When",
+    "changes": "Changes",
+    "system": "System",
+    "noChanges": "No fields changed",
+    "changedFields_one": "{{count}} field",
+    "changedFields_other": "{{count}} fields",
+    "empty": "Nothing has been recorded for this team yet."
+  },
   "developers": {
     "navLink": "Developers",
     "title": "Developers",

@@ -29,17 +29,18 @@ use super::stamp::Replacements;
 /// disk at generation time. The generator only needs to know their names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTemplate {
-    model: &'static str,
-    parent: Option<&'static str>,
-    module: &'static str,
+    /// The ownership chain, from the template's own model outward to the team.
+    /// Each link pairs a model name with the module under
+    /// `backend/src/scaffolding/` that holds its slice, and the first link is
+    /// the template itself. `Team` is not a link: it belongs to the framework
+    /// and no template stamps it.
+    chain: &'static [(&'static str, &'static str)],
     frontend: &'static [&'static str],
 }
 
 /// The template for a model owned directly by a team.
 const TEAM_OWNED: ModelTemplate = ModelTemplate {
-    model: "CreativeConcept",
-    parent: None,
-    module: "absolutely_abstract",
+    chain: &[("CreativeConcept", "absolutely_abstract")],
     frontend: &[
         "frontend/src/api/routes/creativeConceptRoutes.ts",
         "frontend/src/components/CreativeConceptForm.tsx",
@@ -51,37 +52,72 @@ const TEAM_OWNED: ModelTemplate = ModelTemplate {
 
 /// The template for a model owned through a team-owned parent.
 ///
-/// A nested model has no pages of its own: its whole slice is the section
-/// component its parent's show page renders.
+/// A nested model has no list page: its table is the section component its
+/// parent's show page renders. It does own a show page, because that page is
+/// what the next depth down attaches its own section to.
 const NESTED: ModelTemplate = ModelTemplate {
-    model: "TangibleThing",
-    parent: Some("CreativeConcept"),
-    module: "completely_concrete",
+    chain: &[
+        ("TangibleThing", "completely_concrete"),
+        ("CreativeConcept", "absolutely_abstract"),
+    ],
     frontend: &[
         "frontend/src/api/routes/tangibleThingRoutes.ts",
         "frontend/src/components/TangibleThingForm.tsx",
         "frontend/src/components/TangibleThingsSection.tsx",
         "frontend/src/locales/models/tangibleThings.en-US.json",
+        "frontend/src/pages/TangibleThingPage.tsx",
     ],
 };
+
+/// The template for a model owned through a nested parent.
+///
+/// The same shape as [`NESTED`] one level further out: the chain resolves
+/// through two joins rather than one, and the team every handler needs comes
+/// off the chain's root, which is the only link that carries a `team_id`.
+const DEEPLY_NESTED: ModelTemplate = ModelTemplate {
+    chain: &[
+        ("GranularDetail", "exceedingly_granular"),
+        ("TangibleThing", "completely_concrete"),
+        ("CreativeConcept", "absolutely_abstract"),
+    ],
+    frontend: &[
+        "frontend/src/api/routes/granularDetailRoutes.ts",
+        "frontend/src/components/GranularDetailForm.tsx",
+        "frontend/src/components/GranularDetailsSection.tsx",
+        "frontend/src/locales/models/granularDetails.en-US.json",
+        "frontend/src/pages/GranularDetailPage.tsx",
+    ],
+};
+
+/// How many parents an ownership chain may name before the team.
+///
+/// Two, because three living templates prove three depths, and a template is
+/// the only thing that can teach the generator a join it has never written.
+const MAX_ANCESTORS: usize = 2;
 
 impl ModelTemplate {
     /// The template model's name, e.g. `TangibleThing`.
     #[must_use]
     pub fn model(self) -> &'static str {
-        self.model
+        self.chain[0].0
     }
 
-    /// The template parent's name, for the nested template.
+    /// The template's ancestors, nearest parent first, as name and module.
+    #[must_use]
+    pub fn ancestors(self) -> &'static [(&'static str, &'static str)] {
+        &self.chain[1..]
+    }
+
+    /// The template parent's name, for a nested template.
     #[must_use]
     pub fn parent(self) -> Option<&'static str> {
-        self.parent
+        self.ancestors().first().map(|(model, _module)| *model)
     }
 
     /// The template module under `backend/src/scaffolding/`.
     #[must_use]
     pub fn module(self) -> &'static str {
-        self.module
+        self.chain[0].1
     }
 
     /// The template's frontend files, relative to the application root.
@@ -100,9 +136,26 @@ impl ModelTemplate {
     /// which is a bug in the framework rather than in an application.
     #[must_use]
     pub fn table(self) -> String {
-        Names::parse(self.model)
+        Names::parse(self.model())
             .expect("template names are valid")
             .snake_plural()
+    }
+
+    /// The tables of the template's ancestors, nearest parent first.
+    ///
+    /// # Panics
+    /// Panics if a template name in this module is not a parseable model name,
+    /// which is a bug in the framework rather than in an application.
+    #[must_use]
+    pub fn ancestor_tables(self) -> Vec<String> {
+        self.ancestors()
+            .iter()
+            .map(|(model, _module)| {
+                Names::parse(model)
+                    .expect("template names are valid")
+                    .snake_plural()
+            })
+            .collect()
     }
 }
 
@@ -142,7 +195,9 @@ pub(super) const ROUTER_INDENT: usize = 4;
 #[derive(Debug, Clone)]
 pub struct ModelScaffold {
     model: Names,
-    parent: Option<Names>,
+    /// The chain above the model, nearest parent first, `Team` excluded.
+    /// Empty for a team-owned model.
+    ancestors: Vec<Names>,
     fields: Vec<Field>,
 }
 
@@ -151,26 +206,27 @@ impl ModelScaffold {
     ///
     /// `ownership` is the comma-separated chain ending in `Team`, exactly as
     /// Bullet Train writes it: `Team` for a team-owned model, `Project,Team`
-    /// for a model owned through `Project`.
+    /// for a model owned through `Project`, `Goal,Project,Team` for one owned
+    /// through a nested parent.
     ///
     /// # Errors
     /// Returns an error when a name does not parse, when the chain does not
-    /// end in `Team`, when the chain is deeper than one parent, or when a
-    /// field argument is malformed, duplicated, or names a column the
-    /// scaffolder maintains.
+    /// end in `Team`, when it names more than two parents or the same model
+    /// twice, or when a field argument is malformed, duplicated, or names a
+    /// column the scaffolder maintains.
     pub fn parse(model: &str, ownership: &str, fields: &[String]) -> Result<Self, ScaffoldError> {
         let model = Names::parse(model)?;
-        let parent = parse_ownership(ownership, &model)?;
+        let ancestors = parse_ownership(ownership, &model)?;
 
         let fields = fields
             .iter()
             .map(|argument| Field::parse(argument))
             .collect::<Result<Vec<_>, _>>()?;
-        validate_fields(&fields, parent.as_ref())?;
+        validate_fields(&fields, ancestors.first())?;
 
         Ok(Self {
             model,
-            parent,
+            ancestors,
             fields,
         })
     }
@@ -184,36 +240,45 @@ impl ModelScaffold {
     /// The parent model's names, for a nested model.
     #[must_use]
     pub fn parent(&self) -> Option<&Names> {
-        self.parent.as_ref()
+        self.ancestors.first()
+    }
+
+    /// The model's whole ownership chain, nearest parent first.
+    ///
+    /// Empty for a team-owned model, one entry for a nested one, two for a
+    /// grandchild. The length is what selects the living template.
+    #[must_use]
+    pub fn ancestors(&self) -> &[Names] {
+        &self.ancestors
     }
 
     /// The living template this scaffold transforms.
     #[must_use]
     pub fn template(&self) -> ModelTemplate {
-        if self.parent.is_some() {
-            NESTED
-        } else {
-            TEAM_OWNED
+        match self.ancestors.len() {
+            0 => TEAM_OWNED,
+            1 => NESTED,
+            // `parse` is the only constructor, and it refuses a deeper chain.
+            _two => DEEPLY_NESTED,
         }
     }
 
     /// The full rewrite from template names to this model's names.
     ///
-    /// A nested model rewrites two names, its own and its parent's, plus the
-    /// template module paths: the generated code refers to the parent module
-    /// the earlier scaffold created, never to the template it came from.
+    /// A nested model rewrites its own name and every ancestor's, plus the
+    /// template module paths: the generated code refers to the modules the
+    /// earlier scaffolds created, never to the templates they came from.
     #[must_use]
     pub fn replacements(&self) -> Replacements {
         let template = self.template();
         let mut pairs = name_pairs(template.model(), &self.model);
         pairs.extend(module_pairs(template.module(), &self.module()));
 
-        if let (Some(template_parent), Some(parent)) = (template.parent(), self.parent.as_ref()) {
-            pairs.extend(name_pairs(template_parent, parent));
-            // The template's parent is the team-owned template, and the
-            // generated code reaches the parent through the module its own
-            // scaffold created.
-            pairs.extend(module_pairs(TEAM_OWNED.module(), &parent.snake_plural()));
+        for ((template_name, template_module), ancestor) in
+            template.ancestors().iter().zip(&self.ancestors)
+        {
+            pairs.extend(name_pairs(template_name, ancestor));
+            pairs.extend(module_pairs(template_module, &ancestor.snake_plural()));
         }
 
         Replacements::new(pairs)
@@ -346,12 +411,20 @@ impl ModelScaffold {
 /// names the generated components carry.
 impl ModelScaffold {
     /// The `UrlTree` entries inserted into `frontend/src/urls.ts`.
+    ///
+    /// Every model owns a show page, and so a route to it. Only a team-owned
+    /// model owns a list page: a nested model's table lives on its parent's
+    /// show page, which is what a grandchild attaches its own table to.
     #[must_use]
     pub fn url_entries(&self) -> String {
-        let list = self.model.camel_plural();
         let show = self.model.camel();
         let path = self.model.kebab_plural();
-        format!("{list}: '/{path}',\n{show}: '/{path}/:{show}Id',")
+        let member = format!("{show}: '/{path}/:{show}Id',");
+        if self.ancestors.is_empty() {
+            format!("{}: '/{path}',\n{member}", self.model.camel_plural())
+        } else {
+            member
+        }
     }
 
     /// The link factory inserted into `frontend/src/urls.ts`.
@@ -385,24 +458,32 @@ impl ModelScaffold {
     }
 
     /// The page imports inserted into `frontend/src/App.tsx`.
+    ///
+    /// One per page the model owns, which [`url_entries`] decides.
+    ///
+    /// [`url_entries`]: ModelScaffold::url_entries
     #[must_use]
     pub fn page_imports(&self) -> String {
         let show = self.show_page();
-        let list = self.list_page();
-        format!(
-            "import {{ {show} }} from './pages/{show}'\n\
-             import {{ {list} }} from './pages/{list}'",
-        )
+        let show_import = format!("import {{ {show} }} from './pages/{show}'");
+        if self.ancestors.is_empty() {
+            let list = self.list_page();
+            format!("{show_import}\nimport {{ {list} }} from './pages/{list}'")
+        } else {
+            show_import
+        }
     }
 
     /// The `<Route>` elements inserted into `frontend/src/App.tsx`.
     #[must_use]
     pub fn route_elements(&self) -> String {
-        format!(
-            "{}\n{}",
-            route_element(&self.model.camel_plural(), &self.list_page()),
-            route_element(&self.model.camel(), &self.show_page()),
-        )
+        let show = route_element(&self.model.camel(), &self.show_page());
+        if self.ancestors.is_empty() {
+            let list = route_element(&self.model.camel_plural(), &self.list_page());
+            format!("{list}\n{show}")
+        } else {
+            show
+        }
     }
 
     /// The navigation entry inserted into `AppShell.tsx`.
@@ -433,11 +514,11 @@ impl ModelScaffold {
 
     /// How a nested model attaches to the page its parent's scaffold wrote.
     ///
-    /// `None` for a team-owned model, which owns its own pages instead of
-    /// attaching to someone else's.
+    /// `None` for a team-owned model, which is nobody's child. Every other
+    /// depth attaches identically, because every parent owns a show page.
     #[must_use]
     pub fn child_attachment(&self) -> Option<ChildAttachment> {
-        let parent = self.parent.as_ref()?;
+        let parent = self.ancestors.first()?;
         let section = format!("{}Section", self.model.pascal_plural());
         let parent_id = format!("{}Id", parent.camel());
         Some(ChildAttachment {
@@ -464,11 +545,11 @@ impl ModelScaffold {
 
 /// Every artifact a scaffolded model owns, and what each one receives.
 ///
-/// The paths are relative to the application root. Both ownership depths are
-/// listed: a team-owned model owns the two pages, a nested model owns the
-/// section component instead, and neither owns the other's files. A caller
-/// applies the entries whose file exists, which is how `anubis scaffold field`
-/// works on either depth without being told which it is looking at.
+/// The paths are relative to the application root, and every ownership depth's
+/// files are listed: a team-owned model owns a list page, a nested model owns
+/// the section component its parent renders instead, and both own a show page.
+/// A caller applies the entries whose file exists, which is how `anubis
+/// scaffold field` works at any depth without being told which it is looking at.
 ///
 /// The model's locale file is not here: it is JSON, so it takes structural
 /// insertion rather than anchors. [`locale_file`] names it.
@@ -571,8 +652,8 @@ fn route_element(path: &str, page: &str) -> String {
     )
 }
 
-/// Parses the ownership chain, returning the parent of a nested model.
-fn parse_ownership(ownership: &str, model: &Names) -> Result<Option<Names>, ScaffoldError> {
+/// Parses the ownership chain into the model's ancestors, nearest first.
+fn parse_ownership(ownership: &str, model: &Names) -> Result<Vec<Names>, ScaffoldError> {
     let chain = ownership
         .split(',')
         .map(str::trim)
@@ -590,24 +671,38 @@ fn parse_ownership(ownership: &str, model: &Names) -> Result<Option<Names>, Scaf
              reaches a team"
         )));
     }
-
-    match parents {
-        [] => Ok(None),
-        [parent] => {
-            let parent = Names::parse(parent)?;
-            if parent.pascal() == model.pascal() {
-                return Err(ScaffoldError::new(format!(
-                    "`{}` cannot own itself",
-                    model.pascal()
-                )));
-            }
-            Ok(Some(parent))
-        }
-        _deeper => Err(ScaffoldError::new(format!(
-            "ownership chain `{ownership}` nests deeper than one parent; scaffolding supports \
-             `Team` and `<Parent>,Team` today, and deeper chains are on the roadmap"
-        ))),
+    if parents.len() > MAX_ANCESTORS {
+        return Err(ScaffoldError::new(format!(
+            "ownership chain `{ownership}` names {} parents; scaffolding supports `Team`, \
+             `<Parent>,Team`, and `<Parent>,<GrandParent>,Team`, because a living template is \
+             what proves each depth and there are three of them",
+            parents.len(),
+        )));
     }
+
+    let mut ancestors: Vec<Names> = Vec::with_capacity(parents.len());
+    for parent in parents {
+        let parent = Names::parse(parent)?;
+        if parent.pascal() == model.pascal() {
+            return Err(ScaffoldError::new(format!(
+                "`{}` cannot own itself",
+                model.pascal()
+            )));
+        }
+        // A repeated link would generate two modules under one name and a
+        // chain that walks in a circle.
+        if ancestors
+            .iter()
+            .any(|earlier| earlier.pascal() == parent.pascal())
+        {
+            return Err(ScaffoldError::new(format!(
+                "`{}` appears twice in ownership chain `{ownership}`",
+                parent.pascal(),
+            )));
+        }
+        ancestors.push(parent);
+    }
+    Ok(ancestors)
 }
 
 /// Rejects duplicate fields, fields that fight the template, and fields that
@@ -755,6 +850,69 @@ mod tests {
     }
 
     #[test]
+    fn a_grandchild_rewrites_its_whole_chain() {
+        let scaffold = ModelScaffold::parse("Task", "Goal,Project,Team", &[]).unwrap();
+        assert_eq!(scaffold.template().module(), "exceedingly_granular");
+        assert_eq!(
+            scaffold
+                .ancestors()
+                .iter()
+                .map(super::Names::pascal)
+                .collect::<Vec<_>>(),
+            ["Goal", "Project"],
+            "the chain reads from the model outward",
+        );
+
+        let replacements = scaffold.replacements();
+        assert_eq!(
+            replacements.apply("use crate::scaffolding::completely_concrete::TangibleThing;"),
+            "use crate::goals::Goal;",
+        );
+        assert_eq!(
+            replacements.apply("use crate::scaffolding::absolutely_abstract::CreativeConcept;"),
+            "use crate::projects::Project;",
+        );
+        assert_eq!(
+            replacements.apply("granular_details::tangible_thing_id"),
+            "tasks::goal_id",
+        );
+        assert_eq!(
+            replacements.apply("GranularDetail::valid_tangible_things"),
+            "Task::valid_goals",
+        );
+        // The team every handler needs comes off the chain's root, which is
+        // the only link carrying a `team_id`.
+        assert_eq!(
+            replacements.apply("creative_concept.team_id"),
+            "project.team_id",
+        );
+    }
+
+    #[test]
+    fn a_grandchild_attaches_to_its_nested_parents_page() {
+        let scaffold = ModelScaffold::parse("Task", "Goal,Project,Team", &[]).unwrap();
+
+        let attachment = scaffold
+            .child_attachment()
+            .expect("a grandchild attaches to its parent");
+        assert_eq!(attachment.page, "frontend/src/pages/GoalPage.tsx");
+        assert_eq!(
+            attachment.element, "<TasksSection goalId={goalId} teamId={teamId} />",
+            "a section is handed its parent's id, whatever the parent's depth",
+        );
+
+        // A grandchild is listed on its parent's page, so it owns no list
+        // page and no navigation entry, exactly as a nested model does.
+        assert_eq!(scaffold.url_entries(), "task: '/tasks/:taskId',");
+        assert_eq!(
+            scaffold.page_imports(),
+            "import { TaskPage } from './pages/TaskPage'",
+        );
+        assert!(scaffold.route_elements().contains("<TaskPage />"));
+        assert!(!scaffold.route_elements().contains("<TasksPage />"));
+    }
+
+    #[test]
     fn added_fields_are_planned_like_a_scaffold_field_run() {
         let scaffold = ModelScaffold::parse(
             "Project",
@@ -877,6 +1035,13 @@ mod tests {
             attachment.element, "<GoalsSection projectId={projectId} teamId={teamId} />",
             "a section is handed its parent's id and the team its options are scoped to",
         );
+        // It owns a show page for its own children to attach to, and no list
+        // page, because its table is the section above.
+        assert_eq!(scaffold.url_entries(), "goal: '/goals/:goalId',");
+        assert_eq!(
+            scaffold.page_imports(),
+            "import { GoalPage } from './pages/GoalPage'",
+        );
 
         let replacements = scaffold.replacements();
         assert_eq!(
@@ -910,11 +1075,19 @@ mod tests {
         ModelScaffold::parse("Goal", "Project", &[]).unwrap_err();
         ModelScaffold::parse("Goal", "", &[]).unwrap_err();
         ModelScaffold::parse("Goal", "Goal,Team", &[]).unwrap_err();
+        ModelScaffold::parse("Task", "Goal,Task,Team", &[]).unwrap_err();
 
-        let deep = ModelScaffold::parse("Task", "Goal,Project,Team", &[]).unwrap_err();
+        let repeated = ModelScaffold::parse("Task", "Goal,Goal,Team", &[]).unwrap_err();
         assert!(
-            deep.message().contains("roadmap"),
-            "deeper chains must point at the roadmap: {}",
+            repeated.message().contains("appears twice"),
+            "a repeated link must be named: {}",
+            repeated.message(),
+        );
+
+        let deep = ModelScaffold::parse("Task", "Note,Goal,Project,Team", &[]).unwrap_err();
+        assert!(
+            deep.message().contains("<GrandParent>,Team"),
+            "a fourth level must name the depths that exist: {}",
             deep.message(),
         );
     }

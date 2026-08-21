@@ -23,6 +23,7 @@ roles:
     models:
       CreativeConcept: [read]
       TangibleThing: [read]
+      GranularDetail: [read]
       PeripheralNotion: [read]
       # 🐺 anubis:models:default
 
@@ -32,6 +33,7 @@ roles:
     models:
       CreativeConcept: [manage]
       TangibleThing: [manage]
+      GranularDetail: [manage]
       PeripheralNotion: [manage]
       # 🐺 anubis:models:editor
 

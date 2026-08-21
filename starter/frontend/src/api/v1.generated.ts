@@ -13,6 +13,13 @@ export type CreateCreativeConceptBody = {
   name: string
 }
 
+/** The fields a granular detail is created from, on both surfaces. */
+export type CreateGranularDetailBody = {
+  /** Blank or absent stores no description. */
+  description?: string | null
+  name: string
+}
+
 /** The fields a tangible thing is created from, on both surfaces. */
 export type CreateTangibleThingBody = {
   /** Blank or absent stores no description. */
@@ -54,6 +61,36 @@ export type CreativeConceptsBody = {
 export type ErrorV1 = {
   /** A user-safe description of what went wrong. */
   message: string
+}
+
+/** A granular detail, owned through its tangible thing. */
+export type GranularDetail = {
+  /** When the granular detail was created. */
+  created_at: string
+  /** Optional long-form detail. */
+  description?: string | null
+  /** Primary key. */
+  id: string
+  /** Display name. */
+  name: string
+  /** The parent tangible thing; the ownership chain continues through it. */
+  tangible_thing_id: string
+  /** When the granular detail was last updated, kept by the database trigger. */
+  updated_at: string
+}
+
+/** One granular detail, as every endpoint that answers with one wraps it. */
+export type GranularDetailBody = {
+  granular_detail: GranularDetailView
+}
+
+/** A granular detail, as every endpoint serializes it. */
+export type GranularDetailView = GranularDetail
+
+/** A page of granular details, in the locked list envelope. */
+export type GranularDetailsBody = {
+  granular_details: GranularDetailView[]
+  pagination: Pagination
 }
 
 /** The page a list response describes, beside its records. */
@@ -120,6 +157,15 @@ export type UpdateCreativeConceptBody = {
   /** Blank clears the description, absent leaves it alone, which is exactly how the form behaves. */
   description?: string | null
   name?: string | null
+}
+
+/** The fields a granular detail is updated from, on both surfaces. */
+export type UpdateGranularDetailBody = {
+  /** Blank clears the description, absent leaves it alone, which is exactly how the form behaves. */
+  description?: string | null
+  name?: string | null
+  /** Moves the granular detail to another tangible thing of the same team. */
+  tangible_thing_id?: string | null
 }
 
 /** The fields a tangible thing is updated from, on both surfaces. */
@@ -190,6 +236,24 @@ export function createAnubisV1(options: ClientOptions) {
       .json<TangibleThingBody>()
   }
 
+  /** Fetch one granular detail. */
+  async function showGranularDetail(granularDetailId: string): Promise<GranularDetailBody> {
+    return client.get(`api/v1/granular-details/${granularDetailId}`).json<GranularDetailBody>()
+  }
+
+  /** Update one granular detail. */
+  async function updateGranularDetail(
+    granularDetailId: string,
+    body: UpdateGranularDetailBody,
+  ): Promise<GranularDetailBody> {
+    return client.patch(`api/v1/granular-details/${granularDetailId}`, { json: body }).json<GranularDetailBody>()
+  }
+
+  /** Delete one granular detail. */
+  async function deleteGranularDetail(granularDetailId: string): Promise<void> {
+    await client.delete(`api/v1/granular-details/${granularDetailId}`)
+  }
+
   /** Fetch one tangible thing. */
   async function showTangibleThing(tangibleThingId: string): Promise<TangibleThingBody> {
     return client.get(`api/v1/tangible-things/${tangibleThingId}`).json<TangibleThingBody>()
@@ -208,6 +272,21 @@ export function createAnubisV1(options: ClientOptions) {
     await client.delete(`api/v1/tangible-things/${tangibleThingId}`)
   }
 
+  /** List a tangible thing's granular details. */
+  async function listGranularDetails(tangibleThingId: string): Promise<GranularDetailsBody> {
+    return client.get(`api/v1/tangible-things/${tangibleThingId}/granular-details`).json<GranularDetailsBody>()
+  }
+
+  /** Create a granular detail under a tangible thing. */
+  async function createGranularDetail(
+    tangibleThingId: string,
+    body: CreateGranularDetailBody,
+  ): Promise<GranularDetailBody> {
+    return client
+      .post(`api/v1/tangible-things/${tangibleThingId}/granular-details`, { json: body })
+      .json<GranularDetailBody>()
+  }
+
   /** The team the caller's token belongs to. */
   async function showTeam(): Promise<TeamEnvelopeV1> {
     return client.get('api/v1/team').json<TeamEnvelopeV1>()
@@ -221,9 +300,14 @@ export function createAnubisV1(options: ClientOptions) {
     deleteCreativeConcept,
     listTangibleThings,
     createTangibleThing,
+    showGranularDetail,
+    updateGranularDetail,
+    deleteGranularDetail,
     showTangibleThing,
     updateTangibleThing,
     deleteTangibleThing,
+    listGranularDetails,
+    createGranularDetail,
     showTeam,
   } as const
 }

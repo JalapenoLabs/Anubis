@@ -729,10 +729,10 @@ fn validate_name(name: &str) -> Result<(), ScaffoldError> {
 
 /// One artifact of a model's slice, as a destination for field insertions.
 ///
-/// Which artifacts a model has depends on its ownership depth: a team-owned
-/// model has a list page and a show page, a nested model has one section
-/// component instead. The caller knows which files exist; this enum only says
-/// what each kind of file receives.
+/// Which artifacts a model has depends on its ownership depth: every model has
+/// a show page, a team-owned one has a list page beside it, and a nested one
+/// has a section component instead. The caller knows which files exist; this
+/// enum only says what each kind of file receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {
     /// `backend/src/<models>/model.rs`.

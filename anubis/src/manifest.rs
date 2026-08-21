@@ -337,6 +337,23 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/tenancy/teams/{team_id}/invitations/{invitation_id}",
         area: "tenancy",
     },
+    // The signed-in user's own notification inbox, mounted beside the
+    // application's account routes.
+    RouteEntry {
+        method: "GET",
+        path: "/account/notifications",
+        area: "notifications",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/account/notifications/read-all",
+        area: "notifications",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/account/notifications/{notification_id}/read",
+        area: "notifications",
+    },
     // Billing: the plan an organization is on, and the two Stripe redirects.
     RouteEntry {
         method: "GET",
@@ -510,6 +527,7 @@ plans:
                     &rate_limit,
                 ),
             )
+            .nest("/account", crate::notifications::router(pool.clone()))
             .nest(
                 "/billing",
                 crate::billing::router(

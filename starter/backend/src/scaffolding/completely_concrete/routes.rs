@@ -278,6 +278,7 @@ async fn insert_record(
     connection: &mut AsyncPgConnection,
     creative_concept: &CreativeConcept,
     body: CreateTangibleThingBody,
+    context: &anubis::audit::Context,
 ) -> Result<TangibleThingView, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
@@ -313,8 +314,20 @@ async fn insert_record(
                 .await?;
             // 🐺 anubis:create-associations
 
+            let (record_id, label) = (record.id, record.name.clone());
             let tangible_thing = TangibleThingView::one(connection, record).await?;
             anubis::webhooks::emit(connection, team_id, CREATED_EVENT, &tangible_thing).await?;
+            // Audited from the same seam the webhook is emitted from, so
+            // every scaffolded model is in the team's log with no code of
+            // its own. See `docs/audit.md`.
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::created(MODEL, record_id)
+                    .team(team_id)
+                    .label(&label),
+            )
+            .await?;
             Ok(tangible_thing)
         })
         .await
@@ -329,6 +342,7 @@ async fn apply_changes(
     record: TangibleThing,
     creative_concept: &CreativeConcept,
     body: UpdateTangibleThingBody,
+    context: &anubis::audit::Context,
 ) -> Result<TangibleThingView, ApiError> {
     let name = match body.name.as_deref().map(str::trim) {
         Some("") => return Err(ApiError::validation("Name the tangible thing.")),
@@ -341,6 +355,11 @@ async fn apply_changes(
     // in scope before the anchor rather than after it.
     let team_id = creative_concept.team_id;
     // 🐺 anubis:update-normalize
+
+    // The record as it stood, so the audit event can say what moved. A
+    // clone rather than a re-read: this is the row the handler already
+    // loaded and authorized.
+    let before = record.clone();
 
     connection
         .transaction::<TangibleThingView, ApiError, _>(async |connection| {
@@ -369,8 +388,15 @@ async fn apply_changes(
                 creative_concept_id,
                 // 🐺 anubis:changeset-values
             };
-            let tangible_thing = if changes.is_empty() {
-                TangibleThingView::one(connection, record).await?
+            let ((tangible_thing, moved), label) = if changes.is_empty() {
+                let label = record.name.clone();
+                (
+                    (
+                        TangibleThingView::one(connection, record).await?,
+                        anubis::audit::Changes::new(),
+                    ),
+                    label,
+                )
             } else {
                 let updated: TangibleThing = diesel::update(
                     tangible_things::table.filter(tangible_things::id.eq(record.id)),
@@ -379,12 +405,29 @@ async fn apply_changes(
                 .returning(TangibleThing::as_returning())
                 .get_result(connection)
                 .await?;
-                TangibleThingView::one(connection, updated).await?
+                // The change set is the diff of the record itself, which is
+                // why a column added by `anubis scaffold field` is audited
+                // the moment it exists.
+                let moved = anubis::audit::Changes::between(&before, &updated)?;
+                let label = updated.name.clone();
+                (
+                    (TangibleThingView::one(connection, updated).await?, moved),
+                    label,
+                )
             };
 
             // Emitted even when the change set was empty, because an
             // association reconciled above is a change the columns cannot see.
             anubis::webhooks::emit(connection, team_id, UPDATED_EVENT, &tangible_thing).await?;
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::updated(MODEL, before.id)
+                    .team(team_id)
+                    .label(&label)
+                    .changes(moved),
+            )
+            .await?;
             Ok(tangible_thing)
         })
         .await
@@ -398,9 +441,11 @@ async fn delete_record(
     connection: &mut AsyncPgConnection,
     record: TangibleThing,
     creative_concept: &CreativeConcept,
+    context: &anubis::audit::Context,
 ) -> Result<(), ApiError> {
     let team_id = creative_concept.team_id;
     let record_id = record.id;
+    let label = record.name.clone();
 
     connection
         .transaction::<(), ApiError, _>(async |connection| {
@@ -409,6 +454,14 @@ async fn delete_record(
                 .execute(connection)
                 .await?;
             anubis::webhooks::emit(connection, team_id, DESTROYED_EVENT, &tangible_thing).await?;
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::destroyed(MODEL, record_id)
+                    .team(team_id)
+                    .label(&label),
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -438,6 +491,7 @@ async fn list(
 async fn create(
     State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
     Json(body): Json<CreateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -446,7 +500,8 @@ async fn create(
         load_parent(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Create)?;
 
-    let tangible_thing = insert_record(&mut connection, &creative_concept, body).await?;
+    let tangible_thing =
+        insert_record(&mut connection, &creative_concept, body, &context.by(&user)).await?;
     Ok((
         StatusCode::CREATED,
         Json(TangibleThingBody { tangible_thing }),
@@ -472,6 +527,7 @@ async fn show(
 async fn update(
     State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
+    context: anubis::audit::Context,
     Path(tangible_thing_id): Path<Uuid>,
     Json(body): Json<UpdateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -480,13 +536,21 @@ async fn update(
         load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
-    let tangible_thing = apply_changes(&mut connection, record, &creative_concept, body).await?;
+    let tangible_thing = apply_changes(
+        &mut connection,
+        record,
+        &creative_concept,
+        body,
+        &context.by(&user),
+    )
+    .await?;
     Ok(Json(TangibleThingBody { tangible_thing }))
 }
 
 async fn destroy(
     State(state): State<TangibleThingState>,
     CurrentUser(user): CurrentUser,
+    context: anubis::audit::Context,
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -494,7 +558,13 @@ async fn destroy(
         load(&mut connection, user.id, tangible_thing_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
-    delete_record(&mut connection, tangible_thing, &creative_concept).await?;
+    delete_record(
+        &mut connection,
+        tangible_thing,
+        &creative_concept,
+        &context.by(&user),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -595,6 +665,7 @@ async fn api_show(
 async fn api_create(
     State(state): State<TangibleThingState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
     Json(body): Json<CreateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -604,7 +675,13 @@ async fn api_create(
     let creative_concept =
         load_parent_for_token(&mut connection, &caller, creative_concept_id).await?;
 
-    let tangible_thing = insert_record(&mut connection, &creative_concept, body).await?;
+    let tangible_thing = insert_record(
+        &mut connection,
+        &creative_concept,
+        body,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(TangibleThingBody { tangible_thing }),
@@ -631,6 +708,7 @@ async fn api_create(
 async fn api_update(
     State(state): State<TangibleThingState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Path(tangible_thing_id): Path<Uuid>,
     Json(body): Json<UpdateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -640,7 +718,14 @@ async fn api_update(
     let (record, creative_concept) =
         load_for_token(&mut connection, &caller, tangible_thing_id).await?;
 
-    let tangible_thing = apply_changes(&mut connection, record, &creative_concept, body).await?;
+    let tangible_thing = apply_changes(
+        &mut connection,
+        record,
+        &creative_concept,
+        body,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok(Json(TangibleThingBody { tangible_thing }))
 }
 
@@ -662,6 +747,7 @@ async fn api_update(
 async fn api_destroy(
     State(state): State<TangibleThingState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     caller.require(&state.roles, Action::Destroy, MODEL)?;
@@ -670,7 +756,13 @@ async fn api_destroy(
     let (tangible_thing, creative_concept) =
         load_for_token(&mut connection, &caller, tangible_thing_id).await?;
 
-    delete_record(&mut connection, tangible_thing, &creative_concept).await?;
+    delete_record(
+        &mut connection,
+        tangible_thing,
+        &creative_concept,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -94,6 +94,12 @@ pub async fn boot() -> Option<(Router, TestOutbox)> {
             ),
         )
         .nest("/account", anubis_starter::account_router(&pool, &roles))
+        // The team's audit log, which is where a narrative reads back what its
+        // writes recorded.
+        .nest(
+            "/account",
+            anubis::audit::router(pool.clone(), roles.clone()),
+        )
         // Where a provider's events arrive, with no session and no token.
         .nest("/webhooks", anubis_starter::webhooks_router(&pool))
         .layer(anubis::guard::layer(pool, roles));

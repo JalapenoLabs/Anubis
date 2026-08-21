@@ -284,10 +284,12 @@ updated:
   frontend/src/pages/CompanyPage.tsx
 ```
 
-A nested model owns a section (its table and its form) rather than pages of its
-own, and the parent's show page renders it. Two levels is the limit today;
-[a third](scaffolding.md#deferred-a-third-level-of-ownership) is designed and
-deliberately not shipped.
+A nested model owns a section (its table and its form) rather than a list page
+of its own, and the parent's show page renders it. It does own a show page, and
+that page is what the next level down attaches its own section to:
+`Task Goal,Project,Team` generates a model owned through a nested parent.
+[Three levels](scaffolding.md#three-levels-of-ownership) is the limit, because
+each depth is a living template rather than a flag.
 
 ## Add a field
 

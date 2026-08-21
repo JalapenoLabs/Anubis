@@ -29,6 +29,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit::{self, Changes};
 use crate::auth::CurrentUser;
 use crate::auth::routes::validate_email;
 use crate::billing::{Limits, PlanSet};
@@ -43,7 +44,7 @@ use crate::schema::{
     invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
 use crate::tenancy::bootstrap::{DEFAULT_ROLE, holds_admin};
-use crate::tenancy::invitation::{self, InvitationTarget};
+use crate::tenancy::invitation::{self, Invitation, InvitationTarget};
 use crate::tenancy::management::lock_organization;
 use crate::tenancy::model::{Organization, Team};
 
@@ -421,6 +422,7 @@ async fn list_organization_members(
 async fn create_invitation(
     State(state): State<TenancyState>,
     CurrentUser(inviter): CurrentUser,
+    context: audit::Context,
     Json(body): Json<CreateInvitationBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let email = validate_email(&body.email)?;
@@ -438,8 +440,8 @@ async fn create_invitation(
         } => organization_id,
     };
 
-    let token = connection
-        .transaction::<String, ApiError, _>(async |transaction| {
+    let (invitation, token) = connection
+        .transaction::<(Invitation, String), ApiError, _>(async |transaction| {
             lock_organization(transaction, organization_id).await?;
             if let Some(limits) = state.limits.as_ref() {
                 limits
@@ -447,10 +449,35 @@ async fn create_invitation(
                     .await?;
             }
 
-            let token =
+            let (invitation, token) =
                 invitation::create(transaction, target, &email, &granted_roles, inviter.id).await?;
             state.queue_seat_sync(transaction, organization_id).await?;
-            Ok(token)
+
+            // Recorded in the team when the invitation names one, so a team
+            // admin reading their own log sees who was invited into it.
+            let event = audit::Event::new(audit::INVITATION_CREATED, "Invitation")
+                .subject(invitation.id)
+                .label(&invitation.email)
+                .changes(Changes::new().field(
+                    "roles",
+                    Vec::<String>::new(),
+                    granted_roles.clone(),
+                ));
+            let event = match invitation.team_id {
+                Some(team_id) => event.team(team_id),
+                None => event.organization(organization_id),
+            };
+            audit::record(transaction, &context.by(&inviter), &event).await?;
+
+            notify_invitee(
+                transaction,
+                &email,
+                &inviter.email,
+                &target_name,
+                team_id_of(target),
+            )
+            .await?;
+            Ok((invitation, token))
         })
         .await?;
 
@@ -473,23 +500,11 @@ async fn create_invitation(
         );
     }
 
-    // Re-read what was stored so the response reflects the database.
-    let stored: (Uuid, DateTime<Utc>) = crate::schema::invitations::table
-        .filter(crate::schema::invitations::email.eq(&email))
-        .order(crate::schema::invitations::created_at.desc())
-        .select((
-            crate::schema::invitations::id,
-            crate::schema::invitations::expires_at,
-        ))
-        .first(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
     let response = InvitationBody {
         invitation: InvitationResponse {
-            id: stored.0,
+            id: invitation.id,
             email,
-            expires_at: stored.1,
+            expires_at: invitation.expires_at,
         },
     };
     Ok((StatusCode::CREATED, Json(response)))
@@ -498,6 +513,7 @@ async fn create_invitation(
 async fn claim_invitation(
     State(state): State<TenancyState>,
     CurrentUser(claimant): CurrentUser,
+    context: audit::Context,
     Json(body): Json<ClaimBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -512,6 +528,37 @@ async fn claim_invitation(
                 state
                     .queue_seat_sync(transaction, claimed.organization_id)
                     .await?;
+
+                // Two facts, and a log that only kept one of them would answer
+                // half the question: the invitation was accepted, and somebody
+                // joined. The subject differs, so they are two rows.
+                let joined = audit::person_label(
+                    claimant.first_name.as_deref(),
+                    claimant.last_name.as_deref(),
+                    &claimant.email,
+                );
+                let context = context.by(&claimant);
+                for event in [
+                    audit::Event::new(audit::INVITATION_CLAIMED, "Invitation")
+                        .subject(claimed.id)
+                        .label(&claimed.email),
+                    audit::Event::new(audit::MEMBER_ADDED, "User")
+                        .subject(claimant.id)
+                        .label(&joined)
+                        .changes(Changes::new().field(
+                            "roles",
+                            Vec::<String>::new(),
+                            claimed.roles.clone(),
+                        )),
+                ] {
+                    let event = match claimed.team_id {
+                        Some(team_id) => event.team(team_id),
+                        None => event.organization(claimed.organization_id),
+                    };
+                    audit::record(transaction, &context, &event).await?;
+                }
+
+                notify_admins_of_claim(transaction, claimed, claimant.id, &claimant.email).await?;
             }
             Ok(claimed)
         })
@@ -539,6 +586,125 @@ async fn claim_invitation(
     };
 
     Ok(Json(ClaimResponseBody { organization, team }))
+}
+
+/// The team an invitation joins, when it joins one.
+fn team_id_of(target: InvitationTarget) -> Option<Uuid> {
+    match target {
+        InvitationTarget::Team { team_id, .. } => Some(team_id),
+        InvitationTarget::Organization(_organization_id) => None,
+    }
+}
+
+/// Tells an invited address that already has an account about its invitation.
+///
+/// An address with no account is skipped rather than remembered: there is no
+/// inbox to write to, and the email carries the invitation either way. The
+/// claim token stays in that email and never reaches the notification, because
+/// a token is a credential and the row would be storing it in the clear, so
+/// the notice explains where to accept rather than linking to it.
+async fn notify_invitee(
+    connection: &mut AsyncPgConnection,
+    email: &str,
+    inviter_email: &str,
+    target_name: &str,
+    team_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let invitee: Option<Uuid> = users::table
+        .filter(users::email.eq(email))
+        .select(users::id)
+        .first(connection)
+        .await
+        .optional()
+        .map_err(log_internal)?;
+
+    let Some(invitee) = invitee else {
+        return Ok(());
+    };
+
+    crate::notifications::notify(
+        connection,
+        crate::notifications::NewNotification {
+            user_id: invitee,
+            team_id,
+            kind: crate::notifications::INVITATION_RECEIVED,
+            title: &format!("{inviter_email} invited you to join {target_name}"),
+            body: Some("Accept from the link in the invitation email."),
+            href: None,
+        },
+    )
+    .await
+    .map_err(log_internal)?;
+
+    Ok(())
+}
+
+/// Tells the admins of what was joined that somebody joined it.
+///
+/// The claimant is left out of their own news, which matters because claiming
+/// an admin invitation makes them one of the recipients this reads.
+async fn notify_admins_of_claim(
+    connection: &mut AsyncPgConnection,
+    claimed: &invitation::Invitation,
+    claimant_id: Uuid,
+    claimant_email: &str,
+) -> Result<(), ApiError> {
+    // A team invitation is news for the team's admins, an organization one for
+    // the organization's, and each names the screen its own roster is on.
+    let (name, href, recipients) = if let Some(team_id) = claimed.team_id {
+        let name: String = teams::table
+            .find(team_id)
+            .select(teams::name)
+            .first(connection)
+            .await
+            .map_err(log_internal)?;
+        let recipients = crate::notifications::team_admins(connection, team_id)
+            .await
+            .map_err(log_internal)?;
+        (
+            name,
+            crate::notifications::team_settings_href(team_id),
+            recipients,
+        )
+    } else {
+        let name: String = organizations::table
+            .find(claimed.organization_id)
+            .select(organizations::name)
+            .first(connection)
+            .await
+            .map_err(log_internal)?;
+        let recipients =
+            crate::notifications::organization_admins(connection, claimed.organization_id)
+                .await
+                .map_err(log_internal)?;
+        (
+            name,
+            crate::notifications::organization_settings_href(claimed.organization_id),
+            recipients,
+        )
+    };
+
+    let title = format!("{claimant_email} joined {name}");
+    for recipient in recipients {
+        if recipient == claimant_id {
+            continue;
+        }
+        crate::notifications::notify(
+            connection,
+            crate::notifications::NewNotification {
+                user_id: recipient,
+                team_id: claimed.team_id,
+                kind: crate::notifications::INVITATION_CLAIMED,
+                title: &title,
+                body: None,
+                href: Some(&href),
+            },
+        )
+        .await
+        .map_err(log_internal)?;
+    }
+
+    Ok(())
 }
 
 /// Resolves the invitation target, authorizes the inviter against it, and

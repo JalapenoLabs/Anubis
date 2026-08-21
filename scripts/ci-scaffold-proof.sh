@@ -43,7 +43,7 @@ cd "$root"
 # this by hand. CI checks out clean, so this only ever fires locally. The list
 # names the modules the sequence below generates, and moves when it does.
 leftovers=""
-for module in projects tickets goals tags applied_tags stripe_webhooks; do
+for module in projects tickets goals tasks tags applied_tags stripe_webhooks; do
   if [ -e "starter/backend/src/$module" ]; then
     leftovers="$leftovers starter/backend/src/$module"
   fi
@@ -87,14 +87,17 @@ echo "== scaffolding a domain into starter/ =="
 
 # One domain, covering every scaffolder and every shape they generate: a
 # team-owned model with extra fields, a field added afterwards, the field types
-# the templates prove, a nested model attaching itself to its parent's page, a
+# the templates prove, all three ownership depths with each nested model
+# attaching itself to its parent's page, a field added at the deepest one, a
 # join and the has-many-through field that reads through it, both flavours of
-# belongs_to on both ownership depths, a sign-in provider, and an incoming
+# belongs_to on two ownership depths, a sign-in provider, and an incoming
 # webhook receiver.
 scaffold model Project Team name:text_field description:text_area
 scaffold field Project priority:text_field
 scaffold model Ticket Team title:text_field urgency:number_field open:boolean due_date:date_field
 scaffold model Goal Project,Team name:text_field
+scaffold model Task Goal,Project,Team name:text_field
+scaffold field Task effort:number_field
 scaffold model Tag Team name:text_field
 scaffold join AppliedTag "project_id{class_name=Project}" "tag_id{class_name=Tag}"
 scaffold field Project "tag_ids:super_select{class_name=Tag}"

@@ -8,6 +8,7 @@ import { initReactI18next } from 'react-i18next'
 import enUS from './locales/en-US.json'
 import creativeConceptsEnUS from './locales/models/creativeConcepts.en-US.json'
 import tangibleThingsEnUS from './locales/models/tangibleThings.en-US.json'
+import granularDetailsEnUS from './locales/models/granularDetails.en-US.json'
 // 🐺 anubis:locale-imports
 
 export const i18n = i18next.use(initReactI18next)
@@ -23,6 +24,7 @@ i18n.init({
         ...enUS,
         ...creativeConceptsEnUS,
         ...tangibleThingsEnUS,
+        ...granularDetailsEnUS,
         // 🐺 anubis:locales
       },
     },

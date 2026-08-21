@@ -346,9 +346,10 @@ The demo is honest or it is worthless. Say what ships:
   `number_field`, `boolean`, `date_field`, and the two `super_select` spellings.
   The component library ships eighteen controls; the generator's table is the
   subset the living templates prove, and it grows by adding a row.
-- **Two levels of ownership.** `Task Goal,Project,Team` is refused by name.
-  [The design for a third](scaffolding.md#deferred-a-third-level-of-ownership)
-  is written down.
+- **Three levels of ownership.** `Task Goal,Project,Team` generates. A fourth
+  link is refused by name, because
+  [a depth is a living template](scaffolding.md#three-levels-of-ownership)
+  rather than a flag.
 - **No admin panel, no user impersonation, no onboarding wizard, no in-app
   notifications, no audit log, no drag-and-drop ordering.** Bullet Train has
   them; Anubis does not, yet.

@@ -28,7 +28,7 @@ The last runs the application binary because the document belongs to the applica
 
 ## The scaffold proof
 
-Every scaffolder slab was proven by hand: generate real models into the starter, run the full gates, revert. The Scaffold job makes that continuous. `scripts/ci-scaffold-proof.sh` generates one domain into the real `starter/` tree with every command in the family, covering every shape a template takes: a team-owned model with extra fields, a field added afterwards, each field type the templates prove, a nested model attaching itself to its parent's show page, a join with the association field that reads through it, a sign-in provider, and an incoming webhook receiver. Then it holds the output to the bar hand-written code is held to.
+Every scaffolder slab was proven by hand: generate real models into the starter, run the full gates, revert. The Scaffold job makes that continuous. `scripts/ci-scaffold-proof.sh` generates one domain into the real `starter/` tree with every command in the family, covering every shape a template takes: a team-owned model with extra fields, a field added afterwards, each field type the templates prove, all three ownership depths with each nested model attaching itself to its parent's show page, a field added at the deepest one, a join with the association field that reads through it, a sign-in provider, and an incoming webhook receiver. Then it holds the output to the bar hand-written code is held to.
 
 | Gate | What it catches |
 |---|---|

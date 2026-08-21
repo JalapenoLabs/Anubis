@@ -111,6 +111,9 @@ const REVALIDATE: HeaderValue = HeaderValue::from_static("no-cache");
 /// deliberately absent, being exact routes with nothing nested under them:
 /// they always match their own router and so can never reach the fallback.
 pub const RESERVED_PREFIXES: &[&str] = &[
+    // The signed-in user's own surface: the framework's notification inbox,
+    // and the account routes an application mounts beside it.
+    "/account",
     "/api",
     "/auth",
     "/billing",

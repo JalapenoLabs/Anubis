@@ -10,6 +10,7 @@
 //! `docs/architecture.md`.
 
 pub mod api;
+pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod config;
@@ -20,6 +21,7 @@ pub mod http;
 pub mod jobs;
 pub mod mail;
 pub mod manifest;
+pub mod notifications;
 pub mod rate_limit;
 pub mod realtime;
 pub mod roles;

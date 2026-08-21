@@ -332,6 +332,49 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One person's in-app notifications. See `docs/notifications.md`.
+    ///
+    /// `kind` is the machine-readable type an application translates by;
+    /// `title`, `body`, and `href` are the rendered notice, stored once so the
+    /// inbox reads as it was written.
+    notifications (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        team_id -> Nullable<Uuid>,
+        kind -> Text,
+        title -> Text,
+        body -> Nullable<Text>,
+        href -> Nullable<Text>,
+        read_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// The append-only audit log. See `docs/audit.md`.
+    ///
+    /// `team_id` is null for an account event, which belongs to the person
+    /// rather than to a tenant; `user_id` is null for a system act and for an
+    /// actor whose account has since been deleted, which is what `actor_name`
+    /// survives. Nothing updates or deletes a row, so there is no
+    /// `updated_at`.
+    audit_events (id) {
+        id -> Uuid,
+        team_id -> Nullable<Uuid>,
+        organization_id -> Nullable<Uuid>,
+        user_id -> Nullable<Uuid>,
+        actor_name -> Nullable<Text>,
+        action -> Text,
+        subject_type -> Text,
+        subject_id -> Nullable<Uuid>,
+        subject_label -> Nullable<Text>,
+        changes -> Jsonb,
+        request_id -> Nullable<Text>,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(sessions -> users (user_id));
 diesel::joinable!(user_avatars -> users (user_id));
 diesel::joinable!(user_mfa -> users (user_id));
@@ -365,3 +408,12 @@ diesel::joinable!(webhook_endpoints -> teams (team_id));
 diesel::joinable!(webhook_deliveries -> webhook_endpoints (webhook_endpoint_id));
 diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);
 diesel::allow_tables_to_appear_in_same_query!(webhook_endpoints, webhook_deliveries, teams);
+diesel::joinable!(notifications -> users (user_id));
+diesel::joinable!(notifications -> teams (team_id));
+// The audit log is read on its own, filtered by the tenant and the actor it
+// already carries, so it declares its foreign keys without joining across
+// them. Adding it to an existing `allow_tables_to_appear_in_same_query!` group
+// would re-declare pairs that group already covers.
+diesel::joinable!(audit_events -> teams (team_id));
+diesel::joinable!(audit_events -> organizations (organization_id));
+diesel::joinable!(audit_events -> users (user_id));

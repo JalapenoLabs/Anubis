@@ -11,9 +11,12 @@ import { Spinner } from '@heroui/react'
 import { ClaimInvitationPage } from './pages/ClaimInvitationPage'
 import { CreativeConceptPage } from './pages/CreativeConceptPage'
 import { CreativeConceptsPage } from './pages/CreativeConceptsPage'
+import { TangibleThingPage } from './pages/TangibleThingPage'
+import { GranularDetailPage } from './pages/GranularDetailPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { BillingPage } from './pages/billing/BillingPage'
 import { DevelopersPage } from './pages/developers/DevelopersPage'
+import { AuditLogPage } from './pages/auditLog/AuditLogPage'
 import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
 import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
@@ -125,6 +128,14 @@ export function App() {
       }
     />
     <Route
+      path={UrlTree.teamAuditLog}
+      element={
+        <Workspace>
+          <AuditLogPage />
+        </Workspace>
+      }
+    />
+    <Route
       path={UrlTree.organizationSettings}
       element={
         <Workspace>
@@ -153,6 +164,22 @@ export function App() {
       element={
         <Workspace>
           <CreativeConceptPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.tangibleThing}
+      element={
+        <Workspace>
+          <TangibleThingPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.granularDetail}
+      element={
+        <Workspace>
+          <GranularDetailPage />
         </Workspace>
       }
     />

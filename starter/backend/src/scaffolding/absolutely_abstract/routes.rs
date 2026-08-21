@@ -273,6 +273,7 @@ async fn insert_record(
     connection: &mut AsyncPgConnection,
     team_id: Uuid,
     body: CreateCreativeConceptBody,
+    context: &anubis::audit::Context,
 ) -> Result<CreativeConceptView, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
@@ -305,8 +306,20 @@ async fn insert_record(
                 .await?;
             // 🐺 anubis:create-associations
 
+            let (record_id, label) = (record.id, record.name.clone());
             let creative_concept = CreativeConceptView::one(connection, record).await?;
             anubis::webhooks::emit(connection, team_id, CREATED_EVENT, &creative_concept).await?;
+            // Audited from the same seam the webhook is emitted from, so
+            // every scaffolded model is in the team's log with no code of
+            // its own. See `docs/audit.md`.
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::created(MODEL, record_id)
+                    .team(team_id)
+                    .label(&label),
+            )
+            .await?;
             Ok(creative_concept)
         })
         .await
@@ -320,6 +333,7 @@ async fn apply_changes(
     connection: &mut AsyncPgConnection,
     record: CreativeConcept,
     body: UpdateCreativeConceptBody,
+    context: &anubis::audit::Context,
 ) -> Result<CreativeConceptView, ApiError> {
     let name = match body.name.as_deref().map(str::trim) {
         Some("") => return Err(ApiError::validation("Name the creative concept.")),
@@ -333,6 +347,11 @@ async fn apply_changes(
     let team_id = record.team_id;
     // 🐺 anubis:update-normalize
 
+    // The record as it stood, so the audit event can say what moved. A
+    // clone rather than a re-read: this is the row the handler already
+    // loaded and authorized.
+    let before = record.clone();
+
     connection
         .transaction::<CreativeConceptView, ApiError, _>(async |connection| {
             // Associations are reconciled before the columns, so a request that
@@ -344,8 +363,15 @@ async fn apply_changes(
                 description,
                 // 🐺 anubis:changeset-values
             };
-            let creative_concept = if changes.is_empty() {
-                CreativeConceptView::one(connection, record).await?
+            let ((creative_concept, moved), label) = if changes.is_empty() {
+                let label = record.name.clone();
+                (
+                    (
+                        CreativeConceptView::one(connection, record).await?,
+                        anubis::audit::Changes::new(),
+                    ),
+                    label,
+                )
             } else {
                 let updated: CreativeConcept = diesel::update(
                     creative_concepts::table.filter(creative_concepts::id.eq(record.id)),
@@ -354,12 +380,29 @@ async fn apply_changes(
                 .returning(CreativeConcept::as_returning())
                 .get_result(connection)
                 .await?;
-                CreativeConceptView::one(connection, updated).await?
+                // The change set is the diff of the record itself, which is
+                // why a column added by `anubis scaffold field` is audited
+                // the moment it exists.
+                let moved = anubis::audit::Changes::between(&before, &updated)?;
+                let label = updated.name.clone();
+                (
+                    (CreativeConceptView::one(connection, updated).await?, moved),
+                    label,
+                )
             };
 
             // Emitted even when the change set was empty, because an
             // association reconciled above is a change the columns cannot see.
             anubis::webhooks::emit(connection, team_id, UPDATED_EVENT, &creative_concept).await?;
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::updated(MODEL, before.id)
+                    .team(team_id)
+                    .label(&label)
+                    .changes(moved),
+            )
+            .await?;
             Ok(creative_concept)
         })
         .await
@@ -372,9 +415,11 @@ async fn apply_changes(
 async fn delete_record(
     connection: &mut AsyncPgConnection,
     record: CreativeConcept,
+    context: &anubis::audit::Context,
 ) -> Result<(), ApiError> {
     let team_id = record.team_id;
     let record_id = record.id;
+    let label = record.name.clone();
 
     connection
         .transaction::<(), ApiError, _>(async |connection| {
@@ -383,6 +428,14 @@ async fn delete_record(
                 .execute(connection)
                 .await?;
             anubis::webhooks::emit(connection, team_id, DESTROYED_EVENT, &creative_concept).await?;
+            anubis::audit::record(
+                connection,
+                context,
+                &anubis::audit::Event::destroyed(MODEL, record_id)
+                    .team(team_id)
+                    .label(&label),
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -409,12 +462,19 @@ async fn list(
 async fn create(
     State(state): State<CreativeConceptState>,
     member: TeamMember,
+    context: anubis::audit::Context,
     Json(body): Json<CreateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     member.require(Action::Create, MODEL)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let creative_concept = insert_record(&mut connection, member.team.id, body).await?;
+    let creative_concept = insert_record(
+        &mut connection,
+        member.team.id,
+        body,
+        &context.by(&member.user),
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(CreativeConceptBody { creative_concept }),
@@ -439,6 +499,7 @@ async fn show(
 async fn update(
     State(state): State<CreativeConceptState>,
     CurrentUser(user): CurrentUser,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
     Json(body): Json<UpdateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -446,13 +507,14 @@ async fn update(
     let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Update)?;
 
-    let creative_concept = apply_changes(&mut connection, record, body).await?;
+    let creative_concept = apply_changes(&mut connection, record, body, &context.by(&user)).await?;
     Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
 async fn destroy(
     State(state): State<CreativeConceptState>,
     CurrentUser(user): CurrentUser,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -460,7 +522,7 @@ async fn destroy(
         load(&mut connection, user.id, creative_concept_id).await?;
     require(&state.roles, &membership, Action::Destroy)?;
 
-    delete_record(&mut connection, creative_concept).await?;
+    delete_record(&mut connection, creative_concept, &context.by(&user)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -552,12 +614,19 @@ async fn api_show(
 async fn api_create(
     State(state): State<CreativeConceptState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Json(body): Json<CreateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     caller.require(&state.roles, Action::Create, MODEL)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let creative_concept = insert_record(&mut connection, caller.team.id, body).await?;
+    let creative_concept = insert_record(
+        &mut connection,
+        caller.team.id,
+        body,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(CreativeConceptBody { creative_concept }),
@@ -584,6 +653,7 @@ async fn api_create(
 async fn api_update(
     State(state): State<CreativeConceptState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
     Json(body): Json<UpdateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -592,7 +662,13 @@ async fn api_update(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let record = load_for_token(&mut connection, &caller, creative_concept_id).await?;
 
-    let creative_concept = apply_changes(&mut connection, record, body).await?;
+    let creative_concept = apply_changes(
+        &mut connection,
+        record,
+        body,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok(Json(CreativeConceptBody { creative_concept }))
 }
 
@@ -614,6 +690,7 @@ async fn api_update(
 async fn api_destroy(
     State(state): State<CreativeConceptState>,
     caller: ApiCaller,
+    context: anubis::audit::Context,
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     caller.require(&state.roles, Action::Destroy, MODEL)?;
@@ -621,7 +698,12 @@ async fn api_destroy(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let creative_concept = load_for_token(&mut connection, &caller, creative_concept_id).await?;
 
-    delete_record(&mut connection, creative_concept).await?;
+    delete_record(
+        &mut connection,
+        creative_concept,
+        &context.by_application(&caller.application),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

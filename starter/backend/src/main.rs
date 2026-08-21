@@ -98,7 +98,15 @@ async fn main() {
         // Public profile pictures at /users/{user_id}/avatar.
         .merge(anubis::auth::avatar_router(pool.clone()))
         // The realtime channel socket at /realtime.
-        .merge(anubis::realtime::router(pool.clone(), channels))
+        .merge(anubis::realtime::router(pool.clone(), channels.clone()))
+        // The signed-in user's notification inbox at /account/notifications,
+        // beside the application's own account routes below.
+        .nest("/account", anubis::notifications::router(pool.clone()))
+        // The team's audit log, read-only, beside the records it is about.
+        .nest(
+            "/account",
+            anubis::audit::router(pool.clone(), roles.clone()),
+        )
         .nest(
             "/auth",
             anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
@@ -158,25 +166,10 @@ async fn main() {
         // CurrentUser through these extensions.
         .layer(anubis::guard::layer(pool.clone(), roles));
 
-    // In production the built frontend ships with the binary: every path the
-    // routers above declined resolves to the SPA, so a cold load of a client
-    // route works. `/account` joins the framework's own prefixes (`/webhooks`
-    // among them) as a place where an unmatched path is a JSON 404 rather than
-    // index.html: a caller that asked for JSON deserves an error it can act on,
-    // not an HTML page and a `200`. Unset SPA_DIR leaves the browser to the
-    // Vite dev server, the development default.
-    let app = match &config.spa_dir {
-        Some(dir) => {
-            let assets = anubis::spa::Assets::new(dir)
-                .expect("SPA_DIR must point at a built frontend (yarn build)")
-                .reserve("/account");
-            app.fallback_service(assets.into_service())
-        }
-        None => app,
-    };
+    let app = behind_the_spa(app, &config);
 
     // Background jobs run in this process, in a worker built beside this one.
-    let worker = worker(&pool, plans, &config);
+    let worker = worker(&pool, plans, &config, channels);
 
     let (stop_worker, worker_stops) = tokio::sync::oneshot::channel::<()>();
     let working = tokio::spawn(worker.run(async move {
@@ -198,22 +191,58 @@ async fn main() {
         .expect("the job worker must shut down cleanly");
 }
 
+/// Puts the built frontend behind `app`, when this process is serving it.
+///
+/// In production the built frontend ships with the binary: every path the
+/// routers declined resolves to the SPA, so a cold load of a client route
+/// works. `/account` joins the framework's own prefixes (`/webhooks` among
+/// them) as a place where an unmatched path is a JSON 404 rather than
+/// index.html: a caller that asked for JSON deserves an error it can act on,
+/// not an HTML page and a `200`. Unset `SPA_DIR` leaves the browser to the Vite
+/// dev server, which is the development default.
+///
+/// # Panics
+/// Panics when `SPA_DIR` names something that is not a built frontend, which is
+/// a deployment mistake worth stopping the boot for.
+fn behind_the_spa(app: Router, config: &AppConfig) -> Router {
+    let Some(dir) = &config.spa_dir else {
+        return app;
+    };
+
+    let assets = anubis::spa::Assets::new(dir)
+        .expect("SPA_DIR must point at a built frontend (yarn build)")
+        .reserve("/account");
+    app.fallback_service(assets.into_service())
+}
+
 /// Builds the background job worker this process runs.
 ///
 /// Registering a job is the whole of the wiring: it subscribes the worker to
-/// that job's queue and captures whatever the handler needs. Three jobs are the
-/// framework's own, outgoing webhook delivery and the two halves of the Stripe
-/// subscription lifecycle; the application's are registered by `register_jobs`,
-/// which is where a scaffolded job lands.
-fn worker(pool: &anubis::db::DbPool, plans: PlanSet, config: &AppConfig) -> anubis::jobs::Worker {
+/// that job's queue and captures whatever the handler needs. Four jobs are the
+/// framework's own, outgoing webhook delivery, the notification ping, and the
+/// two halves of the Stripe subscription lifecycle; the application's are
+/// registered by `register_jobs`, which is where a scaffolded job lands.
+fn worker(
+    pool: &anubis::db::DbPool,
+    plans: PlanSet,
+    config: &AppConfig,
+    channels: anubis::realtime::Channels,
+) -> anubis::jobs::Worker {
     let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), config);
     let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans, config);
     let seats = reconciler.clone();
+    // A notification commits with the write that caused it; this is what tells
+    // the recipient's browser to refetch once that commit has happened.
+    let pinger = anubis::notifications::Pinger::new(channels);
 
     let worker = anubis::jobs::Worker::builder(pool.clone())
         .register(move |job: anubis::webhooks::DeliverWebhook| {
             let deliverer = deliverer.clone();
             async move { deliverer.deliver(job).await }
+        })
+        .register(move |job: anubis::notifications::PingRecipient| {
+            let pinger = pinger.clone();
+            async move { pinger.ping(job).await }
         })
         // Stripe's events become subscription rows here, on their own queue.
         .register(move |job: anubis::billing::ProcessStripeEvent| {

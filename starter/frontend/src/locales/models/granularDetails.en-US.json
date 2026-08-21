@@ -1,0 +1,20 @@
+{
+  "granularDetails": {
+    "title": "Granular details",
+    "subtitle": "The grandchild template: every granular detail belongs to this tangible thing.",
+    "noDescription": "No description",
+    "empty": "No granular details yet. Add the first one below.",
+    "open": "Open",
+    "createTitle": "Add a granular detail",
+    "createAction": "Create granular detail",
+    "editTitle": "Edit {{name}}",
+    "deleteAction": "Delete granular detail",
+    "notFound": "That granular detail is not available.",
+    "fields": {
+      "name": "Name",
+      "nameHelp": "Name the granular detail.",
+      "description": "Description",
+      "descriptionHelp": "Leave it blank to clear the description."
+    }
+  }
+}

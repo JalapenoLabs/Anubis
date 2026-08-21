@@ -9,6 +9,7 @@ import ky from 'ky'
 import { createAccountRoutes } from './routes/accountRoutes'
 import { createAuthRoutes } from './routes/authRoutes'
 import { createBillingRoutes } from './routes/billingRoutes'
+import { createNotificationRoutes } from './routes/notificationRoutes'
 import { createTenancyRoutes } from './routes/tenancyRoutes'
 
 type AnubisApiOptions = {
@@ -66,6 +67,7 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     ...createAccountRoutes(client),
     ...createTenancyRoutes(client),
     ...createBillingRoutes(client),
+    ...createNotificationRoutes(client),
     totpQrUrl,
     avatarUrl,
   } as const

@@ -287,6 +287,40 @@ export type BillingCheckoutRequest = {
   interval: string
 }
 
+/**
+ * One notice in the signed-in user's inbox.
+ *
+ * `kind` is the machine-readable type, `<subject>.<event>`, and `title` and
+ * `body` are the English text the backend stored when it wrote the row. An
+ * application with a translated inbox looks its own copy up by `kind` and
+ * renders that instead.
+ */
+export type AppNotification = {
+  id: string
+  /** The team the notice is about; null when it is about the person. */
+  teamId: string | null
+  kind: string
+  title: string
+  body: string | null
+  /** Where the entry navigates, as an application path; null when nowhere. */
+  href: string | null
+  /** When the recipient read it; null while it is unread. */
+  readAt: string | null
+  createdAt: string
+}
+
+/** One page of the inbox, and the count the bell's badge shows. */
+export type NotificationsPage = {
+  /** Unread first, then newest first. */
+  notifications: AppNotification[]
+  /** Unread across the whole inbox, not just this page. */
+  unread: number
+  page: number
+  limit: number
+  totalItems: number
+  totalPages: number
+}
+
 /** Raw wire shape; the backend serializes snake_case fields. */
 export type WireUser = {
   id: string

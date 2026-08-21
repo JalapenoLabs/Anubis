@@ -25,6 +25,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
 use crate::auth::user_token::TokenPurpose;
@@ -144,6 +145,7 @@ struct ChangePasswordBody {
 async fn change_password(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     jar: CookieJar,
     Json(body): Json<ChangePasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -153,9 +155,25 @@ async fn change_password(
     let password_hash = state.hasher.hash(body.new_password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    diesel::update(users::table.find(user.id))
-        .set((users::password_hash.eq(&password_hash),))
-        .execute(&mut connection)
+    // The rotation and its record commit together: a log missing a password
+    // change is exactly the gap an audit log exists to close. The change set
+    // stays empty, because the fact is the whole of what an auditor needs and
+    // neither password belongs in a table anybody can read.
+    connection
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            diesel::update(users::table.find(user.id))
+                .set((users::password_hash.eq(&password_hash),))
+                .execute(transaction)
+                .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&user),
+                &audit::Event::new(audit::PASSWORD_CHANGED, "User").subject(user.id),
+            )
+            .await?;
+            Ok(())
+        })
         .await
         .map_err(log_internal)?;
 
@@ -332,6 +350,7 @@ async fn list_sessions(
 async fn revoke_session(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Path(session_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -347,6 +366,15 @@ async fn revoke_session(
     if deleted == 0 {
         return Err(ApiError::not_found());
     }
+
+    audit::record(
+        &mut connection,
+        &context.by(&user),
+        &audit::Event::new(audit::SESSION_REVOKED, "Session").subject(session_id),
+    )
+    .await
+    .map_err(log_internal)?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -364,6 +392,7 @@ struct DeleteAccountBody {
 async fn delete_account(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     jar: CookieJar,
     Json(body): Json<DeleteAccountBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -371,11 +400,24 @@ async fn delete_account(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     connection
-        .transaction(async |transaction| {
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            // Recorded before the account goes, and it outlives it: the row's
+            // `user_id` is set to null by the delete while `actor_name` keeps
+            // who this was, which is the whole reason the name is copied.
+            audit::record(
+                transaction,
+                &context.by(&user),
+                &audit::Event::new(audit::ACCOUNT_DELETED, "User")
+                    .subject(user.id)
+                    .label(&user.email),
+            )
+            .await?;
+
             crate::tenancy::settle_departure(transaction, user.id).await?;
             diesel::delete(users::table.find(user.id))
                 .execute(transaction)
-                .await
+                .await?;
+            Ok(())
         })
         .await
         .map_err(log_internal)?;

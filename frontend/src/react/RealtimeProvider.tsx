@@ -28,9 +28,20 @@ export function RealtimeProvider(props: Props) {
 
 /** Returns the client provided by the nearest RealtimeProvider. */
 export function useRealtime(): RealtimeClient {
-  const client = useContext(RealtimeContext)
+  const client = useOptionalRealtime()
   if (!client) {
     throw new Error('useRealtime requires a <RealtimeProvider> above it in the tree')
   }
   return client
+}
+
+/**
+ * Returns the nearest provider's client, or null when there is no provider.
+ *
+ * For components that are better without realtime than absent: the
+ * notification bell works either way, live under a provider and on its own
+ * fetches without one.
+ */
+export function useOptionalRealtime(): RealtimeClient | null {
+  return useContext(RealtimeContext)
 }

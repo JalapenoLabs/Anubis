@@ -5,6 +5,7 @@ import type { TangibleThing } from '../api/routes/tangibleThingRoutes'
 // Core
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Link } from 'react-router'
 import useSWR from 'swr'
 import { useTeamContext } from '../context/TeamProvider'
 
@@ -30,6 +31,7 @@ import {
   listTangibleThings,
 } from '../api/routes/tangibleThingRoutes'
 import { can } from '../roles.generated'
+import { getTangibleThingUrl } from '../urls'
 
 const PAGE_LIMIT = 10
 
@@ -131,6 +133,12 @@ export function TangibleThingsSection(props: Props) {
                     {/* 🐺 anubis:list-cells */}
                     <TableCell>
                       <div className='level-left gap-2'>
+                        <Link
+                          to={getTangibleThingUrl(tangibleThing.id)}
+                          className='text-primary'
+                        >{
+                            t('tangibleThings.open')
+                          }</Link>
                         { mayWrite
                           ? <Button
                               size='sm'

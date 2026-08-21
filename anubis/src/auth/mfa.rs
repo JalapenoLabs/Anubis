@@ -32,6 +32,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::model::UserResponse;
 use crate::auth::routes::AuthState;
 use crate::auth::secret_box::{self, SecretKey};
@@ -163,6 +164,7 @@ struct RecoveryCodesBody {
 async fn confirm(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Json(body): Json<CodeBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
@@ -192,6 +194,16 @@ async fn confirm(
         .await
         .map_err(log_internal)?;
 
+    // The seed and the recovery codes stay out of the log by never being put
+    // in it; that a second factor is now in force is the auditable fact.
+    audit::record(
+        &mut connection,
+        &context.by(&user),
+        &audit::Event::new(audit::MFA_ENROLLED, "User").subject(user.id),
+    )
+    .await
+    .map_err(log_internal)?;
+
     Ok(Json(RecoveryCodesBody {
         recovery_codes: codes,
     }))
@@ -205,6 +217,7 @@ struct PasswordBody {
 async fn disable(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Json(body): Json<PasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let matched = state
@@ -219,6 +232,14 @@ async fn disable(
     discard_enrollment(&mut connection, user.id)
         .await
         .map_err(log_internal)?;
+
+    audit::record(
+        &mut connection,
+        &context.by(&user),
+        &audit::Event::new(audit::MFA_DISABLED, "User").subject(user.id),
+    )
+    .await
+    .map_err(log_internal)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

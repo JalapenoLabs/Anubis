@@ -50,11 +50,12 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit::{self, Changes};
 use crate::auth::CurrentUser;
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
 use crate::schema::{
-    invitations, organization_memberships, organizations, team_memberships, teams,
+    invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
 use crate::tenancy::bootstrap::{self, ADMIN_ROLE, holds_admin};
 use crate::tenancy::model::{Organization, OrganizationMembership, Team, TeamMembership};
@@ -141,14 +142,26 @@ struct MembershipBody {
 async fn create_organization(
     State(state): State<TenancyState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     Json(body): Json<NameBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let name = validate_name(&body.name, "organization")?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let (organization, team) = connection
-        .transaction(async |transaction| {
-            bootstrap::create_organization(transaction, user.id, &name).await
+        .transaction::<(Organization, Team), diesel::result::Error, _>(async |transaction| {
+            let (organization, team) =
+                bootstrap::create_organization(transaction, user.id, &name).await?;
+            audit::record(
+                transaction,
+                &context.by(&user),
+                &audit::Event::new(audit::ORGANIZATION_CREATED, "Organization")
+                    .organization(organization.id)
+                    .subject(organization.id)
+                    .label(&organization.name),
+            )
+            .await?;
+            Ok((organization, team))
         })
         .await
         .map_err(log_internal)?;
@@ -162,19 +175,43 @@ async fn create_organization(
 async fn rename_organization(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
     Json(body): Json<NameBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
     let name = validate_name(&body.name, "organization")?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let organization: Organization =
-        diesel::update(organizations::table.find(member.organization.id))
-            .set(organizations::name.eq(&name))
-            .returning(Organization::as_returning())
-            .get_result(&mut connection)
-            .await
-            .map_err(log_internal)?;
+    // The rename and its record share one transaction, so the log can never
+    // hold a rename that did not happen, nor miss one that did.
+    let organization: Organization = connection
+        .transaction::<Organization, diesel::result::Error, _>(async |transaction| {
+            let organization: Organization =
+                diesel::update(organizations::table.find(member.organization.id))
+                    .set(organizations::name.eq(&name))
+                    .returning(Organization::as_returning())
+                    .get_result(transaction)
+                    .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::ORGANIZATION_RENAMED, "Organization")
+                    .organization(organization.id)
+                    .subject(organization.id)
+                    .label(&organization.name)
+                    .changes(Changes::new().field(
+                        "name",
+                        member.organization.name.clone(),
+                        organization.name.clone(),
+                    )),
+            )
+            .await?;
+
+            Ok(organization)
+        })
+        .await
+        .map_err(log_internal)?;
 
     Ok(Json(OrganizationBody { organization }))
 }
@@ -187,6 +224,7 @@ async fn rename_organization(
 async fn delete_organization(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
 
@@ -196,6 +234,20 @@ async fn delete_organization(
         .await
         .map_err(|error| restricted_by_records(error, "organization"))?;
 
+    // Recorded against nobody's tenant, deliberately. Audit rows cascade from
+    // the organization they name, so naming this one would delete the record
+    // of its own deletion; the act lands in the actor's account log instead,
+    // which is the one place that outlives the organization.
+    audit::record(
+        &mut connection,
+        &context.by(&member.user),
+        &audit::Event::new(audit::ORGANIZATION_DESTROYED, "Organization")
+            .subject(member.organization.id)
+            .label(&member.organization.name),
+    )
+    .await
+    .map_err(log_internal)?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -203,6 +255,7 @@ async fn delete_organization(
 async fn create_team(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
     Json(body): Json<NameBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
@@ -210,8 +263,22 @@ async fn create_team(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let team = connection
-        .transaction(async |transaction| {
-            bootstrap::create_team(transaction, member.organization.id, &name, member.user.id).await
+        .transaction::<Team, diesel::result::Error, _>(async |transaction| {
+            let team =
+                bootstrap::create_team(transaction, member.organization.id, &name, member.user.id)
+                    .await?;
+            // Recorded against the new team rather than its organization, so
+            // the first line of a team's own log says where the team came from.
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::TEAM_CREATED, "Team")
+                    .team(team.id)
+                    .subject(team.id)
+                    .label(&team.name),
+            )
+            .await?;
+            Ok(team)
         })
         .await
         .map_err(log_internal)?;
@@ -226,23 +293,42 @@ async fn create_team(
 async fn delete_team(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
     Path((_organization_id, team_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let deleted = diesel::delete(
+    // The name comes back with the delete, because the audit event has to say
+    // which team went and by then there is nothing left to ask.
+    let deleted: Option<String> = diesel::delete(
         teams::table
             .filter(teams::id.eq(team_id))
             .filter(teams::organization_id.eq(member.organization.id)),
     )
-    .execute(&mut connection)
+    .returning(teams::name)
+    .get_result(&mut connection)
     .await
+    .optional()
     .map_err(|error| restricted_by_records(error, "team"))?;
 
-    if deleted == 0 {
+    let Some(name) = deleted else {
         return Err(ApiError::not_found());
-    }
+    };
+
+    // Recorded against the organization: the team's own audit rows cascaded
+    // away with it, and the organization is what survives to hold this one.
+    audit::record(
+        &mut connection,
+        &context.by(&member.user),
+        &audit::Event::new(audit::TEAM_DESTROYED, "Team")
+            .organization(member.organization.id)
+            .subject(team_id)
+            .label(&name),
+    )
+    .await
+    .map_err(log_internal)?;
+
     // The team's memberships went with it, and some of those people may have
     // held a seat nowhere else.
     state
@@ -259,6 +345,7 @@ async fn delete_team(
 async fn remove_organization_member(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
     Path((_organization_id, membership_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
@@ -277,9 +364,28 @@ async fn remove_organization_member(
                 ));
             }
 
+            // Read before the delete, because the label has to say who left
+            // and afterwards the membership is gone.
+            let label = account_label(transaction, target.user_id).await?;
+
             diesel::delete(organization_memberships::table.find(target.id))
                 .execute(transaction)
                 .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::MEMBER_REMOVED, "OrganizationMembership")
+                    .organization(member.organization.id)
+                    .subject(target.id)
+                    .label(&label)
+                    .changes(Changes::new().field(
+                        "roles",
+                        target.roles.clone(),
+                        Vec::<String>::new(),
+                    )),
+            )
+            .await?;
 
             // Two admins removing each other at the same instant would each
             // leave the other standing on their own reading; the lock orders
@@ -310,6 +416,7 @@ async fn remove_organization_member(
 async fn leave_organization(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     connection
@@ -323,6 +430,20 @@ async fn leave_organization(
             diesel::delete(organization_memberships::table.find(leaving.id))
                 .execute(transaction)
                 .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::MEMBER_LEFT, "OrganizationMembership")
+                    .organization(member.organization.id)
+                    .subject(leaving.id)
+                    .label(&audit::person_label(
+                        member.user.first_name.as_deref(),
+                        member.user.last_name.as_deref(),
+                        &member.user.email,
+                    )),
+            )
+            .await?;
 
             if holds_admin(&leaving.roles) {
                 require_organization_keeps_an_admin(transaction, member.organization.id, "leave")
@@ -341,16 +462,38 @@ async fn leave_organization(
 async fn rename_team(
     State(state): State<TenancyState>,
     member: TeamMember,
+    context: audit::Context,
     Json(body): Json<NameBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_team_admin(&member)?;
     let name = validate_name(&body.name, "team")?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let team: Team = diesel::update(teams::table.find(member.team.id))
-        .set(teams::name.eq(&name))
-        .returning(Team::as_returning())
-        .get_result(&mut connection)
+    let team: Team = connection
+        .transaction::<Team, diesel::result::Error, _>(async |transaction| {
+            let team: Team = diesel::update(teams::table.find(member.team.id))
+                .set(teams::name.eq(&name))
+                .returning(Team::as_returning())
+                .get_result(transaction)
+                .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::TEAM_RENAMED, "Team")
+                    .team(team.id)
+                    .subject(team.id)
+                    .label(&team.name)
+                    .changes(Changes::new().field(
+                        "name",
+                        member.team.name.clone(),
+                        team.name.clone(),
+                    )),
+            )
+            .await?;
+
+            Ok(team)
+        })
         .await
         .map_err(log_internal)?;
 
@@ -365,6 +508,7 @@ async fn rename_team(
 async fn change_member_roles(
     State(state): State<TenancyState>,
     member: TeamMember,
+    context: audit::Context,
     Path((_team_id, membership_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<RolesBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -393,6 +537,39 @@ async fn change_member_roles(
             if stepped_down(&target, &roles) {
                 require_team_keeps_an_admin(transaction, member.team.id, "step down").await?;
             }
+
+            let label = member_label(transaction, target.id).await?;
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::MEMBER_ROLE_CHANGED, "TeamMembership")
+                    .team(member.team.id)
+                    .subject(target.id)
+                    .label(&label)
+                    .changes(Changes::new().field("roles", target.roles.clone(), roles.clone())),
+            )
+            .await?;
+
+            // Only a claimed membership has somebody to tell, and an admin
+            // editing their own roles already knows. The notice commits with
+            // the change, so a request that ends in a `409` sends nothing.
+            if let Some(target_user_id) = target.user_id
+                && target_user_id != member.user.id
+            {
+                crate::notifications::notify(
+                    transaction,
+                    crate::notifications::NewNotification {
+                        user_id: target_user_id,
+                        team_id: Some(member.team.id),
+                        kind: crate::notifications::MEMBERSHIP_ROLES_CHANGED,
+                        title: &format!("Your role in {} changed", member.team.name),
+                        body: Some(&format!("You now hold: {}.", roles.join(", "))),
+                        href: Some(&crate::notifications::team_settings_href(member.team.id)),
+                    },
+                )
+                .await?;
+            }
+
             Ok(target.id)
         })
         .await?;
@@ -410,6 +587,7 @@ async fn change_member_roles(
 async fn remove_member(
     State(state): State<TenancyState>,
     member: TeamMember,
+    context: audit::Context,
     Path((_team_id, membership_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_team_admin(&member)?;
@@ -426,9 +604,28 @@ async fn remove_member(
                 ));
             }
 
+            // Read before the delete: afterwards the membership, and the
+            // invitation that may be all this person ever had, are both gone.
+            let label = member_label(transaction, target.id).await?;
+
             diesel::delete(team_memberships::table.find(target.id))
                 .execute(transaction)
                 .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::MEMBER_REMOVED, "TeamMembership")
+                    .team(member.team.id)
+                    .subject(target.id)
+                    .label(&label)
+                    .changes(Changes::new().field(
+                        "roles",
+                        target.roles.clone(),
+                        Vec::<String>::new(),
+                    )),
+            )
+            .await?;
 
             // The caller is a claimed admin and is not the target, so this only
             // fires when the caller was demoted by a request that committed
@@ -450,6 +647,7 @@ async fn remove_member(
 async fn leave_team(
     State(state): State<TenancyState>,
     member: TeamMember,
+    context: audit::Context,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     connection
@@ -463,6 +661,20 @@ async fn leave_team(
             diesel::delete(team_memberships::table.find(leaving.id))
                 .execute(transaction)
                 .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&member.user),
+                &audit::Event::new(audit::MEMBER_LEFT, "TeamMembership")
+                    .team(member.team.id)
+                    .subject(leaving.id)
+                    .label(&audit::person_label(
+                        member.user.first_name.as_deref(),
+                        member.user.last_name.as_deref(),
+                        &member.user.email,
+                    )),
+            )
+            .await?;
 
             if stepped_down(&leaving, &[]) {
                 require_team_keeps_an_admin(transaction, member.team.id, "leave").await?;
@@ -480,22 +692,37 @@ async fn leave_team(
 async fn revoke_team_invitation(
     State(state): State<TenancyState>,
     member: TeamMember,
+    context: audit::Context,
     Path((_team_id, invitation_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_team_admin(&member)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let pending_membership = diesel::delete(
+    // The address comes back with the delete: an invitation is recognized by
+    // who it was sent to, and afterwards nothing remembers.
+    let revoked = diesel::delete(
         invitations::table
             .filter(invitations::id.eq(invitation_id))
             .filter(invitations::team_id.eq(member.team.id)),
     )
-    .returning(invitations::team_membership_id)
-    .get_result::<Option<Uuid>>(&mut connection)
+    .returning((invitations::team_membership_id, invitations::email))
+    .get_result::<(Option<Uuid>, String)>(&mut connection)
     .await
     .optional()
-    .map_err(log_internal)?
-    .ok_or_else(ApiError::not_found)?;
+    .map_err(log_internal)?;
+
+    let (pending_membership, email) = revoked.ok_or_else(ApiError::not_found)?;
+
+    audit::record(
+        &mut connection,
+        &context.by(&member.user),
+        &audit::Event::new(audit::INVITATION_REVOKED, "Invitation")
+            .team(member.team.id)
+            .subject(invitation_id)
+            .label(&email),
+    )
+    .await
+    .map_err(log_internal)?;
 
     discard_pending_membership(&mut connection, pending_membership).await?;
     // An invitation holds a seat until it is claimed or taken back.
@@ -512,22 +739,41 @@ async fn revoke_team_invitation(
 async fn revoke_organization_invitation(
     State(state): State<TenancyState>,
     member: OrganizationMember,
+    context: audit::Context,
     Path((_organization_id, invitation_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_organization_admin(&member)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let pending_membership = diesel::delete(
+    let revoked = diesel::delete(
         invitations::table
             .filter(invitations::id.eq(invitation_id))
             .filter(invitations::organization_id.eq(member.organization.id)),
     )
-    .returning(invitations::team_membership_id)
-    .get_result::<Option<Uuid>>(&mut connection)
+    .returning((
+        invitations::team_membership_id,
+        invitations::email,
+        invitations::team_id,
+    ))
+    .get_result::<(Option<Uuid>, String, Option<Uuid>)>(&mut connection)
     .await
     .optional()
-    .map_err(log_internal)?
-    .ok_or_else(ApiError::not_found)?;
+    .map_err(log_internal)?;
+
+    let (pending_membership, email, team_id) = revoked.ok_or_else(ApiError::not_found)?;
+
+    // An organization admin may revoke an invitation into one of their teams,
+    // and that belongs in the team's log rather than the organization's.
+    let event = audit::Event::new(audit::INVITATION_REVOKED, "Invitation")
+        .subject(invitation_id)
+        .label(&email);
+    let event = match team_id {
+        Some(team_id) => event.team(team_id),
+        None => event.organization(member.organization.id),
+    };
+    audit::record(&mut connection, &context.by(&member.user), &event)
+        .await
+        .map_err(log_internal)?;
 
     discard_pending_membership(&mut connection, pending_membership).await?;
     state
@@ -559,6 +805,47 @@ async fn discard_pending_membership(
     .map_err(log_internal)?;
 
     Ok(())
+}
+
+/// How a team membership reads in the audit log.
+///
+/// Delegates to the roster's own labeller, so the name an admin saw in the
+/// roster is the name they see in the log, and a pending member reads as the
+/// address their invitation went to rather than as a blank.
+///
+/// A membership that has just vanished (a race with another admin) has no
+/// label; the event still records what happened, and the id it names is the
+/// answer to what it happened to.
+async fn member_label(
+    connection: &mut AsyncPgConnection,
+    membership_id: Uuid,
+) -> Result<String, ApiError> {
+    let labels = TeamMembership::labels_for(connection, &[membership_id]).await?;
+    Ok(labels
+        .get(&membership_id)
+        .cloned()
+        .unwrap_or_else(|| membership_id.to_string()))
+}
+
+/// How an account reads in the audit log, for a surface holding only their id.
+///
+/// Selects the three columns the label is built from rather than loading a
+/// whole account, which is all a label ever needs.
+async fn account_label(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<String, ApiError> {
+    let account: (Option<String>, Option<String>, String) = users::table
+        .find(user_id)
+        .select((users::first_name, users::last_name, users::email))
+        .first(connection)
+        .await?;
+
+    Ok(audit::person_label(
+        account.0.as_deref(),
+        account.1.as_deref(),
+        &account.2,
+    ))
 }
 
 /// Loads one membership of the team, answering `404` for anything else.

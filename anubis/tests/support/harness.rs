@@ -124,6 +124,11 @@ impl Harness {
                 "/developers",
                 anubis::webhooks::router(pool.clone(), roles.clone(), &config),
             )
+            .nest("/account", anubis::notifications::router(pool.clone()))
+            .nest(
+                "/account",
+                anubis::audit::router(pool.clone(), roles.clone()),
+            )
             .merge(anubis::realtime::router(pool.clone(), channels.clone()))
             .merge(anubis::auth::avatar_router(pool.clone()))
             .layer(anubis::guard::layer(pool.clone(), roles));

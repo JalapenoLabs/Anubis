@@ -68,7 +68,11 @@ pub(crate) enum InvitationTarget {
     },
 }
 
-/// Creates an invitation, returning the raw token for the email link.
+/// Creates an invitation, returning it and the raw token for the email link.
+///
+/// The row comes back rather than being read again afterwards, so the caller's
+/// response, its audit record, and what was stored are the same three facts
+/// from one write.
 ///
 /// Replaces any pending invitation for the same email and target (including
 /// its unclaimed membership), so re-inviting is always safe. Team invitations
@@ -79,7 +83,7 @@ pub(crate) async fn create(
     email: &str,
     roles: &[String],
     invited_by: Uuid,
-) -> Result<String, diesel::result::Error> {
+) -> Result<(Invitation, String), diesel::result::Error> {
     // Replace any pending invitation for this email and target. Deleting the
     // invitation cascades nothing; the linked unclaimed membership is removed
     // explicitly.
@@ -131,7 +135,7 @@ pub(crate) async fn create(
     let raw_token = token::generate();
     let token_hash = token::hash(&raw_token);
 
-    diesel::insert_into(invitations::table)
+    let invitation: Invitation = diesel::insert_into(invitations::table)
         .values(NewInvitation {
             email,
             organization_id,
@@ -142,10 +146,11 @@ pub(crate) async fn create(
             token_hash: &token_hash,
             expires_at: Utc::now() + Duration::days(INVITATION_TTL_DAYS),
         })
-        .execute(connection)
+        .returning(Invitation::as_returning())
+        .get_result(connection)
         .await?;
 
-    Ok(raw_token)
+    Ok((invitation, raw_token))
 }
 
 /// Consumes an invitation token, joining the claimant to its target.

@@ -25,6 +25,7 @@ import {
   NavbarContent,
   NavbarItem,
 } from '@heroui/react'
+import { NotificationBell } from '@jalapenolabs/anubis'
 import { Breadcrumbs } from './Breadcrumbs'
 import { CreateOrganizationModal } from './tenancy/CreateOrganizationModal'
 
@@ -33,6 +34,7 @@ import {
   UrlTree,
   getOrganizationBillingUrl,
   getOrganizationSettingsUrl,
+  getTeamAuditLogUrl,
   getTeamDevelopersUrl,
   getTeamSettingsUrl,
 } from '../urls'
@@ -52,6 +54,7 @@ type Props = {
  */
 const TENANCY_ACTIONS = {
   teamSettings: 'tenancy:team-settings',
+  teamAuditLog: 'tenancy:team-audit-log',
   organizationSettings: 'tenancy:organization-settings',
   organizationBilling: 'tenancy:organization-billing',
   newOrganization: 'tenancy:new-organization',
@@ -80,6 +83,15 @@ export function AppShell(props: Props) {
         return
       }
       navigate(getTeamSettingsUrl(current.team.id))
+      return
+    }
+
+    if (action === TENANCY_ACTIONS.teamAuditLog) {
+      if (!current) {
+        console.debug('audit log chosen with no team selected')
+        return
+      }
+      navigate(getTeamAuditLogUrl(current.team.id))
       return
     }
 
@@ -143,6 +155,7 @@ export function AppShell(props: Props) {
                 ? []
                 : [
                     TENANCY_ACTIONS.teamSettings,
+                    TENANCY_ACTIONS.teamAuditLog,
                     TENANCY_ACTIONS.organizationSettings,
                     TENANCY_ACTIONS.organizationBilling,
                   ]
@@ -171,6 +184,9 @@ export function AppShell(props: Props) {
               >
                 <DropdownItem key={TENANCY_ACTIONS.teamSettings}>{
                     t('team.settings.navLink')
+                  }</DropdownItem>
+                <DropdownItem key={TENANCY_ACTIONS.teamAuditLog}>{
+                    t('auditLog.navLink')
                   }</DropdownItem>
                 <DropdownItem key={TENANCY_ACTIONS.organizationSettings}>{
                     t('organization.settings.navLink')
@@ -215,6 +231,17 @@ export function AppShell(props: Props) {
             </NavbarItem>
           : null
         }
+        <NavbarItem>
+          <NotificationBell
+            onNavigate={(href) => navigate(href)}
+            labels={{
+              bell: t('notifications.bell'),
+              heading: t('notifications.heading'),
+              empty: t('notifications.empty'),
+              markAllRead: t('notifications.markAllRead'),
+            }}
+          />
+        </NavbarItem>
         <NavbarItem>
           <Dropdown placement='bottom-end'>
             <DropdownTrigger>

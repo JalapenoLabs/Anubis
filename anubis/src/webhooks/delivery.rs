@@ -12,9 +12,9 @@
 use std::fmt::{self, Debug, Display, Formatter};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
@@ -33,6 +33,14 @@ use crate::schema::{webhook_deliveries, webhook_endpoints};
 /// which is the contract every webhook publisher states. Waiting longer only
 /// holds a worker slot open for an endpoint that is already misbehaving.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one "endpoint stopped answering" notice speaks for.
+///
+/// A receiver that is down fails every event sent to it, so the notice is
+/// rate limited to one per endpoint per day: long enough that a busy team
+/// hears about an outage once, short enough that an outage lasting a week is
+/// mentioned more than once.
+const DEAD_NOTICE_WINDOW_HOURS: i64 = 24;
 
 /// Longest failure message kept on a delivery row.
 ///
@@ -256,6 +264,9 @@ impl Deliverer {
                     },
                 )
                 .await?;
+                if exhausted {
+                    announce_dead(&mut connection, &delivery, &endpoint).await?;
+                }
                 Err(failure.message.into())
             }
         }
@@ -368,6 +379,75 @@ async fn load(
         .first(connection)
         .await
         .optional()
+}
+
+/// Tells a team's admins that one of their endpoints stopped answering.
+///
+/// Sent once per endpoint per [`DEAD_NOTICE_WINDOW`], not once per delivery: a
+/// receiver that is down fails everything sent to it, and an inbox holding one
+/// notice per lost event would say less than a single one does.
+///
+/// The endpoint is left active. Pausing a team's subscription on the
+/// framework's initiative would lose events nobody asked it to lose, so the
+/// team is told and the decision stays theirs; the delivery log on the
+/// Developers screen is what the notice points at.
+async fn announce_dead(
+    connection: &mut AsyncPgConnection,
+    delivery: &WebhookDelivery,
+    endpoint: &endpoint::WebhookEndpoint,
+) -> Result<(), BoxError> {
+    let recent_notice: i64 = webhook_deliveries::table
+        .filter(webhook_deliveries::webhook_endpoint_id.eq(endpoint.id))
+        .filter(webhook_deliveries::id.ne(delivery.id))
+        .filter(webhook_deliveries::status.eq(DeliveryStatus::Dead.as_str()))
+        .filter(
+            webhook_deliveries::updated_at
+                .gt(Utc::now() - TimeDelta::hours(DEAD_NOTICE_WINDOW_HOURS)),
+        )
+        .count()
+        .get_result(connection)
+        .await?;
+    if recent_notice > 0 {
+        return Ok(());
+    }
+
+    let admins = crate::notifications::team_admins(connection, endpoint.team_id).await?;
+    if admins.is_empty() {
+        return Ok(());
+    }
+
+    let title = "A webhook endpoint stopped answering".to_owned();
+    let body = format!(
+        "{} could not be delivered to {} after {} attempts.",
+        delivery.event_type,
+        endpoint.url,
+        DeliverWebhook::MAX_ATTEMPTS,
+    );
+    let href = crate::notifications::team_developers_href(endpoint.team_id);
+
+    // One transaction for the whole audience, so every admin is told or none
+    // is, and the pings commit with the rows they announce.
+    connection
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            for admin in admins {
+                crate::notifications::notify(
+                    transaction,
+                    crate::notifications::NewNotification {
+                        user_id: admin,
+                        team_id: Some(endpoint.team_id),
+                        kind: crate::notifications::WEBHOOK_DELIVERY_FAILED,
+                        title: &title,
+                        body: Some(&body),
+                        href: Some(&href),
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
 }
 
 /// Writes one attempt's outcome onto its row.
