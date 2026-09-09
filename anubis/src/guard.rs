@@ -3,10 +3,19 @@
 //! Handlers opt into tenancy enforcement by taking a guard extractor as an
 //! argument. [`TeamMember`] resolves the route's `{team_id}` against the
 //! signed-in user's membership; [`OrganizationMember`] does the same for
-//! `{organization_id}`. Extraction rejects before the handler body runs:
-//! `401` when not signed in, `404` when the target does not exist *or* the
-//! user is not a member (identical responses, so probing ids reveals
-//! nothing).
+//! `{organization_id}`, and [`SubTenantMember`] for `{sub_tenant_id}`.
+//! Extraction rejects before the handler body runs: `401` when not signed in,
+//! `404` when the target does not exist *or* the user is not a member
+//! (identical responses, so probing ids reveals nothing).
+//!
+//! Every guard honors a suspension, which is a deny rather than a missing
+//! grant: a suspended organization membership closes every tenant in the
+//! organization, and a suspended sub-tenant membership closes that sub-tenant
+//! and the teams scoped to it. The rule and its reasoning live with
+//! [`anubis::tenancy::resolve_sub_tenant_access`], which is the one place that
+//! resolves sub-tenant access.
+//!
+//! [`anubis::tenancy::resolve_sub_tenant_access`]: crate::tenancy::resolve_sub_tenant_access
 //!
 //! Permissions come from the compiled role set: `member.require(action,
 //! model)` answers `403` unless one of the membership's roles grants the
@@ -42,13 +51,18 @@ use crate::auth::{CurrentUser, User};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::roles::{Action, RoleSet};
-use crate::schema::{organization_memberships, organizations, team_memberships, teams};
-use crate::tenancy::{Organization, OrganizationMembership, Team, TeamMembership};
+use crate::schema::{
+    organization_memberships, organizations, sub_tenant_memberships, team_memberships, teams,
+};
+use crate::tenancy::{
+    Organization, OrganizationMembership, SubTenant, SubTenantAccess, Team, TeamMembership,
+    resolve_sub_tenant_access,
+};
 
 /// Bundles the request extensions the guard extractors need.
 ///
-/// Add to any router whose handlers use [`TeamMember`], [`OrganizationMember`],
-/// or [`CurrentUser`].
+/// Add to any router whose handlers use [`TeamMember`], [`SubTenantMember`],
+/// [`OrganizationMember`], or [`CurrentUser`].
 #[must_use]
 pub fn layer(
     pool: DbPool,
@@ -113,20 +127,108 @@ where
                     .eq(teams::id)
                     .and(team_memberships::user_id.eq(user.id))),
             )
+            // A suspension is a deny, so it closes the team route too: the
+            // organization's cuts every team in it, and a sub-tenant's cuts
+            // the teams scoped to that sub-tenant. Both joins are left joins
+            // filtered on a null timestamp, so a member with no membership at
+            // the tier above passes exactly as they did before the tier
+            // existed.
+            .left_join(
+                organization_memberships::table.on(organization_memberships::organization_id
+                    .eq(teams::organization_id)
+                    .and(organization_memberships::user_id.eq(user.id))),
+            )
+            .left_join(
+                sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
+                    .nullable()
+                    .eq(teams::sub_tenant_id)
+                    .and(sub_tenant_memberships::user_id.eq(user.id))),
+            )
             .filter(teams::id.eq(team_id))
+            .filter(organization_memberships::suspended_at.is_null())
+            .filter(sub_tenant_memberships::suspended_at.is_null())
             .select((Team::as_select(), TeamMembership::as_select()))
             .first(&mut connection)
             .await
             .optional()
             .map_err(log_internal)?;
 
-        // Unknown team and non-membership answer identically.
+        // Unknown team, non-membership, and suspension answer identically.
         let (team, membership) = found.ok_or_else(ApiError::not_found)?;
 
         Ok(Self {
             user,
             team,
             membership,
+            roles,
+        })
+    }
+}
+
+/// The signed-in user's standing in the route's `{sub_tenant_id}` sub-tenant.
+///
+/// A caller reaches a sub-tenant along four paths (organization admin, full
+/// organization member, an explicit grant, or a team that reaches it), and
+/// this guard never works out which for itself: it asks
+/// [`resolve_sub_tenant_access`], the one function that answers, and the
+/// [`access`](Self::access) it carries is that answer.
+#[derive(Debug, Clone)]
+pub struct SubTenantMember {
+    /// The signed-in user.
+    pub user: User,
+    /// The sub-tenant named in the route.
+    pub sub_tenant: SubTenant,
+    /// How the user reaches it, and every role key that applies.
+    pub access: SubTenantAccess,
+    roles: Arc<RoleSet>,
+}
+
+impl SubTenantMember {
+    /// Returns `true` when a held role grants the action on the model.
+    #[must_use]
+    pub fn can(&self, action: Action, model: &str) -> bool {
+        self.roles.can(&self.access.roles, action, model)
+    }
+
+    /// Rejects with `403` unless a held role grants the action on the model.
+    ///
+    /// # Errors
+    /// Returns a forbidden [`ApiError`] when no held role grants the action.
+    pub fn require(&self, action: Action, model: &str) -> Result<(), ApiError> {
+        if self.can(action, model) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(
+                "You do not have permission to do that.",
+            ))
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for SubTenantMember
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
+        let sub_tenant_id = path_uuid(parts, "sub_tenant_id").await?;
+        let (pool, roles) = guard_extensions(parts)?;
+
+        let mut connection = pool.get().await.map_err(log_internal)?;
+
+        let found = resolve_sub_tenant_access(&mut connection, user.id, sub_tenant_id)
+            .await
+            .map_err(log_internal)?;
+
+        // Unknown sub-tenant and unreachable sub-tenant answer identically.
+        let (sub_tenant, access) = found.ok_or_else(ApiError::not_found)?;
+
+        Ok(Self {
+            user,
+            sub_tenant,
+            access,
             roles,
         })
     }
@@ -186,6 +288,8 @@ where
                     .and(organization_memberships::user_id.eq(user.id))),
             )
             .filter(organizations::id.eq(organization_id))
+            // A suspension is a deny, not a missing grant.
+            .filter(organization_memberships::suspended_at.is_null())
             .select((
                 Organization::as_select(),
                 OrganizationMembership::as_select(),
@@ -195,7 +299,8 @@ where
             .optional()
             .map_err(log_internal)?;
 
-        // Unknown organization and non-membership answer identically.
+        // Unknown organization, non-membership, and suspension answer
+        // identically.
         let (organization, membership) = found.ok_or_else(ApiError::not_found)?;
 
         Ok(Self {

@@ -52,3 +52,19 @@ export function can(
     return Boolean(grants?.[model]?.includes(action))
   })
 }
+
+// The tenancy tiers each role may be granted at.
+export type RoleScope = 'organization' | 'sub_tenant' | 'team'
+
+export const RoleScopes = {
+  admin: [ 'organization', 'sub_tenant', 'team' ],
+  billing: [ 'organization' ],
+  default: [ 'organization', 'sub_tenant', 'team' ],
+  editor: [ 'organization', 'sub_tenant', 'team' ],
+} as const satisfies Record<RoleKey, readonly RoleScope[]>
+
+const scopesByRole: Record<string, readonly RoleScope[] | undefined> = RoleScopes
+
+export function isGrantableAt(role: string, scope: RoleScope): boolean {
+  return Boolean(scopesByRole[role]?.includes(scope))
+}

@@ -16,6 +16,12 @@
 # changing it is an update on that model, and listing a form's options is a
 # read on the model being offered. One grant per real-world model is what keeps
 # this file legible.
+#
+# `scopes` names the tenancy tiers a role may be granted at, out of
+# `organization`, `sub_tenant`, and `team`. Omit it and the role may be granted
+# at every tier, which is what a role written without it means. Scopes say
+# where a role key attaches, never what it grants, so they do not travel
+# through `includes`.
 
 roles:
   # Every team member holds `default`.
@@ -37,9 +43,11 @@ roles:
       PeripheralNotion: [manage]
       # 🐺 anubis:models:editor
 
-  # Can manage billing and subscriptions.
+  # Can manage billing and subscriptions. Subscriptions attach to the
+  # organization, so the role means nothing anywhere else.
   billing:
     includes: [default]
+    scopes: [organization]
     models: {}
 
   # Full control, including member management.

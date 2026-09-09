@@ -265,7 +265,15 @@ async fn create_team(
     let team = connection
         .transaction::<Team, diesel::result::Error, _>(async |transaction| {
             let team =
-                bootstrap::create_team(transaction, member.organization.id, &name, member.user.id)
+                // Organization-level, so the team is inherited by every
+                // sub-tenant: scoping one is a follow-up endpoint's act.
+                bootstrap::create_team(
+                    transaction,
+                    member.organization.id,
+                    &name,
+                    None,
+                    member.user.id,
+                )
                     .await?;
             // Recorded against the new team rather than its organization, so
             // the first line of a team's own log says where the team came from.

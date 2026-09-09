@@ -1,16 +1,23 @@
 //! The framework-owned tenancy models.
 
 use std::collections::HashMap;
+use std::io::Write;
 
 use chrono::{DateTime, Utc};
+use diesel::deserialize::{self, FromSql, FromSqlRow};
+use diesel::expression::AsExpression;
+use diesel::pg::{Pg, PgValue};
 use diesel::prelude::*;
+use diesel::serialize::{self, Output, ToSql};
+use diesel::sql_types::Text;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::http::FieldOption;
 use crate::schema::{
-    invitations, organization_memberships, organizations, team_memberships, teams, users,
+    invitations, organization_memberships, organizations, sub_tenant_memberships, sub_tenants,
+    team_memberships, teams, users,
 };
 
 /// The top-level tenant: owns teams, billing, and org-wide settings.
@@ -25,6 +32,29 @@ pub struct Organization {
     /// When the organization was created.
     pub created_at: DateTime<Utc>,
     /// When the organization was last updated.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The tier between an organization and its teams: it owns the work.
+///
+/// A sub-tenant is what GCP calls a project, Jira calls a project, and GitHub
+/// calls a repository. It holds its own membership and its own teams, while
+/// the organization above it stays the billing and policy umbrella. Every
+/// organization has at least one, created with it, so an application that
+/// never surfaces the tier still has a complete ownership chain.
+#[derive(Debug, Clone, Serialize, Queryable, Selectable)]
+#[diesel(table_name = sub_tenants)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct SubTenant {
+    /// Primary key.
+    pub id: Uuid,
+    /// The organization this sub-tenant belongs to.
+    pub organization_id: Uuid,
+    /// Display name.
+    pub name: String,
+    /// When the sub-tenant was created.
+    pub created_at: DateTime<Utc>,
+    /// When the sub-tenant was last updated.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -43,6 +73,62 @@ pub struct Team {
     pub created_at: DateTime<Utc>,
     /// When the team was last updated.
     pub updated_at: DateTime<Utc>,
+    /// The sub-tenant this team is scoped to, or `None` for an
+    /// organization-level team that every sub-tenant inherits.
+    pub sub_tenant_id: Option<Uuid>,
+}
+
+/// How far an organization membership reaches into the organization's work.
+///
+/// The distinction is GitHub's between an organization member and an outside
+/// collaborator: a full member's standing cascades into every sub-tenant, and
+/// a guest reaches only the sub-tenants and teams they were granted by name.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsExpression, FromSqlRow, Default,
+)]
+#[diesel(sql_type = Text)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationAccess {
+    /// Reaches every sub-tenant in the organization.
+    #[default]
+    Full,
+    /// Reaches only what was granted explicitly.
+    Guest,
+}
+
+impl OrganizationAccess {
+    /// The value's spelling in the database and in JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Guest => "guest",
+        }
+    }
+}
+
+impl ToSql<Text, Pg> for OrganizationAccess {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        out.write_all(self.as_str().as_bytes())?;
+        Ok(serialize::IsNull::No)
+    }
+}
+
+impl FromSql<Text, Pg> for OrganizationAccess {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        // A `CHECK` constraint keeps any other value out of the column, so an
+        // unknown one is a corrupted row rather than an access level to guess
+        // at. Failing loudly beats quietly reading it as the weaker of the two.
+        match bytes.as_bytes() {
+            b"full" => Ok(Self::Full),
+            b"guest" => Ok(Self::Guest),
+            other => Err(format!(
+                "unknown organization access {:?}",
+                String::from_utf8_lossy(other)
+            )
+            .into()),
+        }
+    }
 }
 
 /// Joins a user to an organization with org-level roles.
@@ -58,6 +144,37 @@ pub struct OrganizationMembership {
     pub user_id: Uuid,
     /// Role keys granted at the organization level.
     pub roles: Vec<String>,
+    /// When the membership was created.
+    pub created_at: DateTime<Utc>,
+    /// When the membership was last updated.
+    pub updated_at: DateTime<Utc>,
+    /// How far the membership reaches into the organization's sub-tenants.
+    pub access: OrganizationAccess,
+    /// When the member was suspended, or `None` while they are in good
+    /// standing. A suspension cuts them out of the organization entirely.
+    pub suspended_at: Option<DateTime<Utc>>,
+}
+
+/// Joins a user to a sub-tenant with sub-tenant-level roles.
+///
+/// This is the explicit grant a guest reaches a sub-tenant through, and the
+/// row an administrator suspends to cut somebody out of one sub-tenant without
+/// touching their standing anywhere else.
+#[derive(Debug, Clone, Serialize, Queryable, Selectable)]
+#[diesel(table_name = sub_tenant_memberships)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct SubTenantMembership {
+    /// Primary key.
+    pub id: Uuid,
+    /// The sub-tenant joined.
+    pub sub_tenant_id: Uuid,
+    /// The member.
+    pub user_id: Uuid,
+    /// Role keys granted at the sub-tenant level.
+    pub roles: Vec<String>,
+    /// When the member was suspended from this sub-tenant, or `None` while
+    /// they are in good standing.
+    pub suspended_at: Option<DateTime<Utc>>,
     /// When the membership was created.
     pub created_at: DateTime<Utc>,
     /// When the membership was last updated.
@@ -244,10 +361,18 @@ pub(crate) struct NewOrganization<'a> {
 }
 
 #[derive(Insertable)]
+#[diesel(table_name = sub_tenants)]
+pub(crate) struct NewSubTenant<'a> {
+    pub organization_id: Uuid,
+    pub name: &'a str,
+}
+
+#[derive(Insertable)]
 #[diesel(table_name = teams)]
 pub(crate) struct NewTeam<'a> {
     pub organization_id: Uuid,
     pub name: &'a str,
+    pub sub_tenant_id: Option<Uuid>,
 }
 
 #[derive(Insertable)]

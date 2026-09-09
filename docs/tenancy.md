@@ -1,23 +1,68 @@
 # Tenancy, Teams, and Organizations
 
-Anubis adopts Bullet Train's multi-tenancy model ("teams should be an MVP feature") and extends it one level: Organizations sit above Teams.
+Anubis adopts Bullet Train's multi-tenancy model ("teams should be an MVP feature") and extends it two levels: Organizations sit above Teams, and SubTenants sit between them.
 
 ## Entity model
 
 ```
 User ─< OrganizationMembership >─ Organization
-User ─< TeamMembership >─ Team ─> Organization
+                                       │
+                                       ├─< SubTenant
+                                       │      │
+User ─< SubTenantMembership >──────────┘      │
+                                              │
+User ─< TeamMembership >─ Team ───────────────┘  (nullable sub_tenant_id)
 ```
 
 - **User**: a person who can log in. Owns credentials, profile, and preferences. Owns nothing domain-related directly.
-- **Organization**: the top-level tenant. Owns Teams, billing, and org-wide settings. Every Team belongs to exactly one Organization.
+- **Organization**: the top-level tenant. The billing and policy umbrella. It owns people and policy, not work.
+- **SubTenant**: the tier that owns the work. GCP calls it a project, Jira calls it a project, GitHub calls it a repository, Linear calls it a workspace; the shape is the same every time. It belongs to exactly one Organization and holds its own membership and its own Teams.
 - **Team**: the working tenant. All domain resources chain their ownership back to a Team.
-- **OrganizationMembership**: joins a User to an Organization, carrying org-level roles (org admin, billing).
+- **OrganizationMembership**: joins a User to an Organization, carrying org-level roles (org admin, billing), an `access` level, and a `suspended_at` marker.
+- **SubTenantMembership**: joins a User to a SubTenant, carrying sub-tenant-level roles and its own `suspended_at`. This is the explicit grant a guest reaches a sub-tenant through.
 - **TeamMembership**: joins a User to a Team, carrying team-level roles. Domain resources are assigned to TeamMemberships, never directly to Users. This allows assigning work to invited people who have not signed up yet, and keeps assignments intact when a user leaves.
 - **Invitation**: created when someone is added to a Team or Organization by email. The emailed 256-bit token (hashed at rest, 14-day expiry) is the credential; whichever signed-in account holds it may claim, and claiming consumes the invitation. Team invitations pre-create the unclaimed TeamMembership, so the membership (id, roles, and any resource assignments) survives the claim intact; organization invitations create the OrganizationMembership at claim time. Re-inviting an email replaces the pending invitation. Inviting requires the admin role on the target, and organization admins may invite to any team in their organization. An admin can revoke a pending invitation, which discards the unclaimed membership with it; a claimed invitation no longer exists, so a claim cannot be taken back.
-- **Role**: declared in `roles.yml`, granted through memberships at either level.
+- **Role**: declared in `roles.yml`, granted through memberships at any of the three levels.
 
-At signup, every user gets a personal Organization containing a default Team, so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
+At signup, every user gets a personal Organization containing a default SubTenant ("Main") and a default Team ("General"), so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
+
+## The sub-tenant tier
+
+The tier is optional in every sense that matters: an application that never surfaces it sees a complete ownership chain regardless, because every organization has a sub-tenant from the moment it exists, and an ownership chain that ends in `Team` keeps working exactly as it did. What the tier adds is a place for applications whose domain is organized around projects, repositories, or workspaces, where mapping that concept onto a Team collapses the tier the product is built around.
+
+A Team's `sub_tenant_id` is nullable, and the two states are GitHub's split between an organization team and repository access:
+
+- **Null** is an organization-level team, inherited by every sub-tenant in the organization. This is the state a team is created in, and the state every team was in before the tier existed.
+- **Set** scopes the team to one sub-tenant, and it never leaks to another. A composite foreign key over `(sub_tenant_id, organization_id)` makes a team scoped to another organization's sub-tenant impossible in the schema rather than only in the queries that read it.
+
+### Access resolution
+
+`anubis::tenancy::resolve_sub_tenant_access` is the one function that answers who reaches a sub-tenant and with which roles. Nothing re-derives it: two call sites working the rules out for themselves would eventually disagree about who may read something, and a disagreement between two authorization paths is a data leak.
+
+**A suspension is a deny.** It is checked before any grant and outranks every one of them, the organization administrator's bypass included, because a deny an admin bit silently ignored would not be a deny. A suspended organization membership cuts the member out of every tenant in the organization; a suspended sub-tenant membership cuts them out of that sub-tenant and the teams scoped to it. All three guards honor it.
+
+Otherwise a grant applies when any of these hold, and the caller's resolved roles are the **union** of every grant that applies. Permission is monotone in the role set (`RoleSet::can` asks whether *any* held role grants the action), so the union is exactly the strongest standing the caller holds across the tiers:
+
+| Path | Rule |
+|---|---|
+| Organization admin | The `admin` role bypasses the tier and reaches every sub-tenant in the organization |
+| Full organization member | `access = full` cascades into every sub-tenant |
+| Guest | `access = guest` cascades into nothing, and reaches only what was granted by name |
+| Sub-tenant membership | An explicit grant, applying to full members and guests alike, since it can only add |
+| Team | An organization-level team is inherited by every sub-tenant; a scoped team reaches only its own |
+
+Two consequences are worth stating rather than leaving to be discovered. An organization membership marked `guest` that also holds `admin` is a contradiction an administrator can write, and admin wins. And a team membership grants reach whatever the member's organization access says, because putting somebody on a team is itself the explicit act: an administrator confining a guest to one sub-tenant scopes the team to it rather than leaving the team organization-level.
+
+The `SubTenantMember` guard is the first caller. It resolves the route's `{sub_tenant_id}` and answers `404` for a sub-tenant that does not exist and for one the caller cannot reach, byte-identical, so probing ids reveals nothing.
+
+### Not built yet
+
+The tier's foundation is the schema, the model, the resolution function, the guard, and the auto-created default. Still to come, tracked on [Anubis #93](https://github.com/JalapenoLabs/Anubis/issues/93):
+
+- The scaffolder's template family for an ownership chain ending in `SubTenant`, and the equivalents of the three existing depth templates.
+- Management endpoints and screens for creating, renaming, and deleting a sub-tenant, managing its roster, scoping a team to it, and setting `access` and `suspended_at`. Until they exist, an application writes those columns itself.
+- The membership overview (`GET /tenancy/memberships`) does not yet group teams by sub-tenant.
+- The last-admin invariant does not yet cover suspension, because nothing in the framework creates one. The endpoint that does must take the same organization lock the other membership changes take.
 
 ## Ownership chain
 
@@ -38,6 +83,8 @@ Selectable associations are scoped through generated `valid_*` methods on the mo
 ## Roles and permissions
 
 Roles are declared once, in `config/roles.yml`, with role inheritance (`admin` includes `editor` and `billing`) and per-model action grants (`read`, `create`, `update`, `destroy`, or `manage` as shorthand for all four), modeled on `bullet_train-roles`. The starter ships the baseline vocabulary: `default`, `editor`, `billing`, and `admin`.
+
+A role may also name `scopes`, the tenancy tiers it can be granted at, out of `organization`, `sub_tenant`, and `team`. Omitting it means every tier, which is what a role written before the sub-tenant tier existed keeps meaning; the starter scopes `billing` to `organization`, because subscriptions attach to the organization and the role means nothing anywhere else. Scopes say where a role key attaches, never what it grants, so they do not travel through `includes`. `RoleSet::is_grantable_at` is the backend's question and `isGrantableAt` is the SPA's.
 
 One definition drives both sides of the stack:
 
@@ -67,7 +114,7 @@ Tenancy is manageable from the API, not only at signup. The routes mount under `
 | `POST /tenancy/teams/{team_id}/leave` | team member | Leave the team |
 | `DELETE /tenancy/teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
 
-Team-scoped routes take the `TeamMember` guard and organization-scoped routes take `OrganizationMember`, so the discipline is the one every ownership chain follows: `401` when signed out, `404` when the caller is not a member (byte-identical to a nonexistent id), and `403` when a member lacks the role. Dissolving a team is an organization act rather than a team act, which is why deletion is nested under the organization: a team's own admins run the team, and the organization decides whether the team exists.
+Team-scoped routes take the `TeamMember` guard, organization-scoped routes take `OrganizationMember`, and sub-tenant-scoped routes take `SubTenantMember`, so the discipline is the one every ownership chain follows: `401` when signed out, `404` when the caller is not a member (byte-identical to a nonexistent id), and `403` when a member lacks the role. Dissolving a team is an organization act rather than a team act, which is why deletion is nested under the organization: a team's own admins run the team, and the organization decides whether the team exists.
 
 Roles are replaced wholesale rather than patched, so a request states the end state and two admins editing the same member cannot interleave into a set neither asked for. Every requested key is checked against the compiled `roles.yml`; an unknown key is a `400`, and an empty list means the baseline `default` role.
 
@@ -93,7 +140,7 @@ So removing another member normally cannot break the rule, since the caller is a
 
 ### Cascade semantics
 
-Deletion cascades, deliberately. The framework's migrations declare `ON DELETE CASCADE` from `organizations` to teams, memberships, and invitations, and from `teams` to memberships, invitations, and platform applications. The scaffolder's living templates declare the same on the ownership chain: a team-owned table's `team_id` references `teams(id) ON DELETE CASCADE`, and a nested model cascades from its parent. So deleting a team deletes the records that chain to it, and deleting an organization deletes its teams first.
+Deletion cascades, deliberately. The framework's migrations declare `ON DELETE CASCADE` from `organizations` to sub-tenants, teams, memberships, and invitations; from `sub_tenants` to their memberships and to the teams scoped to them; and from `teams` to memberships, invitations, and platform applications. The scaffolder's living templates declare the same on the ownership chain: a team-owned table's `team_id` references `teams(id) ON DELETE CASCADE`, and a nested model cascades from its parent. So deleting a team deletes the records that chain to it, and deleting an organization deletes its teams first.
 
 Cascade is the right default here because the ownership chain already means "this record exists inside that team". Restrict would force a caller to empty a team by hand through endpoints that may not exist yet, and orphaning is not an option since a record with no team has no tenant and therefore no reachable authorization. An application that deliberately declares a restricting reference of its own is respected rather than overridden: the delete answers `409 Conflict` telling the caller to remove those records first, instead of failing as a `500`.
 
@@ -101,9 +148,9 @@ Cascade is the right default here because the ownership chain already means "thi
 
 Deleting an account is terminal and must always succeed, so it settles what the user leaves behind instead of refusing. In the same transaction that removes the user, the framework:
 
-1. Deletes the user's organization and team memberships.
-2. Deletes every organization nobody can reach any more, meaning no organization memberships and no claimed team memberships remain anywhere in it. This is what keeps a personal organization from outliving its only member.
-3. Keeps every surviving organization and team administrable. One that still has members but lost its last admin promotes its longest-standing remaining member. If a surviving organization has no organization memberships left at all, and lives on only through its teams, the longest-standing team member gains the organization membership as its admin.
+1. Deletes the user's organization, sub-tenant, and team memberships.
+2. Deletes every organization nobody can reach any more, meaning no organization memberships, no claimed team memberships, and no sub-tenant memberships remain anywhere in it. This is what keeps a personal organization from outliving its only member, and what stops a guest's project being deleted out from under them.
+3. Keeps every surviving organization and team administrable. One that still has members but lost its last admin promotes its longest-standing remaining member. If a surviving organization has no organization memberships left at all, and lives on only through its teams or its sub-tenants, the longest-standing member of either gains the organization membership as its admin, teams first.
 
 A surviving team with no members left is kept rather than deleted: it still owns application records, and an organization admin can delete it or invite people back into it. The invariant the interactive endpoints defend by refusing, this path defends by succeeding.
 
