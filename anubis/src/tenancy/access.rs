@@ -211,11 +211,14 @@ fn grant(
         roles.extend(team_roles.into_iter().flatten());
     }
 
+    // No path applied, so the caller has no standing here at all.
+    let reach = reach?;
+
     Some(SubTenantAccess {
         organization_membership,
         membership,
         roles: roles.into_iter().collect(),
-        reach: reach?,
+        reach,
     })
 }
 
