@@ -1,13 +1,28 @@
 @import 'tailwindcss';
 
 @plugin './hero.ts';
-/* Yarn workspaces hoist @heroui/theme to the repo root; standalone installs
-   keep it local. Tailwind skips whichever glob matches nothing. */
+/* Where the packages Tailwind must scan actually sit, which is three places
+   depending on how this file is reached. `@source` paths are relative to this
+   file, and a glob that matches nothing is skipped rather than reported, so
+   all three are listed and whichever one exists wins.
+
+     ../         a standalone install, packages beside this workspace
+     ../../      a stamped application, hoisted to its repository root
+     ../../../   this template in place, hoisted to the framework root
+
+   The third is the one that only holds here. A stamped application drops the
+   `starter/` level, so a template that lists only its own depth is correct in
+   this repository and wrong in every application generated from it. Getting it
+   wrong is silent: Tailwind generates none of HeroUI's utilities, the build
+   succeeds, the application's own classes work, and every framework component
+   renders unstyled. */
 @source '../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
+@source '../../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
 @source '../../../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
-/* The field components ship as TypeScript source, so the same pair of globs
-   points Tailwind at the framework package. */
+/* The field components ship as TypeScript source, so the same globs point
+   Tailwind at the framework package. */
 @source '../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
+@source '../../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
 @source '../../../node_modules/@jalapenolabs/anubis/src/**/*.{ts,tsx}';
 @custom-variant dark (&:is(.dark *));
 
