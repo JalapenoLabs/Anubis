@@ -21,7 +21,7 @@
 //! application untouched.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use anubis::scaffold::{
     Artifact, BelongsTo, Field, FieldScaffold, JoinScaffold, LOCALE_FIELDS, ModelScaffold,
@@ -30,7 +30,7 @@ use anubis::scaffold::{
     table_block,
 };
 
-use super::{app_root, display, fail, read};
+use super::{app_root, display, fail, format_rust_files, read};
 
 /// The grants a scaffolded model receives, one per role-suffixed anchor.
 ///
@@ -39,9 +39,6 @@ const ROLE_GRANTS: [(&str, &str); 2] = [
     (anchor::ROLES_DEFAULT, "read"),
     (anchor::ROLES_EDITOR, "manage"),
 ];
-
-/// The Rust edition the framework and every stamped application build on.
-const EDITION: &str = "2024";
 
 /// Runs `anubis scaffold model <Model> <ParentChain> [field:type ...]`.
 pub(crate) fn model(model: &str, ownership: &str, fields: &[String]) -> ExitCode {
@@ -78,6 +75,7 @@ struct Plan {
 impl Plan {
     /// Writes every planned file, then formats the Rust ones.
     fn apply(&self, root: &Path) -> Result<(), String> {
+        let mut written = Vec::new();
         for (relative, contents) in self.created.iter().chain(&self.updated) {
             let path = root.join(relative);
             if let Some(parent) = path.parent() {
@@ -86,17 +84,10 @@ impl Plan {
             }
             std::fs::write(&path, contents)
                 .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+            written.push(path);
         }
-        format_rust_files(root, self);
+        format_rust_files(&written);
         Ok(())
-    }
-
-    /// Every path the plan touches.
-    fn paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.created
-            .iter()
-            .chain(&self.updated)
-            .map(|(path, _contents)| path)
     }
 }
 
@@ -599,36 +590,6 @@ fn regenerate_roles_client(root: &Path, roles: &str) -> Result<(PathBuf, String)
     let set = anubis::roles::RoleSet::from_yaml(roles)
         .map_err(|error| format!("the updated config/roles.yml is invalid: {error}"))?;
     Ok((relative, set.to_typescript()))
-}
-
-/// Formats the Rust files the scaffold wrote, when `rustfmt` is available.
-///
-/// Name-for-name transformation cannot preserve line widths: a shorter model
-/// name lets a wrapped statement fit on one line again, a longer one pushes a
-/// statement past the width. The formatter settles it, which is what keeps
-/// `cargo fmt --check` green on untouched generated code. A missing `rustfmt`
-/// is not fatal, since the output is valid Rust either way.
-fn format_rust_files(root: &Path, plan: &Plan) {
-    let files = plan
-        .paths()
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .map(|path| root.join(path))
-        .collect::<Vec<_>>();
-    if files.is_empty() {
-        return;
-    }
-
-    match Command::new("rustfmt")
-        .args(["--edition", EDITION])
-        .args(&files)
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(_status) => eprintln!("warning: rustfmt reported an error on the generated files"),
-        Err(_error) => {
-            eprintln!("warning: rustfmt is not on PATH; the generated files are unformatted");
-        }
-    }
 }
 
 /// Prints what was generated, and what still needs a hand.

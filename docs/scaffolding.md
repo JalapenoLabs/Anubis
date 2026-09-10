@@ -287,7 +287,7 @@ and on the frontend:
 
 Every artifact is a transformation of the application's own files: the migration comes from the migration that created the template's table, the schema block from the template's `table!` block, the module from the template module, the test from the template's narrative, the pages from the template model's pages. Improving a template improves every later scaffold.
 
-The run is planned before anything is written, so a missing template, a missing anchor, or an existing module stops the command with the application untouched. Anchor insertions are idempotent, and a model whose module already exists is refused rather than overwritten. Generated Rust is formatted with `rustfmt` when it is on `PATH`: transformation cannot preserve line widths, since a shorter model name lets a wrapped statement fit again, and the formatter settles it.
+The run is planned before anything is written, so a missing template, a missing anchor, or an existing module stops the command with the application untouched. Anchor insertions are idempotent, and a model whose module already exists is refused rather than overwritten. Generated Rust is formatted with `rustfmt` when it is on `PATH`: transformation preserves neither import order nor line width, since a shorter model name lets a wrapped statement fit again and a name that sorts elsewhere moves within its `use` block, and the formatter settles both. `anubis new` runs the same pass over the tree it stamps.
 
 ### Fields
 
@@ -731,6 +731,8 @@ The engine does no file I/O; the CLI is its thin filesystem shell. That split ke
 ## How `anubis new` works
 
 The starter tree is embedded into the `anubis` binary at build time, so stamping is offline and always matches the installed framework version. Stamping rewrites the app name across every path and file, then overlays the files that make the result a standalone repository: a workspace `Cargo.toml` carrying the framework's lint bar, a standalone `backend/Cargo.toml`, a root `package.json`, `.yarnrc.yml`, `.gitignore`, `README.md`, `.env.example`, `.github/workflows/ci.yml`, and the toolchain and clippy pins. Until the crate and npm package are published, stamped apps depend on the framework from its git repository (Cargo git dependency; yarn `#workspace=` git protocol). Drift-gate tests pin the overlay's dependency versions to the framework workspace, the CI template's tool versions to this repository's workflow, and the `.env.example` overlay to the one this repository runs on.
+
+The stamped Rust is then formatted with `rustfmt`, for the same reason `scaffold model` formats its output: rewriting the crate name moves it inside every `use` block it appears in, since `axum` sorts after `acme` and before `zebra`, so no template order is right for every name a developer might type. A stamped tree therefore passes the `cargo fmt --check` its own CI runs first. A missing `rustfmt` is not fatal; the command says to run `cargo fmt --all` and carries on.
 
 The stamped workflow holds the application to the framework's own bar, on GitHub-hosted runners: see [ci.md](ci.md#ci-for-stamped-applications).
 
