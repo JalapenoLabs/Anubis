@@ -201,12 +201,12 @@ jobs:
   # Browser-level proof that the starter's screens work against the real stack:
   # Postgres, the Rust backend, and Vite, driven by Chromium.
   #
-  # Advisory to start with. Playwright's browsers need system libraries the
-  # self-hosted Rocky 9 runners are not guaranteed to carry, and `playwright
-  # install --with-deps` shells out to the system package manager as root,
-  # which a runner may refuse; a missing libatk must not block unrelated work
-  # from merging. Flip continue-on-error to false once a run on a fresh runner
-  # provisions its browser cleanly, the same convention the audits above use.
+  # Advisory. Playwright's browsers need system libraries the self-hosted
+  # Rocky 9 runners are not guaranteed to carry, and Playwright installs them
+  # through the system package manager as root, which a runner may refuse; a
+  # missing libatk must not block unrelated work from merging. Flip
+  # continue-on-error to false once a run on a fresh runner provisions its
+  # browser cleanly, the same convention the audits above use.
   e2e:
     name: E2E
     runs-on: [self-hosted, rocky9, earthly, docker]
@@ -252,13 +252,22 @@ jobs:
       - name: Build the backend
         run: cargo build -p anubis-starter
 
-      # Idempotent: the runner keeps ~/.cache/ms-playwright between runs, so
-      # only a fresh runner pays the download. Allowed to fail on its own,
-      # because a runner that already carries the libraries still runs the
-      # suite, and the failure is worth seeing in the log either way.
-      - name: Install Chromium
+      # The system libraries Chromium links against are the runner's to carry,
+      # and Playwright installs them through the system package manager as
+      # root, which these Rocky 9 runners have no apt-get for. Asking for them
+      # separately is what keeps that refusal from taking the browser download
+      # with it: a runner that already carries the libraries runs the suite
+      # either way, and the failure is worth seeing in the log.
+      - name: Install Chromium system dependencies
         continue-on-error: true
-        run: yarn workspace anubis-starter-frontend exec playwright install --with-deps chromium
+        run: yarn workspace anubis-starter-frontend exec playwright install-deps chromium
+
+      # Idempotent: the runner keeps ~/.cache/ms-playwright between runs, so
+      # only a fresh runner pays the download. A browser that will not download
+      # fails the step, because every spec after it fails on a missing
+      # executable and says nothing about the application.
+      - name: Install Chromium
+        run: yarn workspace anubis-starter-frontend exec playwright install chromium
 
       # The suite drives the same three processes `yarn dev` starts. Playwright
       # waits for the stack itself (e2e/global-setup.ts), so this step starts

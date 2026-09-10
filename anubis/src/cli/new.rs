@@ -10,6 +10,12 @@
 //! crate and npm package are published, stamped apps depend on the framework
 //! straight from its git repository.
 //!
+//! The stamped Rust is then formatted, because rewriting the crate name moves
+//! it within the `use` blocks the templates carry: `axum` sorts after `acme`
+//! and before `zebra`, so no template order is right for every name. Without
+//! the formatter a stamped application fails `cargo fmt --check` on its first
+//! CI run.
+//!
 //! Stamped applications are private by default (`"license": "UNLICENSED"`,
 //! no LICENSE file); `--license mit` writes an MIT LICENSE instead.
 
@@ -114,7 +120,7 @@ pub(crate) fn run(name: &str, license: License) -> ExitCode {
     }
 
     let replacements = replacements_for(name, license);
-    let mut written = 0_usize;
+    let mut written = Vec::new();
 
     for (relative, bytes) in embedded::STARTER_FILES {
         let destination = target.join(replacements.apply(relative));
@@ -127,7 +133,7 @@ pub(crate) fn run(name: &str, license: License) -> ExitCode {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
-        written += 1;
+        written.push(destination);
     }
 
     for (relative, template) in OVERLAY_FILES {
@@ -137,20 +143,24 @@ pub(crate) fn run(name: &str, license: License) -> ExitCode {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
-        written += 1;
+        written.push(destination);
     }
 
     if license == License::Mit {
         let year = chrono::Utc::now().year();
         let text = MIT_LICENSE.replace(LICENSE_YEAR_PLACEHOLDER, &year.to_string());
-        if let Err(error) = write_file(&target.join("LICENSE"), text.as_bytes()) {
+        let destination = target.join("LICENSE");
+        if let Err(error) = write_file(&destination, text.as_bytes()) {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
-        written += 1;
+        written.push(destination);
     }
 
-    println!("created `{name}` ({written} files)");
+    // Settles where the new crate name sorts. See the module documentation.
+    super::format_rust_files(&written);
+
+    println!("created `{name}` ({} files)", written.len());
     println!();
     println!("Next steps:");
     println!("  cd {name}");

@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Page } from '@playwright/test'
+import type { Page, Response } from '@playwright/test'
 
 // Core
 import { expect } from '@playwright/test'
@@ -62,7 +62,9 @@ export async function signUp(page: Page, purpose: string): Promise<Account> {
 
   await page.goto(UrlTree.signUp)
   await fillCredentials(page, account)
+  const registration = page.waitForResponse(byPath('/auth/register'))
   await page.getByRole('button', { name: strings.auth.signUp.action }).click()
+  expectAuthAccepted(await registration)
   await expectDashboard(page)
 
   return account
@@ -71,8 +73,49 @@ export async function signUp(page: Page, purpose: string): Promise<Account> {
 /** Signs `account` in from the sign-in page the browser is already on. */
 export async function signIn(page: Page, account: Account): Promise<void> {
   await fillCredentials(page, account)
+  const login = page.waitForResponse(byPath('/auth/login'))
   // Exactly, because the page also offers "Sign in with a passkey".
   await page.getByRole('button', { name: strings.auth.signIn.action, exact: true }).click()
+  expectAuthAccepted(await login)
+}
+
+/** Matches the response to `path`, whatever origin the run is driving. */
+function byPath(path: string) {
+  return (response: Response) => new URL(response.url()).pathname === path
+}
+
+/**
+ * Fails with the reason when the backend refuses an auth request.
+ *
+ * Every spec starts by signing up and one of them signs back in, so a refusal
+ * leaves the browser on the form it submitted and every assertion after it
+ * times out against a screen that was never going to render. Read on its own,
+ * that failure says only that a heading is missing, which is the least useful
+ * true thing the suite could report.
+ *
+ * The rate limiter is the refusal that actually happens. The suite registers
+ * an account per spec, the limiter budgets registrations per client address,
+ * and a stack that enforces it therefore runs out partway through a few
+ * consecutive runs, which reads as a spec that passed twice and then failed
+ * for no reason.
+ */
+function expectAuthAccepted(response: Response): void {
+  if (response.ok()) {
+    return
+  }
+
+  const { pathname } = new URL(response.url())
+  if (response.status() === 429) {
+    throw new Error(
+      `${pathname} answered 429 Too Many Requests.\n`
+      + 'This suite spends auth budgets no person reaches: it registers an account per spec, and\n'
+      + 'the limiter counts registrations per client address, so a stack that enforces it runs out\n'
+      + 'after a few consecutive runs.\n'
+      + 'Start the backend with RATE_LIMIT_DISABLED=true, which is what `yarn e2e` and CI do.',
+    )
+  }
+
+  throw new Error(`${pathname} answered ${response.status()}, so the account never signed in.`)
 }
 
 /**
