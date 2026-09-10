@@ -64,8 +64,9 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Working tenants. All domain resources chain ownership back to a team.
-    teams (id) {
+    /// The tier between an organization and its teams: owns the work, its own
+    /// membership, and its own teams. Every organization has at least one.
+    sub_tenants (id) {
         id -> Uuid,
         organization_id -> Uuid,
         name -> Text,
@@ -75,7 +76,41 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// Joins users to sub-tenants, carrying sub-tenant-level role keys. A row
+    /// is the explicit grant a guest organization member reaches a sub-tenant
+    /// through; `suspended_at` makes the row a deny instead.
+    sub_tenant_memberships (id) {
+        id -> Uuid,
+        sub_tenant_id -> Uuid,
+        user_id -> Uuid,
+        roles -> Array<Text>,
+        suspended_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// Working tenants. All domain resources chain ownership back to a team.
+    ///
+    /// `sub_tenant_id` is null for an organization-level team, which every
+    /// sub-tenant inherits; a set value scopes the team to one sub-tenant.
+    teams (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        sub_tenant_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
     /// Joins users to organizations, carrying org-level role keys.
+    ///
+    /// `access` says whether the membership cascades into every sub-tenant
+    /// (`full`) or reaches only the ones granted explicitly (`guest`), and
+    /// `suspended_at` cuts the member out of the organization entirely.
     organization_memberships (id) {
         id -> Uuid,
         organization_id -> Uuid,
@@ -83,6 +118,8 @@ diesel::table! {
         roles -> Array<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        access -> Text,
+        suspended_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -387,6 +424,9 @@ diesel::joinable!(invitations -> organizations (organization_id));
 diesel::joinable!(invitations -> teams (team_id));
 diesel::joinable!(user_tokens -> users (user_id));
 diesel::joinable!(teams -> organizations (organization_id));
+diesel::joinable!(sub_tenants -> organizations (organization_id));
+diesel::joinable!(sub_tenant_memberships -> sub_tenants (sub_tenant_id));
+diesel::joinable!(sub_tenant_memberships -> users (user_id));
 diesel::joinable!(organization_memberships -> organizations (organization_id));
 diesel::joinable!(organization_memberships -> users (user_id));
 diesel::joinable!(team_memberships -> teams (team_id));
@@ -396,8 +436,10 @@ diesel::allow_tables_to_appear_in_same_query!(oauth_identities, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
 diesel::allow_tables_to_appear_in_same_query!(
     organizations,
+    sub_tenants,
     teams,
     organization_memberships,
+    sub_tenant_memberships,
     team_memberships,
     invitations,
     users,

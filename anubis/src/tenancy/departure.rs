@@ -22,7 +22,10 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
-use crate::schema::{organization_memberships, organizations, team_memberships, teams};
+use crate::schema::{
+    organization_memberships, organizations, sub_tenant_memberships, sub_tenants, team_memberships,
+    teams,
+};
 use crate::tenancy::bootstrap::{ADMIN_ROLE, holds_admin};
 use crate::tenancy::model::NewOrganizationMembership;
 
@@ -41,8 +44,9 @@ pub(crate) async fn settle_departure(
         .load(connection)
         .await?;
 
-    // An organization is affected when the user held a membership in it, or in
-    // one of its teams; a team-only member still keeps it alive.
+    // An organization is affected when the user held a membership in it, in
+    // one of its sub-tenants, or in one of its teams; a member at any of those
+    // levels still keeps it alive.
     let mut organization_ids: BTreeSet<Uuid> = organization_memberships::table
         .filter(organization_memberships::user_id.eq(user_id))
         .select(organization_memberships::organization_id)
@@ -56,9 +60,21 @@ pub(crate) async fn settle_departure(
         .load(connection)
         .await?;
     organization_ids.extend(team_organization_ids);
+    let sub_tenant_organization_ids: Vec<Uuid> = sub_tenant_memberships::table
+        .inner_join(sub_tenants::table)
+        .filter(sub_tenant_memberships::user_id.eq(user_id))
+        .select(sub_tenants::organization_id)
+        .load(connection)
+        .await?;
+    organization_ids.extend(sub_tenant_organization_ids);
 
     diesel::delete(
         organization_memberships::table.filter(organization_memberships::user_id.eq(user_id)),
+    )
+    .execute(connection)
+    .await?;
+    diesel::delete(
+        sub_tenant_memberships::table.filter(sub_tenant_memberships::user_id.eq(user_id)),
     )
     .execute(connection)
     .await?;
@@ -106,8 +122,20 @@ async fn is_deserted(
         .count()
         .get_result(connection)
         .await?;
+    if team_members > 0 {
+        return Ok(false);
+    }
 
-    Ok(team_members == 0)
+    // A guest granted one sub-tenant and nothing else is still somebody who
+    // can reach the organization's work, so their grant keeps it alive.
+    let sub_tenant_members: i64 = sub_tenant_memberships::table
+        .inner_join(sub_tenants::table)
+        .filter(sub_tenants::organization_id.eq(organization_id))
+        .count()
+        .get_result(connection)
+        .await?;
+
+    Ok(sub_tenant_members == 0)
 }
 
 /// Promotes the longest-standing member when an organization has no admin.
@@ -139,8 +167,10 @@ async fn ensure_organization_admin(
     }
 
     // The organization has no organization memberships at all, and survives
-    // only through its teams: the longest-standing team member takes it over.
-    let successor: Option<Uuid> = team_memberships::table
+    // only through its teams or its sub-tenants: the longest-standing member
+    // of either takes it over. Teams come first because a team member works in
+    // the organization, where a sub-tenant grant may be a guest's.
+    let team_successor: Option<Uuid> = team_memberships::table
         .inner_join(teams::table)
         .filter(teams::organization_id.eq(organization_id))
         .filter(team_memberships::user_id.is_not_null())
@@ -150,6 +180,18 @@ async fn ensure_organization_admin(
         .await
         .optional()?
         .flatten();
+
+    let successor = match team_successor {
+        Some(successor) => Some(successor),
+        None => sub_tenant_memberships::table
+            .inner_join(sub_tenants::table)
+            .filter(sub_tenants::organization_id.eq(organization_id))
+            .select(sub_tenant_memberships::user_id)
+            .order(sub_tenant_memberships::created_at.asc())
+            .first(connection)
+            .await
+            .optional()?,
+    };
 
     if let Some(successor) = successor {
         diesel::insert_into(organization_memberships::table)

@@ -5,14 +5,17 @@
 //! the same roles.yml always renders byte-identical TypeScript, so CI can
 //! fail on drift with a plain diff.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use chrono::Datelike;
 
-use crate::roles::ModelGrants;
+use crate::roles::{ModelGrants, Scope};
 
-pub(crate) fn render(resolved: &BTreeMap<String, ModelGrants>) -> String {
+pub(crate) fn render(
+    resolved: &BTreeMap<String, ModelGrants>,
+    scopes: &BTreeMap<String, BTreeSet<Scope>>,
+) -> String {
     let year = chrono::Utc::now().year();
     let mut out = String::new();
 
@@ -70,6 +73,28 @@ pub(crate) fn render(resolved: &BTreeMap<String, ModelGrants>) -> String {
          \x20\x20\x20\x20const grants = grantsByRole[role]\n\
          \x20\x20\x20\x20return Boolean(grants?.[model]?.includes(action))\n\
          \x20\x20})\n\
+         }\n\
+         \n",
+    );
+
+    out.push_str("// The tenancy tiers each role may be granted at.\n");
+    out.push_str("export type RoleScope = 'organization' | 'sub_tenant' | 'team'\n\n");
+    out.push_str("export const RoleScopes = {\n");
+    for (role, tiers) in scopes {
+        let rendered_tiers = tiers
+            .iter()
+            .map(|scope| format!("'{}'", scope.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "  {}: [ {rendered_tiers} ],", key(role));
+    }
+    out.push_str("} as const satisfies Record<RoleKey, readonly RoleScope[]>\n\n");
+
+    out.push_str(
+        "const scopesByRole: Record<string, readonly RoleScope[] | undefined> = RoleScopes\n\
+         \n\
+         export function isGrantableAt(role: string, scope: RoleScope): boolean {\n\
+         \x20\x20return Boolean(scopesByRole[role]?.includes(scope))\n\
          }\n",
     );
 
@@ -112,6 +137,7 @@ roles:
     models:
       Project: [manage]
   billing:
+    scopes: [organization]
     models: {}
 ";
 
@@ -132,6 +158,25 @@ roles:
             "got:\n{rendered}"
         );
         assert!(!rendered.contains(';'), "no semicolons, got:\n{rendered}");
+    }
+
+    #[test]
+    fn renders_the_tier_each_role_may_be_granted_at() {
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+        let rendered = set.to_typescript();
+
+        assert!(
+            rendered.contains("billing: [ 'organization' ],"),
+            "a declared scope narrows the role, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("admin: [ 'organization', 'sub_tenant', 'team' ],"),
+            "an undeclared scope means every tier, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("export function isGrantableAt("),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]
