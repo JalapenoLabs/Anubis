@@ -26,7 +26,7 @@
 //! Run it deliberately:
 //!
 //! ```sh
-//! DATABASE_URL=postgres://app:app@localhost:54321/app_development \
+//! DATABASE_URL=postgres://app:app@127.0.0.1:54321/app_development \
 //! RATE_LIMIT_DISABLED=true \
 //!   cargo test --release -p anubis-framework --test login_storm -- --ignored --nocapture
 //! ```

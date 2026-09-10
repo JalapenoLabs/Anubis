@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::time::Instant;
 use tower::ServiceExt;
 
 async fn send(
@@ -93,17 +94,51 @@ async fn login_attempts_run_out_per_client_address() {
         "email": format!("nobody-{}@example.com", uuid::Uuid::new_v4()),
         "password": "a wrong password entirely",
     });
-    for attempt in 0..quota {
-        let (status, _headers, body) = send(&router, "/login", &credentials, attacker).await;
+    // The budget leaks continuously rather than resetting on a boundary, so
+    // how many attempts it admits depends on how long they take: one cell
+    // returns every `period / quota`, which is six seconds here. Spending the
+    // budget therefore means sending until the refusal arrives, not sending
+    // exactly `quota` requests and assuming none replenished. Each attempt
+    // costs a real argon2id verification, so on a loaded machine the burst
+    // outlasts an emission interval and the naive count is wrong.
+    let period = anubis::rate_limit::Budget::Credentials.period();
+    let emission = period / quota;
+    // Four budgets' worth: enough that a working limiter always refuses
+    // inside it, few enough that a broken one fails rather than hangs.
+    let ceiling = quota * 4;
+
+    let start = Instant::now();
+    let mut admitted = 0_u32;
+    let mut refusal = None;
+    for attempt in 0..ceiling {
+        let (status, headers, body) = send(&router, "/login", &credentials, attacker).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refusal = Some((headers, body));
+            break;
+        }
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "attempt {attempt} is within the budget, body: {body}",
+            "attempt {attempt} was admitted, so it must be a plain rejection, body: {body}",
         );
+        admitted += 1;
     }
 
-    let (status, headers, body) = send(&router, "/login", &credentials, attacker).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "body: {body}");
+    let elapsed = start.elapsed();
+    let (headers, body) = refusal.unwrap_or_else(|| {
+        panic!("the budget never ran out: {admitted} attempts admitted in {elapsed:?}")
+    });
+
+    // What the leak can have returned while the burst was in flight. Asserting
+    // against this rather than against `quota` alone is what makes the test
+    // independent of how slow the machine is, without letting a limiter that
+    // admits everything pass.
+    let replenished = elapsed.as_nanos() / emission.as_nanos();
+    let ceiling_for_run = u128::from(quota) + replenished;
+    assert!(
+        u128::from(admitted) <= ceiling_for_run,
+        "admitted {admitted} in {elapsed:?}, over the budget of {quota} plus {replenished} leaked",
+    );
     let retry_after = headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())

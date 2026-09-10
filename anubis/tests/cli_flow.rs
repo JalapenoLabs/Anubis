@@ -101,6 +101,35 @@ fn new_stamps_a_complete_renamed_application() {
     std::fs::remove_dir_all(scratch).expect("scratch directory is removable");
 }
 
+/// A stamped tree passes the `cargo fmt --check` its own CI runs first.
+///
+/// The name is the point. Templates carry the import order their own crate
+/// name earned, and stamping moves the name within every `use` block it
+/// appears in: `zebra` sorts after `axum`, `acme` sorts before it. Nothing
+/// but the formatter can be right for both, so `anubis new` runs it.
+#[test]
+fn new_stamps_a_formatted_tree() {
+    let app = stamp("zebra", &[]);
+
+    let mut sources = Vec::new();
+    collect_rust_files(&app, &mut sources);
+    assert!(!sources.is_empty(), "a stamped app ships Rust sources");
+
+    let check = Command::new("rustfmt")
+        .args(["--edition", "2024", "--check"])
+        .args(&sources)
+        .output()
+        .expect("rustfmt is on PATH wherever the framework is built");
+    assert!(
+        check.status.success(),
+        "the stamped tree is unformatted:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    remove(&app);
+}
+
 /// A stamped app arrives with CI and its development environment in place,
 /// and with no credential written twice.
 #[test]
@@ -354,6 +383,21 @@ fn remove(app: &Path) {
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+/// Collects every `.rs` file under `directory` into `into`.
+///
+/// The walk is what makes the format check a real gate: it finds the files the
+/// stamp wrote rather than the files the stamp remembered to format.
+fn collect_rust_files(directory: &Path, into: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(directory).expect("stamped directories are readable") {
+        let path = entry.expect("stamped entries are readable").path();
+        if path.is_dir() {
+            collect_rust_files(&path, into);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            into.push(path);
+        }
+    }
 }
 
 fn assert_no_token(directory: &Path) {
