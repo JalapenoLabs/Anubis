@@ -62,7 +62,7 @@ yarn workspace anubis-starter-frontend test:e2e   # in a second terminal
 
 Or `yarn e2e` from the repository root, which starts all three, runs the specs, and stops the servers however the run ended. `yarn playwright install chromium` provisions the browser once per machine.
 
-`yarn e2e` starts the backend with `RATE_LIMIT_DISABLED=true`, and CI does the same. Each spec registers an account, which is a rate no person reaches and the auth limiter refuses with a `429`; the limiter is exactly what [api.md](api.md#rate-limiting) says it is, a budget for suites that drive these endpoints hard from one address, and it has its own Rust narrative. Running the suite against a stack started by a plain `yarn dev` works until the third sign-up.
+`yarn e2e` starts the backend with `RATE_LIMIT_DISABLED=true`, and CI does the same. Each spec registers an account, which is a rate no person reaches and the auth limiter refuses with a `429`; the limiter is exactly what [api.md](api.md#rate-limiting) says it is, a budget for suites that drive these endpoints hard from one address, and it has its own Rust narrative. A stack started by a plain `yarn dev` enforces it, and its budget is ten registrations an hour against three sign-ups a run, so a fourth consecutive run runs out partway through. `signUp` reads the registration response and fails with that reason and the variable to set, because the alternative is three specs timing out on a dashboard heading that was never going to render.
 
 `E2E_BASE_URL` points the specs somewhere else, which is what CI sets and what running them against a deployed environment needs. Vite runs with `strictPort`, so 5173 being taken is an error rather than a quiet move to 5174: `APP_URL` names that origin, and every email link, OAuth redirect, and Stripe return is built from it.
 
@@ -92,6 +92,8 @@ A page can render several forms with identically labelled fields, a show page ho
 ### Flake
 
 Retries are off and there are no sleeps. Playwright's auto-waiting is the only synchronization the specs use, so a spec that needs a sleep is reporting something real about the application. A retry would hide exactly that, and a suite whose failures are not believed is worse than no suite. Specs run one at a time (`workers: 1`) so that a failure reads as one story rather than three interleaved ones.
+
+The suite submits a create form faster than the list beside it can load, which a person never does, so a scaffolded section has to hold one invariant: a write revalidates its own list, and the read that was already in flight when the write landed is discarded rather than rendered over the result. `mutate()` after the write is what states it, and `src/pages/CreativeConceptPage.test.tsx` pins it by holding the section's first list read open until after the create.
 
 ## Test-database isolation
 

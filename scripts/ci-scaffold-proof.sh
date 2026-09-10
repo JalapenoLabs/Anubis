@@ -11,7 +11,7 @@
 # with `yarn dev` stopped:
 #
 #   docker compose --env-file .env.example -f starter/compose.yaml up -d --wait
-#   DATABASE_URL=postgres://anubis_starter:anubis-starter-dev-password@localhost:54321/anubis_starter_development \
+#   DATABASE_URL=postgres://anubis_starter:anubis-starter-dev-password@127.0.0.1:54321/anubis_starter_development \
 #     bash scripts/ci-scaffold-proof.sh
 #
 # It writes generated models into starter/ and leaves them there, so the output
