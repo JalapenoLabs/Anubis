@@ -1,7 +1,8 @@
 //! The Anubis starter application server.
 //!
-//! The composition root: it reads configuration, migrates the database, and
-//! mounts the framework's routers alongside the application's own
+//! The composition root: it reads configuration, migrates the database, seeds
+//! the operator the environment names, and mounts the framework's routers
+//! alongside the application's own
 //! [`account_router`], with the built frontend behind them all. The
 //! application itself lives in the library beside this file, which is what
 //! lets the integration tests drive the real routers.
@@ -78,6 +79,14 @@ async fn main() {
     let pool = db::connect(database.url())
         .await
         .expect("failed to connect to the database");
+
+    // ANUBIS_INITIAL_ADMIN_EMAIL, when the deployment sets it. The platform
+    // tier has no roster to appoint the first operator through, so the
+    // environment is what appoints them. Idempotent, and never a password
+    // reset; see docs/tenancy.md.
+    anubis::platform::ensure_initial_admin(&pool, &config, &roles)
+        .await
+        .expect("failed to seed the initial admin");
 
     // SMTP when SMTP_URL is set, otherwise the log mailer, which prints emails
     // and their action links to the console.

@@ -1,6 +1,6 @@
 # Tenancy, Teams, and Organizations
 
-Anubis adopts Bullet Train's multi-tenancy model ("teams should be an MVP feature") and extends it two levels: Organizations sit above Teams, and SubTenants sit between them.
+Anubis adopts Bullet Train's multi-tenancy model ("teams should be an MVP feature") and extends it two levels: Organizations sit above Teams, and SubTenants sit between them. Above all three sits the Platform, which is the deployment itself and is not a tenant at all.
 
 ## Entity model
 
@@ -22,7 +22,7 @@ User ─< TeamMembership >─ Team ───────────────
 - **SubTenantMembership**: joins a User to a SubTenant, carrying sub-tenant-level roles and its own `suspended_at`. This is the explicit grant a guest reaches a sub-tenant through.
 - **TeamMembership**: joins a User to a Team, carrying team-level roles. Domain resources are assigned to TeamMemberships, never directly to Users. This allows assigning work to invited people who have not signed up yet, and keeps assignments intact when a user leaves.
 - **Invitation**: created when someone is added to a Team or Organization by email. The emailed 256-bit token (hashed at rest, 14-day expiry) is the credential; whichever signed-in account holds it may claim, and claiming consumes the invitation. Team invitations pre-create the unclaimed TeamMembership, so the membership (id, roles, and any resource assignments) survives the claim intact; organization invitations create the OrganizationMembership at claim time. Re-inviting an email replaces the pending invitation. Inviting requires the admin role on the target, and organization admins may invite to any team in their organization. An admin can revoke a pending invitation, which discards the unclaimed membership with it; a claimed invitation no longer exists, so a claim cannot be taken back.
-- **Role**: declared in `roles.yml`, granted through memberships at any of the three levels.
+- **Role**: declared in `roles.yml`, granted through memberships at any of the three levels, or held on the user at the platform tier.
 
 At signup, every user gets a personal Organization containing a default SubTenant ("Main") and a default Team ("General"), so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
 
@@ -64,6 +64,47 @@ The tier's foundation is the schema, the model, the resolution function, the gua
 - The membership overview (`GET /tenancy/memberships`) does not yet group teams by sub-tenant.
 - The last-admin invariant does not yet cover suspension, because nothing in the framework creates one. The endpoint that does must take the same organization lock the other membership changes take.
 
+## The platform tier
+
+The platform is the deployment. It is what the process is serving, there is exactly one of it, and it is nobody's tenant: an operator is not a member of every organization, they are above the question. So the tier has no entity, no roster, and no id in a route, and a role granted there lives on the user (`users.platform_roles`) rather than on a membership row.
+
+A role reaches the tier only by naming it:
+
+```yaml
+operator:
+  scopes: [platform]
+  models:
+    Sample: [manage]
+```
+
+That is the one scope which is not in the default set, and the reason is blast radius. Omitting `scopes` means every *tenancy* tier, so every role written before this tier existed keeps meaning exactly what it meant. A `default` role that silently became grantable over the whole deployment would be the worst possible default.
+
+`anubis::guard::PlatformMember` is the guard. It admits an account holding any platform-scoped role and answers every other signed-in account `404`, byte-identical to a route that does not exist, for the same reason the tenant guards do it: an operator console that returns `403` has told a stranger it is there. Holding a platform role is admission; what an operator may do still comes from the compiled role set, so a handler calls `operator.require(Action::Update, "Sample")` exactly as a team handler does.
+
+### Appointing the first operator
+
+Every tenancy tier appoints administrators through somebody who is already one, and the platform has nobody. Two environment variables close the loop:
+
+| Variable | Meaning |
+|---|---|
+| `ANUBIS_INITIAL_ADMIN_EMAIL` | The account that operates this deployment |
+| `ANUBIS_INITIAL_ADMIN_PASSWORD` | The password, used only if the boot has to create the account |
+
+`anubis::platform::ensure_initial_admin` applies them, and an application calls it once, right after its migrations. Both are validated when configuration loads, so a typo stops the boot beside every other configuration mistake rather than halfway through.
+
+**The seed is a grant, never a reset**, which is what makes it safe to leave in a production environment:
+
+- No account at that address: one is created with its email already verified (the deployment vouched for it, and there is no inbox to click a link in), its personal organization bootstrapped exactly as registration does it, and `operator` granted.
+- An account without the role: the role is granted and **the password is not touched**, so the variable cannot become a standing override of somebody's chosen password, and a leaked deployment config is not a way into an existing account.
+- An account that already holds it: nothing happens and nothing is written, including in the audit log.
+
+Revoking is deliberately absent. Removing the variables leaves the operator in place, because a boot that silently demoted the only operator would lock the deployment out of itself. Every grant is recorded in the audit log as `platform.roles_changed`, attributed to the system, on neither a team nor an organization, exactly as a password change is.
+
+### Not built yet
+
+- Endpoints and a screen for listing operators and granting or revoking the role. Until they exist, an application writes `users.platform_roles` itself or re-runs the seed with a different address.
+- Platform-scoped resources in the scaffolder. `anubis scaffold model` chains every model to a Team; a deployment-wide catalog is hand-written today.
+
 ## Ownership chain
 
 Every scaffolded model declares its parent chain back to a Team, exactly like Bullet Train:
@@ -84,7 +125,7 @@ Selectable associations are scoped through generated `valid_*` methods on the mo
 
 Roles are declared once, in `config/roles.yml`, with role inheritance (`admin` includes `editor` and `billing`) and per-model action grants (`read`, `create`, `update`, `destroy`, or `manage` as shorthand for all four), modeled on `bullet_train-roles`. The starter ships the baseline vocabulary: `default`, `editor`, `billing`, and `admin`.
 
-A role may also name `scopes`, the tenancy tiers it can be granted at, out of `organization`, `sub_tenant`, and `team`. Omitting it means every tier, which is what a role written before the sub-tenant tier existed keeps meaning; the starter scopes `billing` to `organization`, because subscriptions attach to the organization and the role means nothing anywhere else. Scopes say where a role key attaches, never what it grants, so they do not travel through `includes`. `RoleSet::is_grantable_at` is the backend's question and `isGrantableAt` is the SPA's.
+A role may also name `scopes`, the tiers it can be granted at, out of `platform`, `organization`, `sub_tenant`, and `team`. Omitting it means every tenancy tier, which is what a role written before either newer tier existed keeps meaning; the starter scopes `billing` to `organization`, because subscriptions attach to the organization and the role means nothing anywhere else, and `operator` to `platform`. Scopes say where a role key attaches, never what it grants, so they do not travel through `includes`. `RoleSet::is_grantable_at` is the backend's question and `isGrantableAt` is the SPA's.
 
 One definition drives both sides of the stack:
 

@@ -10,6 +10,7 @@ export type RoleKey =
   | 'billing'
   | 'default'
   | 'editor'
+  | 'operator'
 
 export const RoleGrants = {
   admin: {
@@ -36,6 +37,7 @@ export const RoleGrants = {
     PeripheralNotion: [ 'read', 'create', 'update', 'destroy' ],
     TangibleThing: [ 'read', 'create', 'update', 'destroy' ],
   },
+  operator: {},
 } as const satisfies Record<RoleKey, Partial<Record<string, readonly PermissionAction[]>>>
 
 // Widened view so arbitrary runtime role keys index safely.
@@ -53,14 +55,15 @@ export function can(
   })
 }
 
-// The tenancy tiers each role may be granted at.
-export type RoleScope = 'organization' | 'sub_tenant' | 'team'
+// The tiers each role may be granted at.
+export type RoleScope = 'platform' | 'organization' | 'sub_tenant' | 'team'
 
 export const RoleScopes = {
   admin: [ 'organization', 'sub_tenant', 'team' ],
   billing: [ 'organization' ],
   default: [ 'organization', 'sub_tenant', 'team' ],
   editor: [ 'organization', 'sub_tenant', 'team' ],
+  operator: [ 'platform' ],
 } as const satisfies Record<RoleKey, readonly RoleScope[]>
 
 const scopesByRole: Record<string, readonly RoleScope[] | undefined> = RoleScopes

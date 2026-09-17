@@ -40,6 +40,11 @@ pub struct User {
     pub time_zone: String,
     /// BCP 47 locale tag; defaults to en-US.
     pub locale: String,
+    /// Role keys held at the platform tier, empty for everyone but an operator.
+    ///
+    /// The platform has no roster to join through, so the grant lives on the
+    /// account. See [`crate::guard::PlatformMember`].
+    pub platform_roles: Vec<String>,
 }
 
 impl fmt::Debug for User {
@@ -55,6 +60,7 @@ impl fmt::Debug for User {
             .field("last_name", &self.last_name)
             .field("time_zone", &self.time_zone)
             .field("locale", &self.locale)
+            .field("platform_roles", &self.platform_roles)
             .finish()
     }
 }
@@ -84,6 +90,11 @@ pub struct UserResponse {
     pub time_zone: String,
     /// BCP 47 locale tag.
     pub locale: String,
+    /// Role keys the account holds at the platform tier, empty for most.
+    ///
+    /// The SPA draws the operator surfaces from this with the generated
+    /// `can` helper, exactly as it draws a team's from a membership's roles.
+    pub platform_roles: Vec<String>,
     /// When the account was created.
     pub created_at: DateTime<Utc>,
     /// Version of the stored avatar; `None` when the account has none.
@@ -107,6 +118,7 @@ impl UserResponse {
             last_name: user.last_name.clone(),
             time_zone: user.time_zone.clone(),
             locale: user.locale.clone(),
+            platform_roles: user.platform_roles.clone(),
             created_at: user.created_at,
             avatar_version,
         }
@@ -145,6 +157,7 @@ mod tests {
             last_name: None,
             time_zone: "UTC".to_owned(),
             locale: "en-US".to_owned(),
+            platform_roles: Vec::new(),
         }
     }
 

@@ -26,6 +26,14 @@ export type User = {
    * after an upload and every view of the account update at once.
    */
   avatarVersion: string | null
+  /**
+   * Role keys held at the platform tier, empty for everyone but an operator.
+   *
+   * The platform is the deployment itself and has no roster, so the grant
+   * lives on the account. Pass these to the generated `can` helper to draw an
+   * operator surface, exactly as a membership's roles draw a team's.
+   */
+  platformRoles: readonly string[]
 }
 
 export type UserEnvelope = {
@@ -332,6 +340,7 @@ export type WireUser = {
   locale: string
   created_at: string
   avatar_version: string | null
+  platform_roles: readonly string[]
 }
 
 export type WireUserEnvelope = {
@@ -357,6 +366,9 @@ export function toUser(wire: WireUser): User {
     // A payload from an older backend has no version at all, which reads the
     // same as an account with no picture: the bare avatar URL.
     avatarVersion: wire.avatar_version ?? null,
+    // Same reasoning: a backend from before the platform tier sends no roles,
+    // and holding none is what every ordinary account holds anyway.
+    platformRoles: wire.platform_roles ?? [],
   }
 }
 

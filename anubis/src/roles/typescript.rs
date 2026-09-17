@@ -77,8 +77,8 @@ pub(crate) fn render(
          \n",
     );
 
-    out.push_str("// The tenancy tiers each role may be granted at.\n");
-    out.push_str("export type RoleScope = 'organization' | 'sub_tenant' | 'team'\n\n");
+    out.push_str("// The tiers each role may be granted at.\n");
+    out.push_str("export type RoleScope = 'platform' | 'organization' | 'sub_tenant' | 'team'\n\n");
     out.push_str("export const RoleScopes = {\n");
     for (role, tiers) in scopes {
         let rendered_tiers = tiers
@@ -139,6 +139,9 @@ roles:
   billing:
     scopes: [organization]
     models: {}
+  operator:
+    scopes: [platform]
+    models: {}
 ";
 
     #[test]
@@ -171,7 +174,11 @@ roles:
         );
         assert!(
             rendered.contains("admin: [ 'organization', 'sub_tenant', 'team' ],"),
-            "an undeclared scope means every tier, got:\n{rendered}"
+            "an undeclared scope means every tenancy tier, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("operator: [ 'platform' ],"),
+            "the platform tier is reached only by naming it, got:\n{rendered}"
         );
         assert!(
             rendered.contains("export function isGrantableAt("),

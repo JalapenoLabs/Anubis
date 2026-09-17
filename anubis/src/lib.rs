@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod mail;
 pub mod manifest;
 pub mod notifications;
+pub mod platform;
 pub mod rate_limit;
 pub mod realtime;
 pub mod roles;

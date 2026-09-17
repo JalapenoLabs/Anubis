@@ -684,6 +684,7 @@ The image bakes the deployment shape and none of its secrets:
 | `DATABASE_URL` | yes | Postgres, the system of record |
 | `APP_URL` | yes | The public base URL; every email link, OAuth redirect, and Stripe return is built from it |
 | `ANUBIS_SECRET_KEY` | yes in production | Base64 for 32 bytes, from `anubis secret generate` |
+| `ANUBIS_INITIAL_ADMIN_EMAIL`, `ANUBIS_INITIAL_ADMIN_PASSWORD` | to appoint an operator | Grants that address the platform `operator` role at every boot, creating the account once. A grant, never a password reset |
 | `SMTP_URL`, `MAIL_FROM` | to send real email | Otherwise mail goes to the log |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | to charge money | Otherwise every organization is on the free plan |
 | `REDIS_URL` | for more than one instance | Fans realtime channels out across instances |

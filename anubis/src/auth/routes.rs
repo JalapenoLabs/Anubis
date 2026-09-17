@@ -41,16 +41,13 @@ use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{password, session, user_token};
+use crate::auth::{password, policy, session, user_token};
 use crate::config::{AppConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::mail::{Email, Mailer};
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
-
-/// Upper bound from RFC 3696; anything longer cannot be a deliverable address.
-const MAX_EMAIL_CHARS: usize = 320;
 
 /// Returns the authentication routes for an application to mount.
 ///
@@ -540,41 +537,13 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
 
 /// Normalizes (trim + lowercase) and structurally validates an email address.
 pub(crate) fn validate_email(raw: &str) -> Result<String, ApiError> {
-    let email = raw.trim().to_lowercase();
-
-    if email.is_empty() || email.chars().count() > MAX_EMAIL_CHARS {
-        return Err(ApiError::validation("Enter a valid email address."));
-    }
-    let Some((local, domain)) = email.split_once('@') else {
-        return Err(ApiError::validation("Enter a valid email address."));
-    };
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.contains('@')
-        || email.contains(char::is_whitespace)
-    {
-        return Err(ApiError::validation("Enter a valid email address."));
-    }
-
-    Ok(email)
+    policy::normalize_email(raw).ok_or_else(|| ApiError::validation("Enter a valid email address."))
 }
 
 /// Enforces the password length policy shared by registration and reset.
 pub(crate) fn validate_password(candidate: &str) -> Result<(), ApiError> {
-    let password_chars = candidate.chars().count();
-    if password_chars < password::MIN_PASSWORD_CHARS {
-        return Err(ApiError::validation(format!(
-            "Passwords must be at least {} characters.",
-            password::MIN_PASSWORD_CHARS
-        )));
-    }
-    if password_chars > password::MAX_PASSWORD_CHARS {
-        return Err(ApiError::validation(format!(
-            "Passwords must be at most {} characters.",
-            password::MAX_PASSWORD_CHARS
-        )));
-    }
-    Ok(())
+    policy::check_password_policy(candidate)
+        .map_err(|violation| ApiError::validation(format!("Passwords must be {violation}.")))
 }
 
 fn invalid_credentials() -> ApiError {

@@ -18,6 +18,7 @@ diesel::table! {
         last_name -> Nullable<Text>,
         time_zone -> Text,
         locale -> Text,
+        platform_roles -> Array<Text>,
     }
 }
 
