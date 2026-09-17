@@ -4,7 +4,7 @@ CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with
 
 ## Workflow
 
-`.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `develop`:
+`.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `develop`. `.github/workflows/pull-review.yml` reviews pull requests with Claude and Codex, on its own runner; see [PR review](#pr-review). The CI workflow's jobs are:
 
 - **Rust job**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, the roles, plans, and client drift checks, then `cargo audit`.
 - **Frontend job**: `yarn install --immutable`, then typecheck, lint, test, build, and `yarn npm audit`.
@@ -76,6 +76,18 @@ The job is advisory (`continue-on-error: true`) to start with, for one reason: `
 The Rust and Frontend jobs each end with a vulnerability audit: `cargo audit` against RustSec advisories, and `yarn npm audit --all --recursive` against npm's. Both run `continue-on-error: true`, so a fresh advisory published overnight reports on every push without blocking unrelated work from merging. Flip both to blocking once the reports are routinely empty and a new advisory is something the team wants to fix before merging.
 
 `cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The runners keep `~/.cargo/bin` between runs, so only the first run on a fresh runner pays the few minutes it takes to compile.
+
+## PR review
+
+Every pull request from a branch of this repository gets an automated Claude and Codex review. `.github/workflows/pull-review.yml` is the organization's standard consumer file, identical in every JalapenoLabs repository, and holds no review logic: it checks out the pull request, checks out the private [JalapenoLabs/github-actions](https://github.com/JalapenoLabs/github-actions) repository into `.reviewer/` for the length of the job, and runs its `review-pr` action. Nothing from that repository is committed here, and the pipeline, its models, and its review policy live there.
+
+It is the one workflow that does not run on the build pool. It targets `[self-hosted, reviewer]`, a dedicated runner holding the reviewers' credentials, and takes every credential from organization secrets and variables, so this repository configures nothing. It checks out no submodules: `bullet_train/bullet_train` is reference material rather than code this repository builds.
+
+**Fork pull requests are never reviewed.** This repository is public and that runner holds credentials, so a fork's code must never be checked out on it. The job-level `if:` guard is what enforces that; do not remove it.
+
+The trigger is `pull_request_target`, which runs the copy of the workflow on the pull request's base branch, so a pull request cannot change how it is reviewed, and a change to this file takes effect once it reaches `develop` (and `main` for promotions).
+
+Drafts are skipped until marked ready, and a push that only merges the base branch is skipped once both reviewers have reviewed the pull request. A head commit whose subject starts with `[REVIEW]`, or a re-run of the workflow, forces a full review.
 
 ## Releases
 
