@@ -1,7 +1,7 @@
 //! Outgoing email for Anubis applications.
 //!
 //! [`Mailer`] is the one service the framework and applications send email
-//! through. Three backends exist:
+//! through. Four backends exist:
 //!
 //! - [`Mailer::log`]: writes each email to structured logs, action links
 //!   included. The development default; nothing leaves the machine.
@@ -9,6 +9,11 @@
 //!   your tests read, in the spirit of Rails' `ActionMailer::Base.deliveries`.
 //! - [`Mailer::smtp`]: delivers through an SMTP relay over rustls. The
 //!   production backend.
+//! - [`Mailer::custom`]: delivers through a [`Transport`] the application
+//!   supplies, for a provider reached by API rather than by relay. That is what
+//!   rendering a provider-hosted template needs: a template is chosen by id and
+//!   filled from [`Email::params`], and neither survives being flattened into
+//!   an RFC 5322 message.
 //!
 //! [`Mailer::from_config`] picks between them: an application delivers over
 //! SMTP wherever `SMTP_URL` is set, and writes to the log everywhere else, so
@@ -25,7 +30,7 @@
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), anubis::mail::Error> {
-//! use anubis::mail::{Email, Mailer};
+//! use anubis::mail::{Email, EmailKind, Mailer};
 //!
 //! let mailer = Mailer::smtp(
 //!     "smtps://apikey:secret@smtp.example.com:465",
@@ -33,11 +38,12 @@
 //! )?;
 //!
 //! mailer
-//!     .send(Email {
-//!         to: "someone@example.com".to_owned(),
-//!         subject: "Welcome".to_owned(),
-//!         text_body: "Glad you are here.".to_owned(),
-//!     })
+//!     .send(Email::new(
+//!         EmailKind::Application("welcome"),
+//!         "someone@example.com",
+//!         "Welcome",
+//!         "Glad you are here.",
+//!     ))
 //!     .await?;
 //! # Ok(())
 //! # }
@@ -54,7 +60,9 @@
 //! [`crate::config`] and `docs/email.md` for the DNS record and rotation.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use lettre::message::Mailbox;
@@ -64,15 +72,110 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::config::{AppConfig, DkimConfig};
 
-/// A plain-text email ready for delivery.
+/// Which email this is, independently of the words in it.
+///
+/// A transport that renders from templates needs to know which template, and
+/// matching on the subject line would be matching on prose. This is the stable
+/// name: the subject may be reworded, and this will not change.
+///
+/// Non-exhaustive because the framework will send emails it does not send
+/// today, and a `match` in an application should not stop compiling when it
+/// does. Match with a `_` arm and decide there what an unrecognized email
+/// should do; falling back to [`Email::text_body`] is usually right.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmailKind {
+    /// Confirm a newly registered address. Parameters: `link`.
+    VerifyEmailAddress,
+    /// A one-time code that signs somebody in. Parameters: `code`, `minutes`.
+    SignInCode,
+    /// The link that sets a new password. Parameters: `link`.
+    ResetPassword,
+    /// Confirm an address the account is moving to. Parameters: `link`.
+    ConfirmEmailChange,
+    /// An invitation to join a team or an organization.
+    ///
+    /// Parameters: `link`, `inviter`, `target`, `days`.
+    Invitation,
+    /// An application's own email, named by the application.
+    ///
+    /// The framework never constructs this. It exists so an application can
+    /// send through the same mailer and be recognized by the same transport.
+    Application(&'static str),
+}
+
+/// An email ready for delivery.
+///
+/// Every email carries a plain-text body, and always will: it is what the log
+/// and test backends show, what an SMTP relay sends, and what a transport falls
+/// back to for an email it has no template for. [`Email::kind`] and
+/// [`Email::params`] are for transports that render instead of deliver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Email {
     /// Recipient address.
     pub to: String,
     /// Subject line.
     pub subject: String,
-    /// Plain-text body. HTML templating arrives with a later milestone.
+    /// Plain-text body, and the thing every backend can always send.
     pub text_body: String,
+    /// Which email this is, for a transport that renders from templates.
+    pub kind: EmailKind,
+    /// The values the body was built from, for that same transport.
+    ///
+    /// Ordered, so two equal emails render the same request and a test can
+    /// assert on the whole map. The keys each kind carries are documented on
+    /// [`EmailKind`]; they are the framework's contract with a transport, so
+    /// removing one is a breaking change.
+    pub params: BTreeMap<String, String>,
+}
+
+impl Email {
+    /// A plain-text email of `kind`, with no parameters yet.
+    #[must_use]
+    pub fn new(
+        kind: EmailKind,
+        to: impl Into<String>,
+        subject: impl Into<String>,
+        text_body: impl Into<String>,
+    ) -> Self {
+        Self {
+            to: to.into(),
+            subject: subject.into(),
+            text_body: text_body.into(),
+            kind,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// Adds a parameter a template can render.
+    #[must_use]
+    pub fn with_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.insert(name.into(), value.into());
+        self
+    }
+}
+
+/// Delivers an [`Email`] some way the framework does not know about.
+///
+/// Implement this to send through a provider's API rather than a relay, which
+/// is what rendering a provider-hosted template requires: a template is chosen
+/// by id and filled from [`Email::params`], and neither survives being flattened
+/// into an RFC 5322 message. [`Mailer::custom`] takes the result.
+///
+/// The framework calls this from request handlers, so an implementation should
+/// be cheap to clone behind its `Arc` and should not block.
+pub trait Transport: fmt::Debug + Send + Sync + 'static {
+    /// Delivers `email`, or explains why it could not.
+    ///
+    /// Boxed rather than an `async fn`, because a trait with one is not
+    /// dyn-compatible and this is only useful behind `dyn`.
+    ///
+    /// # Errors
+    /// Whatever the underlying service refused, as an [`Error`].
+    fn deliver<'a>(
+        &'a self,
+        email: &'a Email,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 }
 
 /// Sends email through the configured backend. Cheap to clone.
@@ -86,9 +189,23 @@ enum Backend {
     Log,
     Test(TestOutbox),
     Smtp(Smtp),
+    Custom(Arc<dyn Transport>),
 }
 
 impl Mailer {
+    /// A mailer that delivers through `transport`.
+    ///
+    /// For sending through a provider's API rather than a relay. The framework
+    /// never builds this: an application constructs its transport and passes
+    /// the mailer to [`crate::AppState`], because the provider, its credential
+    /// and its template ids are the application's, not the framework's.
+    #[must_use]
+    pub fn custom(transport: Arc<dyn Transport>) -> Self {
+        Self {
+            backend: Backend::Custom(transport),
+        }
+    }
+
     /// A mailer that writes each email to structured logs. Development default.
     #[must_use]
     pub fn log() -> Self {
@@ -200,6 +317,7 @@ impl Mailer {
             Backend::Log => {
                 tracing::info!(
                     email.to = %email.to,
+                    email.kind = ?email.kind,
                     email.subject = %email.subject,
                     email.body = %email.text_body,
                     "email delivered to log backend for {{email.to}}: {{email.subject}}",
@@ -222,6 +340,18 @@ impl Mailer {
                     email.to = %email.to,
                     email.subject = %email.subject,
                     "email delivered over SMTP to {{email.to}}: {{email.subject}}",
+                );
+                Ok(())
+            }
+            Backend::Custom(transport) => {
+                transport.deliver(&email).await?;
+
+                // Parameters carry action links and one-time codes, so the
+                // envelope and the kind are logged and the values are not.
+                tracing::info!(
+                    email.to = %email.to,
+                    email.kind = ?email.kind,
+                    "email delivered by transport to {{email.to}}: {{email.kind}}",
                 );
                 Ok(())
             }
@@ -372,6 +502,31 @@ impl Error {
             backtrace: Backtrace::capture(),
         }
     }
+
+    /// Wraps a failure from a [`Transport`] an application implements.
+    ///
+    /// The private constructor above takes a `&'static str` and a source,
+    /// which suits the framework's own call sites and suits a transport
+    /// badly: what a provider's API refused arrives as a status code and a
+    /// body, and there may be no error type underneath it to wrap. Without
+    /// this an implementor could not return the error the trait requires.
+    ///
+    /// Say what failed, not what it was carrying: this is logged, and an
+    /// email's parameters hold one-time codes and action links.
+    #[must_use]
+    pub fn transport(reason: impl Display) -> Self {
+        Self {
+            context: "the mail transport refused the message",
+            source: reason.to_string().into(),
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    /// The same, for a transport that does have an error to wrap.
+    #[must_use]
+    pub fn transport_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::new("the mail transport refused the message", source)
+    }
 }
 
 impl Display for Error {
@@ -392,9 +547,13 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
-    use super::{Email, Mailer, Smtp, address_domain, dkim, is_valid_signing_key, signing_key};
+    use super::{
+        Email, EmailKind, Error, Mailer, Smtp, Transport, address_domain, dkim,
+        is_valid_signing_key, signing_key,
+    };
     use crate::config::{AppConfig, DkimConfig};
     use lettre::message::Mailbox;
     use lettre::{AsyncSmtpTransport, Tokio1Executor};
@@ -409,11 +568,12 @@ mod tests {
     const TEST_ED25519_SEED: &str = "urSx/qgLgH8LRgRC4LWmUspd20lyppax/7lmY0bhqTw=";
 
     fn sample_email() -> Email {
-        Email {
-            to: "someone@example.com".to_owned(),
-            subject: "Hello".to_owned(),
-            text_body: "A body with a link: https://example.com/x?token=abc".to_owned(),
-        }
+        Email::new(
+            EmailKind::Application("sample"),
+            "someone@example.com",
+            "Hello",
+            "A body with a link: https://example.com/x?token=abc",
+        )
     }
 
     /// An SMTP backend pointed at a port nothing listens on.
@@ -691,5 +851,103 @@ mod tests {
         .expect("a configured key must parse");
         let mailer = Mailer::from_config(&signing).expect("the signing relay must build");
         assert!(format!("{mailer:?}").contains("signed: true"));
+    }
+
+    /// A transport that records what it was handed, the way a provider's
+    /// client would read it before building a request.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        seen: Mutex<Vec<Email>>,
+    }
+
+    impl Transport for Recorder {
+        fn deliver<'a>(
+            &'a self,
+            email: &'a Email,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+            Box::pin(async move {
+                self.seen
+                    .lock()
+                    .expect("the recorder lock is never poisoned")
+                    .push(email.clone());
+                Ok(())
+            })
+        }
+    }
+
+    /// A transport that refuses, the way a provider does when a key is wrong.
+    #[derive(Debug)]
+    struct Refuses;
+
+    impl Transport for Refuses {
+        fn deliver<'a>(
+            &'a self,
+            _email: &'a Email,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+            Box::pin(async { Err(Error::transport("the provider rejected the API key")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_is_handed_the_kind_and_the_parameters() {
+        // The reason this trait exists: a provider-hosted template is chosen by
+        // id and filled from the parameters, and neither can be recovered from
+        // a rendered plain-text body.
+        let recorder = Arc::new(Recorder::default());
+        let mailer = Mailer::custom(Arc::clone(&recorder) as Arc<dyn Transport>);
+
+        mailer
+            .send(
+                Email::new(
+                    EmailKind::SignInCode,
+                    "someone@example.com",
+                    "Your sign-in code",
+                    "Your sign-in code is 123456",
+                )
+                .with_param("code", "123456")
+                .with_param("minutes", "10"),
+            )
+            .await
+            .expect("the recorder accepts every email");
+
+        let seen = recorder.seen.lock().expect("not poisoned");
+        let [email] = seen.as_slice() else {
+            panic!("expected exactly one email, got {}", seen.len());
+        };
+        assert_eq!(email.kind, EmailKind::SignInCode);
+        assert_eq!(email.params.get("code").map(String::as_str), Some("123456"));
+        assert_eq!(email.params.get("minutes").map(String::as_str), Some("10"));
+        // And the body survives, because a transport with no template for a
+        // kind has to be able to fall back to it.
+        assert!(email.text_body.contains("123456"));
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_refuses_fails_the_send() {
+        // Otherwise an application would log a success for an email nobody got.
+        let mailer = Mailer::custom(Arc::new(Refuses));
+
+        let error = mailer
+            .send(Email::new(
+                EmailKind::VerifyEmailAddress,
+                "someone@example.com",
+                "Verify your email address",
+                "Confirm within 3 days",
+            ))
+            .await
+            .expect_err("the transport refused");
+
+        assert!(error.to_string().contains("API key"), "got: {error}");
+    }
+
+    #[test]
+    fn a_parameter_added_twice_keeps_the_last_value() {
+        // `with_param` reads as a builder, and a builder that silently kept the
+        // first value would be a surprise worth documenting rather than having.
+        let email = Email::new(EmailKind::ResetPassword, "a@example.com", "s", "b")
+            .with_param("link", "first")
+            .with_param("link", "second");
+
+        assert_eq!(email.params.get("link").map(String::as_str), Some("second"));
     }
 }

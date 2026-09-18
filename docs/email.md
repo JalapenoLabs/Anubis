@@ -7,8 +7,51 @@ All outgoing email goes through `anubis::mail::Mailer`, a cheap-to-clone service
 - **`Mailer::log`**: writes each email to structured logs, action links included. The development default; nothing leaves the machine, and the logged link is how you complete verification flows locally.
 - **`Mailer::test`**: captures emails in an in-memory outbox whose handle tests read, in the spirit of Rails' `ActionMailer::Base.deliveries`. Framework integration tests and application tests both use it.
 - **`Mailer::smtp`**: delivers through an SMTP relay, optionally signing each message with DKIM. The production backend, built on `lettre` with rustls and the RustCrypto signing stack; no OpenSSL is linked anywhere in the tree.
+- **`Mailer::custom`**: delivers through a `Transport` the application implements, for a provider reached by its API rather than by a relay.
 
-`Mailer::from_config` picks the backend, so which one runs is a deployment decision rather than a code change. The starter's composition root calls it.
+`Mailer::from_config` picks between the first three, so which one runs is a deployment decision rather than a code change. The starter's composition root calls it. A custom transport is constructed by the application, because the provider, its credential and its template ids are the application's.
+
+## Sending through a provider's API
+
+A relay takes a finished message. Some providers instead host the template, choose it by id, and fill it from named values, which a rendered plain-text body cannot carry. `Transport` is how an application reaches one:
+
+```rust
+use std::pin::Pin;
+use std::sync::Arc;
+use anubis::mail::{Email, EmailKind, Error, Mailer, Transport};
+
+#[derive(Debug)]
+struct Provider { /* an HTTP client and an API key */ }
+
+impl Transport for Provider {
+    fn deliver<'a>(
+        &'a self,
+        email: &'a Email,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let template = match email.kind {
+                EmailKind::VerifyEmailAddress => Some(41),
+                EmailKind::SignInCode => Some(42),
+                // A kind this deployment has no template for still has to be
+                // sent, so fall back to `email.text_body`.
+                _ => None,
+            };
+            // ... post `template` and `email.params`, or the plain body ...
+            Ok(())
+        })
+    }
+}
+
+let mailer = Mailer::custom(Arc::new(Provider { /* .. */ }));
+```
+
+`EmailKind` is the stable name of each email, so a transport matches on that rather than on a subject line, which is prose and gets reworded. It is `#[non_exhaustive]`: match with a `_` arm, because the framework will send emails it does not send today and an application should not stop compiling when it does.
+
+`Email::params` carries the values the body was built from. The keys each kind carries are documented on `EmailKind` and are the framework's contract with a transport, so removing one is a breaking change.
+
+Every email still carries `text_body`, and always will. It is what the log and test backends show, what a relay sends, and what a transport falls back to for a kind it has no template for.
+
+`Error::transport` builds the error the trait returns. Say what failed rather than what it was carrying: the message is logged, and an email's parameters hold one-time codes and action links.
 
 ## SMTP
 
@@ -139,4 +182,4 @@ Password-reset requests answer identically whether or not the email is registere
 
 ## Content
 
-Bodies are plain text today; HTML templating is on the roadmap. User-facing email copy is English until backend i18n lands (also roadmap).
+Bodies are plain text, and every email carries one whatever backend sends it. An application that wants HTML or a designed template reaches a provider that hosts one, through `Transport` above; the framework does not render HTML. User-facing email copy is English until backend i18n lands (roadmap).

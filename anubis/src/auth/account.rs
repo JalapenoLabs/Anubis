@@ -31,7 +31,7 @@ use crate::auth::routes::{AuthState, validate_email, validate_password};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{CurrentUser, password, session, token, user_token};
 use crate::http::ApiError;
-use crate::mail::Email;
+use crate::mail::{Email, EmailKind};
 use crate::schema::{sessions, users};
 
 /// Longest accepted name, time zone, or locale value.
@@ -227,15 +227,17 @@ async fn request_email_change(
     .map_err(log_internal)?;
 
     let link = format!("{}/change-email?token={raw_token}", state.app_url);
-    let mail = Email {
-        to: new_email.clone(),
-        subject: "Confirm your new email address".to_owned(),
-        text_body: format!(
+    let mail = Email::new(
+        EmailKind::ConfirmEmailChange,
+        new_email.clone(),
+        "Confirm your new email address",
+        format!(
             "Confirm this address to make it the sign-in email for your account.\n\n\
              Confirm within 1 hour: {link}\n\n\
              If you weren't expecting this, ignore this email.",
         ),
-    };
+    )
+    .with_param("link", &link);
     if let Err(error) = state.mailer.send(mail).await {
         tracing::error!(
             error.message = %error,

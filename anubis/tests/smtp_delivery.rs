@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use anubis::config::AppConfig;
-use anubis::mail::{Email, Mailer};
+use anubis::mail::{Email, EmailKind, Mailer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -137,11 +137,12 @@ async fn a_message_travels_through_the_real_transport_to_the_relay() {
     .expect("the mailer must build");
 
     mailer
-        .send(Email {
-            to: "someone@example.com".to_owned(),
-            subject: "Verify your email".to_owned(),
-            text_body: "Confirm with https://app.example.com/verify-email?token=abc".to_owned(),
-        })
+        .send(Email::new(
+            EmailKind::Application("delivery-test"),
+            "someone@example.com".to_owned(),
+            "Verify your email".to_owned(),
+            "Confirm with https://app.example.com/verify-email?token=abc".to_owned(),
+        ))
         .await
         .expect("the relay must accept the message");
 
@@ -200,11 +201,12 @@ async fn a_configured_key_signs_every_message_the_relay_receives() {
     let mailer = Mailer::from_config(&config).expect("the mailer must build");
 
     mailer
-        .send(Email {
-            to: "someone@example.com".to_owned(),
-            subject: "Verify your email".to_owned(),
-            text_body: "Confirm with https://app.example.com/verify-email?token=abc".to_owned(),
-        })
+        .send(Email::new(
+            EmailKind::Application("delivery-test"),
+            "someone@example.com".to_owned(),
+            "Verify your email".to_owned(),
+            "Confirm with https://app.example.com/verify-email?token=abc".to_owned(),
+        ))
         .await
         .expect("the relay must accept the message");
 
@@ -252,11 +254,12 @@ async fn a_relay_that_is_not_listening_surfaces_as_a_send_error() {
         .expect("the mailer must build without contacting the relay");
 
     let error = mailer
-        .send(Email {
-            to: "someone@example.com".to_owned(),
-            subject: "Verify your email".to_owned(),
-            text_body: "Confirm your address.".to_owned(),
-        })
+        .send(Email::new(
+            EmailKind::Application("delivery-test"),
+            "someone@example.com".to_owned(),
+            "Verify your email".to_owned(),
+            "Confirm your address.".to_owned(),
+        ))
         .await
         .expect_err("a dead relay must fail the send");
 

@@ -25,7 +25,7 @@ use crate::auth::routes::{AuthState, signed_in_jar, validate_email};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{mfa, user_token};
 use crate::http::ApiError;
-use crate::mail::Email;
+use crate::mail::{Email, EmailKind};
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
 
@@ -77,14 +77,17 @@ async fn request_code(
                 .await
                 .map_err(log_internal)?;
 
-        let mail = Email {
-            to: user.email.clone(),
-            subject: "Your sign-in code".to_owned(),
-            text_body: format!(
+        let mail = Email::new(
+            EmailKind::SignInCode,
+            user.email.clone(),
+            "Your sign-in code",
+            format!(
                 "Your sign-in code is {code}\n\n\
                  It expires in 10 minutes. If this wasn't you, ignore this email.",
             ),
-        };
+        )
+        .with_param("code", &code)
+        .with_param("minutes", "10");
         if let Err(error) = state.mailer.send(mail).await {
             tracing::error!(
                 error.message = %error,

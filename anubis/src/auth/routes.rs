@@ -45,7 +45,7 @@ use crate::auth::{password, session, user_token};
 use crate::config::{AppConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
-use crate::mail::{Email, Mailer};
+use crate::mail::{Email, EmailKind, Mailer};
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
 
@@ -388,15 +388,17 @@ async fn request_password_reset(
         let link = format!("{}/reset-password?token={token}", state.app_url);
         deliver(
             &state.mailer,
-            Email {
-                to: user.email.clone(),
-                subject: "Reset your password".to_owned(),
-                text_body: format!(
+            Email::new(
+                EmailKind::ResetPassword,
+                user.email.clone(),
+                "Reset your password",
+                format!(
                     "Someone requested a password reset for this account.\n\n\
                      Set a new password within 30 minutes: {link}\n\n\
                      If this wasn't you, ignore this email; your password is unchanged.",
                 ),
-            },
+            )
+            .with_param("link", &link),
         )
         .await;
     }
@@ -467,14 +469,16 @@ async fn send_verification_email(
     let link = format!("{}/verify-email?token={token}", state.app_url);
     deliver(
         &state.mailer,
-        Email {
-            to: user.email.clone(),
-            subject: "Verify your email address".to_owned(),
-            text_body: format!(
+        Email::new(
+            EmailKind::VerifyEmailAddress,
+            user.email.clone(),
+            "Verify your email address",
+            format!(
                 "Welcome! Confirm this email address within 3 days: {link}\n\n\
                  If you didn't create this account, ignore this email.",
             ),
-        },
+        )
+        .with_param("link", &link),
     )
     .await;
 }
