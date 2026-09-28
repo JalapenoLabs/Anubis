@@ -37,7 +37,7 @@ use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
-use crate::mail::{Email, Mailer};
+use crate::mail::{Email, EmailKind, Mailer};
 use crate::rate_limit::RateLimiter;
 use crate::roles::RoleSet;
 use crate::schema::{
@@ -482,17 +482,22 @@ async fn create_invitation(
         .await?;
 
     let link = format!("{}/claim-invitation?token={token}", state.app_url);
-    let mail = Email {
-        to: email.clone(),
-        subject: format!("You're invited to join {target_name}"),
-        text_body: format!(
+    let mail = Email::new(
+        EmailKind::Invitation,
+        email.clone(),
+        format!("You're invited to join {target_name}"),
+        format!(
             "{} invited you to join {target_name}.\n\n\
              Accept within {} days: {link}\n\n\
              If you weren't expecting this, ignore this email.",
             inviter.email,
             invitation::INVITATION_TTL_DAYS,
         ),
-    };
+    )
+    .with_param("link", &link)
+    .with_param("inviter", &inviter.email)
+    .with_param("target", target_name)
+    .with_param("days", invitation::INVITATION_TTL_DAYS.to_string());
     if let Err(error) = state.mailer.send(mail).await {
         tracing::error!(
             error.message = %error,
