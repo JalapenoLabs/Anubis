@@ -5,13 +5,13 @@ import type { Editor } from '@tiptap/core'
 
 // Core
 import { useEffect } from 'react'
-import { EditorContent, useEditor } from '@tiptap/react'
+import { EditorContent, useEditor, useEditorState } from '@tiptap/react'
 
 // User interface
 import { Button, Tooltip } from '@heroui/react'
 
 // Utility
-import StarterKit from '@tiptap/starter-kit'
+import { StarterKit } from '@tiptap/starter-kit'
 
 // Misc
 import { RICH_TEXT_PROSE } from './richText'
@@ -49,7 +49,17 @@ export function RichTextEditor(props: Props) {
   const isEditable = !props.isDisabled && !props.isReadOnly
 
   const editor = useEditor({
-    extensions: [ StarterKit ],
+    extensions: [
+      // Tiptap 3's kit also bundles links, underline, and a trailing empty
+      // paragraph. The toolbar is the editor's whole vocabulary, so a mark it
+      // cannot apply or remove stays out, and a document is stored exactly as
+      // written rather than with a paragraph the editor appended on load.
+      StarterKit.configure({
+        link: false,
+        underline: false,
+        trailingNode: false,
+      }),
+    ],
     content: props.html,
     editable: isEditable,
     autofocus: props.autoFocus,
@@ -78,12 +88,15 @@ export function RichTextEditor(props: Props) {
     }
     const current = editor.isEmpty ? '' : editor.getHTML()
     if (current !== props.html) {
-      editor.commands.setContent(props.html, false)
+      editor.commands.setContent(props.html, { emitUpdate: false })
     }
   }, [ editor, props.html ])
 
+  // Tiptap emits an update when editability changes, by default. Toggling it
+  // changes no content, and an update here would hand the form its own value
+  // back on every mount as though the person had typed it.
   useEffect(() => {
-    editor?.setEditable(isEditable)
+    editor?.setEditable(isEditable, false)
   }, [ editor, isEditable ])
 
   const border = props.isInvalid
@@ -117,68 +130,86 @@ type ToolbarProps = {
 function RichTextToolbar(props: ToolbarProps) {
   const { editor, labels } = props
 
+  // Tiptap 3 no longer re-renders the component holding the editor on every
+  // transaction, so the pressed states subscribe here. The selector compares
+  // by value, which lets a keystroke that moves no mark skip the render.
+  const active = useEditorState({
+    editor,
+    selector: ({ editor: current }) => ({
+      bold: current.isActive('bold'),
+      italic: current.isActive('italic'),
+      strike: current.isActive('strike'),
+      heading: current.isActive('heading', { level: 2 }),
+      subheading: current.isActive('heading', { level: 3 }),
+      bulletList: current.isActive('bulletList'),
+      orderedList: current.isActive('orderedList'),
+      quote: current.isActive('blockquote'),
+      code: current.isActive('codeBlock'),
+    }),
+  })
+
   const actions = [
     {
       key: 'bold',
       face: <span className='font-bold'>B</span>,
       title: labels.bold,
-      isActive: editor.isActive('bold'),
+      isActive: active.bold,
       run: () => editor.chain().focus().toggleBold().run(),
     },
     {
       key: 'italic',
       face: <span className='italic'>I</span>,
       title: labels.italic,
-      isActive: editor.isActive('italic'),
+      isActive: active.italic,
       run: () => editor.chain().focus().toggleItalic().run(),
     },
     {
       key: 'strike',
       face: <span className='line-through'>S</span>,
       title: labels.strike,
-      isActive: editor.isActive('strike'),
+      isActive: active.strike,
       run: () => editor.chain().focus().toggleStrike().run(),
     },
     {
       key: 'heading',
       face: <span>H2</span>,
       title: labels.heading,
-      isActive: editor.isActive('heading', { level: 2 }),
+      isActive: active.heading,
       run: () => editor.chain().focus().toggleHeading({ level: 2 }).run(),
     },
     {
       key: 'subheading',
       face: <span>H3</span>,
       title: labels.subheading,
-      isActive: editor.isActive('heading', { level: 3 }),
+      isActive: active.subheading,
       run: () => editor.chain().focus().toggleHeading({ level: 3 }).run(),
     },
     {
       key: 'bulletList',
       face: <span>&bull;</span>,
       title: labels.bulletList,
-      isActive: editor.isActive('bulletList'),
+      isActive: active.bulletList,
       run: () => editor.chain().focus().toggleBulletList().run(),
     },
     {
       key: 'orderedList',
       face: <span>1.</span>,
       title: labels.orderedList,
-      isActive: editor.isActive('orderedList'),
+      isActive: active.orderedList,
       run: () => editor.chain().focus().toggleOrderedList().run(),
     },
     {
       key: 'quote',
       face: <span>&ldquo;</span>,
       title: labels.quote,
-      isActive: editor.isActive('blockquote'),
+      isActive: active.quote,
       run: () => editor.chain().focus().toggleBlockquote().run(),
     },
     {
       key: 'code',
       face: <span className='font-mono'>&lt;&gt;</span>,
       title: labels.code,
-      isActive: editor.isActive('codeBlock'),
+      isActive: active.code,
       run: () => editor.chain().focus().toggleCodeBlock().run(),
     },
     {
