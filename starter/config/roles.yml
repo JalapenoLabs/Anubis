@@ -17,11 +17,15 @@
 # read on the model being offered. One grant per real-world model is what keeps
 # this file legible.
 #
-# `scopes` names the tenancy tiers a role may be granted at, out of
+# `scopes` names the tiers a role may be granted at, out of `platform`,
 # `organization`, `sub_tenant`, and `team`. Omit it and the role may be granted
-# at every tier, which is what a role written without it means. Scopes say
-# where a role key attaches, never what it grants, so they do not travel
+# at every tenancy tier, which is what a role written without it means. Scopes
+# say where a role key attaches, never what it grants, so they do not travel
 # through `includes`.
+#
+# `platform` is the exception: a role reaches it only by naming it, because the
+# platform is the deployment itself and no role should acquire that reach by
+# saying nothing.
 
 roles:
   # Every team member holds `default`.
@@ -53,4 +57,13 @@ roles:
   # Full control, including member management.
   admin:
     includes: [editor, billing]
+    models: {}
+
+  # Operates the deployment itself, above every organization in it. Held on the
+  # account rather than through a membership, because the platform has no
+  # roster; ANUBIS_INITIAL_ADMIN_EMAIL is what appoints the first one. The
+  # starter grants it nothing, because the starter has no operator screens: an
+  # application adds the models its own operators work with.
+  operator:
+    scopes: [platform]
     models: {}

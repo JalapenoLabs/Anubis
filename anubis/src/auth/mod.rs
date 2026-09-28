@@ -19,6 +19,7 @@ mod extract;
 mod mfa;
 mod model;
 mod passkey;
+mod policy;
 pub(crate) mod routes;
 mod session;
 pub(crate) mod token;
@@ -30,6 +31,7 @@ pub use avatar::public_router as avatar_router;
 pub use extract::CurrentUser;
 #[doc(inline)]
 pub use model::{User, UserResponse};
+pub(crate) use policy::{check_password_policy, normalize_email};
 #[doc(inline)]
 pub use routes::router;
 #[doc(inline)]

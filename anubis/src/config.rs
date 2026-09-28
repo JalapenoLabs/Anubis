@@ -31,6 +31,8 @@
 //! | `STRIPE_SECRET_KEY` | unset | Stripe secret key, e.g. `sk_live_...`; setting it enables billing |
 //! | `STRIPE_WEBHOOK_SECRET` | unset | Secret Stripe signs billing events with, e.g. `whsec_...`; setting it enables the billing receiver |
 //! | `STRIPE_API_BASE` | `https://api.stripe.com` | Where Stripe's API lives; overridden only by tests and mocks |
+//! | `ANUBIS_INITIAL_ADMIN_EMAIL` | unset | Account granted the platform `operator` role at every boot, e.g. `ops@acme.com` |
+//! | `ANUBIS_INITIAL_ADMIN_PASSWORD` | unset | Password for that account, used only when the boot creates it. Required with the email |
 //!
 //! Each OpenID Connect provider in [`crate::auth::oauth::known_providers`]
 //! adds three more, named after the provider:
@@ -367,6 +369,15 @@ const STRIPE_WEBHOOK_SECRET_VAR: &str = "STRIPE_WEBHOOK_SECRET";
 const STRIPE_WEBHOOK_SECRET_FORM: &str = "a Stripe webhook signing secret, e.g. `whsec_...`, from the endpoint's page in the \
      Stripe dashboard";
 
+/// Account granted the platform operator role at boot.
+const INITIAL_ADMIN_EMAIL_VAR: &str = "ANUBIS_INITIAL_ADMIN_EMAIL";
+
+/// What a valid `ANUBIS_INITIAL_ADMIN_EMAIL` looks like, quoted back in errors.
+const INITIAL_ADMIN_EMAIL_FORM: &str = "an email address, e.g. ops@acme.com";
+
+/// Password the boot gives the initial operator account when it creates one.
+const INITIAL_ADMIN_PASSWORD_VAR: &str = "ANUBIS_INITIAL_ADMIN_PASSWORD";
+
 /// What a valid `TRUSTED_PROXY_HEADER` looks like, quoted back in errors.
 const HEADER_NAME_FORM: &str = "an HTTP header name, e.g. `x-forwarded-for`";
 
@@ -378,6 +389,42 @@ const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Matches the port the starter frontend proxies to during development.
 const DEFAULT_PORT: u16 = 3000;
+
+/// The operator account a deployment seeds at boot.
+///
+/// The password is a secret, so this type never exposes it through `Debug`;
+/// read it deliberately with [`InitialAdminConfig::password`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct InitialAdminConfig {
+    email: String,
+    password: String,
+}
+
+impl InitialAdminConfig {
+    /// The normalized address of the account to seed.
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// The password the seed gives the account, when it has to create one.
+    ///
+    /// An account that already exists keeps the password it has; see
+    /// [`crate::platform::ensure_initial_admin`].
+    #[must_use]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl fmt::Debug for InitialAdminConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialAdminConfig")
+            .field("email", &self.email)
+            .field("password", &"...")
+            .finish()
+    }
+}
 
 /// The runtime environment an application is running in.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -680,6 +727,11 @@ pub struct AppConfig {
     /// Defaults to [`password::DEFAULT_CONCURRENCY`]; see the module docs and
     /// [`crate::auth::password`].
     pub password_hash_concurrency: NonZero<usize>,
+    /// The operator account the deployment seeds, when it names one.
+    ///
+    /// Present makes every boot grant that address the platform `operator`
+    /// role; see the module docs and [`crate::platform::ensure_initial_admin`].
+    pub initial_admin: Option<InitialAdminConfig>,
 }
 
 impl AppConfig {
@@ -793,6 +845,8 @@ impl AppConfig {
             })?,
         };
 
+        let initial_admin = initial_admin_config(&lookup)?;
+
         Ok(Self {
             environment,
             server: ServerConfig { host, port },
@@ -808,8 +862,58 @@ impl AppConfig {
             csp,
             stripe,
             password_hash_concurrency,
+            initial_admin,
         })
     }
+}
+
+/// Resolves the operator account the deployment seeds, if it names one.
+///
+/// Both variables are read here rather than at the moment the seed runs, so a
+/// typo stops the boot beside every other configuration mistake instead of
+/// halfway through migrating a database.
+fn initial_admin_config(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<InitialAdminConfig>, Error> {
+    let Some(email) = non_empty(lookup(INITIAL_ADMIN_EMAIL_VAR)) else {
+        if non_empty(lookup(INITIAL_ADMIN_PASSWORD_VAR)).is_some() {
+            // A password with nobody to give it to is a half-written
+            // deployment, and guessing which half was meant is worse than
+            // saying so.
+            return Err(Error::missing(
+                INITIAL_ADMIN_EMAIL_VAR,
+                "the account the password belongs to",
+            ));
+        }
+        return Ok(None);
+    };
+
+    let email = crate::auth::normalize_email(&email).ok_or_else(|| {
+        Error::invalid(
+            INITIAL_ADMIN_EMAIL_VAR,
+            email.trim(),
+            INITIAL_ADMIN_EMAIL_FORM,
+        )
+    })?;
+
+    let Some(password) = non_empty(lookup(INITIAL_ADMIN_PASSWORD_VAR)) else {
+        return Err(Error::missing(
+            INITIAL_ADMIN_PASSWORD_VAR,
+            "a password for the account, in case this boot has to create it",
+        ));
+    };
+
+    // The same policy registration enforces, checked here so a password the
+    // seed could never store is refused before anything else runs. Only the
+    // rule it broke is reported, because the value is a secret.
+    if let Err(violation) = crate::auth::check_password_policy(&password) {
+        return Err(Error::new(
+            INITIAL_ADMIN_PASSWORD_VAR,
+            format!("invalid value for {INITIAL_ADMIN_PASSWORD_VAR}: expected {violation}"),
+        ));
+    }
+
+    Ok(Some(InitialAdminConfig { email, password }))
 }
 
 /// Resolves the abuse limits: whether they run, and how clients are addressed.

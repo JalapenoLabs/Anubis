@@ -8,6 +8,11 @@
 //! `404` when the target does not exist *or* the user is not a member
 //! (identical responses, so probing ids reveals nothing).
 //!
+//! [`PlatformMember`] is the same idea one tier further out. The platform is
+//! the deployment, it names no id in the route and has no roster, so the guard
+//! admits the accounts holding a role `roles.yml` scoped to `platform` and
+//! answers every other account the same `404`.
+//!
 //! Every guard honors a suspension, which is a deny rather than a missing
 //! grant: a suspended organization membership closes every tenant in the
 //! organization, and a suspended sub-tenant membership closes that sub-tenant
@@ -50,7 +55,7 @@ use uuid::Uuid;
 use crate::auth::{CurrentUser, User};
 use crate::db::DbPool;
 use crate::http::ApiError;
-use crate::roles::{Action, RoleSet};
+use crate::roles::{Action, RoleSet, Scope};
 use crate::schema::{
     organization_memberships, organizations, sub_tenant_memberships, team_memberships, teams,
 };
@@ -72,6 +77,80 @@ pub fn layer(
         .layer(Extension(Arc::new(roles)))
         .layer(Extension(pool))
         .into_inner()
+}
+
+/// A signed-in user who operates the deployment itself.
+///
+/// The platform is the tier above every organization, and it has no roster to
+/// join through, so the grant lives on the account: a user holding any role
+/// key `roles.yml` scoped to `platform` extracts, and everybody else is
+/// answered `404`, byte-identical to a route that does not exist. That is the
+/// same opacity the tenant guards give an id the caller cannot reach, and here
+/// it keeps the operator surface from announcing itself to the accounts it
+/// refuses.
+///
+/// Holding a platform role is admission, not permission: what an operator may
+/// do still comes from the compiled role set, so a handler asks for the action
+/// it is about to take.
+///
+/// ```ignore
+/// async fn suspend(operator: PlatformMember) -> Result<..., ApiError> {
+///     operator.require(Action::Update, "Account")?;
+///     ...
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PlatformMember {
+    /// The signed-in operator.
+    pub user: User,
+    roles: Arc<RoleSet>,
+}
+
+impl PlatformMember {
+    /// Returns `true` when a held platform role grants the action on the model.
+    #[must_use]
+    pub fn can(&self, action: Action, model: &str) -> bool {
+        self.roles.can(&self.user.platform_roles, action, model)
+    }
+
+    /// Rejects with `403` unless a held platform role grants the action.
+    ///
+    /// # Errors
+    /// Returns a forbidden [`ApiError`] when no held role grants the action.
+    pub fn require(&self, action: Action, model: &str) -> Result<(), ApiError> {
+        if self.can(action, model) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden(
+                "You do not have permission to do that.",
+            ))
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for PlatformMember
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
+        let (_pool, roles) = guard_extensions(parts)?;
+
+        // A key the application later removed from roles.yml, or scoped away
+        // from the platform, stops admitting its holders the moment the file
+        // says so: the column is a grant, and the file is what a grant means.
+        let operates = user
+            .platform_roles
+            .iter()
+            .any(|role| roles.is_grantable_at(role, Scope::Platform));
+        if !operates {
+            return Err(ApiError::not_found());
+        }
+
+        Ok(Self { user, roles })
+    }
 }
 
 /// The signed-in user's standing in the route's `{team_id}` team.

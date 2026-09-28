@@ -27,12 +27,17 @@
 //!       Project: [manage]
 //! ```
 //!
-//! `scopes` names the tenancy tiers a role may be granted at, out of
-//! `organization`, `sub_tenant`, and `team`. Omitting it means every tier,
-//! which is what a role written before the sub-tenant tier existed keeps
+//! `scopes` names the tiers a role may be granted at, out of `platform`,
+//! `organization`, `sub_tenant`, and `team`. Omitting it means every tenancy
+//! tier, which is what a role written before either newer tier existed keeps
 //! meaning. It is about where a role key may be attached, never about what it
 //! grants, so it does not travel through `includes`: a role that includes
 //! `billing` inherits its grants without inheriting its tier.
+//!
+//! `platform` is the one tier a role only reaches by naming it. The platform
+//! is the deployment itself, so a role granted there operates every tenant in
+//! it, and a role that never asked for that reach must not acquire it by
+//! sitting in a file written before the tier existed. See [`Scope::TENANCY`].
 
 mod typescript;
 
@@ -74,13 +79,19 @@ impl Action {
     }
 }
 
-/// A tenancy tier a role may be granted at.
+/// A tier a role may be granted at.
 ///
-/// The tiers are the tenancy model's, in the order they nest. Ordering the
-/// variants that way keeps the generated TypeScript and every listing in the
-/// same, readable sequence.
+/// The tiers are the tenancy model's, outermost first, with the platform above
+/// them all. Ordering the variants that way keeps the generated TypeScript and
+/// every listing in the same, readable sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
+    /// Held on the user, and operating the whole deployment.
+    ///
+    /// The platform has no roster to join through, so this is the one tier
+    /// granted on the account itself rather than through a membership. See
+    /// [`crate::guard::PlatformMember`].
+    Platform,
     /// Granted through an organization membership.
     Organization,
     /// Granted through a sub-tenant membership.
@@ -90,14 +101,26 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Every tier, in the order they nest. The default for a role that names
-    /// no scopes, so a file written before the tier existed keeps its meaning.
-    pub const ALL: [Self; 3] = [Self::Organization, Self::SubTenant, Self::Team];
+    /// Every tier that exists, outermost first.
+    pub const ALL: [Self; 4] = [
+        Self::Platform,
+        Self::Organization,
+        Self::SubTenant,
+        Self::Team,
+    ];
+
+    /// The tiers inside a tenant, which is what a role naming no scopes means.
+    ///
+    /// The platform is deliberately absent. A role reaches it only by naming
+    /// it, so a file written before the tier existed keeps its meaning and no
+    /// ordinary team role silently becomes an operator's.
+    pub const TENANCY: [Self; 3] = [Self::Organization, Self::SubTenant, Self::Team];
 
     /// The tier's YAML and TypeScript spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Platform => "platform",
             Self::Organization => "organization",
             Self::SubTenant => "sub_tenant",
             Self::Team => "team",
@@ -121,6 +144,16 @@ struct RoleDefinition {
 
 /// Per-model action grants for one resolved role.
 pub type ModelGrants = BTreeMap<String, BTreeSet<Action>>;
+
+/// Role key that operates the deployment, the platform tier's `admin`.
+///
+/// The tenancy tiers each have a roster an administrator is appointed through,
+/// and the platform has none, so one key has to be well known: it is what
+/// `ANUBIS_INITIAL_ADMIN_EMAIL` grants and what
+/// [`crate::guard::PlatformMember`] is usually asked about. An application
+/// that wants operators declares it in `roles.yml` with `scopes: [platform]`;
+/// one that wants none leaves it out, and the platform tier stays empty.
+pub const OPERATOR_ROLE: &str = "operator";
 
 /// The fully resolved role and permission definitions of an application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,10 +231,19 @@ impl RoleSet {
         self.resolved.get(role)
     }
 
-    /// The tenancy tiers a role may be granted at, if the role is defined.
+    /// The tiers a role may be granted at, if the role is defined.
     #[must_use]
     pub fn scopes(&self, role: &str) -> Option<&BTreeSet<Scope>> {
         self.scopes.get(role)
+    }
+
+    /// The role keys grantable at the platform tier, in sorted order.
+    ///
+    /// This is what an operator screen offers and what the initial-admin seed
+    /// checks its key against, so neither has to filter the whole set itself.
+    pub fn platform_role_keys(&self) -> impl Iterator<Item = &str> {
+        self.role_keys()
+            .filter(|role| self.is_grantable_at(role, Scope::Platform))
     }
 
     /// Returns `true` when the role is defined and may be granted at the tier.
@@ -223,22 +265,23 @@ impl RoleSet {
     }
 }
 
-/// Reads a role's declared scopes, defaulting to every tier.
+/// Reads a role's declared scopes, defaulting to every tenancy tier.
 fn collect_scopes(key: &str, definition: &RoleDefinition) -> Result<BTreeSet<Scope>, Error> {
     if definition.scopes.is_empty() {
-        return Ok(Scope::ALL.into_iter().collect());
+        return Ok(Scope::TENANCY.into_iter().collect());
     }
 
     definition
         .scopes
         .iter()
         .map(|word| match word.as_str() {
+            "platform" => Ok(Scope::Platform),
             "organization" => Ok(Scope::Organization),
             "sub_tenant" => Ok(Scope::SubTenant),
             "team" => Ok(Scope::Team),
             unknown => Err(Error::new(format!(
                 "role {key:?} names unknown scope {unknown:?} \
-                 (expected organization, sub_tenant, or team)"
+                 (expected platform, organization, sub_tenant, or team)"
             ))),
         })
         .collect()
@@ -422,10 +465,10 @@ roles:
     }
 
     #[test]
-    fn a_role_naming_no_scopes_may_be_granted_at_every_tier() {
+    fn a_role_naming_no_scopes_may_be_granted_at_every_tenancy_tier() {
         let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
 
-        for scope in Scope::ALL {
+        for scope in Scope::TENANCY {
             assert!(
                 set.is_grantable_at("editor", scope),
                 "an unscoped role must reach {scope:?}",
@@ -435,6 +478,40 @@ roles:
             !set.is_grantable_at("ghost", Scope::Team),
             "an undefined role is grantable nowhere",
         );
+    }
+
+    #[test]
+    fn the_platform_tier_is_reached_only_by_naming_it() {
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+
+        assert!(
+            !set.is_grantable_at("admin", Scope::Platform),
+            "a role written before the platform tier must not acquire its reach",
+        );
+        assert_eq!(
+            set.platform_role_keys().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "a file naming no platform role leaves the tier empty",
+        );
+
+        let yaml = "
+roles:
+  default:
+    models:
+      Project: [read]
+  operator:
+    scopes: [platform]
+    models:
+      Project: [manage]
+";
+        let set = RoleSet::from_yaml(yaml).expect("a platform role must parse");
+
+        assert!(set.is_grantable_at("operator", Scope::Platform));
+        assert!(
+            !set.is_grantable_at("operator", Scope::Team),
+            "naming one tier narrows the role to it",
+        );
+        assert_eq!(set.platform_role_keys().collect::<Vec<_>>(), ["operator"]);
     }
 
     #[test]
