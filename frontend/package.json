@@ -70,7 +70,7 @@
     "@codemirror/lang-sql": "^6.8.0",
     "@codemirror/state": "^6.0.0",
     "@codemirror/view": "^6.0.0",
-    "@tiptap/core": "^2.11.0",
+    "@tiptap/core": "^3.31.3",
     "@tiptap/pm": "^2.11.0",
     "@tiptap/react": "^2.11.0",
     "@tiptap/starter-kit": "^2.11.0",
@@ -106,7 +106,7 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
     "vite-plugin-dts": "^4.3.0",
-    "vitest": "^3.0.0"
+    "vitest": "^5.0.2"
   },
   "packageManager": "yarn@4.17.0"
 }
