@@ -56,6 +56,23 @@ impl TokenPurpose {
     }
 }
 
+/// When the outstanding token of this purpose was issued, if one is.
+///
+/// Issuing replaces the previous token, so this is when the latest one went
+/// out, which is what a resend cooldown measures from.
+pub(crate) async fn issued_at(
+    connection: &mut AsyncPgConnection,
+    user_id: Uuid,
+    purpose: TokenPurpose,
+) -> Result<Option<DateTime<Utc>>, diesel::result::Error> {
+    user_tokens::table
+        .filter(user_tokens::user_id.eq(user_id))
+        .filter(user_tokens::purpose.eq(purpose.as_str()))
+        .select(diesel::dsl::max(user_tokens::created_at))
+        .first(connection)
+        .await
+}
+
 /// Failed attempts allowed against one attempt-limited token.
 pub(crate) const MAX_TOKEN_ATTEMPTS: i32 = 5;
 

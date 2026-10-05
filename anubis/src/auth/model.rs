@@ -71,6 +71,10 @@ impl fmt::Debug for User {
 pub(crate) struct NewUser<'a> {
     pub email: &'a str,
     pub password_hash: &'a str,
+    /// `None` inserts the column default, `UTC`.
+    pub time_zone: Option<&'a str>,
+    /// `None` inserts the column default, `en-US`.
+    pub locale: Option<&'a str>,
 }
 
 /// The user shape serialized in HTTP responses.

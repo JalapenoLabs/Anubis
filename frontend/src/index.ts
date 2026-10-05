@@ -28,6 +28,7 @@ export type {
   PasskeyLoginChallenge,
   PasskeyRegistrationChallenge,
   ProfileUpdate,
+  Registration,
   SignInResult,
   TeamRosterMember,
   TenancyOrganization,

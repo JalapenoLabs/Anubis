@@ -35,7 +35,10 @@ use crate::mail::{Email, EmailKind};
 use crate::schema::{sessions, users};
 
 /// Longest accepted name, time zone, or locale value.
-const MAX_FIELD_CHARS: usize = 100;
+///
+/// Registration reads it too, so a preference sent at sign-up and one saved
+/// later on the profile are held to the same bound.
+pub(crate) const MAX_FIELD_CHARS: usize = 100;
 
 pub(crate) fn router() -> Router<AuthState> {
     Router::new()
