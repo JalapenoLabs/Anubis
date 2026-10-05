@@ -235,7 +235,27 @@ async fn login(
     State(state): State<AuthState>,
     Json(body): Json<CredentialsBody>,
 ) -> Result<axum::response::Response, ApiError> {
-    let credentials = validate_credentials(body)?;
+    // Signing in judges nothing about the shape of what was typed. The length
+    // rule is a sign-up rule, and quoting it here tells somebody guessing which
+    // guesses are worth making; a malformed address answering differently from
+    // an unknown one is a second thing learned. Every refusal is the same 401.
+    //
+    // The one bound kept is the ceiling, so a megabyte of "password" is refused
+    // before it reaches argon2. It answers the same way, and since it is
+    // decided before any lookup it says nothing about whether the account exists.
+    if body.password.chars().count() > password::MAX_PASSWORD_CHARS {
+        tracing::debug!("a sign-in was refused for a password over the ceiling");
+        return Err(invalid_credentials());
+    }
+    let Some(email) = policy::normalize_email(&body.email) else {
+        // The same CPU as a real check, as for an address nobody holds below.
+        state.hasher.verify_against_dummy(body.password).await?;
+        return Err(invalid_credentials());
+    };
+    let credentials = ValidCredentials {
+        email,
+        password: body.password,
+    };
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
