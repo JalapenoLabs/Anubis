@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { AnubisFieldProps, FieldOption } from './types'
+import type { ReactNode } from 'react'
 import type { FieldValues } from 'react-hook-form'
 
 // Core
@@ -36,6 +37,11 @@ type Props<Values extends FieldValues> = AnubisFieldProps<Values> & {
   onSearch?: (query: string) => void
   /** Renders the loading indicator while a search is in flight. */
   isLoading?: boolean
+  /**
+   * Drawn inside the control before the text, usually an icon naming what
+   * the list holds, so a column of dropdowns reads at a glance.
+   */
+  startContent?: ReactNode
 }
 
 /**
@@ -118,6 +124,7 @@ export function SuperSelectField<Values extends FieldValues>(props: Props<Values
         isDisabled={props.isDisabled || props.isReadOnly}
         isInvalid={isInvalid}
         isLoading={props.isLoading}
+        startContent={props.startContent}
         selectedKey={null}
         inputValue={searchText}
         onInputChange={setSearchText}
@@ -160,6 +167,7 @@ export function SuperSelectField<Values extends FieldValues>(props: Props<Values
       isDisabled={props.isDisabled || props.isReadOnly}
       isInvalid={isInvalid}
       isLoading={props.isLoading}
+      startContent={props.startContent}
       selectedKey={field.value == null ? null : String(field.value)}
       onSelectionChange={(key) => field.onChange(key == null ? null : String(key))}
       // Listened to rather than controlled: the control keeps showing the

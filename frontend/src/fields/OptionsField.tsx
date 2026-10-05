@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { AnubisFieldProps, FieldOption } from './types'
+import type { ReactNode } from 'react'
 import type { FieldValues } from 'react-hook-form'
 
 // User interface
@@ -19,6 +20,11 @@ type Props<Values extends FieldValues> = AnubisFieldProps<Values> & {
   variant?: 'select' | 'radio'
   /** Radio layout. Ignored by the select variant. */
   orientation?: 'vertical' | 'horizontal'
+  /**
+   * Drawn inside the dropdown before the chosen value, usually an icon naming
+   * what the list holds. Ignored by the radio variant, which has no box.
+   */
+  startContent?: ReactNode
 }
 
 /**
@@ -67,6 +73,7 @@ export function OptionsField<Values extends FieldValues>(props: Props<Values>) {
           aria-label={props.label}
           className='w-full'
           placeholder={props.placeholder}
+          startContent={props.startContent}
           isRequired={props.isRequired}
           isDisabled={props.isDisabled || props.isReadOnly}
           isInvalid={isInvalid}

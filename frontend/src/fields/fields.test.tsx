@@ -318,6 +318,18 @@ describe('OptionsField', () => {
 
     expect(formRef.current?.getValues('choice')).toBe('published')
   })
+
+  it('should draw what it is given at the start of the dropdown', () => {
+    renderField((control) => <OptionsField
+      control={control}
+      name='choice'
+      label='Status'
+      options={statusOptions}
+      startContent={<span data-testid='status-icon' />}
+    />)
+
+    expect(screen.getByTestId('status-icon')).toBeTruthy()
+  })
 })
 
 describe('SuperSelectField', () => {
@@ -334,6 +346,18 @@ describe('SuperSelectField', () => {
     await user.click(await screen.findByRole('option', { name: 'Draft' }))
 
     expect(formRef.current?.getValues('choice')).toBe('draft')
+  })
+
+  it('should draw what it is given at the start of the search box', () => {
+    renderField((control) => <SuperSelectField
+      control={control}
+      name='choice'
+      label='Owner'
+      options={statusOptions}
+      startContent={<span data-testid='owner-icon' />}
+    />)
+
+    expect(screen.getByTestId('owner-icon')).toBeTruthy()
   })
 
   it('should collect several values, and drop one from its chip', async () => {
