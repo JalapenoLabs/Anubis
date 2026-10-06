@@ -622,8 +622,9 @@ async fn deliver(mailer: &Mailer, email: Email) {
 /// the [`audit::SESSION_CREATED`] record complete rather than a convention
 /// each path has to remember. The session and its record commit together, so
 /// a browser never holds a session the log does not know about. `context` is
-/// the request's, so the record carries the address, browser and location the
-/// sign-in came from; see [`crate::server::origin`].
+/// the request's, so the record carries the address and browser the sign-in
+/// came from, and the location the browser reported; see
+/// [`crate::server::origin`].
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
     connection: &mut diesel_async::AsyncPgConnection,

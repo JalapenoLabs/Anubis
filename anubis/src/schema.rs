@@ -412,7 +412,7 @@ diesel::table! {
         created_at -> Timestamptz,
         ip_address -> Nullable<Text>,
         user_agent -> Nullable<Text>,
-        location -> Nullable<Text>,
+        reported_location -> Nullable<Text>,
     }
 }
 

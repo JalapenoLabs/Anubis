@@ -11,8 +11,9 @@
 //! passkey and OpenID Connect paths are proved in their own ceremony suites,
 //! which already stand up the authenticator and the provider they need. The
 //! second act puts the origin layer in front of the router and proves the
-//! address, the browser and the location reach the row, and that a location
-//! header nobody configured is ignored.
+//! address, the browser and the location the browser reported reach the row,
+//! bounded and printable, with no configuration, and that a browser which
+//! reports nothing records nothing.
 //!
 //! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
 //! always provides one.
@@ -42,7 +43,7 @@ struct SignIn {
     changes: Value,
     ip_address: Option<String>,
     user_agent: Option<String>,
-    location: Option<String>,
+    reported_location: Option<String>,
 }
 
 impl SignIn {
@@ -72,7 +73,7 @@ async fn sign_ins(harness: &Harness, email: &str) -> Vec<SignIn> {
             audit_events::changes,
             audit_events::ip_address,
             audit_events::user_agent,
-            audit_events::location,
+            audit_events::reported_location,
         ))
         .load(&mut connection)
         .await
@@ -170,34 +171,32 @@ async fn every_path_that_issues_a_session_records_how() {
     assert!(
         records
             .iter()
-            .all(|record| record.ip_address.is_none() && record.location.is_none()),
+            .all(|record| record.ip_address.is_none() && record.reported_location.is_none()),
         "a router nothing hardened measured no origin, and records none: {records:?}",
     );
 }
 
 #[tokio::test]
-async fn a_sign_in_records_the_address_browser_and_location_it_came_from() {
+async fn a_sign_in_records_the_address_browser_and_reported_location_it_came_from() {
     let Some(database) = TestDatabase::create("sign_in_record_flow_origin").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
 
-    let trusting = anubis::config::AppConfig::from_lookup(|name| match name {
+    let behind_proxy = anubis::config::AppConfig::from_lookup(|name| match name {
         "ANUBIS_ENV" => Some("test".to_owned()),
         "TRUSTED_PROXY_HEADER" => Some("x-forwarded-for".to_owned()),
-        "TRUSTED_LOCATION_HEADER" => Some("x-client-geo-location".to_owned()),
         _ => None,
     })
     .expect("the test config must parse");
-    let behind_balancer = anubis::server::origin::layer(harness.router.clone(), &trusting);
+    let proxied = anubis::server::origin::layer(harness.router.clone(), &behind_proxy);
 
     let email = format!("origin-{}@example.com", Uuid::new_v4());
     let _cookie = register(&harness.router, &email).await;
-    let (status, body) = sign_in_from(&behind_balancer, &email).await;
+    let (status, body) = sign_in_from(&proxied, &email, Some("Meridian, Idaho, US")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    let records = sign_ins(&harness, &email).await;
-    let latest = records.last().expect("the password sign-in was recorded");
+    let latest = latest_sign_in(&harness, &email).await;
     assert_eq!(latest.method(), SignInMethod::Password.as_str());
     assert_eq!(
         latest.ip_address.as_deref(),
@@ -205,46 +204,131 @@ async fn a_sign_in_records_the_address_browser_and_location_it_came_from() {
         "the hop the trusted proxy appended, never the one the client wrote",
     );
     assert_eq!(latest.user_agent.as_deref(), Some(BROWSER));
-    assert_eq!(latest.location.as_deref(), Some("US,mountain view"));
+    assert_eq!(
+        latest.reported_location.as_deref(),
+        Some("Meridian, Idaho, US"),
+        "a reported location needs no configuration to be recorded",
+    );
 
-    // The same request through a deployment that trusts no location header:
-    // the header still arrives, because a client can send anything, and the
-    // row ignores it.
-    let untrusting = anubis::config::AppConfig::from_lookup(|name| match name {
+    // A deployment that trusts no proxy still records what the browser
+    // reported, clipped and printable, because nothing decides anything on it.
+    let bare_config = anubis::config::AppConfig::from_lookup(|name| match name {
         "ANUBIS_ENV" => Some("test".to_owned()),
         _ => None,
     })
     .expect("the test config must parse");
-    let bare = anubis::server::origin::layer(harness.router.clone(), &untrusting);
-    let (status, body) = sign_in_from(&bare, &email).await;
+    let bare = anubis::server::origin::layer(harness.router.clone(), &bare_config);
+    let oversized = format!(
+        "Meridian,\tIdaho, {}",
+        "x".repeat(anubis::server::origin::MAX_LOCATION_CHARS)
+    );
+    let (status, body) = sign_in_from(&bare, &email, Some(&oversized)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    let records = sign_ins(&harness, &email).await;
-    let latest = records.last().expect("the second sign-in was recorded");
-    assert_eq!(latest.location, None, "nobody vouched for that location");
+    let latest = latest_sign_in(&harness, &email).await;
+    let recorded = latest
+        .reported_location
+        .expect("the reported location was recorded");
+    assert_eq!(
+        recorded.chars().count(),
+        anubis::server::origin::MAX_LOCATION_CHARS
+    );
+    assert!(
+        recorded.starts_with("Meridian,Idaho, "),
+        "the tab is gone: {recorded}"
+    );
     assert_eq!(
         latest.ip_address.as_deref(),
         Some("198.51.100.7"),
         "with no proxy trusted, the peer is the client",
     );
+
+    // A browser that did not look itself up reports nothing, and the row says
+    // nothing rather than carrying the previous sign-in's answer.
+    let (status, body) = sign_in_from(&bare, &email, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        latest_sign_in(&harness, &email).await.reported_location,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_reported_location_never_reaches_a_listing() {
+    let Some(database) = TestDatabase::create("sign_in_record_flow_listing").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let bare_config = anubis::config::AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        _ => None,
+    })
+    .expect("the test config must parse");
+    let bare = anubis::server::origin::layer(harness.router.clone(), &bare_config);
+
+    let email = format!("listing-{}@example.com", Uuid::new_v4());
+    let _cookie = register(&harness.router, &email).await;
+    let (status, body) = sign_in_from(&bare, &email, Some("Meridian, Idaho, US")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let mut connection = harness.pool.get().await.expect("a connection is available");
+    let event: anubis::audit::AuditEvent = audit_events::table
+        .filter(audit_events::action.eq(anubis::audit::SESSION_CREATED))
+        .order(audit_events::created_at.desc())
+        .select(anubis::audit::AuditEvent::as_select())
+        .first(&mut connection)
+        .await
+        .expect("the sign-in was recorded");
+    assert_eq!(
+        event.reported_location.as_deref(),
+        Some("Meridian, Idaho, US")
+    );
+
+    let listed = serde_json::to_value(&event).expect("an event serializes");
+    assert!(
+        listed.get("action").is_some(),
+        "the listing shape: {listed}"
+    );
+    for field in ["reported_location", "ip_address", "user_agent"] {
+        assert!(
+            listed.get(field).is_none(),
+            "{field} is the application's to show, never a listing's: {listed}",
+        );
+    }
 }
 
 /// The browser every request in the origin act claims to be.
 const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0";
 
-/// Signs in with a password through `router`, as a client behind a balancer.
+/// The newest sign-in the account behind `email` has made.
+async fn latest_sign_in(harness: &Harness, email: &str) -> SignIn {
+    sign_ins(harness, email)
+        .await
+        .pop()
+        .expect("a sign-in was recorded")
+}
+
+/// Signs in with a password through `router`, as a client behind a proxy.
 ///
 /// The connection is described the way the accept loop describes one, and the
 /// forwarding header carries a first hop the client wrote itself, which is the
-/// one a careless reader would trust.
-async fn sign_in_from(router: &Router, email: &str) -> (StatusCode, Value) {
-    let mut request = Request::builder()
+/// one a careless reader would trust. `reported_location` is what the browser
+/// says about itself, when it says anything.
+async fn sign_in_from(
+    router: &Router,
+    email: &str,
+    reported_location: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method("POST")
         .uri("/auth/login")
         .header(CONTENT_TYPE, "application/json")
         .header(USER_AGENT, BROWSER)
-        .header("x-forwarded-for", "10.0.0.1, 203.0.113.5")
-        .header("x-client-geo-location", "US,mountain view")
+        .header("x-forwarded-for", "10.0.0.1, 203.0.113.5");
+    if let Some(location) = reported_location {
+        builder = builder.header(anubis::server::origin::REPORTED_LOCATION_HEADER, location);
+    }
+    let mut request = builder
         .body(Body::from(
             serde_json::to_vec(&json!({ "email": email, "password": PASSWORD }))
                 .expect("the body serializes"),

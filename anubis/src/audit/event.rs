@@ -440,10 +440,10 @@ pub struct AuditEvent {
     /// The client's description of itself. Never serialized, as above.
     #[serde(skip_serializing)]
     pub user_agent: Option<String>,
-    /// A trusted load balancer's guess at where the client was. Never
-    /// serialized, as above.
+    /// Where the client's browser said it was, which nothing vouches for.
+    /// Never serialized, as above.
     #[serde(skip_serializing)]
-    pub location: Option<String>,
+    pub reported_location: Option<String>,
 }
 
 /// The insertable shape; the database fills the id and the timestamp.
@@ -462,7 +462,7 @@ pub(super) struct NewAuditEvent<'a> {
     pub request_id: Option<&'a str>,
     pub ip_address: Option<String>,
     pub user_agent: Option<&'a str>,
-    pub location: Option<&'a str>,
+    pub reported_location: Option<&'a str>,
 }
 
 #[cfg(test)]

@@ -25,7 +25,6 @@
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
-//! | `TRUSTED_LOCATION_HEADER` | unset | Header a trusted load balancer writes the client's approximate location into, e.g. `x-client-geo-location` |
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
 //! | `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive, e.g. `script-src https://plausible.io; connect-src https://plausible.io` |
@@ -159,15 +158,6 @@
 //! forwarding header would be attacker-supplied. Set it only when a proxy you
 //! control appends to that header, because the limiter reads the last entry,
 //! the one that proxy wrote. See [`crate::rate_limit`] and `docs/api.md`.
-//!
-//! `TRUSTED_LOCATION_HEADER` names the header a load balancer writes the
-//! client's approximate location into, such as the `x-client-geo-location` a
-//! Google external Application Load Balancer can be told to add. The audit log
-//! copies it onto every event a request records, beside the address the proxy
-//! rule above resolves. Leave it unset unless a proxy you control overwrites
-//! that header on every request: a client can send any header it likes, and
-//! an unset variable records no location rather than one a stranger typed.
-//! See [`crate::server::origin`] and `docs/audit.md`.
 //!
 //! `PASSWORD_HASH_CONCURRENCY` is the limit behind those budgets, and it is a
 //! memory budget written as a count: each argon2 computation holds 19 MiB
@@ -329,9 +319,6 @@ const RATE_LIMIT_DISABLED_VAR: &str = "RATE_LIMIT_DISABLED";
 
 /// Names the forwarding header that identifies the client behind a proxy.
 const TRUSTED_PROXY_HEADER_VAR: &str = "TRUSTED_PROXY_HEADER";
-
-/// Names the header a trusted load balancer writes the client's location into.
-const TRUSTED_LOCATION_HEADER_VAR: &str = "TRUSTED_LOCATION_HEADER";
 
 /// Caps how many argon2 computations may hold memory at once.
 const PASSWORD_HASH_CONCURRENCY_VAR: &str = "PASSWORD_HASH_CONCURRENCY";
@@ -745,11 +732,6 @@ pub struct AppConfig {
     /// Present makes every boot grant that address the platform `operator`
     /// role; see the module docs and [`crate::platform::ensure_initial_admin`].
     pub initial_admin: Option<InitialAdminConfig>,
-    /// The header a trusted load balancer writes the client's location into.
-    ///
-    /// Absent by default, which records no location at all; see the module
-    /// docs and [`crate::server::origin`].
-    pub trusted_location_header: Option<HeaderName>,
 }
 
 impl AppConfig {
@@ -864,7 +846,6 @@ impl AppConfig {
         };
 
         let initial_admin = initial_admin_config(&lookup)?;
-        let trusted_location_header = header_name(&lookup, TRUSTED_LOCATION_HEADER_VAR)?;
 
         Ok(Self {
             environment,
@@ -882,7 +863,6 @@ impl AppConfig {
             stripe,
             password_hash_concurrency,
             initial_admin,
-            trusted_location_header,
         })
     }
 }
@@ -948,32 +928,21 @@ fn rate_limit_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<RateLim
             .ok_or_else(|| Error::invalid(RATE_LIMIT_DISABLED_VAR, value.trim(), BOOLEAN_FORM))?,
     };
 
-    let trusted_proxy_header = header_name(lookup, TRUSTED_PROXY_HEADER_VAR)?;
+    let trusted_proxy_header = match non_empty(lookup(TRUSTED_PROXY_HEADER_VAR)) {
+        None => None,
+        Some(value) => {
+            let name = value.trim().to_ascii_lowercase();
+            let parsed = HeaderName::try_from(name).map_err(|_error| {
+                Error::invalid(TRUSTED_PROXY_HEADER_VAR, value.trim(), HEADER_NAME_FORM)
+            })?;
+            Some(parsed)
+        }
+    };
 
     Ok(RateLimitConfig {
         disabled,
         trusted_proxy_header,
     })
-}
-
-/// Reads a variable that names an HTTP header, normalized to lowercase.
-///
-/// A value that cannot be a header name stops startup rather than reading as
-/// unset: both headers this names are ones a trusted proxy writes, and a typo
-/// that silently ignored one would leave the deployment trusting nothing while
-/// its operator believed otherwise.
-fn header_name(
-    lookup: &impl Fn(&str) -> Option<String>,
-    variable: &'static str,
-) -> Result<Option<HeaderName>, Error> {
-    let Some(value) = non_empty(lookup(variable)) else {
-        return Ok(None);
-    };
-
-    let name = value.trim().to_ascii_lowercase();
-    let parsed = HeaderName::try_from(name)
-        .map_err(|_error| Error::invalid(variable, value.trim(), HEADER_NAME_FORM))?;
-    Ok(Some(parsed))
 }
 
 /// Resolves which origins may call the application from a browser.
@@ -2038,26 +2007,6 @@ mod tests {
         let lookup = lookup_from(&[("TRUSTED_PROXY_HEADER", "not a header")]);
         let error = AppConfig::from_lookup(lookup).expect_err("junk header names are rejected");
         assert_eq!(error.variable(), "TRUSTED_PROXY_HEADER");
-    }
-
-    #[test]
-    fn no_location_is_trusted_until_a_header_is_named() {
-        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
-        assert!(defaulted.trusted_location_header.is_none());
-
-        let lookup = lookup_from(&[("TRUSTED_LOCATION_HEADER", " X-Client-Geo-Location ")]);
-        let config = AppConfig::from_lookup(lookup).expect("a header name must parse");
-        assert_eq!(
-            config
-                .trusted_location_header
-                .as_ref()
-                .map(axum::http::HeaderName::as_str),
-            Some("x-client-geo-location"),
-        );
-
-        let lookup = lookup_from(&[("TRUSTED_LOCATION_HEADER", "not a header")]);
-        let error = AppConfig::from_lookup(lookup).expect_err("junk header names are rejected");
-        assert_eq!(error.variable(), "TRUSTED_LOCATION_HEADER");
     }
 
     #[test]

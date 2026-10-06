@@ -190,9 +190,9 @@ pub async fn record(
             user_agent: context
                 .origin()
                 .and_then(|origin| origin.user_agent.as_deref()),
-            location: context
+            reported_location: context
                 .origin()
-                .and_then(|origin| origin.location.as_deref()),
+                .and_then(|origin| origin.reported_location.as_deref()),
         })
         .returning(audit_events::id)
         .get_result(connection)

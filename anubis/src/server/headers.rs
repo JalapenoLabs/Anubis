@@ -407,8 +407,14 @@ fn cors_layer(config: &CorsConfig) -> Option<CorsLayer> {
                 Method::OPTIONS,
             ])
             // Everything a JSON API call needs and nothing else: a bearer
-            // token and a content type.
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            // token, a content type, and the location a browser may report
+            // about itself, which a cross-origin frontend sends like any
+            // other and the server never trusts.
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                super::origin::REPORTED_LOCATION_HEADER,
+            ])
             .max_age(PREFLIGHT_MAX_AGE),
     )
 }

@@ -154,6 +154,12 @@ Recovery codes appear exactly once, on the step after a confirmed enrollment, wi
 
 WebAuthn needs binary where JSON has none, so the package exports the conversion both ceremonies need: `toCredentialCreationOptions` and `toCredentialRequestOptions` decode a challenge into what `navigator.credentials` accepts, `serializeRegistrationCredential` and `serializeAuthenticationCredential` encode the authenticator's answer back, and `base64UrlToArrayBuffer` and `arrayBufferToBase64Url` are the pair underneath. The serializers take `unknown` and validate, because an authenticator's answer is as much a runtime boundary as an HTTP response.
 
+### The TypeScript client
+
+`createAnubisApi({ prefix, hooks })` builds the client every screen above calls. `prefix` is where the framework's routes are mounted, same-origin by default. `hooks` are [ky hooks](https://github.com/sindresorhus/ky#hooks), handed to the client's own `ky.create`, so an application can do to the framework's requests what it does to its own: add a header to each one in `beforeRequest`, or report a failure in `afterResponse`. The client sets no hooks of its own, so the application's are the only ones and nothing is merged or reordered.
+
+The use the framework has in mind is `X-Reported-Location`: a frontend that looks the browser up with a geolocation service sends the answer on the sign-in requests, and the audit log records it as `reported_location` (see [client origin](server.md#client-origin)). A hook must never throw, because a throw rejects the request it was decorating, and a sign-in refused over a decoration is the worst trade available.
+
 ## OAuth sign-in
 
 Three framework routes carry every provider, and the sign-in page needs no per-provider code at all:

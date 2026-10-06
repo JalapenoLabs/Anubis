@@ -29,8 +29,8 @@
 //!    [`RequestId`] extension. An inbound `x-request-id` is overwritten rather
 //!    than honored: the id is the server's own correlation handle, and a caller
 //!    that could choose it could make two unrelated requests share one.
-//! 2. **Client origin.** The client's address, user agent and, behind a
-//!    trusted load balancer, location, left on the request as an
+//! 2. **Client origin.** The client's address, user agent and the location
+//!    its browser reported, left on the request as an
 //!    [`origin::ClientOrigin`] extension the audit log copies onto every event
 //!    the request records. See [`origin`] for what is trusted and why.
 //! 3. **Tracing.** One event per completed request, inside a span carrying the

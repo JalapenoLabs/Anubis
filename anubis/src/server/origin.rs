@@ -8,31 +8,33 @@
 //!
 //! # What is trusted
 //!
-//! Only what a proxy the deployment controls wrote, and nothing a client could
-//! choose:
+//! Only the address, and only under the rule the rate limiter follows:
 //!
-//! - **The address** follows the rule the rate limiter follows, through the
-//!   same function: the last entry of `TRUSTED_PROXY_HEADER` when that is
-//!   configured and usable, the socket peer otherwise. The address an event
-//!   records is therefore the address its request was charged to.
-//! - **The location** is read only from `TRUSTED_LOCATION_HEADER`, and only
-//!   when that is configured. A load balancer that overwrites the header on
-//!   every request makes it the balancer's guess at the client's region and
-//!   city; anywhere else it is whatever the client typed, which is why an
-//!   unset variable records none rather than reading a conventional name.
+//! - **The address** is the last entry of `TRUSTED_PROXY_HEADER` when that is
+//!   configured and usable, the socket peer otherwise, through the same
+//!   function the limiter reads. The address an event records is therefore the
+//!   address its request was charged to.
 //! - **The user agent** is the client's own description of itself, and is
-//!   recorded as exactly that: a hint for a person reading a log, never an
-//!   input to a decision.
+//!   recorded as exactly that: a hint for a person reading a log.
+//! - **The reported location** is whatever the client sent in
+//!   [`REPORTED_LOCATION_HEADER`], and is recorded as exactly that too. A
+//!   browser asks a geolocation service where its own address is and passes
+//!   the answer along, which costs the deployment no load balancer and no
+//!   geolocation database. Anything can send any value, so the name says who
+//!   is speaking: the column is `reported_location`, never `location`.
 //!
-//! Location in particular is display only. Nothing in the framework decides
-//! anything on it, because a geolocation guess is wrong often enough that a
-//! rule built on one would refuse real people.
+//! Neither the user agent nor the reported location is an input to a decision,
+//! anywhere in the framework. A geolocation guess is wrong often enough that a
+//! rule built on one would refuse real people, and one the client wrote itself
+//! would be a rule the client chose.
 //!
-//! # Bounded
+//! # Bounded and printable
 //!
 //! A header is as long as the client makes it, and these are copied into an
 //! append-only table, so both strings are cut to a documented length before
-//! they are kept.
+//! they are kept, and control characters are dropped: a tab or an escape in a
+//! value somebody reads on a screen would say less than nothing. A value that
+//! is not visible ASCII at the protocol level is no value at all.
 //!
 //! # Outside a served request
 //!
@@ -50,32 +52,38 @@ use axum::middleware::Next;
 
 use crate::config::AppConfig;
 
+/// The header a browser reports its own approximate location in.
+///
+/// Untrusted by design: see the module docs. A CORS deployment admits it in
+/// preflight, so a cross-origin frontend can send it too.
+pub const REPORTED_LOCATION_HEADER: HeaderName = HeaderName::from_static("x-reported-location");
+
 /// The most characters of a user agent an event keeps.
 ///
 /// Real browsers send well under three hundred. The bound exists because the
 /// value is the client's to choose and lands in a table nothing prunes.
 pub const MAX_USER_AGENT_CHARS: usize = 512;
 
-/// The most characters of a location an event keeps.
+/// The most characters of a reported location an event keeps.
 ///
-/// A load balancer's region and city fit in a fraction of this; the bound is
-/// for a misconfigured header that carries something else.
+/// A city, its region and its country fit in a fraction of this; the bound is
+/// for a client that sends something else.
 pub const MAX_LOCATION_CHARS: usize = 120;
 
 /// Where one request came from, as far as the deployment can tell.
 ///
-/// Every field is optional, because each depends on something the request or
-/// the deployment may not have: a connection the accept loop described, a
-/// browser that names itself, a load balancer that geolocates.
+/// Every field is optional, because each depends on something the request may
+/// not have: a connection the accept loop described, a browser that names
+/// itself, a browser that looked itself up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientOrigin {
     /// The client's address, resolved under the trusted proxy rule.
     pub address: Option<IpAddr>,
     /// The client's description of itself, bounded to [`MAX_USER_AGENT_CHARS`].
     pub user_agent: Option<String>,
-    /// The trusted load balancer's guess at the client's location, bounded to
-    /// [`MAX_LOCATION_CHARS`]. Absent unless `TRUSTED_LOCATION_HEADER` is set.
-    pub location: Option<String>,
+    /// Where the client says it is, from [`REPORTED_LOCATION_HEADER`], bounded
+    /// to [`MAX_LOCATION_CHARS`]. Display only; never trusted.
+    pub reported_location: Option<String>,
 }
 
 impl ClientOrigin {
@@ -90,24 +98,23 @@ impl ClientOrigin {
         Self {
             address: forwarded.or(peer),
             user_agent: bounded_header(headers, &USER_AGENT, MAX_USER_AGENT_CHARS),
-            location: policy
-                .location_header
-                .as_ref()
-                .and_then(|header| bounded_header(headers, header, MAX_LOCATION_CHARS)),
+            reported_location: bounded_header(
+                headers,
+                &REPORTED_LOCATION_HEADER,
+                MAX_LOCATION_CHARS,
+            ),
         }
     }
 }
 
-/// Which headers a deployment trusts to describe a request's origin.
+/// Which forwarding header a deployment trusts to name the client's address.
 ///
-/// Built from the config [`layer`] is given; see the module docs for why each
-/// one is trusted only when it is named.
+/// Built from the config [`layer`] is given; see the module docs for why it is
+/// trusted only when it is named.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OriginPolicy {
     /// `TRUSTED_PROXY_HEADER`, the forwarding header the client address is in.
     pub proxy_header: Option<HeaderName>,
-    /// `TRUSTED_LOCATION_HEADER`, the header the client's location is in.
-    pub location_header: Option<HeaderName>,
 }
 
 impl OriginPolicy {
@@ -116,7 +123,6 @@ impl OriginPolicy {
     pub fn from_config(config: &AppConfig) -> Self {
         Self {
             proxy_header: config.rate_limit.trusted_proxy_header.clone(),
-            location_header: config.trusted_location_header.clone(),
         }
     }
 }
@@ -146,13 +152,20 @@ async fn record_origin(
     next.run(request).await
 }
 
-/// One header's value, trimmed and cut to `limit` characters.
+/// One header's value, printable, trimmed, and cut to `limit` characters.
 ///
-/// A value that is not text, or is empty once trimmed, is no value: a log
-/// that printed bytes nobody can read would say less than one that printed
-/// nothing.
+/// A value that is not text, or is empty once its control characters are gone
+/// and it is trimmed, is no value: a log that printed bytes nobody can read
+/// would say less than one that printed nothing.
 fn bounded_header(headers: &HeaderMap, name: &HeaderName, limit: usize) -> Option<String> {
-    let value = headers.get(name)?.to_str().ok()?.trim();
+    let printable: String = headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let value = printable.trim();
     if value.is_empty() {
         return None;
     }
@@ -166,7 +179,10 @@ mod tests {
 
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
-    use super::{ClientOrigin, MAX_USER_AGENT_CHARS, OriginPolicy};
+    use super::{
+        ClientOrigin, MAX_LOCATION_CHARS, MAX_USER_AGENT_CHARS, OriginPolicy,
+        REPORTED_LOCATION_HEADER,
+    };
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -184,11 +200,8 @@ mod tests {
     }
 
     #[test]
-    fn nothing_a_client_sends_is_trusted_until_the_deployment_names_it() {
-        let sent = headers(&[
-            ("x-forwarded-for", "10.0.0.1"),
-            ("x-client-geo-location", "US,mountain view"),
-        ]);
+    fn no_forwarded_address_is_trusted_until_the_deployment_names_a_proxy() {
+        let sent = headers(&[("x-forwarded-for", "10.0.0.1")]);
 
         let origin = ClientOrigin::read(&sent, Some(peer()), &OriginPolicy::default());
 
@@ -197,21 +210,16 @@ mod tests {
             Some(peer()),
             "the peer is the client until a proxy is trusted"
         );
-        assert_eq!(
-            origin.location, None,
-            "a location nobody vouched for is not recorded"
-        );
     }
 
     #[test]
-    fn a_trusted_proxy_and_balancer_describe_the_client() {
+    fn a_trusted_proxy_and_the_browser_describe_the_client() {
         let policy = OriginPolicy {
             proxy_header: Some(HeaderName::from_static("x-forwarded-for")),
-            location_header: Some(HeaderName::from_static("x-client-geo-location")),
         };
         let sent = headers(&[
             ("x-forwarded-for", "1.2.3.4, 203.0.113.5"),
-            ("x-client-geo-location", " US,mountain view "),
+            ("x-reported-location", " Meridian, Idaho, US "),
             ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
         ]);
 
@@ -222,11 +230,71 @@ mod tests {
             Some("203.0.113.5".parse().expect("a literal address parses")),
             "the hop the proxy appended, never the one the client wrote first",
         );
-        assert_eq!(origin.location.as_deref(), Some("US,mountain view"));
+        assert_eq!(
+            origin.reported_location.as_deref(),
+            Some("Meridian, Idaho, US")
+        );
         assert_eq!(
             origin.user_agent.as_deref(),
             Some("Mozilla/5.0 (X11; Linux x86_64)")
         );
+    }
+
+    #[test]
+    fn a_reported_location_needs_no_configuration_and_is_absent_when_not_sent() {
+        let sent = headers(&[("x-reported-location", "Meridian, Idaho, US")]);
+        let origin = ClientOrigin::read(&sent, None, &OriginPolicy::default());
+        assert_eq!(
+            origin.reported_location.as_deref(),
+            Some("Meridian, Idaho, US")
+        );
+
+        let silent = ClientOrigin::read(&HeaderMap::new(), None, &OriginPolicy::default());
+        assert_eq!(silent.reported_location, None);
+    }
+
+    #[test]
+    fn a_reported_location_is_cut_to_its_bound_and_stripped_of_control_characters() {
+        let long = "a".repeat(MAX_LOCATION_CHARS * 2);
+        let origin = ClientOrigin::read(
+            &headers(&[("x-reported-location", &long)]),
+            None,
+            &OriginPolicy::default(),
+        );
+        assert_eq!(
+            origin
+                .reported_location
+                .map(|location| location.chars().count()),
+            Some(MAX_LOCATION_CHARS),
+        );
+
+        // A tab is the one control character a header value can carry.
+        let tabbed = ClientOrigin::read(
+            &headers(&[("x-reported-location", "Meridian,\tIdaho")]),
+            None,
+            &OriginPolicy::default(),
+        );
+        assert_eq!(tabbed.reported_location.as_deref(), Some("Meridian,Idaho"));
+
+        let only_tabs = ClientOrigin::read(
+            &headers(&[("x-reported-location", "\t\t")]),
+            None,
+            &OriginPolicy::default(),
+        );
+        assert_eq!(only_tabs.reported_location, None);
+    }
+
+    #[test]
+    fn a_reported_location_that_is_not_visible_ascii_is_no_value() {
+        let mut sent = HeaderMap::new();
+        sent.insert(
+            REPORTED_LOCATION_HEADER,
+            HeaderValue::from_bytes("Zürich".as_bytes()).expect("opaque bytes are a value"),
+        );
+
+        let origin = ClientOrigin::read(&sent, None, &OriginPolicy::default());
+
+        assert_eq!(origin.reported_location, None);
     }
 
     #[test]
