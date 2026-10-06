@@ -17,6 +17,7 @@ Layers, outermost first. The order is the design:
 | Layer | Effect |
 |---|---|
 | Request id | A fresh UUID per request, in the log span, returned as `x-request-id` |
+| Client origin | The client's address, user agent and the location its browser reported, left on the request for the audit log |
 | Tracing | One event per completed request, inside a span naming the method, path, and id |
 | Security headers | The response policy below |
 | CORS | Only when `CORS_ALLOWED_ORIGINS` names origins; otherwise absent entirely |
@@ -30,6 +31,12 @@ The request id is outermost so every later layer logs under it. The timeout is i
 An inbound `x-request-id` is overwritten rather than honored. The id is the server's own correlation handle, and a caller that could choose it could make two unrelated requests share one line of the log. Handlers read it with `Extension<RequestId>` when they want to name it in an event of their own.
 
 Error bodies stay generic (`{"message": "Something went wrong on our side."}`), so the id is the whole bridge between a user's report and the log line that explains it. Ask for it in your support form.
+
+### Client origin
+
+Every request carries a `ClientOrigin` extension (`anubis::server::origin`): the client address under the same trusted-proxy rule the rate limiter uses, the `user-agent` cut to 512 characters, and the `X-Reported-Location` header cut to 120. Both strings lose their control characters before they are kept, and a value that is not visible ASCII is no value. `audit::Context` picks the extension up, so every event a request records says where the act came from; a sign-in is the one that needs it most. A router that is not hardened carries none, the same way it carries no request id.
+
+`X-Reported-Location` is the browser's own word on where it is. A frontend that wants a location on its sign-in records asks a geolocation service from the browser and sends the answer, such as `Meridian, Idaho, US`, on its requests; the TypeScript client's `hooks` option is the place to add it (see [api](api.md#the-typescript-client)). Nothing needs configuring and nothing vouches for it, which is why it is recorded as `reported_location` and is display only: nothing in the framework decides anything on it, because a client can send any header it likes and a geolocation guess is wrong often enough that a rule built on one would refuse real people. The header is the constant `origin::REPORTED_LOCATION_HEADER`, and a CORS deployment admits it in preflight.
 
 ### Request logging
 
@@ -175,7 +182,7 @@ CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
 
 Each entry must be a bare `scheme://host[:port]`: no path, no query, no credentials, and no wildcard. Entries are validated and normalized at startup, so a typo fails the boot rather than the first cross-origin call. `https://*.example.com` is rejected rather than stored, because CORS has no notion of subdomain matching and a rule that can never match is worse than an error.
 
-Allowed requests may carry `Authorization` and `Content-Type`, and use the standard methods. Preflights are cached for ten minutes.
+Allowed requests may carry `Authorization`, `Content-Type` and `X-Reported-Location` (see [client origin](#client-origin)), and use the standard methods. Preflights are cached for ten minutes.
 
 **Credentials are never allowed.** The cross-origin consumer this exists for is the public `/api/v1` surface, which authenticates with a bearer token the caller attaches deliberately. Session cookies stay same-origin, where `SameSite=Lax` already keeps them. That also removes the classic footgun in one stroke: there is no combination of settings here that pairs credentials with a permissive origin, because there are neither credentials nor a wildcard.
 

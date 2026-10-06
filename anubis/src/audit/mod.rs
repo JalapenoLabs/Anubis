@@ -121,6 +121,16 @@ pub const PASSKEY_REMOVED: &str = "passkey.removed";
 pub const SESSION_REVOKED: &str = "session.revoked";
 /// An account was deleted, along with the tenancy it left behind.
 pub const ACCOUNT_DELETED: &str = "account.deleted";
+/// An account signed in, by any path, and a browser session began.
+///
+/// Recorded by every path that issues a session: registering, a password, a
+/// password and a second factor, an emailed code, a passkey, and an OpenID
+/// Connect provider. The change set carries one field, `method`, naming which
+/// of [`crate::auth::SignInMethod`] it was. A session is created rather than
+/// edited, and a create otherwise records an empty set; the method is the one
+/// fact the new session was created with that a reader needs, so it is written
+/// as the field that moved from nothing to that value.
+pub const SESSION_CREATED: &str = "session.created";
 
 /// Writes one audit event through `connection`, returning its id.
 ///
@@ -173,6 +183,16 @@ pub async fn record(
             subject_label: event.subject_label(),
             changes: event.change_set().as_value(),
             request_id: context.request_id(),
+            ip_address: context
+                .origin()
+                .and_then(|origin| origin.address)
+                .map(|address| address.to_string()),
+            user_agent: context
+                .origin()
+                .and_then(|origin| origin.user_agent.as_deref()),
+            reported_location: context
+                .origin()
+                .and_then(|origin| origin.reported_location.as_deref()),
         })
         .returning(audit_events::id)
         .get_result(connection)
@@ -182,7 +202,8 @@ pub async fn record(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCOUNT_DELETED, MEMBER_ROLE_CHANGED, ORGANIZATION_RENAMED, PASSWORD_CHANGED, TEAM_RENAMED,
+        ACCOUNT_DELETED, MEMBER_ROLE_CHANGED, ORGANIZATION_RENAMED, PASSWORD_CHANGED,
+        SESSION_CREATED, TEAM_RENAMED,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -195,6 +216,7 @@ mod tests {
             MEMBER_ROLE_CHANGED,
             PASSWORD_CHANGED,
             ACCOUNT_DELETED,
+            SESSION_CREATED,
         ] {
             let (noun, verb) = action
                 .split_once('.')

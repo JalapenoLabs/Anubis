@@ -433,6 +433,8 @@ async fn a_preflight_from_a_configured_origin_is_answered() {
         .header(ACCESS_CONTROL_ALLOW_HEADERS.as_str())
         .expect("a preflight names the headers");
     assert!(headers.contains("authorization"), "got: {headers}");
+    // A cross-origin frontend reports its location like a same-origin one.
+    assert!(headers.contains("x-reported-location"), "got: {headers}");
     // Even a preflight is a response, so the rest of the policy still applies.
     assert_eq!(
         answer.header(X_CONTENT_TYPE_OPTIONS.as_str()),

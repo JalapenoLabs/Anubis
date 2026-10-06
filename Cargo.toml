@@ -74,6 +74,10 @@ redis = { version = "1.5", default-features = false, features = [
   "tokio-comp",
   "tokio-rustls-comp",
 ] }
+# Secret-shaped text in an error report is masked before it is stored or
+# filed: bearer tokens, vendor keys, cookies, credentials in a URL. Already in
+# the tree under tracing-subscriber's env filter, so naming it adds nothing.
+regex = "1"
 # The outgoing webhook delivery client. Defaults link native TLS, so the set is
 # spelled out and matches what `openidconnect` already builds on: rustls, no
 # OpenSSL, and no second copy of the client in the tree.
@@ -100,6 +104,9 @@ tower = { version = "0.5", features = ["util"] }
 # is covered, and deflate and zstd would each add an encoder to the binary for
 # clients that already accept one of these two.
 tower-http = { version = "0.6", features = [
+  # A handler that panics answers a 500 rather than dropping the connection,
+  # and the panic is filed as an error report. See `anubis::reporting`.
+  "catch-panic",
   "compression-br",
   "compression-gzip",
   "cors",

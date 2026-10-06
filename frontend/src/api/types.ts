@@ -50,6 +50,19 @@ export type Credentials = {
 }
 
 /**
+ * A sign-up: the credentials, and the preferences the account starts with.
+ *
+ * `timeZone` defaults to the browser's own zone, so an account is created
+ * already speaking the person's local time. `locale` has no such default
+ * because only the application knows which languages it ships: pass the one
+ * it resolved, or leave it out and the account starts on the server default.
+ */
+export type Registration = Credentials & {
+  timeZone?: string
+  locale?: string
+}
+
+/**
  * A profile edit. An absent field stays as it is; a blank name clears it.
  *
  * Time zone and locale are required on the account, so blanking either is a

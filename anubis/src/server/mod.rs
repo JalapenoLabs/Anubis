@@ -29,14 +29,18 @@
 //!    [`RequestId`] extension. An inbound `x-request-id` is overwritten rather
 //!    than honored: the id is the server's own correlation handle, and a caller
 //!    that could choose it could make two unrelated requests share one.
-//! 2. **Tracing.** One event per completed request, inside a span carrying the
+//! 2. **Client origin.** The client's address, user agent and the location
+//!    its browser reported, left on the request as an
+//!    [`origin::ClientOrigin`] extension the audit log copies onto every event
+//!    the request records. See [`origin`] for what is trusted and why.
+//! 3. **Tracing.** One event per completed request, inside a span carrying the
 //!    method, the path, and the id, at `INFO` (`WARN` for a `5xx`).
-//! 3. **Security headers.** See [`headers`] for the policy and its reasoning.
-//! 4. **CORS**, only when `CORS_ALLOWED_ORIGINS` names origins. Unset means no
+//! 4. **Security headers.** See [`headers`] for the policy and its reasoning.
+//! 5. **CORS**, only when `CORS_ALLOWED_ORIGINS` names origins. Unset means no
 //!    CORS headers at all, which is the strictest posture a browser honors.
-//! 5. **Compression.** Responses a client said it accepts compressed are
+//! 6. **Compression.** Responses a client said it accepts compressed are
 //!    compressed, brotli or gzip; see below.
-//! 6. **Request timeout**, innermost, so the response it produces still
+//! 7. **Request timeout**, innermost, so the response it produces still
 //!    receives an id and the security headers on its way out.
 //!
 //! # Compression
@@ -81,6 +85,7 @@
 
 mod headers;
 mod health;
+pub mod origin;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -293,7 +298,7 @@ pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
     let app = headers::allow_cross_origin(app, config);
     let app = headers::secure(app, config);
 
-    app.layer(
+    let app = app.layer(
         TraceLayer::new_for_http()
             .make_span_with(RequestSpan)
             // The span already names the request; one event per completed
@@ -303,8 +308,8 @@ pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
             // A 5xx is already reported by `LogResponse` at WARN, and the
             // handler that produced it logged the cause.
             .on_failure(()),
-    )
-    .layer(axum::middleware::from_fn(assign_request_id))
+    );
+    origin::layer(app, config).layer(axum::middleware::from_fn(assign_request_id))
 }
 
 /// Assigns each request an id, and returns it in the response.

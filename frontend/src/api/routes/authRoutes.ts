@@ -8,6 +8,7 @@ import type {
   Passkey,
   PasskeyLoginChallenge,
   PasskeyRegistrationChallenge,
+  Registration,
   SignInResult,
   TotpEnrollment,
   User,
@@ -43,9 +44,16 @@ type WireOauthProvider = {
  * two features and stay beside their login halves.
  */
 export function createAuthRoutes(client: KyInstance) {
-  async function register(credentials: Credentials): Promise<User> {
+  async function register(registration: Registration): Promise<User> {
     const response = await client
-      .post('auth/register', { json: credentials })
+      .post('auth/register', {
+        json: {
+          email: registration.email,
+          password: registration.password,
+          time_zone: registration.timeZone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone,
+          locale: registration.locale,
+        },
+      })
       .json<WireUserEnvelope>()
     return toUser(response.user)
   }

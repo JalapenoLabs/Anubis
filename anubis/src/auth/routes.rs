@@ -37,9 +37,11 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
+use crate::auth::session::SignInMethod;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
 use crate::config::{AppConfig, Environment};
@@ -131,6 +133,20 @@ struct CredentialsBody {
     password: String,
 }
 
+/// What a sign-up carries: the credentials, and the preferences the browser
+/// already knows.
+///
+/// The time zone and locale are optional so a client that sends neither still
+/// registers, and they are never a reason to refuse one: see
+/// [`registration_preference`].
+#[derive(Deserialize)]
+struct RegisterBody {
+    email: String,
+    password: String,
+    time_zone: Option<String>,
+    locale: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct EmailOnlyBody {
     email: String,
@@ -159,9 +175,15 @@ struct MessageBody {
 
 async fn register(
     State(state): State<AuthState>,
-    Json(body): Json<CredentialsBody>,
+    context: audit::Context,
+    Json(body): Json<RegisterBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let credentials = validate_credentials(body)?;
+    let time_zone = registration_preference(body.time_zone, "time zone");
+    let locale = registration_preference(body.locale, "locale");
+    let credentials = validate_credentials(CredentialsBody {
+        email: body.email,
+        password: body.password,
+    })?;
 
     let password_hash = state.hasher.hash(credentials.password).await?;
 
@@ -175,6 +197,8 @@ async fn register(
                 .values(NewUser {
                     email: &credentials.email,
                     password_hash: &password_hash,
+                    time_zone: time_zone.as_deref(),
+                    locale: locale.as_deref(),
                 })
                 .returning(User::as_returning())
                 .get_result(transaction)
@@ -194,7 +218,14 @@ async fn register(
 
     send_verification_email(&state, &mut connection, &created).await;
 
-    let jar = signed_in_jar(&state, &mut connection, created.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &created,
+        SignInMethod::Registration,
+    )
+    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &created)
             .await
@@ -212,9 +243,30 @@ struct MfaChallengeBody {
 
 async fn login(
     State(state): State<AuthState>,
+    context: audit::Context,
     Json(body): Json<CredentialsBody>,
 ) -> Result<axum::response::Response, ApiError> {
-    let credentials = validate_credentials(body)?;
+    // Signing in judges nothing about the shape of what was typed. The length
+    // rule is a sign-up rule, and quoting it here tells somebody guessing which
+    // guesses are worth making; a malformed address answering differently from
+    // an unknown one is a second thing learned. Every refusal is the same 401.
+    //
+    // The one bound kept is the ceiling, so a megabyte of "password" is refused
+    // before it reaches argon2. It answers the same way, and since it is
+    // decided before any lookup it says nothing about whether the account exists.
+    if body.password.chars().count() > password::MAX_PASSWORD_CHARS {
+        tracing::debug!("a sign-in was refused for a password over the ceiling");
+        return Err(invalid_credentials());
+    }
+    let Some(email) = policy::normalize_email(&body.email) else {
+        // The same CPU as a real check, as for an address nobody holds below.
+        state.hasher.verify_against_dummy(body.password).await?;
+        return Err(invalid_credentials());
+    };
+    let credentials = ValidCredentials {
+        email,
+        password: body.password,
+    };
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
@@ -265,7 +317,14 @@ async fn login(
             .into_response());
     }
 
-    let jar = signed_in_jar(&state, &mut connection, user.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &user,
+        SignInMethod::Password,
+    )
+    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await
@@ -304,6 +363,23 @@ async fn me(
     }))
 }
 
+/// How long an account waits between verification emails it asked for.
+///
+/// Per account and kept in the database, because the per-client budget on
+/// the route lives in one process and resets on every deploy, and what is
+/// being rationed is one inbox. Measured from the latest link, so the one
+/// sent at registration counts: a person who signs up and immediately asks
+/// again is told to check the email that is already on its way.
+const VERIFICATION_RESEND_COOLDOWN: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// What a resend decided while it held the account.
+enum Resend {
+    /// A fresh token, to be mailed once the transaction commits.
+    Issued(String),
+    /// The previous link is too recent; this long remains.
+    CoolingDown(chrono::TimeDelta),
+}
+
 async fn request_email_verification(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
@@ -318,7 +394,47 @@ async fn request_email_verification(
     }
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    send_verification_email(&state, &mut connection, &user).await;
+    let resend = connection
+        .transaction(async |transaction| {
+            // Hold the account so two resends queue: without it both read the
+            // same last-sent time, both pass, and the inbox gets two links.
+            let _held: Uuid = users::table
+                .find(user.id)
+                .select(users::id)
+                .for_update()
+                .first(transaction)
+                .await?;
+
+            let last_sent =
+                user_token::issued_at(transaction, user.id, TokenPurpose::EmailVerification)
+                    .await?;
+            if let Some(sent_at) = last_sent {
+                let waited = Utc::now() - sent_at;
+                if waited < VERIFICATION_RESEND_COOLDOWN {
+                    return Ok(Resend::CoolingDown(VERIFICATION_RESEND_COOLDOWN - waited));
+                }
+            }
+
+            let token =
+                user_token::issue(transaction, user.id, TokenPurpose::EmailVerification).await?;
+            Ok::<Resend, diesel::result::Error>(Resend::Issued(token))
+        })
+        .await
+        .map_err(log_internal)?;
+
+    let token = match resend {
+        Resend::Issued(token) => token,
+        Resend::CoolingDown(remaining) => {
+            tracing::debug!(
+                user.id = %user.id,
+                "verification resend refused inside the cooldown for {{user.id}}",
+            );
+            return Err(ApiError::too_many_requests(
+                remaining.to_std().unwrap_or_default(),
+            ));
+        }
+    };
+    deliver_verification_link(&state, &user, &token).await;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -463,6 +579,15 @@ async fn send_verification_email(
         }
     };
 
+    deliver_verification_link(state, user, &token).await;
+}
+
+/// Emails the verification link for a token that was already issued.
+///
+/// Split from [`send_verification_email`] so a resend can issue its token
+/// inside the transaction that decides the cooldown and mail it after that
+/// transaction commits, rather than holding a row lock across a network call.
+async fn deliver_verification_link(state: &AuthState, user: &User, token: &str) {
     let link = format!("{}/verify-email?token={token}", state.app_url);
     deliver(
         &state.mailer,
@@ -490,13 +615,48 @@ async fn deliver(mailer: &Mailer, email: Email) {
     }
 }
 
-/// Creates a session for `user_id` and returns a jar carrying its cookie.
+/// Creates a session for `user`, records the sign-in, and returns a jar
+/// carrying the session's cookie.
+///
+/// Every path that signs somebody in comes through here, which is what makes
+/// the [`audit::SESSION_CREATED`] record complete rather than a convention
+/// each path has to remember. The session and its record commit together, so
+/// a browser never holds a session the log does not know about. `context` is
+/// the request's, so the record carries the address and browser the sign-in
+/// came from, and the location the browser reported; see
+/// [`crate::server::origin`].
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
     connection: &mut diesel_async::AsyncPgConnection,
-    user_id: Uuid,
+    context: &audit::Context,
+    user: &User,
+    method: SignInMethod,
 ) -> Result<CookieJar, ApiError> {
-    let token = session::create(connection, user_id)
+    let actor = context.by(user);
+    let label = audit::person_label(
+        user.first_name.as_deref(),
+        user.last_name.as_deref(),
+        &user.email,
+    );
+
+    let token = connection
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            let token = session::create(transaction, user.id).await?;
+            audit::record(
+                transaction,
+                &actor,
+                &audit::Event::new(audit::SESSION_CREATED, "User")
+                    .subject(user.id)
+                    .label(&label)
+                    .changes(audit::Changes::new().field(
+                        "method",
+                        serde_json::Value::Null,
+                        method.as_str(),
+                    )),
+            )
+            .await?;
+            Ok(token)
+        })
         .await
         .map_err(log_internal)?;
 
@@ -537,6 +697,24 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
         email,
         password: body.password,
     })
+}
+
+/// Keeps a preference sent at sign-up, or drops it so the column default holds.
+///
+/// Held to the bound `PATCH /profile` applies, but a value outside it is
+/// dropped rather than refused: the browser chose it, not the person, and a
+/// sign-up that failed over a time zone would lose the account for a setting
+/// they can change in a second afterwards.
+fn registration_preference(raw: Option<String>, label: &str) -> Option<String> {
+    let trimmed = raw?.trim().to_owned();
+    if trimmed.is_empty() || trimmed.chars().count() > crate::auth::account::MAX_FIELD_CHARS {
+        tracing::debug!(
+            preference.label = label,
+            "registration ignored an unusable {{preference.label}} and kept the default",
+        );
+        return None;
+    }
+    Some(trimmed)
 }
 
 /// Normalizes (trim + lowercase) and structurally validates an email address.

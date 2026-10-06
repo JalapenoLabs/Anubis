@@ -20,6 +20,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::SignInMethod;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, signed_in_jar, validate_email};
 use crate::auth::user_token::TokenPurpose;
@@ -124,6 +125,7 @@ struct MfaChallengeBody {
 
 async fn verify_code(
     State(state): State<AuthState>,
+    context: crate::audit::Context,
     Json(body): Json<VerifyBody>,
 ) -> Result<Response, ApiError> {
     let email = validate_email(&body.email)?;
@@ -185,7 +187,14 @@ async fn verify_code(
             .into_response());
     }
 
-    let jar = signed_in_jar(&state, &mut connection, user.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &user,
+        SignInMethod::EmailCode,
+    )
+    .await?;
     let response_body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await

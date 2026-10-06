@@ -328,10 +328,11 @@ struct CallbackQuery {
 
 async fn callback(
     State(state): State<AuthState>,
+    context: crate::audit::Context,
     Path(provider_key): Path<String>,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    match finish_flow(&state, &provider_key, query).await {
+    match finish_flow(&state, &context, &provider_key, query).await {
         Ok((jar, destination)) => {
             let location = format!("{}{destination}", state.app_url);
             (jar, Redirect::to(&location)).into_response()
@@ -343,6 +344,7 @@ async fn callback(
 /// Verifies one callback and returns the session cookie and where to land.
 async fn finish_flow(
     state: &AuthState,
+    context: &crate::audit::Context,
     provider_key: &str,
     query: CallbackQuery,
 ) -> Result<(axum_extra::extract::CookieJar, String), Failure> {
@@ -436,9 +438,15 @@ async fn finish_flow(
         identity::LinkError::Password(error) => internal(error),
     })?;
 
-    let jar = signed_in_jar(state, &mut connection, user.id)
-        .await
-        .map_err(|_error| Failure::Failed)?;
+    let jar = signed_in_jar(
+        state,
+        &mut connection,
+        context,
+        &user,
+        crate::auth::SignInMethod::Oauth,
+    )
+    .await
+    .map_err(|_error| Failure::Failed)?;
 
     Ok((
         jar,

@@ -1,7 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 // Core
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 // Misc
 import { createAnubisApi } from './createAnubisApi'
@@ -32,5 +32,45 @@ describe('avatarUrl', () => {
 
     expect(api.avatarUrl({ id: USER_ID, avatarVersion: 'WFy7Qm1s3TkPq0aZ' }))
       .toBe(`/framework/users/${USER_ID}/avatar?v=WFy7Qm1s3TkPq0aZ`)
+  })
+})
+
+describe('hooks', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('should run the application\'s hooks on the framework\'s own requests', async () => {
+    const fetchMock = vi.fn<(request: Request) => Promise<Response>>(async () => new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const afterResponse = vi.fn()
+
+    const api = createAnubisApi({
+      hooks: {
+        beforeRequest: [
+          ({ request }) => {
+            request.headers.set('X-Reported-Location', 'Meridian, Idaho, US')
+          },
+        ],
+        afterResponse: [ afterResponse ],
+      },
+    })
+    await api.logout()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const sent = fetchMock.mock.calls[0][0]
+    expect(new URL(sent.url).pathname).toBe('/auth/logout')
+    expect(sent.headers.get('X-Reported-Location')).toBe('Meridian, Idaho, US')
+    expect(afterResponse).toHaveBeenCalledTimes(1)
+  })
+
+  it('should send nothing extra when no hooks are given', async () => {
+    const fetchMock = vi.fn<(request: Request) => Promise<Response>>(async () => new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await createAnubisApi().logout()
+
+    const sent = fetchMock.mock.calls[0][0]
+    expect(sent.headers.has('X-Reported-Location')).toBe(false)
   })
 })

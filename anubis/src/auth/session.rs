@@ -21,6 +21,54 @@ pub const SESSION_COOKIE: &str = "anubis_session";
 /// How long a session lives. Fixed expiry; sliding renewal can come later.
 pub const SESSION_TTL_DAYS: i64 = 30;
 
+/// How an account proved who it was before a session was issued.
+///
+/// Recorded on the [`crate::audit::SESSION_CREATED`] event every sign-in
+/// writes, so a reader of the log can tell a password from a passkey. The
+/// spellings are the event's contract with whoever reads it, which is why they
+/// are constants here rather than strings at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInMethod {
+    /// Registering signs the new account in.
+    Registration,
+    /// An email address and a password, with no second factor confirmed.
+    Password,
+    /// A TOTP or recovery code, completing a password or emailed-code sign-in
+    /// on an account with a confirmed second factor.
+    SecondFactor,
+    /// A one-time code mailed to the address.
+    EmailCode,
+    /// A passkey, which is possession and verification in one step.
+    Passkey,
+    /// An OpenID Connect provider vouching for the address.
+    Oauth,
+}
+
+impl SignInMethod {
+    /// Every method, in the order a sign-in page offers them.
+    pub const ALL: [Self; 6] = [
+        Self::Registration,
+        Self::Password,
+        Self::SecondFactor,
+        Self::EmailCode,
+        Self::Passkey,
+        Self::Oauth,
+    ];
+
+    /// The spelling the audit event records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Registration => "registration",
+            Self::Password => "password",
+            Self::SecondFactor => "second_factor",
+            Self::EmailCode => "email_code",
+            Self::Passkey => "passkey",
+            Self::Oauth => "oauth",
+        }
+    }
+}
+
 #[derive(Insertable)]
 #[diesel(table_name = sessions)]
 struct NewSession<'a> {

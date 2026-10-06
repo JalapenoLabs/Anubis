@@ -17,8 +17,11 @@
 
 mod support;
 
+use anubis::schema::audit_events;
 use axum::Router;
 use axum::http::{HeaderMap, StatusCode};
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use serde_json::{Value, json};
 use support::{SoftAuthenticator, TestDatabase, register, send, session_token};
 use uuid::Uuid;
@@ -42,6 +45,7 @@ async fn a_software_passkey_registers_signs_in_and_is_refused_when_forged() {
         return;
     };
     let router = boot(&database).await;
+    let pool = database.pool().await;
 
     let email = format!("passkey-{}@example.com", Uuid::new_v4());
     let cookie = register(&router, &email).await;
@@ -103,6 +107,29 @@ async fn a_software_passkey_registers_signs_in_and_is_refused_when_forged() {
         .expect("the account has an id")
         .parse()
         .expect("a user id is a UUID");
+
+    // The log records the sign-in by how it was made, after the one
+    // registering made.
+    let mut connection = pool.get().await.expect("a connection is available");
+    let methods: Vec<Value> = audit_events::table
+        .filter(audit_events::action.eq(anubis::audit::SESSION_CREATED))
+        .filter(audit_events::user_id.eq(user_id))
+        .order(audit_events::created_at.asc())
+        .select(audit_events::changes)
+        .load(&mut connection)
+        .await
+        .expect("the log is readable");
+    drop(connection);
+    assert_eq!(
+        methods
+            .iter()
+            .map(|changes| changes["method"]["new"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!(anubis::auth::SignInMethod::Registration.as_str()),
+            json!(anubis::auth::SignInMethod::Passkey.as_str()),
+        ],
+    );
 
     let (_status, _headers, body) = send(
         &router,

@@ -14,6 +14,7 @@ Two properties are the whole design. **A recorded event commits with the write t
 | `subject_type`, `subject_id`, `subject_label` | What it happened to, and how that read at the time |
 | `changes` | The fields that moved, as `{"field": {"old": ..., "new": ...}}` |
 | `request_id` | The `x-request-id` of the request that did it |
+| `ip_address`, `user_agent`, `reported_location` | Where the request came from; see [where an act came from](#where-an-act-came-from) |
 | `created_at` | When it was recorded |
 
 **Names are copied, not joined.** A log that renders "(deleted user)" where a name belongs has lost the answer it exists to give, so `actor_name` and `subject_label` hold how both read at the moment of the act. A deleted account nulls `user_id` and leaves the name standing; a destroyed record leaves its label behind.
@@ -82,8 +83,21 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `PASSKEY_REMOVED` | `passkey.removed` | An account removes a passkey |
 | `SESSION_REVOKED` | `session.revoked` | An account signs one of its sessions out |
 | `ACCOUNT_DELETED` | `account.deleted` | An account is deleted |
+| `SESSION_CREATED` | `session.created` | An account signs in, by any path |
 
 The dot is what tells the two vocabularies apart at a glance, and it is why a scaffolded model's `created` can never collide with a framework verb.
+
+## Sign-ins
+
+Every path that issues a session records `session.created` against the account, in the same transaction as the session: registering, a password, a password or emailed code completed by a second factor, an emailed code, a passkey, and an OpenID Connect provider. They all pass through one function, so the record is complete rather than a convention each path has to remember, and a session the log does not know about cannot exist.
+
+The change set carries one field, `method`, from nothing to one of `anubis::auth::SignInMethod`'s spellings: `registration`, `password`, `second_factor`, `email_code`, `passkey`, `oauth`. A create otherwise records an empty set; the method is the one fact the new session was created with that a reader needs. A password that meets a second-factor challenge records nothing until the code is accepted, because no session exists until then.
+
+## Where an act came from
+
+`ip_address`, `user_agent` and `reported_location` are copied from the request's `ClientOrigin` (see [server](server.md#client-origin)) onto every event recorded with a request's `Context`, so "where did this sign-in come from" has an answer long after the request log has rotated. A job, a sweep, or a router that is not hardened records none.
+
+**The framework's listings never serve them.** The three fields are on `AuditEvent` for an application to read and are skipped when it serializes, so a team's admins reading the team log see what their members did and not where they connect from. An application that shows them, to an operator for instance, reads the fields itself and decides who may see them. An address is personal data in most jurisdictions, so showing one is a privacy-policy decision as much as a screen.
 
 ## Secrets
 

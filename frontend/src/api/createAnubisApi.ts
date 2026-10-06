@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { User } from './types'
+import type { Hooks } from 'ky'
 
 // Utility
 import ky from 'ky'
@@ -15,6 +16,15 @@ import { createTenancyRoutes } from './routes/tenancyRoutes'
 type AnubisApiOptions = {
   /** Path or URL the framework routes are mounted under. Defaults to same-origin. */
   prefix?: string
+  /**
+   * ky hooks run on every framework request, the same hooks an application
+   * gives its own clients: a `beforeRequest` that adds a header, such as the
+   * `X-Reported-Location` the audit log records on a sign-in, or an
+   * `afterResponse` that reports a failure. The client sets none of its own,
+   * so these are the only ones. A hook must never throw: a throw rejects the
+   * request it was decorating.
+   */
+  hooks?: Hooks
 }
 
 /**
@@ -34,6 +44,7 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     // Auth outcomes (401, 409, 400) are modeled responses, not retryable
     // transport failures.
     retry: 0,
+    hooks: options.hooks,
   })
 
   /** The `<img>` source for the pending TOTP enrollment's QR code. */
