@@ -35,4 +35,4 @@ pub(crate) use policy::{check_password_policy, normalize_email};
 #[doc(inline)]
 pub use routes::router;
 #[doc(inline)]
-pub use session::{SESSION_COOKIE, SESSION_TTL_DAYS};
+pub use session::{SESSION_COOKIE, SESSION_TTL_DAYS, SignInMethod};

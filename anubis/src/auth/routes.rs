@@ -37,9 +37,11 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::extract::CurrentUser;
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
+use crate::auth::session::SignInMethod;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
 use crate::config::{AppConfig, Environment};
@@ -173,6 +175,7 @@ struct MessageBody {
 
 async fn register(
     State(state): State<AuthState>,
+    context: audit::Context,
     Json(body): Json<RegisterBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let time_zone = registration_preference(body.time_zone, "time zone");
@@ -215,7 +218,14 @@ async fn register(
 
     send_verification_email(&state, &mut connection, &created).await;
 
-    let jar = signed_in_jar(&state, &mut connection, created.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &created,
+        SignInMethod::Registration,
+    )
+    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &created)
             .await
@@ -233,6 +243,7 @@ struct MfaChallengeBody {
 
 async fn login(
     State(state): State<AuthState>,
+    context: audit::Context,
     Json(body): Json<CredentialsBody>,
 ) -> Result<axum::response::Response, ApiError> {
     // Signing in judges nothing about the shape of what was typed. The length
@@ -306,7 +317,14 @@ async fn login(
             .into_response());
     }
 
-    let jar = signed_in_jar(&state, &mut connection, user.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &user,
+        SignInMethod::Password,
+    )
+    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await
@@ -597,13 +615,47 @@ async fn deliver(mailer: &Mailer, email: Email) {
     }
 }
 
-/// Creates a session for `user_id` and returns a jar carrying its cookie.
+/// Creates a session for `user`, records the sign-in, and returns a jar
+/// carrying the session's cookie.
+///
+/// Every path that signs somebody in comes through here, which is what makes
+/// the [`audit::SESSION_CREATED`] record complete rather than a convention
+/// each path has to remember. The session and its record commit together, so
+/// a browser never holds a session the log does not know about. `context` is
+/// the request's, so the record carries the address, browser and location the
+/// sign-in came from; see [`crate::server::origin`].
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
     connection: &mut diesel_async::AsyncPgConnection,
-    user_id: Uuid,
+    context: &audit::Context,
+    user: &User,
+    method: SignInMethod,
 ) -> Result<CookieJar, ApiError> {
-    let token = session::create(connection, user_id)
+    let actor = context.by(user);
+    let label = audit::person_label(
+        user.first_name.as_deref(),
+        user.last_name.as_deref(),
+        &user.email,
+    );
+
+    let token = connection
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            let token = session::create(transaction, user.id).await?;
+            audit::record(
+                transaction,
+                &actor,
+                &audit::Event::new(audit::SESSION_CREATED, "User")
+                    .subject(user.id)
+                    .label(&label)
+                    .changes(audit::Changes::new().field(
+                        "method",
+                        serde_json::Value::Null,
+                        method.as_str(),
+                    )),
+            )
+            .await?;
+            Ok(token)
+        })
         .await
         .map_err(log_internal)?;
 

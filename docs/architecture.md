@@ -25,6 +25,7 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | OAuth / SSO | OpenID Connect (`openidconnect` crate, reqwest + rustls, no native TLS) | Authorization code with PKCE, server-side state and nonce. Google ships; a provider is enabled by two environment variables, and the sign-in page renders whichever `GET /auth/oauth/providers` reports. `anubis scaffold oauth <provider>` prints that setup and writes nothing. See [api.md](api.md#oauth-sign-in) |
 | Outgoing email | SMTP via `lettre` (tokio + rustls, no native TLS) | One `Mailer` service with log, test, and SMTP backends, selected by `SMTP_URL`. See [email.md](email.md) |
 | Observability | tracing | Structured events with named properties |
+| Error reporting | `error_reports` rows, filed by a background job | Every `ERROR` event, panic, and unexplained `500` becomes a redacted report counted against a fingerprint, and each fingerprint is filed once as an issue through a tracker the application configures; GitHub ships. See [reporting.md](reporting.md) |
 | Errors | Canonical error structs in the framework library; `eyre`/`anyhow` style results allowed in generated application code | Follows the Rust guidelines in force at Jalapeno Labs |
 
 ### Migrations at boot

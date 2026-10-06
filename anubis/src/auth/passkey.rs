@@ -30,6 +30,7 @@ use webauthn_rs::prelude::{
 };
 
 use crate::audit;
+use crate::auth::SignInMethod;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, signed_in_jar};
 use crate::auth::{CurrentUser, token};
@@ -324,6 +325,7 @@ struct UserBody {
 
 async fn login_finish(
     State(state): State<AuthState>,
+    context: audit::Context,
     Json(body): Json<LoginFinishBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let webauthn = relying_party(&state)?;
@@ -380,7 +382,14 @@ async fn login_finish(
         .map_err(log_internal)?;
 
     // A passkey is possession plus verification: strong auth, no TOTP step.
-    let jar = signed_in_jar(&state, &mut connection, user.id).await?;
+    let jar = signed_in_jar(
+        &state,
+        &mut connection,
+        &context,
+        &user,
+        SignInMethod::Passkey,
+    )
+    .await?;
     let response_body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await

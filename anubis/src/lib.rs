@@ -25,6 +25,7 @@ pub mod notifications;
 pub mod platform;
 pub mod rate_limit;
 pub mod realtime;
+pub mod reporting;
 pub mod roles;
 pub mod scaffold;
 pub mod schema;

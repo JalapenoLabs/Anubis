@@ -17,6 +17,7 @@ use crate::auth::User;
 use crate::http::ApiError;
 use crate::schema::audit_events;
 use crate::server::RequestId;
+use crate::server::origin::ClientOrigin;
 
 /// Keys the database maintains rather than a person.
 ///
@@ -40,14 +41,16 @@ const HOUSEKEEPING: [&str; 2] = ["created_at", "updated_at"];
 /// }
 /// ```
 ///
-/// Extraction never fails. Outside a served request there is no request id (the
-/// middleware that mints one lives in [`crate::server`]), and an event without
-/// one is still the truth about what happened.
+/// Extraction never fails. Outside a served request there is no request id and
+/// no client origin (the middleware that records both lives in
+/// [`crate::server`]), and an event without them is still the truth about what
+/// happened.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Context {
     request_id: Option<String>,
     actor_id: Option<Uuid>,
     actor_name: Option<String>,
+    origin: Option<ClientOrigin>,
 }
 
 impl Context {
@@ -71,6 +74,7 @@ impl Context {
             request_id: self.request_id.clone(),
             actor_id: Some(user.id),
             actor_name: Some(display_name(user)),
+            origin: self.origin.clone(),
         }
     }
 
@@ -86,7 +90,15 @@ impl Context {
             request_id: self.request_id.clone(),
             actor_id: None,
             actor_name: Some(application.name.clone()),
+            origin: self.origin.clone(),
         }
+    }
+
+    /// Where the request this context came from arrived from, if anything
+    /// measured it.
+    #[must_use]
+    pub fn origin(&self) -> Option<&ClientOrigin> {
+        self.origin.as_ref()
     }
 
     pub(super) fn actor_id(&self) -> Option<Uuid> {
@@ -116,6 +128,7 @@ where
                 .map(|id| id.as_str().to_owned()),
             actor_id: None,
             actor_name: None,
+            origin: parts.extensions.get::<ClientOrigin>().cloned(),
         })
     }
 }
@@ -417,6 +430,20 @@ pub struct AuditEvent {
     pub request_id: Option<String>,
     /// When the act was recorded.
     pub created_at: DateTime<Utc>,
+    /// The client address the request came from, under the trusted proxy rule.
+    ///
+    /// Never serialized: the framework's own listings show a team's admins
+    /// what their members did, which is not where they connect from. An
+    /// application that shows it reads the field and decides who may see it.
+    #[serde(skip_serializing)]
+    pub ip_address: Option<String>,
+    /// The client's description of itself. Never serialized, as above.
+    #[serde(skip_serializing)]
+    pub user_agent: Option<String>,
+    /// A trusted load balancer's guess at where the client was. Never
+    /// serialized, as above.
+    #[serde(skip_serializing)]
+    pub location: Option<String>,
 }
 
 /// The insertable shape; the database fills the id and the timestamp.
@@ -433,6 +460,9 @@ pub(super) struct NewAuditEvent<'a> {
     pub subject_label: Option<&'a str>,
     pub changes: Value,
     pub request_id: Option<&'a str>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<&'a str>,
+    pub location: Option<&'a str>,
 }
 
 #[cfg(test)]

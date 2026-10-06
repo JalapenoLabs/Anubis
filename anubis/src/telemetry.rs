@@ -18,8 +18,11 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::config::AppConfig;
+use crate::reporting::{ErrorLayer, Reporter};
 
 /// Installs the global tracing subscriber for the application.
 ///
@@ -28,22 +31,46 @@ use crate::config::AppConfig;
 /// # Errors
 /// Returns an [`Error`] when a global subscriber is already installed.
 pub fn init(config: &AppConfig) -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(filter(config))
+        .try_init()
+        .map_err(Error::from_source)?;
+
+    warn_about_risky_defaults(config);
+    Ok(())
+}
+
+/// [`init`], with every `ERROR` event also reported through `reporter`.
+///
+/// The subscriber an application installs when it files its own failures as
+/// issues; see [`crate::reporting`]. The formatter and the filter are the same
+/// as [`init`]'s, and the [`ErrorLayer`] sits beside them, so a line that is
+/// filtered out of the log is never reported either.
+///
+/// # Errors
+/// Returns an [`Error`] when a global subscriber is already installed.
+pub fn init_with_reporting(config: &AppConfig, reporter: &Reporter) -> Result<(), Error> {
+    tracing_subscriber::registry()
+        .with(filter(config))
+        .with(tracing_subscriber::fmt::layer())
+        .with(ErrorLayer::new(reporter.clone()))
+        .try_init()
+        .map_err(|error| Error::from_source(Box::new(error)))?;
+
+    warn_about_risky_defaults(config);
+    Ok(())
+}
+
+/// What is logged: `RUST_LOG` when it is set, otherwise the environment's
+/// default, `debug` in development and `info` everywhere else.
+fn filter(config: &AppConfig) -> EnvFilter {
     let default_directive = if config.environment.is_development() {
         "debug"
     } else {
         "info"
     };
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_error| EnvFilter::new(default_directive));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init()
-        .map_err(Error::from_source)?;
-
-    warn_about_risky_defaults(config);
-    Ok(())
+    EnvFilter::try_from_default_env().unwrap_or_else(|_error| EnvFilter::new(default_directive))
 }
 
 /// Announces defaults that are fine locally and costly anywhere else.

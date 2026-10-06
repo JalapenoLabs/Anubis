@@ -410,6 +410,34 @@ diesel::table! {
         changes -> Jsonb,
         request_id -> Nullable<Text>,
         created_at -> Timestamptz,
+        ip_address -> Nullable<Text>,
+        user_agent -> Nullable<Text>,
+        location -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// One row per distinct fault the application noticed in itself, and the
+    /// issue it was filed as. Keyed by fingerprint, so an error in a loop is
+    /// one row counting occurrences rather than one row each. See
+    /// `anubis::reporting`.
+    error_reports (fingerprint) {
+        fingerprint -> Text,
+        source -> Text,
+        kind -> Text,
+        title -> Text,
+        sample -> Jsonb,
+        state -> Text,
+        issue_number -> Nullable<Int8>,
+        issue_url -> Nullable<Text>,
+        occurrences -> Int8,
+        reported_occurrences -> Int8,
+        failure -> Nullable<Text>,
+        create_unconfirmed -> Bool,
+        first_seen_at -> Timestamptz,
+        last_seen_at -> Timestamptz,
+        checked_at -> Timestamptz,
+        filed_at -> Nullable<Timestamptz>,
     }
 }
 

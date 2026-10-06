@@ -17,6 +17,7 @@ Layers, outermost first. The order is the design:
 | Layer | Effect |
 |---|---|
 | Request id | A fresh UUID per request, in the log span, returned as `x-request-id` |
+| Client origin | The client's address, user agent and, behind a trusted load balancer, location, left on the request for the audit log |
 | Tracing | One event per completed request, inside a span naming the method, path, and id |
 | Security headers | The response policy below |
 | CORS | Only when `CORS_ALLOWED_ORIGINS` names origins; otherwise absent entirely |
@@ -30,6 +31,12 @@ The request id is outermost so every later layer logs under it. The timeout is i
 An inbound `x-request-id` is overwritten rather than honored. The id is the server's own correlation handle, and a caller that could choose it could make two unrelated requests share one line of the log. Handlers read it with `Extension<RequestId>` when they want to name it in an event of their own.
 
 Error bodies stay generic (`{"message": "Something went wrong on our side."}`), so the id is the whole bridge between a user's report and the log line that explains it. Ask for it in your support form.
+
+### Client origin
+
+Every request carries a `ClientOrigin` extension (`anubis::server::origin`): the client address under the same trusted-proxy rule the rate limiter uses, the `user-agent` cut to 512 characters, and the value of `TRUSTED_LOCATION_HEADER` cut to 120 when that variable names a header. `audit::Context` picks it up, so every event a request records says where the act came from; a sign-in is the one that needs it most. A router that is not hardened carries none, the same way it carries no request id.
+
+The location is trusted only when the variable names it, because a client can send any header it likes. Set it only behind a load balancer that writes that header on every request, such as a Google external Application Load Balancer told to add `X-Client-Geo-Location: {client_region},{client_city}`. It is display only: nothing in the framework decides anything on a geolocation guess.
 
 ### Request logging
 
@@ -189,6 +196,7 @@ Allowed requests may carry `Authorization` and `Content-Type`, and use the stand
 | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser |
 | `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive |
 | `TRUSTED_PROXY_HEADER` | unset | Forwarding header naming the client address; see [rate limiting](api.md#rate-limiting) |
+| `TRUSTED_LOCATION_HEADER` | unset | Header a trusted load balancer writes the client's location into; see [client origin](#client-origin) |
 | `SPA_DIR` | unset | Directory of built frontend assets; see [architecture](architecture.md#deployment) |
 
 The timeout, the drain window, and the readiness timeout are constants rather than variables. They are properties of the deployment shape the framework targets, and a knob per timeout is a knob nobody tunes correctly and everybody has to understand.

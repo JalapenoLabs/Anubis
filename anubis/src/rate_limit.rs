@@ -60,7 +60,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request};
-use axum::http::HeaderName;
+use axum::http::{HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use tower::{Layer, Service};
 
@@ -114,6 +114,18 @@ const EMAILS_PER_RECIPIENT: u32 = 5;
 /// campaign, not a burst.
 const EMAIL_PERIOD: Duration = Duration::from_hours(1);
 
+/// Error reports one client may send per [`ERROR_REPORT_PERIOD`].
+///
+/// A browser reports a fault once per page load and at most ten per load, so
+/// thirty an hour is three broken page loads a minute for ten minutes, far
+/// past an honest visitor. The endpoint is open to strangers and every report
+/// it accepts is a database write that may become an issue, so the budget is
+/// what keeps it from being a way to spam either.
+const ERROR_REPORTS: u32 = 30;
+
+/// The window [`ERROR_REPORTS`] is spent over.
+const ERROR_REPORT_PERIOD: Duration = Duration::from_hours(1);
+
 /// How many keys the limiter tracks before it starts evicting.
 ///
 /// At roughly a hundred bytes per key this bounds the map at a few megabytes,
@@ -155,6 +167,9 @@ pub enum Budget {
     EmailPerClient,
     /// Mail bombing measured per target address, whoever asks for it.
     EmailPerRecipient,
+    /// Issue spam: a browser reporting its own failures. See
+    /// [`crate::reporting`].
+    ErrorReports,
 }
 
 impl Budget {
@@ -166,6 +181,7 @@ impl Budget {
             Self::Registration => REGISTRATIONS,
             Self::EmailPerClient => EMAILS_PER_CLIENT,
             Self::EmailPerRecipient => EMAILS_PER_RECIPIENT,
+            Self::ErrorReports => ERROR_REPORTS,
         }
     }
 
@@ -176,6 +192,7 @@ impl Budget {
             Self::Credentials => CREDENTIAL_PERIOD,
             Self::Registration => REGISTRATION_PERIOD,
             Self::EmailPerClient | Self::EmailPerRecipient => EMAIL_PERIOD,
+            Self::ErrorReports => ERROR_REPORT_PERIOD,
         }
     }
 
@@ -192,6 +209,7 @@ impl Budget {
             Self::Registration => "registration",
             Self::EmailPerClient => "email-client",
             Self::EmailPerRecipient => "email-recipient",
+            Self::ErrorReports => "error-reports",
         }
     }
 }
@@ -300,7 +318,7 @@ impl RateLimiter {
     /// misconfigured.
     fn client_address(&self, request: &Request) -> Option<IpAddr> {
         if let Some(header) = &self.inner.trusted_proxy_header
-            && let Some(forwarded) = forwarded_address(request, header)
+            && let Some(forwarded) = forwarded_address(request.headers(), header)
         {
             return Some(forwarded);
         }
@@ -355,14 +373,11 @@ impl RateLimiter {
 /// trusting the first entry would let any caller pick its own rate limit key.
 /// The last entry is the one the trusted proxy appended, which is the address
 /// it accepted the connection from.
-fn forwarded_address(request: &Request, header: &HeaderName) -> Option<IpAddr> {
-    let value = request
-        .headers()
-        .get_all(header)
-        .iter()
-        .next_back()?
-        .to_str()
-        .ok()?;
+///
+/// [`crate::server::origin`] reads the client address through here too, so
+/// the address a sign-in is recorded from is the address it was charged to.
+pub(crate) fn forwarded_address(headers: &HeaderMap, header: &HeaderName) -> Option<IpAddr> {
+    let value = headers.get_all(header).iter().next_back()?.to_str().ok()?;
 
     value.rsplit(',').next()?.trim().parse().ok()
 }

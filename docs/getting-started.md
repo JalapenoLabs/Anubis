@@ -712,7 +712,7 @@ enroll again. Treat a rotation as user communication, not just a deploy.
 - [Tenancy, teams, and organizations](tenancy.md), the model everything chains to
 - [REST API](api.md), the contract, authentication, and rate limits
 - [The server](server.md), what `anubis::server::serve` owns
-- [Background jobs](jobs.md), [Webhooks](webhooks.md), [Realtime](realtime.md), [Billing](billing.md), [Email](email.md)
+- [Background jobs](jobs.md), [Webhooks](webhooks.md), [Realtime](realtime.md), [Billing](billing.md), [Email](email.md), [Error reporting](reporting.md)
 - [Upgrading](upgrading.md), the versioning policy and `anubis upgrade`
 - [Testing](testing.md) and [CI](ci.md)
 

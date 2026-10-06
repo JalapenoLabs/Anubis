@@ -38,6 +38,10 @@ use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use anubis::schema::audit_events;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+
 /// A throwaway RSA key, generated for this test and used nowhere else.
 ///
 /// The mock provider signs its ID tokens with it and publishes the matching
@@ -406,7 +410,7 @@ async fn oauth_sign_in_creates_links_and_refuses() {
     let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
     let router = Router::new().nest(
         "/auth",
-        anubis::auth::router(pool, mailer, &config, &rate_limit),
+        anubis::auth::router(pool.clone(), mailer, &config, &rate_limit),
     );
 
     // ------------------------------------------------------------------
@@ -546,6 +550,33 @@ async fn oauth_sign_in_creates_links_and_refuses() {
         body["user"]["email"],
         Value::String(fresh_email),
         "linking must never rewrite the account's own address",
+    );
+
+    // Both of those were sign-ins, and the log says so, by provider rather
+    // than by password: creating the account here is a sign-in too.
+    let created_uuid: Uuid = created_id
+        .as_str()
+        .expect("an id is a string")
+        .parse()
+        .expect("an id is a UUID");
+    let mut connection = pool.get().await.expect("a connection is available");
+    let recorded: Vec<Value> = audit_events::table
+        .filter(audit_events::action.eq(anubis::audit::SESSION_CREATED))
+        .filter(audit_events::user_id.eq(created_uuid))
+        .select(audit_events::changes)
+        .load(&mut connection)
+        .await
+        .expect("the log is readable");
+    drop(connection);
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|changes| changes["method"]["new"].clone())
+            .collect::<Vec<_>>(),
+        [
+            Value::String(anubis::auth::SignInMethod::Oauth.as_str().to_owned()),
+            Value::String(anubis::auth::SignInMethod::Oauth.as_str().to_owned()),
+        ],
     );
 
     // ------------------------------------------------------------------

@@ -60,6 +60,7 @@ lettre = { workspace = true }
 openidconnect = { workspace = true }
 qrcode = { workspace = true }
 redis = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
