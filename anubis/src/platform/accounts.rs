@@ -196,19 +196,26 @@ impl TemporaryPassword {
         let length = Self::GROUPS * Self::GROUP_LENGTH;
         let mut password = Zeroizing::new(String::with_capacity(length + Self::GROUPS));
         let mut drawn = 0;
+        // One draw usually covers the whole password; a draw whose bytes were
+        // mostly rejected is simply followed by another.
+        let mut entropy = Zeroizing::new([0u8; 32]);
         while drawn < length {
-            let mut byte = [0u8; 1];
-            getrandom::fill(&mut byte).expect("the OS random source must be available");
-            if byte[0] >= REJECTION_THRESHOLD {
-                continue;
-            }
+            getrandom::fill(entropy.as_mut()).expect("the OS random source must be available");
+            for &byte in entropy.iter() {
+                if drawn == length {
+                    break;
+                }
+                if byte >= REJECTION_THRESHOLD {
+                    continue;
+                }
 
-            if drawn > 0 && drawn % Self::GROUP_LENGTH == 0 {
-                password.push('-');
+                if drawn > 0 && drawn % Self::GROUP_LENGTH == 0 {
+                    password.push('-');
+                }
+                let index = usize::from(byte) % Self::ALPHABET.len();
+                password.push(char::from(Self::ALPHABET[index]));
+                drawn += 1;
             }
-            let index = usize::from(byte[0]) % Self::ALPHABET.len();
-            password.push(char::from(Self::ALPHABET[index]));
-            drawn += 1;
         }
         Self(password)
     }

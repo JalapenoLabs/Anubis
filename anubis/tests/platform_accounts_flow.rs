@@ -225,12 +225,7 @@ impl Deployment {
     }
 
     /// Sends `body` to an operator route as the operator.
-    async fn operate(&self, path: &str, body: Option<&Value>) -> (StatusCode, Value) {
-        let method = if path == "/operator/invitations" && body.is_none() {
-            "GET"
-        } else {
-            "POST"
-        };
+    async fn operate(&self, method: &str, path: &str, body: Option<&Value>) -> (StatusCode, Value) {
         let (status, _headers, response) =
             send(&self.router, method, path, body, Some(&self.operator)).await;
         (status, response)
@@ -329,6 +324,7 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- A role the platform cannot grant is refused. -------------------
     let (status, body) = deployment
         .operate(
+            "POST",
             "/operator/invitations",
             Some(&json!({ "email": invitee, "platform_role": "admin" })),
         )
@@ -338,6 +334,7 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- The invitation is written, audited, and mailed. ----------------
     let (status, invitation) = deployment
         .operate(
+            "POST",
             "/operator/invitations",
             Some(&json!({ "email": invitee.to_uppercase(), "platform_role": "operator" })),
         )
@@ -377,7 +374,11 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
 
     // ---- One live invitation per address, and none for an account. ------
     let (status, body) = deployment
-        .operate("/operator/invitations", Some(&json!({ "email": invitee })))
+        .operate(
+            "POST",
+            "/operator/invitations",
+            Some(&json!({ "email": invitee })),
+        )
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert!(
@@ -391,6 +392,7 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     register(router, &registered).await;
     let (status, _body) = deployment
         .operate(
+            "POST",
             "/operator/invitations",
             Some(&json!({ "email": registered })),
         )
@@ -398,7 +400,9 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     assert_eq!(status, StatusCode::CONFLICT, "an account already holds it");
 
     // ---- The pending list carries it. -----------------------------------
-    let (status, listing) = deployment.operate("/operator/invitations", None).await;
+    let (status, listing) = deployment
+        .operate("GET", "/operator/invitations", None)
+        .await;
     assert_eq!(status, StatusCode::OK, "body: {listing}");
     let listed: Vec<&Value> = listing["page"]["invitations"]
         .as_array()
@@ -421,6 +425,7 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- A resend kills the old link and mails a new one. ---------------
     let (status, body) = deployment
         .operate(
+            "POST",
             &format!("/operator/invitations/{invitation_id}/resend"),
             None,
         )
@@ -517,13 +522,16 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     );
     let (status, _body) = deployment
         .operate(
+            "POST",
             &format!("/operator/invitations/{invitation_id}/resend"),
             None,
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "accepted is final");
 
-    let (_status, listing) = deployment.operate("/operator/invitations", None).await;
+    let (_status, listing) = deployment
+        .operate("GET", "/operator/invitations", None)
+        .await;
     assert!(
         listing["page"]["invitations"]
             .as_array()
@@ -536,7 +544,11 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- An expired link answers like every other unusable one. ---------
     let late = format!("late-{}@example.com", Uuid::new_v4());
     let (status, late_invitation) = deployment
-        .operate("/operator/invitations", Some(&json!({ "email": late })))
+        .operate(
+            "POST",
+            "/operator/invitations",
+            Some(&json!({ "email": late })),
+        )
         .await;
     assert_eq!(status, StatusCode::CREATED);
     let late_id: Uuid = serde_json::from_value(late_invitation["id"].clone()).expect("an id");
@@ -556,7 +568,9 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     let (status, body, _cookie) = accept(router, &late_token, INVITEE_PASSWORD).await;
     assert_eq!((status, &body), (unknown_status, &unknown_body));
 
-    let (_status, listing) = deployment.operate("/operator/invitations", None).await;
+    let (_status, listing) = deployment
+        .operate("GET", "/operator/invitations", None)
+        .await;
     let position = listing["page"]["invitations"]
         .as_array()
         .expect("a list")
@@ -567,7 +581,11 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
 
     // A resend revives it with a fresh day.
     let (status, _body) = deployment
-        .operate(&format!("/operator/invitations/{late_id}/resend"), None)
+        .operate(
+            "POST",
+            &format!("/operator/invitations/{late_id}/resend"),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     let (status, _body) = lookup(router, &deployment.latest_token(&late)).await;
@@ -576,13 +594,21 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- Revoking closes the link and frees the address. ----------------
     let revived_token = deployment.latest_token(&late);
     let (status, _body) = deployment
-        .operate(&format!("/operator/invitations/{late_id}/revoke"), None)
+        .operate(
+            "POST",
+            &format!("/operator/invitations/{late_id}/revoke"),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = lookup(router, &revived_token).await;
     assert_eq!((status, &body), (unknown_status, &unknown_body));
     let (status, _body) = deployment
-        .operate(&format!("/operator/invitations/{late_id}/resend"), None)
+        .operate(
+            "POST",
+            &format!("/operator/invitations/{late_id}/resend"),
+            None,
+        )
         .await;
     assert_eq!(
         status,
@@ -597,7 +623,11 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
         1,
     );
     let (status, _body) = deployment
-        .operate("/operator/invitations", Some(&json!({ "email": late })))
+        .operate(
+            "POST",
+            "/operator/invitations",
+            Some(&json!({ "email": late })),
+        )
         .await;
     assert_eq!(
         status,
@@ -608,7 +638,11 @@ async fn an_operator_invites_a_colleague_who_opens_an_account() {
     // ---- An address registered meanwhile cannot be taken over. ----------
     let raced = format!("raced-{}@example.com", Uuid::new_v4());
     let (status, _body) = deployment
-        .operate("/operator/invitations", Some(&json!({ "email": raced })))
+        .operate(
+            "POST",
+            "/operator/invitations",
+            Some(&json!({ "email": raced })),
+        )
         .await;
     assert_eq!(status, StatusCode::CREATED);
     let raced_token = deployment.latest_token(&raced);
@@ -696,6 +730,7 @@ async fn a_temporary_password_admits_nothing_but_choosing_a_new_one() {
     // ---- An unknown account is a 404, and nobody but an operator acts. --
     let (status, _body) = deployment
         .operate(
+            "POST",
             &format!("/operator/accounts/{}/temporary-password", Uuid::new_v4()),
             None,
         )
@@ -718,6 +753,7 @@ async fn a_temporary_password_admits_nothing_but_choosing_a_new_one() {
     // ---- The operator sets one and is handed it once. -------------------
     let (status, body) = deployment
         .operate(
+            "POST",
             &format!("/operator/accounts/{user_id}/temporary-password"),
             None,
         )
