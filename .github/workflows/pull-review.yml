@@ -56,6 +56,7 @@ jobs:
           # would cost every review minutes it never reads.
           submodules: false
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          allow-unsafe-pr-checkout: true
 
       # The review pipeline lives in the private JalapenoLabs/github-actions
       # repository. It is checked out onto the runner for this job only and
