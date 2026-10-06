@@ -101,15 +101,17 @@ impl Fetcher {
         let port = url
             .port_or_known_default()
             .ok_or("the client id names no port")?;
-        let address = self.resolve(host, port).await?;
+        let addresses = self.resolve(host, port).await?;
 
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(FETCH_TIMEOUT)
             .no_proxy()
-            // The connection goes to the address checked above and nowhere
+            // The connection goes to the addresses checked above and nowhere
             // else, whatever the resolver would answer by the time it opens.
-            .resolve(host, address)
+            // All of them, in the resolver's order, so a host answering IPv6
+            // first is still reached from a network that routes only IPv4.
+            .resolve_to_addrs(host, &addresses)
             .build()
             .map_err(|_error| "the metadata client could not be built")?;
 
@@ -175,7 +177,7 @@ impl Fetcher {
     ///
     /// Every address, rather than the first, because a host answering one
     /// public and one private address leaves which one is dialed to chance.
-    async fn resolve(self, host: &str, port: u16) -> Result<SocketAddr, &'static str> {
+    async fn resolve(self, host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
         // `host_str` keeps the brackets on an IPv6 literal, which neither the
         // resolver nor the IP parser accepts.
         let bare = host.trim_start_matches('[').trim_end_matches(']');
@@ -187,16 +189,16 @@ impl Fetcher {
                 .collect(),
         };
 
-        let first = *addresses
-            .first()
-            .ok_or("the client id's host does not resolve")?;
+        if addresses.is_empty() {
+            return Err("the client id's host does not resolve");
+        }
         let all_allowed = addresses.iter().all(|address| {
             is_public(address.ip()) || (self.allow_loopback && address.ip().is_loopback())
         });
         if !all_allowed {
             return Err("the client id's host is not a public address");
         }
-        Ok(first)
+        Ok(addresses)
     }
 }
 

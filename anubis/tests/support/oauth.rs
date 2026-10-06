@@ -52,7 +52,6 @@ impl MetadataDocument {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port must be available");
         let address: SocketAddr = listener.local_addr().expect("the listener is bound");
-        drop(listener);
 
         let client_id = format!("http://127.0.0.1:{}/client.json", address.port());
         let document = json!({
@@ -72,8 +71,8 @@ impl MetadataDocument {
             }),
         );
 
-        let listener =
-            std::net::TcpListener::bind(address).expect("the reserved port must still be free");
+        // The listener that chose the port serves it, so no other test can
+        // take the port in between.
         listener
             .set_nonblocking(true)
             .expect("the listener must go non-blocking");

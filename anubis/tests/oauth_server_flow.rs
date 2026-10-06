@@ -505,6 +505,18 @@ async fn a_person_sees_and_revokes_their_connections() {
     let owner = register(router, &format!("owner-{}@example.com", Uuid::new_v4())).await;
     let stranger = register(router, &format!("stranger-{}@example.com", Uuid::new_v4())).await;
     let document = MetadataDocument::serve("Claude Code");
+
+    // Approved, but the program never came back for its tokens: not a
+    // connection, so not listed.
+    let abandoned = authorize(router, &authorize_params(&document.client_id, "")).await;
+    let _callback = decide(
+        router,
+        &owner,
+        &param(&abandoned, "request").expect("a request id"),
+        true,
+    )
+    .await;
+
     let connection = connect(router, &owner, &document.client_id, "notes:read").await;
 
     let (status, _headers, listed) =

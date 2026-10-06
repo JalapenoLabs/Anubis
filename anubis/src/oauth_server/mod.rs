@@ -249,6 +249,25 @@ mod tests {
         Server::new(pool, &config, Scopes::new())
     }
 
+    /// The backend redirects to the consent screen by path, so the starter's
+    /// route and this constant are one contract in two languages. The check
+    /// is textual for the same reason `spa.rs` checks the dev proxy that way,
+    /// and the starter is what `anubis new` stamps into every application.
+    #[test]
+    fn the_starter_routes_the_consent_screen_where_the_backend_sends_it() {
+        let urls = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../starter/frontend/src/urls.ts"
+        ))
+        .expect("the starter's urls are readable");
+
+        assert!(
+            urls.contains(&format!("consent: '{}'", super::CONSENT_PATH)),
+            "starter/frontend/src/urls.ts must route UrlTree.consent at {}",
+            super::CONSENT_PATH,
+        );
+    }
+
     #[test]
     fn the_resource_is_the_mcp_endpoint_under_app_url() {
         let server = server("https://app.example.com/");

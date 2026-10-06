@@ -2,7 +2,7 @@
 //!
 //! | Route | Effect |
 //! |---|---|
-//! | `GET /oauth/connections` | The signed-in account's live grants, newest first |
+//! | `GET /oauth/connections` | The account's live grants that received tokens, newest first |
 //! | `DELETE /oauth/connections/{grant_id}` | Revoke one, ending the connection whole |
 //!
 //! Both are session routes, the browser managing what the browser approved. A
@@ -26,7 +26,7 @@ use crate::oauth_server::authorize::ClientView;
 use crate::oauth_server::client::ClientRow;
 use crate::oauth_server::grant::{self, Grant};
 use crate::oauth_server::{Scope, Server};
-use crate::schema::{oauth_clients, oauth_grants};
+use crate::schema::{oauth_clients, oauth_grants, oauth_refresh_tokens};
 
 /// One connected client, as the account screen lists it.
 #[derive(Debug, Serialize)]
@@ -53,6 +53,12 @@ pub(crate) async fn list(
         .inner_join(oauth_clients::table)
         .filter(oauth_grants::user_id.eq(user.id))
         .filter(oauth_grants::revoked_at.is_null())
+        // Approving creates the grant before the program exchanges its code.
+        // A program that never came back for its tokens never connected, so
+        // the account does not list it.
+        .filter(diesel::dsl::exists(
+            oauth_refresh_tokens::table.filter(oauth_refresh_tokens::grant_id.eq(oauth_grants::id)),
+        ))
         .order(oauth_grants::created_at.desc())
         .select((Grant::as_select(), ClientRow::as_select()))
         .load(&mut connection)

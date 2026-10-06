@@ -124,7 +124,7 @@ Expired rows are swept as a grant issues tokens and as requests are stored. A sp
 
 The consent screen is the application's SPA at `/consent`, the path `anubis::oauth_server::CONSENT_PATH` names and the starter's `UrlTree.consent` matches. It names the client, the host that vouches for it (a metadata document's host, which the client cannot fake) or a warning that nobody does, the host the code goes to with a warning when that is a program on this device, the scopes with their descriptions, and the account it will act as.
 
-Security settings list the connected apps with a revoke button, through `useConnectedClients` in `@jalapenolabs/anubis`. Revoking ends the grant on the server first, so a row disappears only once its tokens have stopped working.
+Security settings list the connected apps with a revoke button. A grant is listed once its program exchanged the code for tokens: approving creates the grant first, and a program that never came back for its tokens never connected, through `useConnectedClients` in `@jalapenolabs/anubis`. Revoking ends the grant on the server first, so a row disappears only once its tokens have stopped working.
 
 ## Audit
 
