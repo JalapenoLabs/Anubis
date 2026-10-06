@@ -139,6 +139,18 @@ const CLIENT_REGISTRATIONS: u32 = 10;
 /// The window [`CLIENT_REGISTRATIONS`] is spent over.
 const CLIENT_REGISTRATION_PERIOD: Duration = Duration::from_hours(1);
 
+/// OAuth authorization requests one client address may start per
+/// [`AUTHORIZATION_PERIOD`].
+///
+/// A person connects a program a handful of times, retries included. The
+/// endpoint is unauthenticated and may fetch a client's metadata document from
+/// a URL the request names, so the budget is what keeps it from being a way to
+/// make this server fetch the internet on a stranger's behalf.
+const AUTHORIZATIONS: u32 = 30;
+
+/// The window [`AUTHORIZATIONS`] is spent over.
+const AUTHORIZATION_PERIOD: Duration = Duration::from_hours(1);
+
 /// How many keys the limiter tracks before it starts evicting.
 ///
 /// At roughly a hundred bytes per key this bounds the map at a few megabytes,
@@ -186,6 +198,9 @@ pub enum Budget {
     /// Table spam: OAuth Dynamic Client Registration. See
     /// [`crate::oauth_server`].
     ClientRegistration,
+    /// Fetch amplification: OAuth authorization requests, which may fetch a
+    /// client's metadata document. See [`crate::oauth_server`].
+    Authorization,
 }
 
 impl Budget {
@@ -199,6 +214,7 @@ impl Budget {
             Self::EmailPerRecipient => EMAILS_PER_RECIPIENT,
             Self::ErrorReports => ERROR_REPORTS,
             Self::ClientRegistration => CLIENT_REGISTRATIONS,
+            Self::Authorization => AUTHORIZATIONS,
         }
     }
 
@@ -211,6 +227,7 @@ impl Budget {
             Self::EmailPerClient | Self::EmailPerRecipient => EMAIL_PERIOD,
             Self::ErrorReports => ERROR_REPORT_PERIOD,
             Self::ClientRegistration => CLIENT_REGISTRATION_PERIOD,
+            Self::Authorization => AUTHORIZATION_PERIOD,
         }
     }
 
@@ -229,6 +246,7 @@ impl Budget {
             Self::EmailPerRecipient => "email-recipient",
             Self::ErrorReports => "error-reports",
             Self::ClientRegistration => "client-registration",
+            Self::Authorization => "authorization",
         }
     }
 }

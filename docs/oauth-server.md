@@ -62,6 +62,7 @@ A client whose `client_id` is an `https` URL, such as Claude Code's `https://cla
 - The URL is `https`, has a path, carries no fragment, credentials, or dot segments, and is already canonical.
 - The host is resolved here, **every** address must be public (no private, loopback, link-local, shared, documentation, reserved, or multicast range, and no IPv6 prefix that maps one back in), and the connection is pinned to the checked address, so a DNS answer that changes in between cannot point the fetch inside the network.
 - No redirects, only a `200` is a document, at most five kilobytes are read, five seconds in all.
+- `/oauth/authorize`, which is where a fetch is triggered, takes thirty requests an hour per client address (`Budget::Authorization`), so the endpoint cannot be used to make this server fetch the internet on a stranger's behalf.
 - The document's `client_id` must equal the URL, it must name the client and 1 to 10 redirect URIs this server would register, and it must not describe a client that authenticates with a shared secret.
 - It is cached per its `Cache-Control`, between five minutes and a day, an hour when it says nothing. A failed fetch is never cached and refuses the request rather than falling back to a stale row.
 

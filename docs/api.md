@@ -103,6 +103,7 @@ Tokens are attempt-limited individually, but the endpoints that accept them woul
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /auth/verify-email/request` | 20 per hour | Client address |
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /tenancy/invitations` | 5 per hour | Target email address |
 | `POST /oauth/register` | 10 per hour | Client address |
+| `GET /oauth/authorize` | 30 per hour | Client address |
 
 Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on.
 

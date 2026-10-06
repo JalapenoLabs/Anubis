@@ -183,8 +183,9 @@ impl Server {
 
 /// Returns the authorization server's routes, to merge at the root.
 ///
-/// The limiter is the application's one [`RateLimiter`], because registration
-/// is charged per client address like every other unauthenticated write.
+/// The limiter is the application's one [`RateLimiter`]: registration and
+/// authorization are charged per client address, because both are open to
+/// strangers and authorization may fetch a URL the request names.
 /// Session routes resolve [`crate::auth::CurrentUser`] through the pool this
 /// router layers on itself.
 pub fn router(server: &Server, rate_limit: &RateLimiter) -> Router {
@@ -205,7 +206,10 @@ pub fn router(server: &Server, rate_limit: &RateLimiter) -> Router {
             "/oauth/register",
             post(client::register).layer(rate_limit.layer(Budget::ClientRegistration)),
         )
-        .route("/oauth/authorize", get(authorize::authorize))
+        .route(
+            "/oauth/authorize",
+            get(authorize::authorize).layer(rate_limit.layer(Budget::Authorization)),
+        )
         .route(
             "/oauth/requests/{request_id}",
             get(authorize::show).post(authorize::decide),
