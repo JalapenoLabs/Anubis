@@ -135,6 +135,19 @@ webauthn-rs-proto = "=0.6.1-dev"
 # named here because `anubis::auth::secret_box` uses it directly.
 zeroize = "1"
 
+# Dev and test builds keep line tables only: panics and backtraces still name
+# file and line, while binaries shrink several-fold, because full DWARF for
+# every dependency is most of what fills target/debug. Incremental compilation
+# is off because its session snapshots pile up without bound (tens of gigabytes
+# per checkout); an edit-rebuild loop costs a little more in exchange.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# Dependencies are never stepped through, so they carry no debug info at all.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"

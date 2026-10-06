@@ -7,6 +7,19 @@ members = [
   "backend",
 ]
 
+# Dev and test builds keep line tables only: panics and backtraces still name
+# file and line, while binaries shrink several-fold, because full DWARF for
+# every dependency is most of what fills target/debug. Incremental compilation
+# is off because its session snapshots pile up without bound (tens of gigabytes
+# per checkout); an edit-rebuild loop costs a little more in exchange.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# Dependencies are never stepped through, so they carry no debug info at all.
+[profile.dev.package."*"]
+debug = false
+
 # The framework's lint bar, stamped with the application so generated and
 # hand-written code are held to the same standard. Relax entries freely; they
 # are yours now.

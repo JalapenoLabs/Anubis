@@ -740,6 +740,10 @@ The stamped workflow holds the application to the framework's own bar, on GitHub
 
 A stamped app configures development through one file. `.env.example` is committed and holds development values; `yarn dev` copies it to `.env` when there is none, then loads it, and passes it to `docker compose --env-file .env`. The database credentials therefore live in exactly one place: compose interpolates them (with the same values as defaults, so a bare `docker compose up` still works) and the backend reads `DATABASE_URL` from the same file. The database is named after the application, and each stamp mints its own development password, so no two applications ship the same default.
 
+### Build profile
+
+The stamped workspace `Cargo.toml` sets `[profile.dev]` to line tables only, with no debug info for dependencies and no incremental compilation, and the framework's own workspace does the same. Full debug info and incremental snapshots are what grow a `target/debug` to tens of gigabytes over a few weeks of rebuilds, since Cargo never deletes an old artifact. Backtraces still name file and line; an application that wants a debugger's variable view sets `debug = true` on its own crates.
+
 ### License
 
 Applications are private by default: `"license": "UNLICENSED"` in `package.json` and no LICENSE file. `anubis new <name> --license mit` writes an MIT LICENSE stamped with the current year and a placeholder for the copyright holder, and sets the manifest field to match.
