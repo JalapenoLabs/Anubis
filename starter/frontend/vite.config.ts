@@ -43,6 +43,14 @@ export default defineConfig({
       // Incoming webhooks, so a provider's test delivery can be pointed at a
       // tunnel to the dev server.
       '/webhooks': 'http://127.0.0.1:3000',
+      // The MCP endpoint, the OAuth authorization server behind it, and the
+      // discovery documents a connecting client reads first. APP_URL names
+      // this dev server, so a client pointed at it in development is issued
+      // tokens for this origin's /mcp, and the Host header the proxy keeps is
+      // the one the endpoint checks.
+      '/mcp': 'http://127.0.0.1:3000',
+      '/oauth': 'http://127.0.0.1:3000',
+      '/.well-known': 'http://127.0.0.1:3000',
       // Avatars are served publicly, outside the authenticated prefixes.
       '/users': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',

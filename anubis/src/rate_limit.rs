@@ -126,6 +126,19 @@ const ERROR_REPORTS: u32 = 30;
 /// The window [`ERROR_REPORTS`] is spent over.
 const ERROR_REPORT_PERIOD: Duration = Duration::from_hours(1);
 
+/// OAuth clients one client address may register per
+/// [`CLIENT_REGISTRATION_PERIOD`].
+///
+/// A program registers once per person connecting it, and Claude and Codex
+/// prefer a metadata document and never register at all when this server
+/// supports one, so ten an hour is far past an honest caller. The endpoint is
+/// open to strangers and each registration is a row, so the budget is the first
+/// of the bounds `docs/oauth-server.md` describes.
+const CLIENT_REGISTRATIONS: u32 = 10;
+
+/// The window [`CLIENT_REGISTRATIONS`] is spent over.
+const CLIENT_REGISTRATION_PERIOD: Duration = Duration::from_hours(1);
+
 /// How many keys the limiter tracks before it starts evicting.
 ///
 /// At roughly a hundred bytes per key this bounds the map at a few megabytes,
@@ -170,6 +183,9 @@ pub enum Budget {
     /// Issue spam: a browser reporting its own failures. See
     /// [`crate::reporting`].
     ErrorReports,
+    /// Table spam: OAuth Dynamic Client Registration. See
+    /// [`crate::oauth_server`].
+    ClientRegistration,
 }
 
 impl Budget {
@@ -182,6 +198,7 @@ impl Budget {
             Self::EmailPerClient => EMAILS_PER_CLIENT,
             Self::EmailPerRecipient => EMAILS_PER_RECIPIENT,
             Self::ErrorReports => ERROR_REPORTS,
+            Self::ClientRegistration => CLIENT_REGISTRATIONS,
         }
     }
 
@@ -193,6 +210,7 @@ impl Budget {
             Self::Registration => REGISTRATION_PERIOD,
             Self::EmailPerClient | Self::EmailPerRecipient => EMAIL_PERIOD,
             Self::ErrorReports => ERROR_REPORT_PERIOD,
+            Self::ClientRegistration => CLIENT_REGISTRATION_PERIOD,
         }
     }
 
@@ -210,6 +228,7 @@ impl Budget {
             Self::EmailPerClient => "email-client",
             Self::EmailPerRecipient => "email-recipient",
             Self::ErrorReports => "error-reports",
+            Self::ClientRegistration => "client-registration",
         }
     }
 }

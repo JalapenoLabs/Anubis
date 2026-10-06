@@ -17,8 +17,8 @@ use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::{db, server, telemetry};
 use anubis_starter::{
-    APP_MIGRATIONS, BILLING_YML, ROLES_YML, account_router, api_v1_router, openapi, register_jobs,
-    webhooks_router,
+    APP_MIGRATIONS, BILLING_YML, ROLES_YML, account_router, api_v1_router, mcp_tools, oauth_scopes,
+    openapi, register_jobs, webhooks_router,
 };
 use axum::Router;
 use mimalloc::MiMalloc;
@@ -47,22 +47,7 @@ async fn main() {
     let config = AppConfig::from_env().expect("invalid environment configuration");
     telemetry::init(&config).expect("failed to install the tracing subscriber");
 
-    // Validated at boot so a bad roles.yml edit can never reach traffic.
-    let roles = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml is invalid");
-    tracing::info!(
-        roles.count = roles.role_keys().count(),
-        "role definitions loaded: {{roles.count}} roles",
-    );
-
-    // Same discipline as roles: a bad billing.yml edit stops the boot rather
-    // than a customer's checkout.
-    let plans = PlanSet::from_yaml(BILLING_YML).expect("config/billing.yml is invalid");
-    tracing::info!(
-        billing.plan.count = plans.plans().len(),
-        billing.plan.free = plans.free().key(),
-        "subscription plans loaded: {{billing.plan.count}} plans, free plan \
-         {{billing.plan.free}}",
-    );
+    let (roles, plans) = definitions();
 
     let database = config
         .database
@@ -167,6 +152,7 @@ async fn main() {
             anubis::api::v1::router_with(pool.clone(), api_v1_router(&pool, &roles), openapi()),
         )
         .nest("/account", account_router(&pool, &roles))
+        .merge(connected_clients(&pool, &config, &rate_limit))
         // Incoming webhooks from third parties. Unauthenticated on purpose,
         // and mounted outside /account so no guard ever asks a provider for a
         // session it does not have.
@@ -198,6 +184,49 @@ async fn main() {
     working
         .await
         .expect("the job worker must shut down cleanly");
+}
+
+/// The application's roles and plans, validated before anything is served.
+///
+/// # Panics
+/// Panics when either file is invalid, so a bad edit stops the boot.
+fn definitions() -> (RoleSet, PlanSet) {
+    // Validated at boot so a bad roles.yml edit can never reach traffic.
+    let roles = RoleSet::from_yaml(ROLES_YML).expect("config/roles.yml is invalid");
+    tracing::info!(
+        roles.count = roles.role_keys().count(),
+        "role definitions loaded: {{roles.count}} roles",
+    );
+
+    // Same discipline as roles: a bad billing.yml edit stops the boot rather
+    // than a customer's checkout.
+    let plans = PlanSet::from_yaml(BILLING_YML).expect("config/billing.yml is invalid");
+    tracing::info!(
+        billing.plan.count = plans.plans().len(),
+        billing.plan.free = plans.free().key(),
+        "subscription plans loaded: {{billing.plan.count}} plans, free plan \
+         {{billing.plan.free}}",
+    );
+
+    (roles, plans)
+}
+
+/// The OAuth authorization server and the MCP endpoint its tokens open.
+///
+/// A person adds this deployment's `/mcp` to Claude Code, Claude Desktop, or
+/// Codex, signs in once in the browser, and approves the client; from then on
+/// the client calls the application's tools as them. Both routers merge at the
+/// root, because the discovery documents live at well-known paths RFC 8414 and
+/// RFC 9728 fix. See docs/oauth-server.md and docs/mcp.md.
+fn connected_clients(
+    pool: &anubis::db::DbPool,
+    config: &AppConfig,
+    rate_limit: &anubis::rate_limit::RateLimiter,
+) -> Router {
+    let authorization = anubis::oauth_server::Server::new(pool.clone(), config, oauth_scopes());
+    Router::new()
+        .merge(anubis::oauth_server::router(&authorization, rate_limit))
+        .merge(anubis::mcp::router(&authorization, mcp_tools()))
 }
 
 /// Puts the built frontend behind `app`, when this process is serving it.

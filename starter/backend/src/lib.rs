@@ -104,6 +104,31 @@ pub fn webhooks_router(pool: &DbPool) -> Router {
     router
 }
 
+/// The scopes a connected client may ask this application for.
+///
+/// Each is one permission a person approves on the consent screen, named the
+/// way it reads in a token (`projects:read`) and described the way it reads on
+/// that screen. None are declared yet: a connection still proves who it acts
+/// for, which is all the framework's `whoami` tool needs. Declare a scope here
+/// before a tool in [`mcp_tools`] requires it; see `docs/oauth-server.md`.
+#[must_use]
+pub fn oauth_scopes() -> anubis::oauth_server::Scopes {
+    anubis::oauth_server::Scopes::new()
+}
+
+/// The tools Claude Code, Claude Desktop, or Codex may call once connected.
+///
+/// Every tool runs as the person who approved the connection, through
+/// `ToolCall::caller`, under the scopes they granted. One statement per tool,
+/// for the same reason [`account_router`] mounts one router per statement.
+/// See `docs/mcp.md`.
+#[must_use]
+pub fn mcp_tools() -> anubis::mcp::Registry {
+    let mut tools = anubis::mcp::Registry::new("Anubis starter", env!("CARGO_PKG_VERSION"));
+    tools = tools.tool(anubis::mcp::whoami());
+    tools
+}
+
 /// The application's own background jobs, registered on the worker.
 ///
 /// `main.rs` builds the worker with the framework's jobs and hands it here, so

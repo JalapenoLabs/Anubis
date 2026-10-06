@@ -24,6 +24,7 @@
 
 mod database;
 mod harness;
+pub mod oauth;
 mod passkey;
 pub mod socket;
 
