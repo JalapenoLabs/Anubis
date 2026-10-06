@@ -138,6 +138,51 @@ export type OauthProvider = {
   displayName: string
 }
 
+/** One permission a connected client may hold, as the consent screen explains it. */
+export type OauthScope = {
+  /** The wire name, such as `samples:read`. */
+  name: string
+  /** What granting it lets the client do, written for the person approving. */
+  description: string
+}
+
+/**
+ * A program asking to act for the signed-in person, such as Claude Code.
+ *
+ * `name` is the client's own word. `verifiedHost` is the host that published
+ * the client's metadata document, which the client cannot fake, and is null
+ * for a client that registered itself: a screen shows the difference.
+ */
+export type OauthClient = {
+  name: string
+  clientId: string
+  kind: 'metadata_document' | 'dynamic'
+  verifiedHost: string | null
+  clientUri: string | null
+}
+
+/** What the consent screen asks the person to approve. */
+export type AuthorizationRequest = {
+  id: string
+  client: OauthClient
+  /** Where the code goes, which the screen must show. */
+  redirectHost: string
+  /** True when the code goes to a program on this device, worth a warning. */
+  redirectIsLoopback: boolean
+  scopes: OauthScope[]
+  expiresAt: string
+}
+
+/** One client the person connected, as account settings list it. */
+export type ConnectedClient = {
+  /** The grant's id, which revoking takes. */
+  id: string
+  client: OauthClient
+  scopes: OauthScope[]
+  createdAt: string
+  lastUsedAt: string
+}
+
 /** A started passkey registration: the browser's options plus the ceremony's token. */
 export type PasskeyRegistrationChallenge = {
   stateToken: string

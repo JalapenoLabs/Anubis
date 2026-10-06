@@ -27,6 +27,8 @@ import { ResetPasswordPage } from './pages/auth/ResetPasswordPage'
 import { SignInPage } from './pages/auth/SignInPage'
 import { SignUpPage } from './pages/auth/SignUpPage'
 import { VerifyEmailPage } from './pages/auth/VerifyEmailPage'
+import { ConsentErrorPage } from './pages/oauth/ConsentErrorPage'
+import { ConsentPage } from './pages/oauth/ConsentPage'
 // 🐺 anubis:page-imports
 
 // Misc
@@ -34,6 +36,8 @@ import { TeamProvider } from './context/TeamProvider'
 
 // Misc
 import {
+  AUTH_ERROR_PARAM,
+  CONSENT_REQUEST_PARAM,
   DESTINATION_PARAM,
   POST_SIGN_IN_REDIRECT_TO,
   UNKNOWN_ROUTE_REDIRECT_TO,
@@ -98,6 +102,27 @@ function Workspace(props: GateProps) {
     <TeamProvider>{
         props.children
       }</TeamProvider>
+  </RequireAuth>
+}
+
+/**
+ * The consent screen, or why there is none.
+ *
+ * A request needs the person signed in, so it passes the auth gate, which
+ * brings them back here afterwards. An error needs nothing: the backend could
+ * not trust the program, and saying so is not the person's business to sign
+ * in for.
+ */
+function ConsentRoute() {
+  const [ searchParams ] = useSearchParams()
+
+  const error = searchParams.get(AUTH_ERROR_PARAM)
+  if (error) {
+    return <ConsentErrorPage code={error} />
+  }
+
+  return <RequireAuth>
+    <ConsentPage requestId={searchParams.get(CONSENT_REQUEST_PARAM) ?? ''} />
   </RequireAuth>
 }
 
@@ -211,6 +236,10 @@ export function App() {
           <ClaimInvitationPage />
         </RequireAuth>
       }
+    />
+    <Route
+      path={UrlTree.consent}
+      element={<ConsentRoute />}
     />
     <Route
       path={UrlTree.signIn}

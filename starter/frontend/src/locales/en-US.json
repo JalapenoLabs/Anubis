@@ -188,6 +188,19 @@
         "current": "This browser",
         "revoke": "Sign out"
       },
+      "connectedClients": {
+        "title": "Connected apps",
+        "subtitle": "Programs you let act as you, such as Claude Code or Codex. Revoking one signs it out at once.",
+        "empty": "No apps are connected. Add this site as an MCP server in Claude Code, Claude Desktop, or Codex to connect one.",
+        "app": "App",
+        "permissions": "Permissions",
+        "identityOnly": "Who you are",
+        "connected": "Connected {{date}}",
+        "lastUsed": "Last used",
+        "verifiedBy": "Published by {{host}}",
+        "unverified": "Self-registered",
+        "revoke": "Revoke"
+      },
       "danger": {
         "title": "Delete this account",
         "subtitle": "Your account, and everything only you own, is deleted immediately. This cannot be undone.",
@@ -422,6 +435,30 @@
       "paused": "Paused",
       "incomplete": "Incomplete",
       "incomplete_expired": "Expired"
+    }
+  },
+  "oauth": {
+    "consent": {
+      "title": "Connect {{client}}",
+      "subtitle": "{{client}} is asking to act as you on this site.",
+      "verifiedBy": "Published by {{host}}, which vouches for this app's name.",
+      "unverified": "This app registered itself, so nobody vouches for its name. Only continue if you started this connection yourself.",
+      "redirect": "After you decide, you go back to {{host}}.",
+      "loopbackWarning": "That address is a program on this computer. Continue only if you just ran a command or clicked a button that asked to connect.",
+      "permissions": "It will be able to:",
+      "identityOnly": "Know who you are. It asks for no other permission.",
+      "signedInAs": "You are signed in as {{email}}.",
+      "approve": "Allow",
+      "deny": "Deny",
+      "expired": "This request expired or was already answered. Start the connection again from the app."
+    },
+    "errors": {
+      "title": "This connection cannot continue",
+      "invalid_client": "The app that sent you here is not one this site recognizes.",
+      "invalid_redirect_uri": "The app asked to send you somewhere it never registered, so this site stopped it.",
+      "invalid_request": "The app's request was incomplete.",
+      "server_error": "Something went wrong on our side. Try connecting again.",
+      "unknown": "The app's request could not be completed. Try connecting again from the app."
     }
   }
 }

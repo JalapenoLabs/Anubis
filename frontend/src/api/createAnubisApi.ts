@@ -11,6 +11,7 @@ import { createAccountRoutes } from './routes/accountRoutes'
 import { createAuthRoutes } from './routes/authRoutes'
 import { createBillingRoutes } from './routes/billingRoutes'
 import { createNotificationRoutes } from './routes/notificationRoutes'
+import { createOauthRoutes } from './routes/oauthRoutes'
 import { createTenancyRoutes } from './routes/tenancyRoutes'
 
 type AnubisApiOptions = {
@@ -79,6 +80,7 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     ...createTenancyRoutes(client),
     ...createBillingRoutes(client),
     ...createNotificationRoutes(client),
+    ...createOauthRoutes(client),
     totpQrUrl,
     avatarUrl,
   } as const
