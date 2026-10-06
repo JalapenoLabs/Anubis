@@ -49,6 +49,18 @@ let mailer = Mailer::custom(Arc::new(Provider { /* .. */ }));
 
 `Email::params` carries the values the body was built from. The keys each kind carries are documented on `EmailKind` and are the framework's contract with a transport, so removing one is a breaking change.
 
+| Kind | Sent when | Parameters |
+|---|---|---|
+| `VerifyEmailAddress` | An account registers, or asks for a new link | `link` |
+| `SignInCode` | Somebody asks to sign in by emailed code | `code`, `minutes` |
+| `ResetPassword` | Somebody asks to reset a password | `link` |
+| `ConfirmEmailChange` | An account moves to a new address | `link` |
+| `Invitation` | A team or organization admin invites somebody | `link`, `inviter`, `target`, `days` |
+| `PlatformInvitation` | An operator invites somebody to open an account on the deployment | `link`, `inviter`, `hours` |
+| `Application(name)` | The application sends one of its own | whatever the application adds |
+
+`PlatformInvitation` names no tenant, because it is not an invitation into one: its `link` opens `/accept-invitation?token=` on the application, where the person chooses their first password and the account is created. `inviter` is the operator's name, or their address when they have none, and `hours` is how long the link works, which is `anubis::platform::INVITATION_TTL_HOURS` (24). A resend mails the same kind again with a fresh link and the previous one stops working. See [tenancy.md](tenancy.md#bringing-people-in).
+
 Every email still carries `text_body`, and always will. It is what the log and test backends show, what a relay sends, and what a transport falls back to for a kind it has no template for.
 
 `Error::transport` builds the error the trait returns. Say what failed rather than what it was carrying: the message is logged, and an email's parameters hold one-time codes and action links.

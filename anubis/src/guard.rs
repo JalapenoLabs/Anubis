@@ -107,6 +107,14 @@ pub struct PlatformMember {
 }
 
 impl PlatformMember {
+    /// The compiled role set the guard admitted this operator against.
+    ///
+    /// Read by the platform primitives that grant a role, so the role an
+    /// operator hands out is checked against the same file that admitted them.
+    pub(crate) fn roles(&self) -> &RoleSet {
+        &self.roles
+    }
+
     /// Returns `true` when a held platform role grants the action on the model.
     #[must_use]
     pub fn can(&self, action: Action, model: &str) -> bool {

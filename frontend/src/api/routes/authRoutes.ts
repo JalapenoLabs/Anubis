@@ -2,6 +2,8 @@
 
 import type {
   Credentials,
+  InvitationAcceptance,
+  InvitationPreview,
   MessageEnvelope,
   MfaStatus,
   OauthProvider,
@@ -99,6 +101,40 @@ export function createAuthRoutes(client: KyInstance) {
     return client
       .post('auth/password-reset/confirm', { json: { token, password }})
       .json<MessageEnvelope>()
+  }
+
+  /**
+   * Reads the address an operator's invitation was sent to.
+   *
+   * Rejects with a `400` for a link that is unknown, already used, revoked,
+   * or expired, all with the same message, so a page cannot tell which.
+   */
+  async function lookupInvitation(token: string): Promise<InvitationPreview> {
+    const response = await client
+      .post('auth/invitations/lookup', { json: { token }})
+      .json<{ email: string, expires_at: string }>()
+    return {
+      email: response.email,
+      expiresAt: response.expires_at,
+    }
+  }
+
+  /**
+   * Accepts an invitation: sets the first password, creates the account, and
+   * signs it in, with the address already verified.
+   */
+  async function acceptInvitation(token: string, acceptance: InvitationAcceptance): Promise<User> {
+    const response = await client
+      .post('auth/invitations/accept', {
+        json: {
+          token,
+          password: acceptance.password,
+          time_zone: acceptance.timeZone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone,
+          locale: acceptance.locale,
+        },
+      })
+      .json<WireUserEnvelope>()
+    return toUser(response.user)
   }
 
   /**
@@ -248,6 +284,8 @@ export function createAuthRoutes(client: KyInstance) {
     confirmEmailVerification,
     requestPasswordReset,
     confirmPasswordReset,
+    lookupInvitation,
+    acceptInvitation,
     requestEmailSignInCode,
     verifyEmailSignInCode,
     listOauthProviders,

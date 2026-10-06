@@ -13,6 +13,8 @@
 //! | `POST /verify-email/confirm` | Confirm the emailed verification token |
 //! | `POST /password-reset/request` | Email a reset link (never reveals account existence) |
 //! | `POST /password-reset/confirm` | Set a new password, revoking every session |
+//! | `POST /invitations/lookup` | Read the address an operator's invitation is for |
+//! | `POST /invitations/accept` | Set a password, create the invited account, sign in |
 //!
 //! Login and password-reset requests respond identically whether or not the
 //! email is registered, in both message and timing, so responses do not leak
@@ -38,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audit;
-use crate::auth::extract::CurrentUser;
+use crate::auth::extract::{CurrentUser, SignedIn};
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
 use crate::auth::session::SignInMethod;
@@ -100,6 +102,7 @@ pub fn router(
             post(request_password_reset).layer(rate_limit.layer(Budget::EmailPerClient)),
         )
         .route("/password-reset/confirm", post(confirm_password_reset))
+        .merge(crate::auth::invitation::router(rate_limit))
         .merge(crate::auth::account::router())
         .merge(crate::auth::email_code::router(rate_limit))
         .merge(crate::auth::mfa::router(rate_limit))
@@ -350,9 +353,13 @@ async fn logout(
     Ok((jar.remove(removal), StatusCode::NO_CONTENT))
 }
 
+/// Answers the signed-in account, a temporary password included.
+///
+/// Takes [`SignedIn`] rather than [`CurrentUser`], because reading the flag is
+/// how the SPA learns it must send the person to change their password.
 async fn me(
     State(state): State<AuthState>,
-    CurrentUser(user): CurrentUser,
+    SignedIn(user): SignedIn,
 ) -> Result<Json<UserBody>, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
@@ -542,8 +549,13 @@ async fn confirm_password_reset(
 
     let password_hash = state.hasher.hash(body.password).await?;
 
+    // A password the account chose through its own inbox replaces any
+    // temporary one an operator set, so the flag goes with it.
     diesel::update(users::table.find(user_id))
-        .set((users::password_hash.eq(&password_hash),))
+        .set((
+            users::password_hash.eq(&password_hash),
+            users::password_change_required.eq(false),
+        ))
         .execute(&mut connection)
         .await
         .map_err(log_internal)?;
@@ -704,8 +716,9 @@ fn validate_credentials(body: CredentialsBody) -> Result<ValidCredentials, ApiEr
 /// Held to the bound `PATCH /profile` applies, but a value outside it is
 /// dropped rather than refused: the browser chose it, not the person, and a
 /// sign-up that failed over a time zone would lose the account for a setting
-/// they can change in a second afterwards.
-fn registration_preference(raw: Option<String>, label: &str) -> Option<String> {
+/// they can change in a second afterwards. Accepting an invitation is a
+/// sign-up too, so it reads the same rule.
+pub(crate) fn registration_preference(raw: Option<String>, label: &str) -> Option<String> {
     let trimmed = raw?.trim().to_owned();
     if trimmed.is_empty() || trimmed.chars().count() > crate::auth::account::MAX_FIELD_CHARS {
         tracing::debug!(

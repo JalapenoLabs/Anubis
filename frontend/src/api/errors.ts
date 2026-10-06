@@ -7,6 +7,17 @@ import { HTTPError } from 'ky'
 const TOO_MANY_REQUESTS = 429
 
 /**
+ * The code a `403` carries when the account must change its password first.
+ *
+ * An operator set a temporary password, and until the account chooses its
+ * own, every authenticated route but `me`, changing the password, and signing
+ * out refuses it with this. Match on it with `getApiErrorCode` and send the
+ * person to the change-password screen; the message is copy and may change,
+ * the code will not.
+ */
+export const PASSWORD_CHANGE_REQUIRED = 'password_change_required'
+
+/**
  * Extracts the backend's user-safe error message from a failed request.
  *
  * Anubis endpoints answer errors as `{"message": "..."}`, which ky pre-parses
@@ -30,6 +41,33 @@ export function getApiErrorMessage(error: unknown): string | null {
   }
 
   console.debug('getApiErrorMessage found no message in the error body', data)
+  return null
+}
+
+/**
+ * Extracts the backend's machine-readable error code from a failed request.
+ *
+ * Most Anubis errors carry only a message. The ones a client must react to by
+ * kind, such as `PASSWORD_CHANGE_REQUIRED`, also carry a stable `code`, and
+ * this is the part of the body to branch on. Returns null when the error is
+ * not an HTTP error or names no code.
+ */
+export function getApiErrorCode(error: unknown): string | null {
+  if (!(error instanceof HTTPError)) {
+    console.debug('getApiErrorCode received a non-HTTP error', error)
+    return null
+  }
+
+  const data: unknown = error.data
+  if (
+    data
+    && typeof data === 'object'
+    && 'code' in data
+    && typeof data.code === 'string'
+  ) {
+    return data.code
+  }
+
   return null
 }
 

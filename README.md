@@ -93,10 +93,10 @@ feature categories are on the left.
 
 | Area | Status | What that means |
 |---|---|---|
-| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation, avatars, account deletion |
+| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation, avatars, account deletion, and operator-set temporary passwords that admit nothing until replaced |
 | **OAuth / SSO** | Ships | OpenID Connect with PKCE. Google in the registry; a provider is two environment variables, and `anubis scaffold oauth <provider>` prints them |
 | **Multi-tenancy** | Ships | User, TeamMembership, Team, Organization, OrganizationMembership, and Invitation. A personal organization and default team at signup. Team and organization settings screens, rosters, and the switcher |
-| **Platform tier** | Partial | A role scoped to `platform` is held on the account and operates the whole deployment, behind the `PlatformMember` guard. `ANUBIS_INITIAL_ADMIN_EMAIL` appoints the first operator at boot. No operator screens yet, and the scaffolder still chains every model to a Team |
+| **Platform tier** | Partial | A role scoped to `platform` is held on the account and operates the whole deployment, behind the `PlatformMember` guard. `ANUBIS_INITIAL_ADMIN_EMAIL` appoints the first operator at boot, and operators invite people (optionally as operators) with 24-hour links the invitee accepts by choosing a password. The primitives ship; operator screens do not yet, and the scaffolder still chains every model to a Team |
 | **Roles and permissions** | Ships | One `config/roles.yml`, compiled to a Rust authorization module and a TypeScript affordances module, drift-gated in CI. Four tiers a role may be scoped to: `platform`, `organization`, `sub_tenant`, `team` |
 | **Scaffolding** | Ships | `scaffold model`, `field`, `join`, `oauth`, `webhook`. Six field spellings today (`text_field`, `text_area`, `number_field`, `boolean`, `date_field`, and `super_select` for both association shapes). Three levels of ownership |
 | **Field components** | Ships | Eighteen React controls in `@jalapenolabs/anubis`, including rich text, a code editor, and file and image pickers. The generator's table is the subset the living templates prove |
