@@ -100,6 +100,7 @@ feature categories are on the left.
 | **Roles and permissions** | Ships | One `config/roles.yml`, compiled to a Rust authorization module and a TypeScript affordances module, drift-gated in CI. Four tiers a role may be scoped to: `platform`, `organization`, `sub_tenant`, `team` |
 | **Scaffolding** | Ships | `scaffold model`, `field`, `join`, `oauth`, `webhook`. Six field spellings today (`text_field`, `text_area`, `number_field`, `boolean`, `date_field`, and `super_select` for both association shapes). Three levels of ownership |
 | **Field components** | Ships | Eighteen React controls in `@jalapenolabs/anubis`, including rich text, a code editor, and file and image pickers. The generator's table is the subset the living templates prove |
+| **Connected clients (MCP)** | Ships | An OAuth 2.1 authorization server (Client ID Metadata Documents, bounded dynamic registration, PKCE `S256`, rotating refresh tokens with reuse detection, revocation, both discovery documents) and an MCP endpoint at `/mcp` the application fills with tools, so Claude Code, Claude Desktop, and Codex act as the person who connected them. A consent screen and a connected apps list in settings |
 | **REST API** | Ships | Versioned `/api/v1`, per-team platform applications with bearer tokens, OpenAPI 3.1, Scalar docs, and a generated TypeScript client, all drift-gated |
 | **Outgoing webhooks** | Ships | Per-team subscriptions, HMAC-SHA256 signatures, at-least-once delivery on the job queue, a delivery log with redelivery, and a debugging screen |
 | **Incoming webhooks** | Ships | `anubis scaffold webhook <Provider>` generates the table, the store-then-process endpoint, the signature check, the job, and the test |
@@ -127,6 +128,7 @@ feature categories are on the left.
 - [Scaffolding](docs/scaffolding.md)
 - [Tenancy, teams, and organizations](docs/tenancy.md)
 - [REST API](docs/api.md)
+- [The OAuth authorization server](docs/oauth-server.md) and [the MCP endpoint](docs/mcp.md)
 - [The server](docs/server.md)
 - [Background jobs](docs/jobs.md)
 - [Webhooks](docs/webhooks.md)
