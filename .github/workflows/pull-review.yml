@@ -27,8 +27,17 @@ jobs:
   review:
     # Fork pull requests are not reviewed. The runner is self-hosted and holds
     # the reviewers' credentials, so a fork's code must never be checked out
-    # on it.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # on it. The one exception is a fork owned by an account named in the
+    # organization variable REVIEWER_TRUSTED_FORK_OWNERS, a JSON array of
+    # logins. It names the fork's owner rather than the pull request's author
+    # because the owner decides what code is on the branch, and every
+    # `synchronize` push lands there. Unset, it trusts nobody.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      || contains(
+        fromJSON(vars.REVIEWER_TRUSTED_FORK_OWNERS || '[]'),
+        github.event.pull_request.head.repo.owner.login
+      )
     runs-on: [self-hosted, reviewer]
     timeout-minutes: 45
     steps:
