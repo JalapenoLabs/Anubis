@@ -3,6 +3,7 @@
 export type {
   AppNotification,
   AuthSession,
+  AuthorizationRequest,
   BillingCheckoutRequest,
   BillingEnforcement,
   BillingOverview,
@@ -12,6 +13,7 @@ export type {
   BillingSubscription,
   ChangePasswordRequest,
   ClaimedInvitation,
+  ConnectedClient,
   CreatedOrganization,
   Credentials,
   EmailChangeRequest,
@@ -24,7 +26,9 @@ export type {
   MessageEnvelope,
   MfaStatus,
   NotificationsPage,
+  OauthClient,
   OauthProvider,
+  OauthScope,
   OrganizationRosterMember,
   Passkey,
   PasskeyLoginChallenge,
@@ -47,6 +51,7 @@ export type {
 } from './webauthn/ceremony'
 export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
+export type { ConnectedClientsResult } from './react/useConnectedClients'
 export type { CurrentUserResult } from './react/useCurrentUser'
 export type { InvitationResult } from './react/useInvitation'
 export type { MembershipsResult } from './react/useMemberships'
@@ -129,6 +134,7 @@ export {
   getRetryAfterSeconds,
 } from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
+export { useConnectedClients } from './react/useConnectedClients'
 export { useCurrentUser } from './react/useCurrentUser'
 export { useInvitation } from './react/useInvitation'
 export { useMemberships } from './react/useMemberships'

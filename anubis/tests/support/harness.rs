@@ -99,6 +99,8 @@ impl Harness {
         let (mailer, outbox) = anubis::mail::Mailer::test();
         let channels = Channels::in_process();
         let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
+        let authorization =
+            anubis::oauth_server::Server::new(pool.clone(), &config, Self::scopes());
 
         let router = Router::new()
             .nest(
@@ -131,6 +133,8 @@ impl Harness {
             )
             .merge(anubis::realtime::router(pool.clone(), channels.clone()))
             .merge(anubis::auth::avatar_router(pool.clone()))
+            .merge(anubis::oauth_server::router(&authorization, &rate_limit))
+            .merge(anubis::mcp::router(&authorization, Self::tools()))
             .layer(anubis::guard::layer(pool.clone(), roles));
 
         Self {
@@ -147,6 +151,38 @@ impl Harness {
     /// Panics when no loopback port is available.
     pub fn serve(&self) -> SocketAddr {
         serve(self.router.clone())
+    }
+
+    /// The scopes a connected client may ask for in these suites.
+    ///
+    /// Two, so a test can grant one and prove the other is refused.
+    pub fn scopes() -> anubis::oauth_server::Scopes {
+        anubis::oauth_server::Scopes::new()
+            .scope("notes:read", "Read your notes")
+            .scope("notes:write", "Write notes in your name")
+    }
+
+    /// The MCP tools these suites call: the framework's `whoami`, and one
+    /// that needs a scope, so scope enforcement has something to refuse.
+    pub fn tools() -> anubis::mcp::Registry {
+        anubis::mcp::Registry::new("Anubis test", "0.0.0")
+            .tool(anubis::mcp::whoami())
+            .tool(
+                anubis::mcp::Tool::new(
+                    "write_note",
+                    "Echo a note back, as if it were written.",
+                    |call: anubis::mcp::ToolCall| async move {
+                        Ok(json!({ "written": call.arguments["text"] }))
+                    },
+                )
+                .input_schema(json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                    "additionalProperties": false,
+                }))
+                .requires("notes:write"),
+            )
     }
 
     /// The application config these suites boot with.

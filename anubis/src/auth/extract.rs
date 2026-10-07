@@ -11,6 +11,12 @@
 //! [`SignedIn`] is the narrow exception, taken only by the routes an account
 //! must reach to get out of that state: reading itself and changing its
 //! password. Signing out reads the cookie directly and needs neither.
+//!
+//! A connected client is held to the same rule: the resource side's
+//! [`crate::oauth_server::Bearer`] refuses a flagged account through
+//! [`refuse_temporary_password`], so a program the person connected before the
+//! rescue cannot act for them while the account is still on the operator's
+//! password.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -53,20 +59,34 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let user = signed_in_user(parts).await?;
-
-        if user.password_change_required {
-            tracing::debug!(
-                user.id = %user.id,
-                "refused {{user.id}} until it replaces its temporary password",
-            );
-            return Err(
-                ApiError::forbidden("Choose a new password before you continue.")
-                    .with_code(PASSWORD_CHANGE_REQUIRED),
-            );
-        }
-
+        refuse_temporary_password(&user)?;
         Ok(Self(user))
     }
+}
+
+/// Refuses an account that must replace its temporary password first.
+///
+/// The one statement of the rule, shared by every credential that resolves to
+/// an account: the session's [`CurrentUser`] and the connected client's
+/// [`crate::oauth_server::Bearer`]. Both answer the same `403` and the same
+/// code, so a client branches on one value whichever way it signed in.
+///
+/// # Errors
+/// Returns a `403` carrying [`PASSWORD_CHANGE_REQUIRED`] when the account is
+/// on a temporary password.
+pub(crate) fn refuse_temporary_password(user: &User) -> Result<(), ApiError> {
+    if !user.password_change_required {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        user.id = %user.id,
+        "refused {{user.id}} until it replaces its temporary password",
+    );
+    Err(
+        ApiError::forbidden("Choose a new password before you continue.")
+            .with_code(PASSWORD_CHANGE_REQUIRED),
+    )
 }
 
 /// Extracts the signed-in user, admitting one that must change its password.

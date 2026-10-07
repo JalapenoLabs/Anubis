@@ -33,6 +33,16 @@ export const UrlTree = {
    */
   organizationBilling: '/organizations/:organizationId/billing',
   claimInvitation: '/claim-invitation',
+  /**
+   * Where a connecting program such as Claude Code sends the person to approve
+   * it.
+   *
+   * The backend redirects here from `/oauth/authorize`, so the path is a
+   * contract with `anubis::oauth_server::CONSENT_PATH` rather than a free
+   * choice, the same way the billing screen's is. Not under `/oauth`: the
+   * backend reserves that prefix for the protocol itself.
+   */
+  consent: '/consent',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
   /**
@@ -67,6 +77,8 @@ export const DESTINATION_PARAM = 'next'
  * another system's failure; the page maps the code to a translated string.
  */
 export const AUTH_ERROR_PARAM = 'error'
+/** Query parameter naming the authorization request the consent screen shows. */
+export const CONSENT_REQUEST_PARAM = 'request'
 
 // ///////////////////////////// //
 //         Link factories        //

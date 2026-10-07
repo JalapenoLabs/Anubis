@@ -6,6 +6,7 @@ import { useCurrentUser } from '@jalapenolabs/anubis'
 // UI
 import { ChangeEmailCard } from '../../components/settings/ChangeEmailCard'
 import { ChangePasswordCard } from '../../components/settings/ChangePasswordCard'
+import { ConnectedClientsCard } from '../../components/settings/ConnectedClientsCard'
 import { DangerZoneCard } from '../../components/settings/DangerZoneCard'
 import { PasskeysCard } from '../../components/settings/PasskeysCard'
 import { SessionsCard } from '../../components/settings/SessionsCard'
@@ -15,7 +16,10 @@ import { TwoFactorCard } from '../../components/settings/TwoFactorCard'
 // Misc
 import { UrlTree } from '../../urls'
 
-/** How the account is proven: password, address, second factor, passkeys, sessions. */
+/**
+ * How the account is proven and who acts for it: password, address, second
+ * factor, passkeys, sessions, and connected apps.
+ */
 export function SecuritySettingsPage() {
   const { user } = useCurrentUser()
 
@@ -33,6 +37,7 @@ export function SecuritySettingsPage() {
     <TwoFactorCard />
     <PasskeysCard />
     <SessionsCard />
+    <ConnectedClientsCard />
     <DangerZoneCard user={user} />
   </SettingsLayout>
 }

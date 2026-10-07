@@ -12,7 +12,7 @@
 //! | `POST /verify-email/request` | Re-send the verification email |
 //! | `POST /verify-email/confirm` | Confirm the emailed verification token |
 //! | `POST /password-reset/request` | Email a reset link (never reveals account existence) |
-//! | `POST /password-reset/confirm` | Set a new password, revoking every session |
+//! | `POST /password-reset/confirm` | Set a new password, revoking every session and connected client |
 //! | `POST /invitations/lookup` | Read the address an operator's invitation is for |
 //! | `POST /invitations/accept` | Set a password, create the invited account, sign in |
 //!
@@ -535,6 +535,7 @@ async fn request_password_reset(
 
 async fn confirm_password_reset(
     State(state): State<AuthState>,
+    context: audit::Context,
     Json(body): Json<ResetBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_password(&body.password)?;
@@ -549,20 +550,28 @@ async fn confirm_password_reset(
 
     let password_hash = state.hasher.hash(body.password).await?;
 
-    // A password the account chose through its own inbox replaces any
-    // temporary one an operator set, so the flag goes with it.
-    diesel::update(users::table.find(user_id))
-        .set((
-            users::password_hash.eq(&password_hash),
-            users::password_change_required.eq(false),
-        ))
-        .execute(&mut connection)
-        .await
-        .map_err(log_internal)?;
+    connection
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            // A password the account chose through its own inbox replaces any
+            // temporary one an operator set, so the flag goes with it.
+            let user: User = diesel::update(users::table.find(user_id))
+                .set((
+                    users::password_hash.eq(&password_hash),
+                    users::password_change_required.eq(false),
+                ))
+                .returning(User::as_returning())
+                .get_result(transaction)
+                .await?;
 
-    // A reset proves the old credentials may be compromised; no session
-    // created under them survives.
-    session::delete_all_for_user(&mut connection, user_id)
+            // A reset proves the old credentials may be compromised: no
+            // session created under them survives, and neither does any
+            // program connected under them. The account is the actor, since
+            // it proved itself through its inbox.
+            session::delete_all_for_user(transaction, user_id).await?;
+            crate::oauth_server::revoke_every_grant(transaction, &context.by(&user), user_id)
+                .await?;
+            Ok(())
+        })
         .await
         .map_err(log_internal)?;
 

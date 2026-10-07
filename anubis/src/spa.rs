@@ -111,6 +111,11 @@ const REVALIDATE: HeaderValue = HeaderValue::from_static("no-cache");
 /// deliberately absent, being exact routes with nothing nested under them:
 /// they always match their own router and so can never reach the fallback.
 pub const RESERVED_PREFIXES: &[&str] = &[
+    // OAuth discovery documents. A client probing for one this server does not
+    // publish, `openid-configuration` for instance, must read a `404` and move
+    // on, where the SPA's `200` and an HTML page would read as a broken
+    // document.
+    "/.well-known",
     // The signed-in user's own surface: the framework's notification inbox,
     // and the account routes an application mounts beside it.
     "/account",
@@ -118,6 +123,11 @@ pub const RESERVED_PREFIXES: &[&str] = &[
     "/auth",
     "/billing",
     "/developers",
+    // The MCP endpoint and the OAuth authorization server behind it. The
+    // consent screen is an SPA page at `/consent`, outside this prefix, so a
+    // client's browser lands on a page while every protocol path answers JSON.
+    "/mcp",
+    "/oauth",
     "/realtime",
     "/tenancy",
     "/users",

@@ -365,6 +365,69 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/account/notifications/{notification_id}/read",
         area: "notifications",
     },
+    // The OAuth authorization server for connected clients: discovery,
+    // registration, consent, tokens, and the account's connections.
+    RouteEntry {
+        method: "GET",
+        path: "/.well-known/oauth-authorization-server",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/.well-known/oauth-protected-resource",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/.well-known/oauth-protected-resource/mcp",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/register",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/oauth/authorize",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/oauth/requests/{request_id}",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/requests/{request_id}",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/token",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/revoke",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/oauth/connections",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/oauth/connections/{grant_id}",
+        area: "oauth_server",
+    },
+    // The MCP endpoint the authorization server's tokens are bound to.
+    RouteEntry {
+        method: "POST",
+        path: "/mcp",
+        area: "mcp",
+    },
     // Billing: the plan an organization is on, and the two Stripe redirects.
     RouteEntry {
         method: "GET",
@@ -515,6 +578,11 @@ plans:
         let roles = RoleSet::from_yaml(ROLES).expect("test roles are valid");
         let mailer = crate::mail::Mailer::log();
         let rate_limit = crate::rate_limit::RateLimiter::new(&config.rate_limit);
+        let authorization = crate::oauth_server::Server::new(
+            pool.clone(),
+            &config,
+            crate::oauth_server::Scopes::new(),
+        );
 
         Router::new()
             .merge(crate::server::health_router(pool.clone()))
@@ -561,6 +629,11 @@ plans:
                 crate::webhooks::router(pool.clone(), roles.clone(), &config),
             )
             .nest("/api/v1", crate::api::v1::router(pool.clone()))
+            .merge(crate::oauth_server::router(&authorization, &rate_limit))
+            .merge(crate::mcp::router(
+                &authorization,
+                crate::mcp::Registry::new("Manifest", "0.0.0").tool(crate::mcp::whoami()),
+            ))
             .layer(crate::guard::layer(pool, roles))
     }
 

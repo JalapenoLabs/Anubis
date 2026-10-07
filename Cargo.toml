@@ -44,6 +44,12 @@ hmac = "0.13"
 http-body-util = "0.1"
 # Decoders limited to formats browsers actually upload.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Checks an MCP tool's arguments against the input schema the application
+# declared, before the tool runs; `rmcp` advertises schemas but does not
+# enforce them. Defaults resolve remote `$ref`s over HTTP and file paths, which
+# a schema written in the application's own source never needs and a server
+# should never do on a caller's behalf, so they stay off.
+jsonschema = { version = "0.58", default-features = false }
 # SMTP delivery for the production mailer. The default feature set links
 # native-tls, so it stays off and the pinned set spells out the policy: the
 # tokio executor, rustls for both smtps:// and STARTTLS, pooled connections,
@@ -82,6 +88,13 @@ regex = "1"
 # spelled out and matches what `openidconnect` already builds on: rustls, no
 # OpenSSL, and no second copy of the client in the tree.
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "rustls-tls"] }
+# The official Model Context Protocol SDK, for the MCP endpoint's protocol
+# layer: JSON-RPC, both protocol eras (the 2025 `initialize` handshake and the
+# stateless 2026-07-28 revision), and the Streamable HTTP transport as a tower
+# service. Defaults add the tool macros and base64 media helpers the framework
+# does not use; authorization is the framework's own, so its client-side
+# `auth` feature stays off too. See docs/mcp.md.
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 # Version comparison for `anubis upgrade`, which orders releases and reads what
 # crates.io reports. Cargo's own semver implementation, and it pulls nothing in.
 semver = "1"

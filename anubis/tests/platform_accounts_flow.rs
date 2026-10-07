@@ -188,6 +188,8 @@ impl Deployment {
         let (mailer, outbox) = anubis::mail::Mailer::test();
         let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
         let accounts = Accounts::new(&config, mailer.clone());
+        let authorization =
+            anubis::oauth_server::Server::new(pool.clone(), &config, support::Harness::scopes());
 
         let router = Router::new()
             .nest(
@@ -202,6 +204,11 @@ impl Deployment {
                 post(temporary_password),
             )
             .route("/dashboard", get(dashboard))
+            .merge(anubis::oauth_server::router(&authorization, &rate_limit))
+            .merge(anubis::mcp::router(
+                &authorization,
+                support::Harness::tools(),
+            ))
             .layer(Extension(accounts))
             .layer(anubis::guard::layer(pool.clone(), roles));
 
@@ -866,4 +873,74 @@ async fn a_temporary_password_admits_nothing_but_choosing_a_new_one() {
     let logged = logs.text();
     assert!(!logged.is_empty(), "the capture must be listening");
     assert!(!logged.contains(&temporary), "a log line holds it");
+}
+
+#[tokio::test]
+async fn a_temporary_password_disconnects_every_connected_client() {
+    let Some(database) = TestDatabase::create("platform_temporary_oauth").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database).await;
+    let router = &deployment.router;
+    let email = format!("connected-{}@example.com", Uuid::new_v4());
+    let cookie = register(router, &email).await;
+    let (_status, _headers, me) = send(router, "GET", "/auth/me", None, Some(&cookie)).await;
+    let user_id: Uuid = serde_json::from_value(me["user"]["id"].clone()).expect("an id");
+
+    // Two programs connected in the account's name.
+    let claude = support::oauth::MetadataDocument::serve("Claude Code");
+    let codex = support::oauth::MetadataDocument::serve("Codex");
+    let first = support::oauth::connect(router, &cookie, &claude.client_id, "notes:read").await;
+    let second = support::oauth::connect(router, &cookie, &codex.client_id, "notes:read").await;
+    let whoami = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "whoami", "arguments": {} },
+    });
+    let (status, _headers, _body) =
+        support::oauth::mcp(router, Some(&first.access_token), &whoami, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = deployment
+        .operate(
+            "POST",
+            &format!("/operator/accounts/{user_id}/temporary-password"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Every token in every family is dead, and a client reads the challenge
+    // that sends it to connect again rather than a refusal it cannot act on.
+    for connection in [&first, &second] {
+        let (status, headers, _body) =
+            support::oauth::mcp(router, Some(&connection.access_token), &whoami, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge = headers["www-authenticate"]
+            .to_str()
+            .expect("a visible header");
+        assert!(
+            challenge.starts_with("Bearer resource_metadata="),
+            "{challenge}"
+        );
+        assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+    }
+    let (status, refused) =
+        support::oauth::refresh(router, &claude.client_id, &first.refresh_token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error"], "invalid_grant");
+
+    // Each grant's end is on the record, as the operator's act.
+    let mut connection = deployment.pool.get().await.expect("a connection");
+    let revoked: Vec<Option<Uuid>> = audit_events::table
+        .filter(audit_events::action.eq(audit::OAUTH_REVOKED))
+        .select(audit_events::user_id)
+        .load(&mut connection)
+        .await
+        .expect("the audit log must be readable");
+    let (_status, _headers, operator) =
+        send(router, "GET", "/auth/me", None, Some(&deployment.operator)).await;
+    let operator_id: Uuid = serde_json::from_value(operator["user"]["id"].clone()).expect("an id");
+    assert_eq!(revoked, [Some(operator_id), Some(operator_id)]);
 }

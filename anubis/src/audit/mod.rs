@@ -141,6 +141,26 @@ pub const ACCOUNT_DELETED: &str = "account.deleted";
 /// fact the new session was created with that a reader needs, so it is written
 /// as the field that moved from nothing to that value.
 pub const SESSION_CREATED: &str = "session.created";
+/// A person approved a client on the consent screen, creating a grant.
+///
+/// The subject is the grant, labeled with the client's name, and the change set
+/// carries the scopes approved. See `docs/oauth-server.md`.
+pub const OAUTH_GRANTED: &str = "oauth.granted";
+/// A grant ended: the person revoked the connection, or the client revoked its
+/// own refresh token.
+pub const OAUTH_REVOKED: &str = "oauth.revoked";
+/// A spent authorization code was presented again, so its grant was revoked.
+///
+/// Two parties holding one code is how an intercepted code looks, which is why
+/// OAuth 2.1 has the grant revoked rather than the second exchange merely
+/// refused.
+pub const OAUTH_CODE_REUSED: &str = "oauth.code_reused";
+/// A rotated-away refresh token was presented again, so its grant was revoked.
+///
+/// The refresh-token family is the grant, and a token used twice means it was
+/// copied; ending the family is what makes a stolen refresh token worth one
+/// race at most.
+pub const OAUTH_REFRESH_REUSED: &str = "oauth.refresh_reused";
 
 /// Writes one audit event through `connection`, returning its id.
 ///
@@ -212,8 +232,9 @@ pub async fn record(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCOUNT_DELETED, INVITATION_RESENT, MEMBER_ROLE_CHANGED, ORGANIZATION_RENAMED,
-        PASSWORD_CHANGED, PASSWORD_TEMPORARY_SET, SESSION_CREATED, TEAM_RENAMED,
+        ACCOUNT_DELETED, INVITATION_RESENT, MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED,
+        OAUTH_REFRESH_REUSED, OAUTH_REVOKED, ORGANIZATION_RENAMED, PASSWORD_CHANGED,
+        PASSWORD_TEMPORARY_SET, SESSION_CREATED, TEAM_RENAMED,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -229,6 +250,10 @@ mod tests {
             SESSION_CREATED,
             INVITATION_RESENT,
             PASSWORD_TEMPORARY_SET,
+            OAUTH_GRANTED,
+            OAUTH_REVOKED,
+            OAUTH_CODE_REUSED,
+            OAUTH_REFRESH_REUSED,
         ] {
             let (noun, verb) = action
                 .split_once('.')

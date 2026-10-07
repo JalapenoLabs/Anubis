@@ -508,3 +508,101 @@ diesel::joinable!(notifications -> teams (team_id));
 diesel::joinable!(audit_events -> teams (team_id));
 diesel::joinable!(audit_events -> organizations (organization_id));
 diesel::joinable!(audit_events -> users (user_id));
+
+diesel::table! {
+    /// Third-party clients of the authorization server, fetched from a Client
+    /// ID Metadata Document or registered dynamically. See
+    /// `docs/oauth-server.md`.
+    oauth_clients (id) {
+        id -> Uuid,
+        client_id -> Text,
+        kind -> Text,
+        name -> Text,
+        client_uri -> Nullable<Text>,
+        redirect_uris -> Array<Text>,
+        created_at -> Timestamptz,
+        refresh_after -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Authorization requests waiting on the person's consent.
+    oauth_authorization_requests (id) {
+        id -> Uuid,
+        client_id -> Uuid,
+        redirect_uri -> Text,
+        scopes -> Array<Text>,
+        state -> Nullable<Text>,
+        code_challenge -> Text,
+        resource -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// One person's consent for one client; every token descends from one.
+    oauth_grants (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        client_id -> Uuid,
+        scopes -> Array<Text>,
+        resource -> Text,
+        created_at -> Timestamptz,
+        last_used_at -> Timestamptz,
+        revoked_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Single-use authorization codes. Rows hold a hash of the code.
+    oauth_authorization_codes (id) {
+        id -> Uuid,
+        grant_id -> Uuid,
+        code_hash -> Text,
+        redirect_uri -> Text,
+        code_challenge -> Text,
+        expires_at -> Timestamptz,
+        used_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Rotating refresh tokens. Rows hold a hash of the token.
+    oauth_refresh_tokens (id) {
+        id -> Uuid,
+        grant_id -> Uuid,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        used_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    /// Short-lived bearer access tokens. Rows hold a hash of the token.
+    oauth_access_tokens (id) {
+        id -> Uuid,
+        grant_id -> Uuid,
+        token_hash -> Text,
+        scopes -> Array<Text>,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+    }
+}
+
+diesel::joinable!(oauth_authorization_requests -> oauth_clients (client_id));
+diesel::joinable!(oauth_grants -> oauth_clients (client_id));
+diesel::joinable!(oauth_grants -> users (user_id));
+diesel::joinable!(oauth_authorization_codes -> oauth_grants (grant_id));
+diesel::joinable!(oauth_refresh_tokens -> oauth_grants (grant_id));
+diesel::joinable!(oauth_access_tokens -> oauth_grants (grant_id));
+diesel::allow_tables_to_appear_in_same_query!(
+    oauth_clients,
+    oauth_authorization_requests,
+    oauth_grants,
+    oauth_authorization_codes,
+    oauth_refresh_tokens,
+    oauth_access_tokens,
+    users,
+);

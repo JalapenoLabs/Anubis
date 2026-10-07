@@ -28,6 +28,7 @@ mod user_token;
 
 #[doc(inline)]
 pub use avatar::public_router as avatar_router;
+pub(crate) use extract::refuse_temporary_password;
 #[doc(inline)]
 pub use extract::{CurrentUser, PASSWORD_CHANGE_REQUIRED, SignedIn};
 #[doc(inline)]
