@@ -121,7 +121,11 @@ Expired rows are swept as a grant issues tokens and as requests are stored. A sp
 
 `Bearer` is to a connected client what `CurrentUser` is to a browser: an extractor yielding the same `User`, plus the token's scopes, the client's name and id, and the grant. A session cookie never satisfies it. A refusal answers `401` with the challenge above; `error="invalid_token"` is added when a token was presented and failed. `Bearer::require_scope` answers `403` with `error="insufficient_scope"` and the scope needed, the step-up challenge the specification describes, for a handler an application protects with it. The MCP endpoint is the one place the framework uses it; see [mcp.md](mcp.md) for how a tool's scope is enforced there.
 
-A live token whose account an operator gave a [temporary password](tenancy.md#temporary-passwords) answers `403` with the code `password_change_required`, the same refusal `CurrentUser` gives a session, and carries no challenge: the token is valid and signing in again would not help. The check runs after the token is resolved, so an unknown token still reads `401` and reveals nothing about any account. The grant survives, and the connection works again once the person chooses a password; revoking it stays the person's call from account settings. The consent routes take `CurrentUser`, so a flagged account cannot approve a new client either.
+A live token whose account an operator gave a [temporary password](tenancy.md#temporary-passwords) answers `403` with the code `password_change_required`, the same refusal `CurrentUser` gives a session, and carries no challenge: the token is valid and signing in again would not help. The check runs after the token is resolved, so an unknown token still reads `401` and reveals nothing about any account. The consent routes take `CurrentUser`, so a flagged account cannot approve a new client either.
+
+### When the password is replaced
+
+Setting a temporary password and completing a password reset both say the old credentials may be in the wrong hands, so each **revokes every grant the account holds**, in the same transaction as the new password and beside the sessions it deletes: every access token and every refresh-token family. Each grant records `oauth.revoked`, attributed to whoever caused it (the operator for a temporary password, the account for a reset), and the request id ties it to the credential event beside it. A revoked token reads `401` with the challenge, which sends the program back through sign-in and consent. A voluntary `POST /auth/change-password` keeps every grant, because the person proved they hold the current password. Account deletion removes grants with the account.
 
 ## The account surface
 
@@ -134,7 +138,7 @@ Security settings list the connected apps with a revoke button. A grant is liste
 | Action | When |
 |---|---|
 | `oauth.granted` | A person approved a client on the consent screen |
-| `oauth.revoked` | The person revoked a connection, or the client revoked its refresh token |
+| `oauth.revoked` | The person revoked a connection, the client revoked its refresh token, or a temporary password or password reset ended every connection |
 | `oauth.code_reused` | A spent code was presented again, and its grant was revoked |
 | `oauth.refresh_reused` | A rotated-away refresh token was presented again, and its grant was revoked |
 

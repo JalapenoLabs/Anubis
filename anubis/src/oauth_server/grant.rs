@@ -17,7 +17,8 @@ use crate::audit;
 use crate::auth::User;
 use crate::auth::token;
 use crate::schema::{
-    oauth_access_tokens, oauth_authorization_codes, oauth_grants, oauth_refresh_tokens, users,
+    oauth_access_tokens, oauth_authorization_codes, oauth_clients, oauth_grants,
+    oauth_refresh_tokens, users,
 };
 
 /// How long an access token is honored.
@@ -221,9 +222,24 @@ pub(crate) async fn record(
         .first(connection)
         .await?;
 
+    record_as(connection, &context.by(&user), action, grant, client_name).await
+}
+
+/// Records an act on a grant under the actor `attributed` already names.
+///
+/// [`record`] attributes to the grant's owner, because a client acts as them.
+/// An act somebody else caused, an operator setting a temporary password, is
+/// theirs, so the caller attributes it and this records it as given.
+async fn record_as(
+    connection: &mut AsyncPgConnection,
+    attributed: &audit::Context,
+    action: &str,
+    grant: &Grant,
+    client_name: &str,
+) -> QueryResult<()> {
     audit::record(
         connection,
-        &context.by(&user),
+        attributed,
         &audit::Event::new(action, "OauthGrant")
             .subject(grant.id)
             .label(client_name)
@@ -235,4 +251,48 @@ pub(crate) async fn record(
     )
     .await?;
     Ok(())
+}
+
+/// Ends every live grant `user_id` holds, recording each as revoked.
+///
+/// Called inside the transaction that replaces an account's password when the
+/// old credentials may be in the wrong hands: an operator's temporary password
+/// and a completed password reset. A connected client is a credential like a
+/// session, so it goes with the sessions; a voluntary password change keeps
+/// both, because the person proved they hold the old password. Each grant
+/// records [`audit::OAUTH_REVOKED`] under `attributed`, the actor the caller
+/// names, and the request id ties it to the credential event beside it.
+///
+/// # Errors
+/// Returns the database's error; the caller's transaction rolls back with it.
+pub(crate) async fn revoke_every_grant(
+    connection: &mut AsyncPgConnection,
+    attributed: &audit::Context,
+    user_id: Uuid,
+) -> QueryResult<usize> {
+    let live: Vec<(Grant, String)> = oauth_grants::table
+        .inner_join(oauth_clients::table)
+        .filter(oauth_grants::user_id.eq(user_id))
+        .filter(oauth_grants::revoked_at.is_null())
+        .select((Grant::as_select(), oauth_clients::name))
+        .load(connection)
+        .await?;
+
+    let mut ended = 0;
+    for (revoked, client_name) in &live {
+        // A concurrent revocation may have ended it first; only the call that
+        // ended it records it.
+        if revoke(connection, revoked.id).await? {
+            record_as(
+                connection,
+                attributed,
+                audit::OAUTH_REVOKED,
+                revoked,
+                client_name,
+            )
+            .await?;
+            ended += 1;
+        }
+    }
+    Ok(ended)
 }

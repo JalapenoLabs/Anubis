@@ -98,8 +98,10 @@ impl Accounts {
     /// Gives an account a generated password it must replace at its next sign-in.
     ///
     /// In one transaction, holding the account: sets the password, marks the
-    /// account as required to change it, deletes every session it has, and
-    /// records [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
+    /// account as required to change it, deletes every session it has, revokes
+    /// every OAuth grant it gave a connected client (each recorded as
+    /// `oauth.revoked` by the operator), and records
+    /// [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
     /// because the fact is the whole of what an auditor needs. The account
     /// signs in with the returned password by any path a password reaches,
     /// and a confirmed second factor is still asked for.
@@ -138,8 +140,15 @@ impl Accounts {
                     .await?;
 
                 // Whoever holds a session for this account now may be the
-                // reason it needed rescuing.
+                // reason it needed rescuing, and so may a program somebody
+                // connected in its name.
                 session::delete_all_for_user(transaction, user.id).await?;
+                crate::oauth_server::revoke_every_grant(
+                    transaction,
+                    &context.by(&operator.user),
+                    user.id,
+                )
+                .await?;
 
                 let label = audit::person_label(
                     user.first_name.as_deref(),

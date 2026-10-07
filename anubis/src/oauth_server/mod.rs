@@ -74,6 +74,8 @@ pub use bearer::{Bearer, Challenge};
 #[doc(inline)]
 pub use scope::{Scope, Scopes};
 
+pub(crate) use grant::revoke_every_grant;
+
 /// The path of the one resource this server issues tokens for.
 ///
 /// The MCP endpoint lives here; see the module docs for why it is fixed.

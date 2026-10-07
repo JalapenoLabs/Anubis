@@ -821,3 +821,97 @@ async fn a_cached_document_nothing_holds_on_to_is_forgotten() {
     .await;
     assert!(param(&consent, "request").is_some(), "{consent}");
 }
+
+/// The token in the most recent password reset email to `email`.
+fn reset_token(harness: &Harness, email: &str) -> String {
+    let message = harness
+        .outbox
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|sent| sent.to == email && sent.subject.contains("Reset"))
+        .expect("the reset email must be in the outbox");
+    let (_before, rest) = message
+        .text_body
+        .split_once("token=")
+        .expect("the reset email must carry a link");
+    rest.split_whitespace()
+        .next()
+        .expect("the token ends at whitespace")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_password_reset_disconnects_every_client_and_a_voluntary_change_does_not() {
+    let Some(database) = TestDatabase::create("oauth_server_password_rotation").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let email = format!("rotate-{}@example.com", Uuid::new_v4());
+    let cookie = register(router, &email).await;
+    let document = MetadataDocument::serve("Claude Code");
+    let connection = connect(router, &cookie, &document.client_id, "notes:read").await;
+
+    // Changing the password while signed in proves the old one was held, so
+    // the connection survives it.
+    let (status, _headers, body) = send(
+        router,
+        "POST",
+        "/auth/change-password",
+        Some(&json!({
+            "current_password": support::PASSWORD,
+            "new_password": "a voluntary new passphrase",
+        })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, _headers, answer) =
+        mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::OK, "body: {answer}");
+    let (status, rotated) = refresh(router, &document.client_id, &connection.refresh_token).await;
+    assert_eq!(status, StatusCode::OK, "body: {rotated}");
+    let access_token = rotated["access_token"].as_str().expect("an access token");
+    let refresh_token = rotated["refresh_token"].as_str().expect("a refresh token");
+    assert_eq!(audited(&harness, anubis::audit::OAUTH_REVOKED).await, 0);
+
+    // A reset says the old credentials may be in the wrong hands, so every
+    // token in the family goes with the sessions.
+    let (status, _headers, _body) = send(
+        router,
+        "POST",
+        "/auth/password-reset/request",
+        Some(&json!({ "email": email })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _headers, body) = send(
+        router,
+        "POST",
+        "/auth/password-reset/confirm",
+        Some(&json!({
+            "token": reset_token(&harness, &email),
+            "password": "a reset new passphrase",
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, headers, _body) = mcp(router, Some(access_token), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers["www-authenticate"]
+        .to_str()
+        .expect("a visible header");
+    assert!(
+        challenge.starts_with("Bearer resource_metadata="),
+        "{challenge}"
+    );
+    assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+    let (status, refused) = refresh(router, &document.client_id, refresh_token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error"], "invalid_grant");
+    assert_eq!(audited(&harness, anubis::audit::OAUTH_REVOKED).await, 1);
+}
