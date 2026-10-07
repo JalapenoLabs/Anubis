@@ -100,9 +100,47 @@ Every tenancy tier appoints administrators through somebody who is already one, 
 
 Revoking is deliberately absent. Removing the variables leaves the operator in place, because a boot that silently demoted the only operator would lock the deployment out of itself. Every grant is recorded in the audit log as `platform.roles_changed`, attributed to the system, on neither a team nor an organization, exactly as a password change is.
 
+### Bringing people in
+
+After the first operator, an operator invites people, and that is the framework's half of an application's user manager. `anubis::platform::Accounts` is built once from the configuration and the mailer the auth router was given, and the application's operator routes call it; every method takes the `PlatformMember` the guard produced, which is both the proof the caller operates the deployment and who the audit log names. Which action each asks of `roles.yml` is the application's `operator.require(...)` before the call.
+
+| Call | Effect |
+|---|---|
+| `accounts.invite(connection, &operator, &context, InviteRequest { email, platform_role })` | Writes an invitation, optionally carrying a platform role, and mails the link |
+| `accounts.resend_invitation(connection, &operator, &context, invitation_id)` | Mails a fresh link with a fresh 24 hours; the previous link stops working |
+| `accounts.revoke_invitation(connection, &operator, &context, invitation_id)` | Withdraws a pending invitation, so its link stops working |
+| `platform::pending_invitations(connection, &list_params)` | The invitations neither accepted nor revoked, most recently sent first, paged |
+| `accounts.set_temporary_password(connection, &operator, &context, user_id)` | Gives an account a generated password it must replace; see below |
+
+**An invitation is a row, not an account.** `platform_invitations` holds the address, the role it will grant, who sent it (by id, and by a copied name that outlives their account), the SHA-256 of the emailed token, and when it was sent, expires, was accepted, or was revoked. The account is created when the invitee accepts, never before, so an address nobody answers for leaves no account, no personal organization, and no password anybody would have to invent. Until it is accepted, registering, an emailed code, and an OpenID Connect provider treat the address exactly as one nobody invited. Creating the account up front was the alternative, and it would make "pending" a property of an account, which a list of pending invitations then filters millions of accounts to find; here the list reads a partial index holding only the live rows.
+
+**The rules**, each a sentence the operator reads rather than a constraint error:
+
+- The address is normalized as registration normalizes it, and an address that already has an account is refused (`409`).
+- One live invitation per address, held by a partial unique index that also decides two invites that race. A second invite is refused with a sentence that says to resend.
+- A role must be one `roles.yml` lets the platform tier grant (`400` otherwise), checked against the same compiled file the guard admitted the operator with. It is granted when the account is created and recorded as `platform.roles_changed`, attributed to the new account.
+- A link works for `INVITATION_TTL_HOURS`, 24. An expired invitation is still pending, says so through `PlatformInvitation::is_expired`, and a resend revives it.
+- Resending or revoking an accepted or revoked invitation is refused (`409`). Resending to an address somebody registered meanwhile is refused too, and revoking is what clears it.
+- Every decision holds the invitation row, so a resend racing an acceptance or a revocation reads the outcome rather than reviving it.
+- Disposable-domain and corporate-only rules are not the framework's. An application that keeps one applies it before calling `invite`.
+
+**The invitee's half is framework-owned**, mounted with the auth routes: `POST /auth/invitations/lookup` answers the address a live link was sent to, and `POST /auth/invitations/accept` takes the password (held to the registration policy), the optional time zone and locale a sign-up takes, creates the account with its **email verified** (opening the link proved the address) and its personal organization bootstrapped, marks the invitation accepted, and signs the account in exactly as login does, recording `session.created` with the method `invitation`. All of it commits in one transaction. The token travels in the body, never the path, because a path is what request tracing writes down. Unknown, used, revoked, and expired tokens answer the same `400` with the same sentence, both routes spend the credential-guessing budget, and an account created at the address after the invitation was sent is answered `409` rather than taken over. `useInvitation(token)` in `@jalapenolabs/anubis` drives the application's accept page.
+
+The audit verbs are the tenancy invitation verbs on the subject type `PlatformInvitation`: `invitation.created`, `invitation.resent`, `invitation.revoked`, and `invitation.claimed`, on neither a team nor an organization.
+
+### Temporary passwords
+
+For the person who cannot sign in and cannot reach their inbox either. `accounts.set_temporary_password` generates a password (four groups of five characters from an alphabet without the ones people misread, about 99 bits), sets it, marks the account `password_change_required`, deletes every session the account had, and records `password.temporary_set` with an empty change set, all in one transaction holding the account. It returns the password once as a `TemporaryPassword`, whose `Debug` prints a placeholder and whose memory is zeroed on drop; the operator hands it over by a channel they trust. It is never stored, mailed, logged, or audited.
+
+The account then signs in normally, by password, and with its second factor if it has one, and the sign-in and `GET /auth/me` carry `password_change_required: true`. **Every other authenticated route answers `403` with the code `password_change_required`** until the account chooses a password of its own. The rule lives in the `CurrentUser` extractor, so it holds for every framework route, every guard built on it, and every application route that takes it, written yet or not. The exceptions take `SignedIn` instead, and there are two: `GET /auth/me`, so the SPA can see the flag, and `POST /auth/change-password`, which clears it. Signing out reads the cookie directly and was never gated. The realtime socket takes `CurrentUser`, so it stays closed until the password changes. A connected client is held to the same rule: `oauth_server::Bearer` answers a live token for a flagged account with the same `403` and the same code, so a program the account connected before the rescue cannot act for it on the operator's password, and the consent screen cannot approve a new one because its routes take `CurrentUser`. See [oauth-server.md](oauth-server.md#the-resource-side).
+
+Changing the password refuses a new password equal to the current one, which is what stops a temporary password from being "changed" into itself, and a password reset through the inbox clears the flag too. An account accepting an invitation sets its own password and never carries the flag.
+
+Hashing it passes a gate of its own, one permit wide, because the auth router's gate is not reachable from an application. One computation at a time adds at most 19 MiB to what the deployment can be made to hold, and setting a temporary password is a rare act a handful of people perform.
+
 ### Not built yet
 
-- Endpoints and a screen for listing operators and granting or revoking the role. Until they exist, an application writes `users.platform_roles` itself or re-runs the seed with a different address.
+- Endpoints and a screen for listing operators and granting or revoking the role, and a screen for the invitations above. The primitives exist; the routes and the user manager are the application's, and the starter does not stamp them yet. Until it does, an application writes them, or writes `users.platform_roles` itself.
 - Platform-scoped resources in the scaffolder. `anubis scaffold model` chains every model to a Team; a deployment-wide catalog is hand-written today.
 
 ## Ownership chain

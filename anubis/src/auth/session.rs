@@ -42,17 +42,20 @@ pub enum SignInMethod {
     Passkey,
     /// An OpenID Connect provider vouching for the address.
     Oauth,
+    /// Accepting an operator's invitation, which creates the account.
+    Invitation,
 }
 
 impl SignInMethod {
     /// Every method, in the order a sign-in page offers them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Registration,
         Self::Password,
         Self::SecondFactor,
         Self::EmailCode,
         Self::Passkey,
         Self::Oauth,
+        Self::Invitation,
     ];
 
     /// The spelling the audit event records.
@@ -65,6 +68,7 @@ impl SignInMethod {
             Self::EmailCode => "email_code",
             Self::Passkey => "passkey",
             Self::Oauth => "oauth",
+            Self::Invitation => "invitation",
         }
     }
 }

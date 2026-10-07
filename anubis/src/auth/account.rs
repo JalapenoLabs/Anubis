@@ -5,7 +5,7 @@
 //! | Route | Effect |
 //! |---|---|
 //! | `PATCH /profile` | Update name, time zone, and locale |
-//! | `POST /change-password` | Rotate the password; other sessions sign out |
+//! | `POST /change-password` | Rotate the password; other sessions sign out; clears a temporary one |
 //! | `POST /change-email/request` | Email a confirmation link to the new address |
 //! | `POST /change-email/confirm` | Swap to the confirmed address |
 //! | `GET /sessions` | List the user's sessions, marking the current one |
@@ -29,7 +29,7 @@ use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{CurrentUser, password, session, token, user_token};
+use crate::auth::{CurrentUser, SignedIn, password, session, token, user_token};
 use crate::http::ApiError;
 use crate::mail::{Email, EmailKind};
 use crate::schema::{sessions, users};
@@ -145,15 +145,28 @@ struct ChangePasswordBody {
     new_password: String,
 }
 
+/// Rotates the password, which is also how a temporary one is replaced.
+///
+/// Takes [`SignedIn`] rather than [`CurrentUser`]: an account on a temporary
+/// password is refused everywhere else, and this is the way out. The new
+/// password may not be the current one, which is what stops a temporary
+/// password from being "changed" into itself; comparing the two strings is
+/// enough, because the current one has just been verified against the hash.
 async fn change_password(
     State(state): State<AuthState>,
-    CurrentUser(user): CurrentUser,
+    SignedIn(user): SignedIn,
     context: audit::Context,
     jar: CookieJar,
     Json(body): Json<ChangePasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_password(&body.new_password)?;
+    let reused = body.new_password == body.current_password;
     verify_password_or_reject(&state.hasher, &user, body.current_password).await?;
+    if reused {
+        return Err(ApiError::validation(
+            "Choose a password different from your current one.",
+        ));
+    }
 
     let password_hash = state.hasher.hash(body.new_password).await?;
 
@@ -165,7 +178,10 @@ async fn change_password(
     connection
         .transaction::<(), diesel::result::Error, _>(async |transaction| {
             diesel::update(users::table.find(user.id))
-                .set((users::password_hash.eq(&password_hash),))
+                .set((
+                    users::password_hash.eq(&password_hash),
+                    users::password_change_required.eq(false),
+                ))
                 .execute(transaction)
                 .await?;
 

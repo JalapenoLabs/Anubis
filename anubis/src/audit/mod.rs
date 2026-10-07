@@ -102,13 +102,23 @@ pub const MEMBER_REMOVED: &str = "member.removed";
 /// Somebody left a tenant of their own accord.
 pub const MEMBER_LEFT: &str = "member.left";
 /// An invitation was sent.
+///
+/// Recorded for a tenant invitation and, on the subject type
+/// `PlatformInvitation`, for an operator's invitation to the deployment.
 pub const INVITATION_CREATED: &str = "invitation.created";
-/// An invitation was accepted, which also adds the member.
+/// A pending invitation went out again with a fresh link, replacing the old.
+pub const INVITATION_RESENT: &str = "invitation.resent";
+/// An invitation was accepted: the member joined, or the account was created.
 pub const INVITATION_CLAIMED: &str = "invitation.claimed";
 /// A pending invitation was taken back before it was claimed.
 pub const INVITATION_REVOKED: &str = "invitation.revoked";
 /// An account's password was rotated.
 pub const PASSWORD_CHANGED: &str = "password.changed";
+/// An operator gave an account a temporary password it must replace.
+///
+/// The change set is empty: who did it to whom is the record, and the
+/// password itself is never written anywhere.
+pub const PASSWORD_TEMPORARY_SET: &str = "password.temporary_set";
 /// An account confirmed a TOTP enrollment.
 pub const MFA_ENROLLED: &str = "mfa.enrolled";
 /// An account turned its TOTP second factor off.
@@ -222,9 +232,9 @@ pub async fn record(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCOUNT_DELETED, MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED,
+        ACCOUNT_DELETED, INVITATION_RESENT, MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED,
         OAUTH_REFRESH_REUSED, OAUTH_REVOKED, ORGANIZATION_RENAMED, PASSWORD_CHANGED,
-        SESSION_CREATED, TEAM_RENAMED,
+        PASSWORD_TEMPORARY_SET, SESSION_CREATED, TEAM_RENAMED,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -238,6 +248,8 @@ mod tests {
             PASSWORD_CHANGED,
             ACCOUNT_DELETED,
             SESSION_CREATED,
+            INVITATION_RESENT,
+            PASSWORD_TEMPORARY_SET,
             OAUTH_GRANTED,
             OAUTH_REVOKED,
             OAUTH_CODE_REUSED,

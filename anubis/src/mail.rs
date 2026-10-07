@@ -97,6 +97,13 @@ pub enum EmailKind {
     ///
     /// Parameters: `link`, `inviter`, `target`, `days`.
     Invitation,
+    /// An operator's invitation to open an account on the deployment itself.
+    ///
+    /// Unlike [`EmailKind::Invitation`] it names no team or organization: the
+    /// link sets the account's first password and creates it. Parameters:
+    /// `link`, `inviter` (the operator's name, or their address when they have
+    /// none), and `hours` (how long the link works).
+    PlatformInvitation,
     /// An application's own email, named by the application.
     ///
     /// The framework never constructs this. It exists so an application can

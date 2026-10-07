@@ -16,19 +16,21 @@ mod account;
 mod avatar;
 mod email_code;
 mod extract;
+mod invitation;
 mod mfa;
-mod model;
+pub(crate) mod model;
 mod passkey;
 mod policy;
 pub(crate) mod routes;
-mod session;
+pub(crate) mod session;
 pub(crate) mod token;
 mod user_token;
 
 #[doc(inline)]
 pub use avatar::public_router as avatar_router;
+pub(crate) use extract::refuse_temporary_password;
 #[doc(inline)]
-pub use extract::CurrentUser;
+pub use extract::{CurrentUser, PASSWORD_CHANGE_REQUIRED, SignedIn};
 #[doc(inline)]
 pub use model::{User, UserResponse};
 pub(crate) use policy::{check_password_policy, normalize_email};

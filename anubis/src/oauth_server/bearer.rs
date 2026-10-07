@@ -17,6 +17,13 @@
 //! has never connected finds the authorization server. A token lacking a scope
 //! is answered `403` with `error="insufficient_scope"` and the scope it needs,
 //! the step-up challenge the MCP specification describes.
+//!
+//! A live token whose account an operator gave a temporary password is
+//! answered `403` with the code [`crate::auth::PASSWORD_CHANGE_REQUIRED`],
+//! exactly as a session is, and carries no challenge: the token is valid, and
+//! signing in again would not help until the person chooses a password. The
+//! check follows authentication, so an unknown token still reads `401` and
+//! says nothing about any account.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
@@ -175,7 +182,11 @@ where
         };
 
         match authenticate(&server, &presented).await {
-            Ok(Some(bearer)) => Ok(bearer),
+            Ok(Some(bearer)) => {
+                crate::auth::refuse_temporary_password(&bearer.user)
+                    .map_err(IntoResponse::into_response)?;
+                Ok(bearer)
+            }
             Ok(None) => Err(Challenge::unauthorized(&server, true).into_response()),
             Err(error) => {
                 tracing::error!(

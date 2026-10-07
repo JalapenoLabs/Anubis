@@ -57,7 +57,7 @@ Names are 1 to 128 characters of `[A-Za-z0-9_.-]`, input schemas must be JSON ob
 WWW-Authenticate: Bearer resource_metadata="<APP_URL>/.well-known/oauth-protected-resource/mcp", scope="<declared scopes>"
 ```
 
-and `error="invalid_token"` added when a token was presented. A session cookie never authenticates here: the browser's credential and the program's are different things, and a page on this origin making MCP calls with the person's cookie is exactly what the endpoint must not allow.
+and `error="invalid_token"` added when a token was presented. A valid token for an account on an operator's temporary password answers `403` with the code `password_change_required` instead, as every session route does; see [tenancy.md](tenancy.md#temporary-passwords). A session cookie never authenticates here: the browser's credential and the program's are different things, and a page on this origin making MCP calls with the person's cookie is exactly what the endpoint must not allow.
 
 ## Protocol and transport
 

@@ -19,6 +19,26 @@ diesel::table! {
         time_zone -> Text,
         locale -> Text,
         platform_roles -> Array<Text>,
+        password_change_required -> Bool,
+    }
+}
+
+diesel::table! {
+    /// Invitations an operator sent to open an account on the deployment.
+    /// Rows hold a hash of the emailed token, never the token.
+    platform_invitations (id) {
+        id -> Uuid,
+        email -> Text,
+        platform_role -> Nullable<Text>,
+        invited_by -> Nullable<Uuid>,
+        invited_by_name -> Text,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        sent_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        accepted_at -> Nullable<Timestamptz>,
+        user_id -> Nullable<Uuid>,
+        revoked_at -> Nullable<Timestamptz>,
     }
 }
 

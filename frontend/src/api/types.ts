@@ -34,10 +34,40 @@ export type User = {
    * operator surface, exactly as a membership's roles draw a team's.
    */
   platformRoles: readonly string[]
+  /**
+   * Whether the account must choose a new password before anything else.
+   *
+   * True after an operator set a temporary password. Until the account
+   * changes it, every framework and application route but `me`, changing the
+   * password, and signing out answers `403` with the code
+   * `PASSWORD_CHANGE_REQUIRED`, so a shell reads this to send the person
+   * straight to the screen that changes it.
+   */
+  passwordChangeRequired: boolean
 }
 
 export type UserEnvelope = {
   user: User
+}
+
+/** What an operator's invitation link says before it is accepted. */
+export type InvitationPreview = {
+  /** The address the invitation was sent to, and the account's address. */
+  email: string
+  /** When the link stops working, as an ISO 8601 timestamp. */
+  expiresAt: string
+}
+
+/** What accepting an invitation sends: the first password and preferences. */
+export type InvitationAcceptance = {
+  password: string
+  /**
+   * IANA time zone the account starts in. Defaults to the browser's own,
+   * exactly as registering does.
+   */
+  timeZone?: string
+  /** BCP 47 locale the account starts in; omitted leaves the default. */
+  locale?: string
 }
 
 export type MessageEnvelope = {
@@ -399,6 +429,7 @@ export type WireUser = {
   created_at: string
   avatar_version: string | null
   platform_roles: readonly string[]
+  password_change_required: boolean
 }
 
 export type WireUserEnvelope = {
@@ -427,6 +458,8 @@ export function toUser(wire: WireUser): User {
     // Same reasoning: a backend from before the platform tier sends no roles,
     // and holding none is what every ordinary account holds anyway.
     platformRoles: wire.platform_roles ?? [],
+    // A backend from before temporary passwords never requires a change.
+    passwordChangeRequired: wire.password_change_required ?? false,
   }
 }
 

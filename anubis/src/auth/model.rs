@@ -45,6 +45,12 @@ pub struct User {
     /// The platform has no roster to join through, so the grant lives on the
     /// account. See [`crate::guard::PlatformMember`].
     pub platform_roles: Vec<String>,
+    /// Whether the account must choose a new password before anything else.
+    ///
+    /// Set by an operator's temporary password, cleared by the first password
+    /// the account chooses. While it holds, [`crate::auth::CurrentUser`]
+    /// refuses the account everywhere but the routes that change a password.
+    pub password_change_required: bool,
 }
 
 impl fmt::Debug for User {
@@ -61,6 +67,7 @@ impl fmt::Debug for User {
             .field("time_zone", &self.time_zone)
             .field("locale", &self.locale)
             .field("platform_roles", &self.platform_roles)
+            .field("password_change_required", &self.password_change_required)
             .finish()
     }
 }
@@ -99,6 +106,14 @@ pub struct UserResponse {
     /// The SPA draws the operator surfaces from this with the generated
     /// `can` helper, exactly as it draws a team's from a membership's roles.
     pub platform_roles: Vec<String>,
+    /// Whether the account must choose a new password before anything else.
+    ///
+    /// True after an operator set a temporary password. Every authenticated
+    /// route but this one, changing the password, and signing out answers
+    /// `403` with the code [`crate::auth::PASSWORD_CHANGE_REQUIRED`] until the
+    /// account sets a password of its own, so the SPA reads this to send the
+    /// person to the screen that does.
+    pub password_change_required: bool,
     /// When the account was created.
     pub created_at: DateTime<Utc>,
     /// Version of the stored avatar; `None` when the account has none.
@@ -123,6 +138,7 @@ impl UserResponse {
             time_zone: user.time_zone.clone(),
             locale: user.locale.clone(),
             platform_roles: user.platform_roles.clone(),
+            password_change_required: user.password_change_required,
             created_at: user.created_at,
             avatar_version,
         }
@@ -162,6 +178,7 @@ mod tests {
             time_zone: "UTC".to_owned(),
             locale: "en-US".to_owned(),
             platform_roles: Vec::new(),
+            password_change_required: false,
         }
     }
 
@@ -182,7 +199,8 @@ mod tests {
         let rendered = serde_json::to_string(&response).expect("serialization must succeed");
         assert!(rendered.contains("sample@example.com"), "got: {rendered}");
         assert!(!rendered.contains("super-secret-hash"), "got: {rendered}");
-        assert!(!rendered.contains("password"), "got: {rendered}");
+        assert!(!rendered.contains("password_hash"), "got: {rendered}");
+        assert!(!rendered.contains("argon2"), "got: {rendered}");
     }
 
     #[test]

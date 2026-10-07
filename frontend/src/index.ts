@@ -17,6 +17,8 @@ export type {
   CreatedOrganization,
   Credentials,
   EmailChangeRequest,
+  InvitationAcceptance,
+  InvitationPreview,
   InviteMemberRequest,
   MembershipOrganization,
   MembershipTeam,
@@ -51,6 +53,7 @@ export type { AnubisApi } from './api/createAnubisApi'
 export type { AnubisV1, ErrorV1, TeamEnvelopeV1, TeamV1 } from './api/v1.generated'
 export type { ConnectedClientsResult } from './react/useConnectedClients'
 export type { CurrentUserResult } from './react/useCurrentUser'
+export type { InvitationResult } from './react/useInvitation'
 export type { MembershipsResult } from './react/useMemberships'
 export type { NotificationBellLabels } from './react/NotificationBell'
 export type { NotificationsResult } from './react/useNotifications'
@@ -124,10 +127,16 @@ export { NOTIFICATIONS_PAGE_SIZE, useNotifications } from './react/useNotificati
 // Misc
 export { createAnubisApi } from './api/createAnubisApi'
 export { createAnubisV1 } from './api/v1.generated'
-export { getApiErrorMessage, getRetryAfterSeconds } from './api/errors'
+export {
+  PASSWORD_CHANGE_REQUIRED,
+  getApiErrorCode,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from './api/errors'
 export { AnubisProvider, useAnubisApi } from './react/AnubisProvider'
 export { useConnectedClients } from './react/useConnectedClients'
 export { useCurrentUser } from './react/useCurrentUser'
+export { useInvitation } from './react/useInvitation'
 export { useMemberships } from './react/useMemberships'
 export { useOauthProviders } from './react/useOauthProviders'
 export { useRetryCountdown } from './react/useRetryCountdown'

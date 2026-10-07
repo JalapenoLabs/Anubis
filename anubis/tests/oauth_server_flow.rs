@@ -12,7 +12,7 @@
 
 mod support;
 
-use anubis::schema::{audit_events, oauth_grants};
+use anubis::schema::{audit_events, oauth_grants, users};
 use axum::http::StatusCode;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -613,4 +613,76 @@ async fn a_client_can_revoke_its_own_connection() {
         mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(audited(&harness, anubis::audit::OAUTH_REVOKED).await, 1);
+}
+
+/// Sets or clears the flag an operator's temporary password leaves on `email`.
+async fn flag_temporary_password(harness: &Harness, email: &str, required: bool) {
+    let mut connection = harness.pool.get().await.expect("a connection");
+    let updated = diesel::update(users::table.filter(users::email.eq(email)))
+        .set(users::password_change_required.eq(required))
+        .execute(&mut connection)
+        .await
+        .expect("the flag updates");
+    assert_eq!(updated, 1, "exactly one account carries {email}");
+}
+
+#[tokio::test]
+async fn an_account_on_a_temporary_password_can_neither_use_nor_approve_a_client() {
+    let Some(database) = TestDatabase::create("oauth_server_temporary_password").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let email = format!("rescued-{}@example.com", Uuid::new_v4());
+    let cookie = register(router, &email).await;
+    let document = MetadataDocument::serve("Claude Code");
+    let connection = connect(router, &cookie, &document.client_id, "notes:read").await;
+
+    let (status, _headers, answer) =
+        mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::OK, "body: {answer}");
+
+    // An operator rescues the account. The connected client is refused with
+    // the same 403 and code a session gets, and no challenge, because the
+    // token is valid and signing in again would not help.
+    flag_temporary_password(&harness, &email, true).await;
+    let (status, headers, body) = mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], anubis::auth::PASSWORD_CHANGE_REQUIRED);
+    assert!(headers.get("www-authenticate").is_none());
+
+    // An unknown token still reads 401 and says nothing about any account.
+    let (status, _headers, _body) = mcp(router, Some("not-a-token"), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The consent screen cannot approve a new client for the account either.
+    let second = MetadataDocument::serve("Codex");
+    let consent = authorize(router, &authorize_params(&second.client_id, "notes:read")).await;
+    let request_id = param(&consent, "request").expect("a request id");
+    for (method, body) in [("GET", None), ("POST", Some(json!({ "approve": true })))] {
+        let (status, _headers, answer) = send(
+            router,
+            method,
+            &format!("/oauth/requests/{request_id}"),
+            body.as_ref(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} body: {answer}");
+        assert_eq!(answer["code"], anubis::auth::PASSWORD_CHANGE_REQUIRED);
+    }
+    let mut db = harness.pool.get().await.expect("a connection");
+    let grants: i64 = oauth_grants::table
+        .count()
+        .get_result(&mut db)
+        .await
+        .expect("the count runs");
+    assert_eq!(grants, 1, "the refused approval created no grant");
+
+    // The grant survived the rescue: once the person chooses a password, the
+    // same token works again, which proves the refusal was the flag.
+    flag_temporary_password(&harness, &email, false).await;
+    let (status, _headers, answer) =
+        mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
+    assert_eq!(status, StatusCode::OK, "body: {answer}");
 }
