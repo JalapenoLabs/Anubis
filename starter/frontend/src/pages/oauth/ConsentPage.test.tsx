@@ -47,7 +47,7 @@ const CALLBACK = 'http://localhost:53682/callback?code=abc&state=xyz&iss=http%3A
  * Answers the consent screen's three requests, telling a decision from a read
  * by method, which the shared table-by-path stub cannot.
  */
-function stubConsent(decisions: unknown[]) {
+function stubConsent(decisions: unknown[], decision: Response = Response.json({ redirect_to: CALLBACK })) {
   vi.stubGlobal('fetch', async (input: Request | string | URL) => {
     const request = input instanceof Request
       ? input
@@ -62,7 +62,7 @@ function stubConsent(decisions: unknown[]) {
     }
     if (pathname === '/oauth/requests/request-1' && request.method === 'POST') {
       decisions.push(await request.json())
-      return Response.json({ redirect_to: CALLBACK })
+      return decision
     }
     return new Response('{}', { status: 404 })
   })
@@ -95,6 +95,36 @@ describe('ConsentPage', () => {
 
     await waitFor(() => expect(assign).toHaveBeenCalledWith(CALLBACK))
     expect(decisions).toEqual([{ approve: true }])
+  })
+
+  it('should say a request that expired while open is gone, not "Not found."', async () => {
+    stubConsent([], Response.json({ message: 'Not found.' }, { status: 404 }))
+
+    renderWithProviders(<ConsentPage requestId='request-1' />, '/consent?request=request-1')
+    fireEvent.click(await screen.findByRole('button', { name: 'Allow' }))
+
+    expect(await screen.findByText(/This request expired or was already answered/)).toBeTruthy()
+    expect(screen.queryByText('Not found.')).toBeNull()
+  })
+
+  it('should send an account on a temporary password to choose its own', async () => {
+    stubFetch({
+      '/auth/me': { status: 200, body: { user: { ...ME.user, password_change_required: true }}},
+      '/oauth/requests/request-1': {
+        status: 403,
+        body: {
+          message: 'Choose a new password before you continue.',
+          code: 'password_change_required',
+        },
+      },
+    })
+
+    renderWithProviders(<ConsentPage requestId='request-1' />, '/consent?request=request-1')
+
+    expect(await screen.findByText(/Your account is on a temporary password/)).toBeTruthy()
+    const link = screen.getByRole('link', { name: 'Choose a new password' })
+    expect(link.getAttribute('href')).toBe('/settings/security')
+    expect(screen.getByText('Connect an app')).toBeTruthy()
   })
 
   it('should say a request is gone rather than that something broke', async () => {

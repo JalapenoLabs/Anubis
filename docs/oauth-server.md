@@ -65,6 +65,7 @@ A client whose `client_id` is an `https` URL, such as Claude Code's `https://cla
 - `/oauth/authorize`, which is where a fetch is triggered, takes thirty requests an hour per client address (`Budget::Authorization`), so the endpoint cannot be used to make this server fetch the internet on a stranger's behalf.
 - The document's `client_id` must equal the URL, it must name the client and 1 to 10 redirect URIs this server would register, and it must not describe a client that authenticates with a shared secret.
 - It is cached per its `Cache-Control`, between five minutes and a day, an hour when it says nothing. A failed fetch is never cached and refuses the request rather than falling back to a stale row.
+- A cached document nothing holds on to, no grant and no pending request, is forgotten once it is stale, swept whenever another document is fetched. The row is only a cache of what the URL says, so forgetting it costs a fetch, and a flood of distinct document URLs leaves rows that live a day at most rather than forever.
 
 Outside production, documents may be fetched from loopback hosts over `http`, which the draft permits for development and testing. That is how the integration tests serve one, and how a developer tries a local client.
 
@@ -124,7 +125,7 @@ A live token whose account an operator gave a [temporary password](tenancy.md#te
 
 ## The account surface
 
-The consent screen is the application's SPA at `/consent`, the path `anubis::oauth_server::CONSENT_PATH` names and the starter's `UrlTree.consent` matches. It names the client, the host that vouches for it (a metadata document's host, which the client cannot fake) or a warning that nobody does, the host the code goes to with a warning when that is a program on this device, the scopes with their descriptions, and the account it will act as.
+The consent screen is the application's SPA at `/consent`, the path `anubis::oauth_server::CONSENT_PATH` names and the starter's `UrlTree.consent` matches. It names the client, the host that vouches for it (a metadata document's host, which the client cannot fake) or a warning that nobody does, the host the code goes to with a warning when that is a program on this device, the scopes with their descriptions, and the account it will act as. A request that expired or was already answered says so in those words, whether it is read or decided, and an account on an operator's temporary password is told to choose its own and linked to the screen that does.
 
 Security settings list the connected apps with a revoke button. A grant is listed once its program exchanged the code for tokens: approving creates the grant first, and a program that never came back for its tokens never connected, through `useConnectedClients` in `@jalapenolabs/anubis`. Revoking ends the grant on the server first, so a row disappears only once its tokens have stopped working.
 

@@ -192,6 +192,7 @@
         "title": "Connected apps",
         "subtitle": "Programs you let act as you, such as Claude Code or Codex. Revoking one signs it out at once.",
         "empty": "No apps are connected. Add this site as an MCP server in Claude Code, Claude Desktop, or Codex to connect one.",
+        "loadFailed": "Your connected apps could not be loaded. Refresh the page to try again.",
         "app": "App",
         "permissions": "Permissions",
         "identityOnly": "Who you are",
@@ -440,6 +441,7 @@
   "oauth": {
     "consent": {
       "title": "Connect {{client}}",
+      "titleUnknown": "Connect an app",
       "subtitle": "{{client}} is asking to act as you on this site.",
       "verifiedBy": "Published by {{host}}, which vouches for this app's name.",
       "unverified": "This app registered itself, so nobody vouches for its name. Only continue if you started this connection yourself.",
@@ -450,7 +452,9 @@
       "signedInAs": "You are signed in as {{email}}.",
       "approve": "Allow",
       "deny": "Deny",
-      "expired": "This request expired or was already answered. Start the connection again from the app."
+      "expired": "This request expired or was already answered. Start the connection again from the app.",
+      "passwordChangeRequired": "Your account is on a temporary password. Choose a new one before you connect an app.",
+      "choosePassword": "Choose a new password"
     },
     "errors": {
       "title": "This connection cannot continue",

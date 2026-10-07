@@ -41,7 +41,7 @@ use crate::oauth_server::Server;
 use crate::oauth_server::document::{MAX_CLIENT_NAME_LENGTH, MAX_REDIRECT_URIS};
 use crate::oauth_server::error::OauthError;
 use crate::oauth_server::redirect;
-use crate::schema::{oauth_clients, oauth_grants};
+use crate::schema::{oauth_authorization_requests, oauth_clients, oauth_grants};
 
 /// How long a dynamic registration may wait for its first grant.
 ///
@@ -174,6 +174,9 @@ pub(crate) async fn resolve(
         ClientFailure::Unknown
     })?;
 
+    sweep_stale_documents(connection, client_id)
+        .await
+        .map_err(log_internal)?;
     let row = NewClient {
         client_id,
         kind: ClientKind::MetadataDocument.as_str(),
@@ -352,6 +355,37 @@ async fn sweep_unused_registrations(connection: &mut AsyncPgConnection) -> Resul
     .execute(connection)
     .await?;
     Ok(())
+}
+
+/// Forgets cached documents nothing holds on to, other than `resolving`'s.
+///
+/// A metadata-document client's row is a cache of what its URL says, so a
+/// stale one with no grant and no pending authorization request costs only a
+/// fetch to rebuild. Without this, every distinct document URL anybody ever
+/// presented would stay forever, and `/oauth/authorize` is open to strangers.
+/// Swept whenever a document is fetched, which is the only thing that adds a
+/// row, so an abandoned one outlives its cache lifetime (a day at most) only
+/// until the next fetch. The URL being resolved is left alone, because the
+/// caller is about to rewrite it and a concurrent request may already hold it.
+async fn sweep_stale_documents(
+    connection: &mut AsyncPgConnection,
+    resolving: &str,
+) -> QueryResult<usize> {
+    diesel::delete(
+        oauth_clients::table
+            .filter(oauth_clients::kind.eq(ClientKind::MetadataDocument.as_str()))
+            .filter(oauth_clients::refresh_after.le(Utc::now()))
+            .filter(oauth_clients::client_id.ne(resolving))
+            .filter(diesel::dsl::not(diesel::dsl::exists(
+                oauth_grants::table.filter(oauth_grants::client_id.eq(oauth_clients::id)),
+            )))
+            .filter(diesel::dsl::not(diesel::dsl::exists(
+                oauth_authorization_requests::table
+                    .filter(oauth_authorization_requests::client_id.eq(oauth_clients::id)),
+            ))),
+    )
+    .execute(connection)
+    .await
 }
 
 /// How many dynamic registrations have no grant behind them.

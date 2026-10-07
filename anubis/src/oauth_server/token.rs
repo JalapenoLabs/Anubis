@@ -230,11 +230,18 @@ async fn refresh(
     // A refresh may ask for less than the grant holds, never more. Checked
     // before the token is spent, so a client that asked for too much keeps the
     // token it can retry with; the grant's scopes never change, so reading
-    // them first decides nothing the spend below could contradict.
+    // them first decides nothing the spend below could contradict. Only a
+    // token that could still be spent is read here: a spent, expired, or
+    // revoked one falls through to the spend below, which is where reuse is
+    // detected, so no scope a caller names can skip that check or learn
+    // that a dead token was ever real.
     if let Some(requested) = form.scope.as_deref() {
         let held: Option<Vec<String>> = oauth_refresh_tokens::table
             .inner_join(oauth_grants::table)
             .filter(oauth_refresh_tokens::token_hash.eq(&token_hash))
+            .filter(oauth_refresh_tokens::used_at.is_null())
+            .filter(oauth_refresh_tokens::expires_at.gt(Utc::now()))
+            .filter(oauth_grants::revoked_at.is_null())
             .select(oauth_grants::scopes)
             .first(connection)
             .await

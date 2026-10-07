@@ -10,6 +10,9 @@ import { getApiErrorMessage, useAnubisApi, useCurrentUser } from '@jalapenolabs/
 // UI
 import { Alert, Button } from '@heroui/react'
 
+// Misc
+import { consentRefusalKey } from './consentRefusal'
+
 type Props = {
   request: AuthorizationRequest
 }
@@ -46,7 +49,12 @@ export function ConsentRequestCard(props: Props) {
     }
     catch (error) {
       console.debug('the consent decision failed', error)
-      setErrorMessage(getApiErrorMessage(error) ?? t('common.somethingWentWrong'))
+      // A request that expired while the page sat open answers 404, whose
+      // server message is a bare "Not found."
+      const refusalKey = consentRefusalKey(error)
+      setErrorMessage(refusalKey
+        ? t(refusalKey)
+        : getApiErrorMessage(error) ?? t('common.somethingWentWrong'))
       setDeciding(null)
     }
   }

@@ -168,8 +168,9 @@ impl Tool {
 
     /// Sets the JSON Schema the arguments must satisfy.
     ///
-    /// The protocol layer checks every call against it before the tool runs,
-    /// so a tool reads [`ToolCall::arguments`] knowing their shape.
+    /// The framework checks every call against it before the tool runs (the
+    /// protocol layer only advertises it), so a tool reads
+    /// [`ToolCall::arguments`] knowing their shape.
     ///
     /// # Panics
     /// Panics when `schema` is not a JSON object, which the specification

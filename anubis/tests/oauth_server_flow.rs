@@ -12,7 +12,7 @@
 
 mod support;
 
-use anubis::schema::{audit_events, oauth_grants, users};
+use anubis::schema::{audit_events, oauth_clients, oauth_grants, users};
 use axum::http::StatusCode;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -329,6 +329,65 @@ async fn a_reused_refresh_token_revokes_the_family() {
         audited(&harness, anubis::audit::OAUTH_REFRESH_REUSED).await,
         1
     );
+}
+
+/// A spent refresh token is a theft signal whatever scope it asks for.
+///
+/// The narrowing check reads the grant's scopes before the token is spent, so
+/// a client that asked for too much can retry. It must not read a token that
+/// is already spent: asking a rotated-away token for a scope the grant lacks
+/// would otherwise answer `invalid_scope` and skip the revocation reuse
+/// earns, and would confirm the token was ever real.
+#[tokio::test]
+async fn a_reused_refresh_token_revokes_the_family_whatever_scope_it_asks_for() {
+    let Some(database) = TestDatabase::create("oauth_server_refresh_scope_reuse").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let cookie = register(router, &format!("rescope-{}@example.com", Uuid::new_v4())).await;
+    let document = MetadataDocument::serve("Codex");
+    let first = connect(router, &cookie, &document.client_id, "notes:read").await;
+
+    let (status, rotated) = refresh(router, &document.client_id, &first.refresh_token).await;
+    assert_eq!(status, StatusCode::OK, "body: {rotated}");
+
+    let (status, reused) = post_form(
+        router,
+        "/oauth/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", &document.client_id),
+            ("refresh_token", &first.refresh_token),
+            ("scope", "notes:read notes:write"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reused["error"], "invalid_grant", "body: {reused}");
+    assert_eq!(
+        audited(&harness, anubis::audit::OAUTH_REFRESH_REUSED).await,
+        1
+    );
+    let newest = rotated["refresh_token"].as_str().expect("a refresh token");
+    let (status, _body) = refresh(router, &document.client_id, newest).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the newest token died too");
+
+    // A token nobody issued reads the same as a spent one, never as a scope
+    // problem.
+    let (status, unknown) = post_form(
+        router,
+        "/oauth/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", &document.client_id),
+            ("refresh_token", "never-issued"),
+            ("scope", "notes:write"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown["error"], "invalid_grant", "body: {unknown}");
 }
 
 #[tokio::test]
@@ -685,4 +744,80 @@ async fn an_account_on_a_temporary_password_can_neither_use_nor_approve_a_client
     let (status, _headers, answer) =
         mcp(router, Some(&connection.access_token), &whoami(), &[]).await;
     assert_eq!(status, StatusCode::OK, "body: {answer}");
+}
+
+/// Marks a cached metadata document as due for fetching again.
+async fn make_stale(harness: &Harness, client_id: &str) {
+    let mut connection = harness.pool.get().await.expect("a connection");
+    diesel::update(oauth_clients::table.filter(oauth_clients::client_id.eq(client_id)))
+        .set(oauth_clients::refresh_after.eq(Some(chrono::Utc::now() - chrono::Duration::hours(1))))
+        .execute(&mut connection)
+        .await
+        .expect("the cache entry updates");
+}
+
+/// Whether a client row exists for `client_id`.
+async fn client_known(harness: &Harness, client_id: &str) -> bool {
+    let mut connection = harness.pool.get().await.expect("a connection");
+    diesel::select(diesel::dsl::exists(
+        oauth_clients::table.filter(oauth_clients::client_id.eq(client_id)),
+    ))
+    .get_result(&mut connection)
+    .await
+    .expect("the lookup runs")
+}
+
+#[tokio::test]
+async fn a_cached_document_nothing_holds_on_to_is_forgotten() {
+    let Some(database) = TestDatabase::create("oauth_server_document_sweep").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let cookie = register(router, &format!("sweep-{}@example.com", Uuid::new_v4())).await;
+
+    // A document somebody presented once and then abandoned: its request was
+    // decided, so nothing points at the cached row any more.
+    let abandoned = MetadataDocument::serve("Abandoned");
+    let consent = authorize(
+        router,
+        &authorize_params(&abandoned.client_id, "notes:read"),
+    )
+    .await;
+    let request_id = param(&consent, "request").expect("a request id");
+    decide(router, &cookie, &request_id, false).await;
+
+    // A document a person connected with, and one still waiting on consent.
+    let connected = MetadataDocument::serve("Claude Code");
+    connect(router, &cookie, &connected.client_id, "notes:read").await;
+    let waiting = MetadataDocument::serve("Codex");
+    authorize(router, &authorize_params(&waiting.client_id, "notes:read")).await;
+
+    for document in [&abandoned, &connected, &waiting] {
+        make_stale(&harness, &document.client_id).await;
+    }
+
+    // Fetching any other document sweeps the stale cache entries nothing
+    // holds, and only those.
+    let next = MetadataDocument::serve("Next");
+    authorize(router, &authorize_params(&next.client_id, "notes:read")).await;
+
+    assert!(!client_known(&harness, &abandoned.client_id).await);
+    assert!(
+        client_known(&harness, &connected.client_id).await,
+        "a grant holds it"
+    );
+    assert!(
+        client_known(&harness, &waiting.client_id).await,
+        "a request holds it"
+    );
+    assert!(client_known(&harness, &next.client_id).await);
+
+    // A forgotten document is fetched again when it is next presented.
+    let consent = authorize(
+        router,
+        &authorize_params(&abandoned.client_id, "notes:read"),
+    )
+    .await;
+    assert!(param(&consent, "request").is_some(), "{consent}");
 }

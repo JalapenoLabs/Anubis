@@ -33,10 +33,13 @@ use url::Url;
 
 use crate::oauth_server::redirect;
 
-/// How long a fetch may take, connecting included.
+/// How long a fetch may take, resolving the host and reading the body included.
 ///
 /// Claude's own discovery and registration calls time out at ten seconds, and
-/// this fetch happens inside the authorization request it is waiting on.
+/// this fetch happens inside the authorization request it is waiting on. The
+/// budget covers the DNS lookup as well as the request, because the host is
+/// the client's to choose and a resolver that never answers is the cheapest
+/// way to hold a request open.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most of a document this server reads, the draft's recommendation.
@@ -89,13 +92,21 @@ impl Fetcher {
         self.check_url(client_id).is_ok()
     }
 
-    /// Fetches the document `client_id` names and checks it.
+    /// Fetches the document `client_id` names and checks it, within
+    /// [`FETCH_TIMEOUT`] from the first lookup to the last byte.
     ///
     /// # Errors
     /// Returns a sentence naming what was wrong, for the log and for the
     /// consent screen's refusal. Nothing it says comes from the document's
     /// contents, so a hostile document cannot write on this server's pages.
     pub(crate) async fn fetch(self, client_id: &str) -> Result<ClientDocument, &'static str> {
+        tokio::time::timeout(FETCH_TIMEOUT, self.fetch_unbounded(client_id))
+            .await
+            .map_err(|_elapsed| "the client's metadata document took longer than five seconds")?
+    }
+
+    /// The fetch itself, which [`Fetcher::fetch`] bounds in time.
+    async fn fetch_unbounded(self, client_id: &str) -> Result<ClientDocument, &'static str> {
         let url = self.check_url(client_id)?;
         let host = url.host_str().ok_or("the client id names no host")?;
         let port = url
@@ -105,7 +116,6 @@ impl Fetcher {
 
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(FETCH_TIMEOUT)
             .no_proxy()
             // The connection goes to the addresses checked above and nowhere
             // else, whatever the resolver would answer by the time it opens.
@@ -352,8 +362,8 @@ mod tests {
     use reqwest::header::HeaderValue;
 
     use super::{
-        DEFAULT_CACHE, Fetcher, MAX_CACHE, MIN_CACHE, RawDocument, cache_lifetime, check_document,
-        is_public,
+        DEFAULT_CACHE, FETCH_TIMEOUT, Fetcher, MAX_CACHE, MIN_CACHE, RawDocument, cache_lifetime,
+        check_document, is_public,
     };
 
     const CLAUDE_CODE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
@@ -459,6 +469,27 @@ mod tests {
             let ip: IpAddr = address.parse().expect("the test address parses");
             assert!(is_public(ip), "{address}");
         }
+    }
+
+    /// The budget is the fetch's own, not the HTTP client's, so it holds a
+    /// host that accepts the connection and never answers.
+    #[tokio::test]
+    async fn a_host_that_never_answers_is_refused_within_the_budget() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port must be available");
+        let port = listener.local_addr().expect("the listener is bound").port();
+        let started = std::time::Instant::now();
+
+        let refused = Fetcher::new(true)
+            .fetch(&format!("http://127.0.0.1:{port}/client.json"))
+            .await;
+
+        assert_eq!(
+            refused,
+            Err("the client's metadata document took longer than five seconds"),
+        );
+        assert!(started.elapsed() < FETCH_TIMEOUT + Duration::from_secs(2));
+        drop(listener);
     }
 
     #[test]

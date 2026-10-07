@@ -51,6 +51,18 @@ describe('ConnectedClientsCard', () => {
     expect(await screen.findByText(/No apps are connected/)).toBeTruthy()
   })
 
+  it('should say the list failed rather than that nothing is connected', async () => {
+    stubFetch({
+      '/auth/me': { status: 200, body: ME },
+      '/oauth/connections': { status: 500, body: { message: 'Something went wrong.' }},
+    })
+
+    renderWithProviders(<ConnectedClientsCard />)
+
+    expect(await screen.findByText(/could not be loaded/)).toBeTruthy()
+    expect(screen.queryByText(/No apps are connected/)).toBeNull()
+  })
+
   it('should list a connection and revoke it before it disappears', async () => {
     let connections = [ CONNECTION ]
     const revoked: string[] = []

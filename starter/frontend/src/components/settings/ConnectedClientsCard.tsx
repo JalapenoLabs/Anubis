@@ -19,17 +19,20 @@ import {
   TableColumn,
   TableHeader,
   TableRow,
+  Tooltip,
 } from '@heroui/react'
 
 /**
  * The programs this account connected, such as Claude Code, each revocable.
  *
  * Revoking ends the connection on the server before the list refreshes, so a
- * row only disappears once the program's tokens have stopped working.
+ * row only disappears once the program's tokens have stopped working. A list
+ * that failed to load says so, because on a security screen "nothing is
+ * connected" is an answer a person acts on.
  */
 export function ConnectedClientsCard() {
   const { t } = useTranslation()
-  const { connectedClients, isLoading, revoke } = useConnectedClients()
+  const { connectedClients, isLoading, error, revoke } = useConnectedClients()
   const [ revokingId, setRevokingId ] = useState<string | null>(null)
   const [ errorMessage, setErrorMessage ] = useState<string | null>(null)
 
@@ -78,7 +81,9 @@ export function ConnectedClientsCard() {
           isLoading={isLoading}
           emptyContent={isLoading
             ? t('common.loading')
-            : t('settings.security.connectedClients.empty')}
+            : error
+              ? t('settings.security.connectedClients.loadFailed')
+              : t('settings.security.connectedClients.empty')}
         >
           {
             (connection: ConnectedClient) => (
@@ -104,9 +109,17 @@ export function ConnectedClientsCard() {
                   <div className='flex flex-wrap gap-1'>{
                       connection.scopes.length
                         ? connection.scopes.map((scope) => (
-                          <Chip key={scope.name} size='sm' variant='flat'>{
-                              scope.name
-                            }</Chip>
+                          // A scope the application stopped declaring has no
+                          // description left to show, only its name.
+                          <Tooltip
+                            key={scope.name}
+                            content={scope.description}
+                            isDisabled={!scope.description}
+                          >
+                            <Chip size='sm' variant='flat'>{
+                                scope.name
+                              }</Chip>
+                          </Tooltip>
                         ))
                         : <span className='opacity-70'>{
                             t('settings.security.connectedClients.identityOnly')

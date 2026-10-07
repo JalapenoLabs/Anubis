@@ -3,15 +3,17 @@
 // Core
 import { useTranslation } from 'react-i18next'
 import useSWR from 'swr'
-import { useAnubisApi } from '@jalapenolabs/anubis'
+import { getApiErrorMessage, useAnubisApi } from '@jalapenolabs/anubis'
 
 // UI
 import { Spinner } from '@heroui/react'
+import { Link } from 'react-router'
 import { AuthLayout } from '../../components/AuthLayout'
 import { ConsentRequestCard } from '../../components/oauth/ConsentRequestCard'
 
-// Utility
-import { HTTPError } from 'ky'
+// Misc
+import { UrlTree } from '../../urls'
+import { consentRefusalKey } from '../../components/oauth/consentRefusal'
 
 type Props = {
   requestId: string
@@ -23,7 +25,8 @@ type Props = {
  * The backend validated the program's request and stored it before sending the
  * browser here, so the page reads it by id and never trusts a parameter the
  * program could have edited. A request answers `404` once it expired or was
- * decided, which the page says in those words rather than as a failure.
+ * decided, which the page says in those words rather than as a failure, and
+ * an account on a temporary password is sent to choose its own first.
  */
 export function ConsentPage(props: Props) {
   const { t } = useTranslation()
@@ -37,14 +40,16 @@ export function ConsentPage(props: Props) {
     { shouldRetryOnError: false },
   )
 
-  const clientName = request.data?.client.name ?? ''
-  const isGone = !props.requestId
-    || (request.error instanceof HTTPError && request.error.response.status === 404)
+  const refusalKey = props.requestId
+    ? consentRefusalKey(request.error)
+    : 'oauth.consent.expired'
 
   return <AuthLayout
-    title={t('oauth.consent.title', { client: clientName })}
+    title={request.data
+      ? t('oauth.consent.title', { client: request.data.client.name })
+      : t('oauth.consent.titleUnknown')}
     subtitle={request.data
-      ? t('oauth.consent.subtitle', { client: clientName })
+      ? t('oauth.consent.subtitle', { client: request.data.client.name })
       : ''}
   >
     { request.isLoading
@@ -56,15 +61,21 @@ export function ConsentPage(props: Props) {
         </div>
       : null
     }
-    { isGone
-      ? <p className='text-danger'>{
-          t('oauth.consent.expired')
+    { refusalKey
+      ? <p className='compact text-danger'>{
+          t(refusalKey)
         }</p>
       : null
     }
-    { request.error && !isGone
+    { refusalKey === 'oauth.consent.passwordChangeRequired'
+      ? <Link to={UrlTree.settingsSecurity} className='text-primary'>{
+          t('oauth.consent.choosePassword')
+        }</Link>
+      : null
+    }
+    { request.error && !refusalKey
       ? <p className='text-danger'>{
-          t('common.somethingWentWrong')
+          getApiErrorMessage(request.error) ?? t('common.somethingWentWrong')
         }</p>
       : null
     }
