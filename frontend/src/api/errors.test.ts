@@ -7,7 +7,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ky from 'ky'
 
 // Misc
-import { getApiErrorMessage, getRetryAfterSeconds } from './errors'
+import {
+  PASSWORD_CHANGE_REQUIRED,
+  getApiErrorCode,
+  getApiErrorMessage,
+  getRetryAfterSeconds,
+} from './errors'
+
+const RATE_LIMITED_BODY = { message: 'Too many requests. Try again in 30 seconds.' }
 
 /**
  * The error a real request produces, so these helpers meet ky's own shape.
@@ -16,9 +23,13 @@ import { getApiErrorMessage, getRetryAfterSeconds } from './errors'
  * was called with what the assertion expects; going through the client is what
  * proves the header and the body survive the trip.
  */
-async function failedRequest(status: number, headers: Record<string, string> = {}) {
+async function failedRequest(
+  status: number,
+  headers: Record<string, string> = {},
+  body: Record<string, unknown> = RATE_LIMITED_BODY,
+) {
   vi.stubGlobal('fetch', async () => {
-    return new Response(JSON.stringify({ message: 'Too many requests. Try again in 30 seconds.' }), {
+    return new Response(JSON.stringify(body), {
       status,
       headers: {
         'content-type': 'application/json',
@@ -74,5 +85,29 @@ describe('getApiErrorMessage', () => {
     const error = await failedRequest(429, { 'retry-after': '30' })
 
     expect(getApiErrorMessage(error)).toBe('Too many requests. Try again in 30 seconds.')
+  })
+})
+
+describe('getApiErrorCode', () => {
+  it('should read the code a refusal names beside its message', async () => {
+    const error = await failedRequest(403, {}, {
+      message: 'Choose a new password before you continue.',
+      code: PASSWORD_CHANGE_REQUIRED,
+    })
+
+    expect(getApiErrorCode(error)).toBe(PASSWORD_CHANGE_REQUIRED)
+    expect(getApiErrorMessage(error)).toBe('Choose a new password before you continue.')
+  })
+
+  it('should answer null for a refusal that names no code', async () => {
+    expect(getApiErrorCode(await failedRequest(409, {}, { message: 'taken' }))).toBeNull()
+  })
+
+  it('should answer null for anything that is not an HTTP error', () => {
+    expect(getApiErrorCode(new Error('the network went away'))).toBeNull()
+  })
+
+  it('should keep the code the backend sends', () => {
+    expect(PASSWORD_CHANGE_REQUIRED).toBe('password_change_required')
   })
 })

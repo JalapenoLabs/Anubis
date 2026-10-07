@@ -108,6 +108,17 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/auth/password-reset/confirm",
         area: "auth",
     },
+    // An operator's invitation, from the invitee's side.
+    RouteEntry {
+        method: "POST",
+        path: "/auth/invitations/lookup",
+        area: "auth",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/auth/invitations/accept",
+        area: "auth",
+    },
     // Profile and account management.
     RouteEntry {
         method: "PATCH",

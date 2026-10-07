@@ -38,6 +38,22 @@
 //! operator in place, because a role the deployment granted is still a role
 //! somebody holds, and a boot that silently demoted the only operator would
 //! lock the deployment out of itself.
+//!
+//! # Bringing people in
+//!
+//! After the first operator, accounts arrive by invitation or by registering.
+//! [`Accounts`] is what an operator surface calls to invite somebody (with a
+//! platform role or without), to resend or revoke that invitation, and to set
+//! a temporary password on an account whose owner is locked out;
+//! [`pending_invitations`] lists the invitations nobody has answered yet. The
+//! application owns the routes and the guard in front of them, and every
+//! function here takes the [`PlatformMember`](crate::guard::PlatformMember)
+//! that guard produced, so none of them can be reached by somebody who does not
+//! operate the deployment. The invitee's half, reading and accepting the link,
+//! is framework-owned and mounted with the auth routes. See `docs/tenancy.md`.
+
+mod accounts;
+mod invitations;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Display, Formatter};
@@ -53,6 +69,15 @@ use crate::db::DbPool;
 use crate::roles::{OPERATOR_ROLE, RoleSet, Scope};
 use crate::schema::users;
 use crate::{audit, tenancy};
+
+#[doc(inline)]
+pub use accounts::{Accounts, TemporaryPassword};
+pub(crate) use invitations::{Acceptance, INVITATION_UNUSABLE, accept_invitation, live_invitation};
+#[doc(inline)]
+pub use invitations::{
+    INVITATION_TTL_HOURS, InviteRequest, PendingInvitations, PlatformInvitation,
+    pending_invitations,
+};
 
 /// Grants the configured account the platform operator role, creating it once.
 ///
@@ -131,7 +156,14 @@ async fn seed(
                     .execute(transaction)
                     .await?;
 
-                record_grant(transaction, &user, &user.platform_roles, &granted).await
+                record_grant(
+                    transaction,
+                    &audit::Context::system(),
+                    &user,
+                    &user.platform_roles,
+                    &granted,
+                )
+                .await
             })
             .await
             .map_err(|source| Error::query(&source))?;
@@ -172,7 +204,14 @@ async fn seed(
             // organization, and every screen a tenant member sees works.
             tenancy::create_personal_organization(transaction, &user).await?;
 
-            record_grant(transaction, &user, &[], &user.platform_roles).await?;
+            record_grant(
+                transaction,
+                &audit::Context::system(),
+                &user,
+                &[],
+                &user.platform_roles,
+            )
+            .await?;
 
             Ok::<User, diesel::result::Error>(user)
         })
@@ -191,10 +230,12 @@ async fn seed(
 /// Records the grant on the account it changed.
 ///
 /// A platform role is account-level, so the row names neither a team nor an
-/// organization, exactly as a password change does. The actor is the system:
-/// the deployment's configuration is what granted this, not a person.
-async fn record_grant(
+/// organization, exactly as a password change does. `context` says who
+/// granted it: the system when the deployment's configuration did, and the
+/// accepting account when an invitation carried the role.
+pub(crate) async fn record_grant(
     connection: &mut diesel_async::AsyncPgConnection,
+    context: &audit::Context,
     user: &User,
     before: &[String],
     after: &[String],
@@ -207,7 +248,7 @@ async fn record_grant(
 
     audit::record(
         connection,
-        &audit::Context::system(),
+        context,
         &audit::Event::new(PLATFORM_ROLES_CHANGED, "User")
             .subject(user.id)
             .label(&label)

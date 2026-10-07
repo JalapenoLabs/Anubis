@@ -86,10 +86,26 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 - **OAuth**: OpenID Connect providers, one line of setup each. See [OAuth sign-in](#oauth-sign-in) below.
 - **Secrets at rest**: recovery codes hash like every other token. A TOTP seed must be read back to compute the expected code, so it is encrypted instead, with AES-256-GCM under the application key in `ANUBIS_SECRET_KEY` (base64 for exactly 32 bytes, required in production; development and test fall back to a public built-in key and warn at startup). Stored values are versioned and self-describing, `v1:<nonce>:<ciphertext>`, so a future scheme can be added without a migration. Mint a key with `anubis secret generate`. A seed that no longer decrypts, because the key rotated, is discarded: the account drops back to single-factor login and the user enrolls again. Rotating therefore un-enrolls every second factor at once, by design; see [key rotation](architecture.md#secrets-at-rest-and-key-rotation). The same `anubis::auth::secret_box` module covers any later secret that needs recoverable storage.
 - **Account management routes**: profile (names, time zone, locale), avatar upload/serve/delete, signed-in password and email change, session listing and revocation, and password-confirmed account deletion.
+- **Invitations from an operator**: `POST /auth/invitations/lookup` (`{token}`) answers `{email, expires_at}` for a live link, and `POST /auth/invitations/accept` (`{token, password, time_zone?, locale?}`) creates the invited account with its address verified and signs it in, answering `201` with the user like registration does. Every unusable token, whether unknown, used, revoked, or expired, answers the same `400` with the same sentence; an address that gained an account after the invitation went out answers `409`. The operator's half is `anubis::platform::Accounts`, behind the application's own routes. See [tenancy.md](tenancy.md#bringing-people-in).
+- **Temporary passwords**: an account an operator gave a temporary password signs in normally, and its user carries `password_change_required: true`. Until it changes its password, every authenticated route except `GET /auth/me` and `POST /auth/change-password` answers `403` with the code `password_change_required`; `POST /auth/logout` was never gated. Changing the password refuses a new one equal to the current one, and clears the flag. See [tenancy.md](tenancy.md#temporary-passwords).
 - **Preferences at sign-up**: `POST /auth/register` takes an optional `time_zone` and `locale` beside the credentials, so an account starts in the person's own zone rather than `UTC`. `register()` in `@jalapenolabs/anubis` sends the browser's zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) unless the caller names one, and sends a locale only when the application passes it, because only the application knows which languages it ships. Both are held to the bound `PATCH /auth/profile` applies, and a value outside it is dropped for the column default rather than refusing the sign-up: the browser chose it, not the person.
 - **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the admin role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch, and `ApiCaller::require` authorizes the token's roles the way `TeamMember::require` authorizes a member's. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; framework API serializers live in the version module (`TeamV1`) and freeze with it, and an application's live in each model's own module.
 
 Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.
+
+## Errors
+
+Every error, on every route, is `{"message": "..."}` with the status that classifies it, and the message is user-safe prose that may be reworded. A refusal a client has to react to by kind rather than by status also carries a stable `code`, which is the one part of the body a client may branch on:
+
+```json
+{ "message": "Choose a new password before you continue.", "code": "password_change_required" }
+```
+
+| Code | Status | Meaning |
+|---|---|---|
+| `password_change_required` | `403` | The account is signed in on a temporary password and must change it first |
+
+A handler adds one with `ApiError::with_code`, and an application declares its own codes the same way, as `snake_case` constants it never renames. `getApiErrorCode(error)` in `@jalapenolabs/anubis` reads it, and `PASSWORD_CHANGE_REQUIRED` is the framework's code as a constant. The `/api/v1` bearer-token surface declares none today, so `ErrorV1` documents only the message.
 
 ## Rate limiting
 
@@ -97,12 +113,12 @@ Tokens are attempt-limited individually, but the endpoints that accept them woul
 
 | Endpoint | Budget | Keyed by |
 |---|---|---|
-| `POST /auth/login`, `POST /auth/mfa/verify`, `POST /auth/email-code/verify` | 10 per minute | Client address |
+| `POST /auth/login`, `POST /auth/mfa/verify`, `POST /auth/email-code/verify`, `POST /auth/invitations/lookup`, `POST /auth/invitations/accept` | 10 per minute | Client address |
 | `POST /auth/register` | 10 per hour | Client address |
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /auth/verify-email/request` | 20 per hour | Client address |
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /tenancy/invitations` | 5 per hour | Target email address |
 
-Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on.
+Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on. The invitation endpoints carry one anyway, because accepting hashes a password, which is the cost a stranger must not get at network speed.
 
 The mail endpoints carry two budgets because the two abuses differ. A client hammering the endpoint is caught per address; a campaign rotating addresses to bomb one inbox is caught per recipient, which is why that budget is the tighter of the two. The recipient is charged before the account lookup and only its SHA-256 becomes a key, so no address sits in memory in the clear and the answer never depends on whether the address is registered.
 

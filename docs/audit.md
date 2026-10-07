@@ -70,6 +70,7 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `TEAM_RENAMED` | `team.renamed` | A team is renamed |
 | `TEAM_DESTROYED` | `team.destroyed` | A team is dissolved |
 | `INVITATION_CREATED` | `invitation.created` | An invitation is sent |
+| `INVITATION_RESENT` | `invitation.resent` | A pending invitation goes out again with a fresh link |
 | `INVITATION_CLAIMED` | `invitation.claimed` | An invitation is accepted |
 | `INVITATION_REVOKED` | `invitation.revoked` | A pending invitation is taken back |
 | `MEMBER_ADDED` | `member.added` | Somebody joins by claiming an invitation |
@@ -77,6 +78,7 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `MEMBER_REMOVED` | `member.removed` | An administrator removes somebody else |
 | `MEMBER_LEFT` | `member.left` | Somebody leaves of their own accord |
 | `PASSWORD_CHANGED` | `password.changed` | An account rotates its password |
+| `PASSWORD_TEMPORARY_SET` | `password.temporary_set` | An operator gives an account a temporary password |
 | `MFA_ENROLLED` | `mfa.enrolled` | An account confirms a TOTP enrollment |
 | `MFA_DISABLED` | `mfa.disabled` | An account turns its second factor off |
 | `PASSKEY_ADDED` | `passkey.added` | An account registers a passkey |
@@ -87,9 +89,11 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 
 The dot is what tells the two vocabularies apart at a glance, and it is why a scaffolded model's `created` can never collide with a framework verb.
 
+The invitation verbs cover both kinds of invitation, told apart by `subject_type`: `Invitation` for a team or organization invitation, recorded on that tenant, and `PlatformInvitation` for an operator's invitation to the deployment, recorded on neither. Claiming a platform invitation creates the account, so that row's actor is the new account; a role the invitation carried is recorded beside it as `platform.roles_changed`. `password.temporary_set` names the operator as the actor and the account as the subject, with an empty change set like every credential event. See [tenancy.md](tenancy.md#the-platform-tier).
+
 ## Sign-ins
 
-Every path that issues a session records `session.created` against the account, in the same transaction as the session: registering, a password, a password or emailed code completed by a second factor, an emailed code, a passkey, and an OpenID Connect provider. They all pass through one function, so the record is complete rather than a convention each path has to remember, and a session the log does not know about cannot exist.
+Every path that issues a session records `session.created` against the account, in the same transaction as the session: registering, a password, a password or emailed code completed by a second factor, an emailed code, a passkey, an OpenID Connect provider, and accepting an operator's invitation (`invitation`). They all pass through one function, so the record is complete rather than a convention each path has to remember, and a session the log does not know about cannot exist.
 
 The change set carries one field, `method`, from nothing to one of `anubis::auth::SignInMethod`'s spellings: `registration`, `password`, `second_factor`, `email_code`, `passkey`, `oauth`. A create otherwise records an empty set; the method is the one fact the new session was created with that a reader needs. A password that meets a second-factor challenge records nothing until the code is accepted, because no session exists until then.
 

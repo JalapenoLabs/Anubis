@@ -5,7 +5,9 @@
 //! the response body; log it with `tracing` at the point of failure and return
 //! [`ApiError::internal`]. The body shape holds for every status, including
 //! the `429` that [`ApiError::too_many_requests`] adds a `Retry-After` header
-//! to.
+//! to. An error a client must react to by kind rather than by status also
+//! carries a stable `code`, added with [`ApiError::with_code`]; the message is
+//! prose and may be reworded, the code may not.
 //!
 //! [`ListParams`] and [`Pagination`] carry the locked list-endpoint
 //! conventions from the repository's `docs/api.md`, so every scaffolded list
@@ -27,6 +29,8 @@ pub struct ApiError {
     message: String,
     /// How long the caller should wait, rendered as a `Retry-After` header.
     retry_after: Option<Duration>,
+    /// A stable, machine-readable name for this refusal, when it has one.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -78,6 +82,7 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("Too many requests. Try again in {seconds} seconds."),
             retry_after: Some(retry_after),
+            code: None,
         }
     }
 
@@ -123,11 +128,32 @@ impl ApiError {
         self.retry_after
     }
 
+    /// Names this refusal with a stable code a client can branch on.
+    ///
+    /// The status says what class of failure this is and the message says it
+    /// to a person, but neither is a contract: two different `403`s are the
+    /// same status, and a message is copy somebody will reword. A code is the
+    /// one part of the body a client may match on, so it is a `snake_case`
+    /// constant the framework or the application declares once and never
+    /// renames. It renders as `"code"` beside `"message"`.
+    #[must_use]
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    /// Returns the machine-readable code, when the error carries one.
+    #[must_use]
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
+    }
+
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
             retry_after: None,
+            code: None,
         }
     }
 }
@@ -165,12 +191,15 @@ impl From<diesel::result::Error> for ApiError {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorBody {
             message: &self.message,
+            code: self.code,
         });
 
         match self.retry_after {
@@ -511,5 +540,28 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
         );
+    }
+
+    async fn rendered_body(error: ApiError) -> serde_json::Value {
+        let body = axum::body::to_bytes(error.into_response().into_body(), 1024)
+            .await
+            .expect("an error body must be readable");
+        serde_json::from_slice(&body).expect("an error body must be JSON")
+    }
+
+    #[tokio::test]
+    async fn a_coded_error_names_its_code_beside_the_message() {
+        let error = ApiError::forbidden("Change your password first.").with_code("must_change");
+        assert_eq!(error.code(), Some("must_change"));
+
+        let body = rendered_body(error).await;
+        assert_eq!(body["message"], "Change your password first.");
+        assert_eq!(body["code"], "must_change");
+    }
+
+    #[tokio::test]
+    async fn an_uncoded_error_carries_no_code_key_at_all() {
+        let body = rendered_body(ApiError::conflict("taken")).await;
+        assert_eq!(body, serde_json::json!({ "message": "taken" }));
     }
 }

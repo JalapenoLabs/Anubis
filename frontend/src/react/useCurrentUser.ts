@@ -11,7 +11,8 @@ import { HTTPError } from 'ky'
 // Misc
 import { useAnubisApi } from './AnubisProvider'
 
-const CURRENT_USER_KEY = 'anubis/current-user'
+/** The SWR key every `useCurrentUser` shares, so a sign-in can write it. */
+export const CURRENT_USER_KEY = 'anubis/current-user'
 
 /**
  * The signed-in user, or null when signed out.
