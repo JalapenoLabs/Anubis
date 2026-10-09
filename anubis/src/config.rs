@@ -24,6 +24,9 @@
 //! | `DKIM_DOMAIN` | the `MAIL_FROM` domain | Domain the signature claims responsibility for |
 //! | `RATE_LIMIT_DISABLED` | `false` | `true` switches off the abuse limits on the auth endpoints |
 //! | `PASSWORD_HASH_CONCURRENCY` | `64` | How many argon2 computations may run at once, each holding 19 MiB |
+//! | `AVATAR_MAX_UPLOAD_BYTES` | `5242880` | Largest avatar upload accepted, in bytes (5 MiB) |
+//! | `AVATAR_MAX_EDGE` | `8192` | Longest avatar width or height the decoder will touch, in pixels |
+//! | `AVATAR_MAX_PIXELS` | `16777216` | Most pixels an avatar may decode to, checked from the header before allocating |
 //! | `TRUSTED_PROXY_HEADER` | unset | Forwarding header a trusted proxy appends the client address to, e.g. `x-forwarded-for` |
 //! | `SPA_DIR` | unset | Directory of built frontend assets to serve, e.g. `frontend/dist`; unset serves no frontend |
 //! | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated exact origins allowed to call the API from a browser, e.g. `https://app.example.com`; unset means same-origin only |
@@ -167,6 +170,18 @@
 //! limit it is derived from, and see [`crate::auth::password`] for why a bound
 //! exists at all.
 //!
+//! # Avatar uploads
+//!
+//! The three `AVATAR_*` variables bound what one avatar upload may cost.
+//! `AVATAR_MAX_UPLOAD_BYTES` caps the request body, and the other two cap what
+//! those bytes may decode to, because a compressed image is a promise about
+//! memory rather than a measure of it: five megabytes of PNG can declare
+//! hundreds of megabytes of pixels. Both pixel limits are checked against the
+//! image's header before the decoder allocates anything; see
+//! [`crate::images::decode`]. The pixel budget is the one that matters for
+//! memory, about four bytes a pixel per upload in flight, so derive it from
+//! the instance rather than from the largest photo anybody might send.
+//!
 //! # Cross-origin access
 //!
 //! `CORS_ALLOWED_ORIGINS` is the whole CORS surface: a comma-separated list of
@@ -242,6 +257,7 @@ use url::{Origin, Url};
 use crate::auth::oauth::{OauthProviderConfig, known_providers};
 use crate::auth::password;
 use crate::auth::secret_box::SecretKey;
+use crate::images::DecodeLimits;
 use crate::rate_limit::RateLimitConfig;
 use crate::server::{self, CorsConfig, CspConfig};
 
@@ -327,6 +343,33 @@ const PASSWORD_HASH_CONCURRENCY_VAR: &str = "PASSWORD_HASH_CONCURRENCY";
 const PASSWORD_HASH_CONCURRENCY_FORM: &str =
     "a positive number of concurrent hashes, each holding 19 MiB, e.g. `64`";
 
+/// Caps the request body of an avatar upload, in bytes.
+const AVATAR_MAX_UPLOAD_BYTES_VAR: &str = "AVATAR_MAX_UPLOAD_BYTES";
+
+/// What a valid `AVATAR_MAX_UPLOAD_BYTES` looks like, quoted back in errors.
+const AVATAR_MAX_UPLOAD_BYTES_FORM: &str = "a positive number of bytes, e.g. `5242880` for 5 MiB";
+
+/// Caps the longest edge of an avatar the decoder will touch.
+const AVATAR_MAX_EDGE_VAR: &str = "AVATAR_MAX_EDGE";
+
+/// What a valid `AVATAR_MAX_EDGE` looks like, quoted back in errors.
+const AVATAR_MAX_EDGE_FORM: &str = "a positive number of pixels, e.g. `8192`";
+
+/// Caps how many pixels an avatar may decode to.
+const AVATAR_MAX_PIXELS_VAR: &str = "AVATAR_MAX_PIXELS";
+
+/// What a valid `AVATAR_MAX_PIXELS` looks like, quoted back in errors.
+const AVATAR_MAX_PIXELS_FORM: &str =
+    "a positive number of pixels, e.g. `16777216` for 4096 squared";
+
+/// The avatar upload's body limit when `AVATAR_MAX_UPLOAD_BYTES` is unset.
+///
+/// Five MiB holds a phone photo at ordinary JPEG quality. The stored avatar
+/// is a 512 px JPEG of a few dozen kilobytes, so nothing is gained by
+/// accepting more than a picture needs to arrive intact.
+const DEFAULT_AVATAR_MAX_UPLOAD_BYTES: NonZero<usize> =
+    NonZero::new(5 * 1024 * 1024).expect("five mebibytes is not zero bytes");
+
 /// Lists the origins allowed to call the application from a browser.
 const CORS_ALLOWED_ORIGINS_VAR: &str = "CORS_ALLOWED_ORIGINS";
 
@@ -389,6 +432,27 @@ const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Matches the port the starter frontend proxies to during development.
 const DEFAULT_PORT: u16 = 3000;
+
+/// What an avatar upload may cost: the bytes it may send and the pixels those
+/// bytes may decode to.
+///
+/// Read from the `AVATAR_*` variables; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AvatarConfig {
+    /// The largest request body accepted, in bytes.
+    pub max_upload_bytes: NonZero<usize>,
+    /// The edge and pixel limits the upload is decoded under.
+    pub decode: DecodeLimits,
+}
+
+impl Default for AvatarConfig {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: DEFAULT_AVATAR_MAX_UPLOAD_BYTES,
+            decode: DecodeLimits::default(),
+        }
+    }
+}
 
 /// The operator account a deployment seeds at boot.
 ///
@@ -727,6 +791,11 @@ pub struct AppConfig {
     /// Defaults to [`password::DEFAULT_CONCURRENCY`]; see the module docs and
     /// [`crate::auth::password`].
     pub password_hash_concurrency: NonZero<usize>,
+    /// What an avatar upload may cost.
+    ///
+    /// Defaults to [`AvatarConfig::default`]; see the module docs and
+    /// [`crate::images`].
+    pub avatar: AvatarConfig,
     /// The operator account the deployment seeds, when it names one.
     ///
     /// Present makes every boot grant that address the platform `operator`
@@ -845,6 +914,7 @@ impl AppConfig {
             })?,
         };
 
+        let avatar = avatar_config(&lookup)?;
         let initial_admin = initial_admin_config(&lookup)?;
 
         Ok(Self {
@@ -862,9 +932,60 @@ impl AppConfig {
             csp,
             stripe,
             password_hash_concurrency,
+            avatar,
             initial_admin,
         })
     }
+}
+
+/// Resolves what an avatar upload may cost.
+///
+/// Zero is refused for all three rather than read as "no limit": a limit of
+/// nothing would refuse every upload, so it can only be a typo, and an
+/// unbounded decode is the thing these variables exist to prevent.
+fn avatar_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<AvatarConfig, Error> {
+    let defaults = AvatarConfig::default();
+
+    let max_upload_bytes = match non_empty(lookup(AVATAR_MAX_UPLOAD_BYTES_VAR)) {
+        None => defaults.max_upload_bytes,
+        Some(value) => value.trim().parse().map_err(|_error| {
+            Error::invalid(
+                AVATAR_MAX_UPLOAD_BYTES_VAR,
+                value.trim(),
+                AVATAR_MAX_UPLOAD_BYTES_FORM,
+            )
+        })?,
+    };
+
+    let max_edge = match non_empty(lookup(AVATAR_MAX_EDGE_VAR)) {
+        None => defaults.decode.max_edge,
+        Some(value) => value
+            .trim()
+            .parse::<NonZero<u32>>()
+            .map_err(|_error| {
+                Error::invalid(AVATAR_MAX_EDGE_VAR, value.trim(), AVATAR_MAX_EDGE_FORM)
+            })?
+            .get(),
+    };
+
+    let max_pixels = match non_empty(lookup(AVATAR_MAX_PIXELS_VAR)) {
+        None => defaults.decode.max_pixels,
+        Some(value) => value
+            .trim()
+            .parse::<NonZero<u64>>()
+            .map_err(|_error| {
+                Error::invalid(AVATAR_MAX_PIXELS_VAR, value.trim(), AVATAR_MAX_PIXELS_FORM)
+            })?
+            .get(),
+    };
+
+    Ok(AvatarConfig {
+        max_upload_bytes,
+        decode: DecodeLimits {
+            max_edge,
+            max_pixels,
+        },
+    })
 }
 
 /// Resolves the operator account the deployment seeds, if it names one.
@@ -1988,6 +2109,37 @@ mod tests {
                 "PASSWORD_HASH_CONCURRENCY",
                 "for input {value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn avatar_uploads_are_bounded_by_default_and_tunable_per_deployment() {
+        let defaulted = AppConfig::from_lookup(|_name| None).expect("defaults must parse");
+        assert_eq!(defaulted.avatar.max_upload_bytes.get(), 5 * 1024 * 1024);
+        assert_eq!(defaulted.avatar.decode.max_edge, 8192);
+        assert_eq!(defaulted.avatar.decode.max_pixels, 4096 * 4096);
+
+        let lookup = lookup_from(&[
+            ("AVATAR_MAX_UPLOAD_BYTES", " 1048576 "),
+            ("AVATAR_MAX_EDGE", "2048"),
+            ("AVATAR_MAX_PIXELS", "1000000"),
+        ]);
+        let config = AppConfig::from_lookup(lookup).expect("the limits must parse");
+        assert_eq!(config.avatar.max_upload_bytes.get(), 1_048_576);
+        assert_eq!(config.avatar.decode.max_edge, 2048);
+        assert_eq!(config.avatar.decode.max_pixels, 1_000_000);
+
+        // Zero would refuse every upload, and the rest are typos.
+        for variable in [
+            "AVATAR_MAX_UPLOAD_BYTES",
+            "AVATAR_MAX_EDGE",
+            "AVATAR_MAX_PIXELS",
+        ] {
+            for value in ["0", "-1", "lots", "1.5"] {
+                let lookup = lookup_from(&[(variable, value)]);
+                let error = AppConfig::from_lookup(lookup).expect_err("junk limits are rejected");
+                assert_eq!(error.variable(), variable, "for input {value:?}");
+            }
         }
     }
 

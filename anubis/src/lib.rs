@@ -18,6 +18,7 @@ pub mod db;
 pub mod eject;
 pub mod guard;
 pub mod http;
+pub mod images;
 pub mod jobs;
 pub mod mail;
 pub mod manifest;

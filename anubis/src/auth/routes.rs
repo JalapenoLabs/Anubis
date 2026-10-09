@@ -25,6 +25,8 @@
 //! The endpoints that send email additionally charge the address they would
 //! mail, because rotating client addresses is how one inbox gets bombed.
 
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -46,9 +48,10 @@ use crate::auth::secret_box::SecretKey;
 use crate::auth::session::SignInMethod;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
-use crate::config::{AppConfig, Environment};
+use crate::config::{AppConfig, AvatarConfig, Environment};
 use crate::db::DbPool;
 use crate::http::ApiError;
+use crate::images::ImageScreen;
 use crate::mail::{Email, EmailKind, Mailer};
 use crate::rate_limit::{Budget, RateLimiter};
 use crate::schema::users;
@@ -64,11 +67,73 @@ use crate::schema::users;
 /// budget an application charges from `/auth` is the same one
 /// [`crate::tenancy::router`] charges when it mails an invitation. Build one
 /// with `RateLimiter::new(&config.rate_limit)` and hand it to both.
+///
+/// An application that plugs behaviour into these routes, such as an
+/// [`ImageScreen`] for uploaded avatars, calls [`router_with`] instead.
 pub fn router(
     pool: DbPool,
     mailer: Mailer,
     config: &AppConfig,
     rate_limit: &RateLimiter,
+) -> Router {
+    router_with(pool, mailer, config, rate_limit, Options::default())
+}
+
+/// What an application plugs into the authentication routes.
+///
+/// Empty by default, which is exactly [`router`]'s behaviour. Each hook is
+/// optional and set with a method of its own, so adding one later breaks no
+/// application that does not use it:
+///
+/// ```ignore
+/// .nest(
+///     "/auth",
+///     anubis::auth::router_with(
+///         pool.clone(),
+///         mailer.clone(),
+///         &config,
+///         &rate_limit,
+///         anubis::auth::Options::new().image_screen(ExplicitContentScreen::load()?),
+///     ),
+/// )
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    image_screen: Option<Arc<dyn ImageScreen>>,
+}
+
+impl Options {
+    /// No hooks: the routes behave as [`router`] mounts them.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Looks at every uploaded avatar with `screen` before it is stored.
+    ///
+    /// The screen sees the decoded source once per upload, after the decode
+    /// limits and before anything is written. A [`crate::images::Verdict::Refuse`]
+    /// answers `400` with [`crate::images::IMAGE_REFUSED`] and a
+    /// [`crate::images::ScreenError`] answers `503` with
+    /// [`crate::images::IMAGE_SCREEN_UNAVAILABLE`]; either way the account
+    /// keeps the picture it had. See `docs/api.md`.
+    #[must_use]
+    pub fn image_screen(mut self, screen: impl ImageScreen) -> Self {
+        self.image_screen = Some(Arc::new(screen));
+        self
+    }
+}
+
+/// Returns the authentication routes with the application's hooks plugged in.
+///
+/// Everything [`router`] says holds here; `options` adds what the application
+/// chose, and [`Options::default`] is [`router`] exactly.
+pub fn router_with(
+    pool: DbPool,
+    mailer: Mailer,
+    config: &AppConfig,
+    rate_limit: &RateLimiter,
+    options: Options,
 ) -> Router {
     let state = AuthState {
         pool: pool.clone(),
@@ -79,6 +144,8 @@ pub fn router(
         oauth: crate::auth::oauth::Runtime::new(config.oauth.clone()),
         rate_limit: rate_limit.clone(),
         hasher: password::Hasher::new(config.password_hash_concurrency),
+        avatar: config.avatar,
+        image_screen: options.image_screen,
     };
 
     Router::new()
@@ -103,7 +170,7 @@ pub fn router(
         )
         .route("/password-reset/confirm", post(confirm_password_reset))
         .merge(crate::auth::invitation::router(rate_limit))
-        .merge(crate::auth::account::router())
+        .merge(crate::auth::account::router(config.avatar.max_upload_bytes))
         .merge(crate::auth::email_code::router(rate_limit))
         .merge(crate::auth::mfa::router(rate_limit))
         .merge(crate::auth::oauth::router())
@@ -128,6 +195,10 @@ pub(crate) struct AuthState {
     /// The gate every argon2 computation passes through; see
     /// [`crate::auth::password`].
     pub(crate) hasher: password::Hasher,
+    /// What an avatar upload may cost.
+    pub(crate) avatar: AvatarConfig,
+    /// The application's look at an uploaded image before it is stored.
+    pub(crate) image_screen: Option<Arc<dyn ImageScreen>>,
 }
 
 #[derive(Deserialize)]

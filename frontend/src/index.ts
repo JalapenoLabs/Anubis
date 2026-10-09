@@ -128,6 +128,8 @@ export { NOTIFICATIONS_PAGE_SIZE, useNotifications } from './react/useNotificati
 export { createAnubisApi } from './api/createAnubisApi'
 export { createAnubisV1 } from './api/v1.generated'
 export {
+  IMAGE_REFUSED,
+  IMAGE_SCREEN_UNAVAILABLE,
   PASSWORD_CHANGE_REQUIRED,
   getApiErrorCode,
   getApiErrorMessage,

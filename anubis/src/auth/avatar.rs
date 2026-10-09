@@ -1,11 +1,21 @@
 //! Avatar upload, optimization, storage, and serving.
 //!
-//! Uploads accept JPEG, PNG, WebP, or GIF up to 5 MiB. The server optimizes
-//! every image the same way: center-crop to a square, resize to at most
-//! 512 px (never upscaled), flatten transparency onto white, and re-encode
-//! as JPEG. The optimized bytes live in the `user_avatars` table, and the
-//! public URL `GET /users/{user_id}/avatar` serves them with a strong `ETag`,
-//! answering `304 Not Modified` to matching `If-None-Match` requests.
+//! Uploads accept JPEG, PNG, WebP, or GIF, up to 5 MiB by default, decoded
+//! under the configured edge and pixel limits
+//! ([`crate::config::AvatarConfig`]), which are checked against the header
+//! before the decoder allocates. When the application gave
+//! [`crate::auth::router_with`] an [`ImageScreen`], the decoded
+//! source goes to it next, and a refusal or a failure to decide stores
+//! nothing. The server then optimizes every image the same way: center-crop
+//! to a square, resize to at most 512 px (never upscaled), flatten
+//! transparency onto white, and re-encode as JPEG. The optimized bytes live in
+//! the `user_avatars` table, and the public URL `GET /users/{user_id}/avatar`
+//! serves them with a strong `ETag`, answering `304 Not Modified` to matching
+//! `If-None-Match` requests.
+//!
+//! Every upload, removal and refusal is audited against the account as
+//! `avatar.uploaded`, `avatar.removed` and `avatar.refused`, carrying the
+//! version token and never the image.
 //!
 //! Serving is versioned. Every profile payload carries an `avatar_version`
 //! derived from the stored image, and consumers request
@@ -18,6 +28,8 @@
 //!
 //! This pipeline is the pattern the scaffolder's image fields will reuse.
 
+use std::num::NonZero;
+
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -29,25 +41,37 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use image::Limits;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::CurrentUser;
+use crate::auth::model::User;
 use crate::auth::routes::AuthState;
+use crate::config::AvatarConfig;
 use crate::db::DbPool;
 use crate::http::ApiError;
+use crate::images::{
+    self, DecodedImage, IMAGE_REFUSED, IMAGE_SCREEN_UNAVAILABLE, ImageScreen, Verdict,
+};
 use crate::schema::user_avatars;
 
-/// Largest accepted upload; the optimized result is far smaller.
-const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// What a person reads when a screen refused their picture.
+///
+/// Deliberately says nothing about why. It is the same sentence whatever the
+/// screen saw, so it can neither accuse anybody nor teach them what to change.
+const REFUSED_MESSAGE: &str = "That image can't be used. Choose a different picture.";
 
-/// Largest source dimensions the decoder will touch, bounding decode bombs.
-const MAX_SOURCE_PIXELS: u32 = 8192;
+/// What a person reads when the screen could not decide.
+const SCREEN_UNAVAILABLE_MESSAGE: &str =
+    "We couldn't check that image just now. Try again in a moment.";
+
+/// The audit log's subject type for an act on an account.
+const ACCOUNT_SUBJECT: &str = "User";
 
 /// Longest edge of a stored avatar. Small sources are not upscaled.
 const TARGET_EDGE: u32 = 512;
@@ -74,13 +98,14 @@ const VERSIONED_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 /// instead, so they never wait out this hour.
 const BARE_CACHE_CONTROL: &str = "public, max-age=3600, stale-while-revalidate=86400";
 
-/// Adds the signed-in avatar management routes to the account router.
-pub(crate) fn account_routes() -> Router<AuthState> {
+/// Adds the signed-in avatar management routes to the account router, with
+/// the upload's body capped at `max_upload_bytes`.
+pub(crate) fn account_routes(max_upload_bytes: NonZero<usize>) -> Router<AuthState> {
     Router::new().route(
         "/profile/avatar",
         axum::routing::post(upload_avatar)
             .delete(delete_avatar)
-            .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            .layer(DefaultBodyLimit::max(max_upload_bytes.get())),
     )
 }
 
@@ -102,58 +127,202 @@ struct AvatarBody {
 async fn upload_avatar(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     if body.is_empty() {
         return Err(ApiError::validation("Attach an image to upload."));
     }
 
-    let optimized = tokio::task::spawn_blocking(move || optimize(&body))
+    let limits = state.avatar.decode;
+    let decoded = tokio::task::spawn_blocking(move || images::decode(&body, &limits))
         .await
         .map_err(log_internal)?
-        .map_err(|error| {
-            tracing::debug!(
-                error.message = %error,
-                "avatar upload rejected: {{error.message}}",
-            );
-            ApiError::validation(
-                "That image could not be read. Upload a JPEG, PNG, WebP, or GIF up to 5 MB.",
-            )
-        })?;
+        .map_err(|error| undecodable(&error, &state.avatar))?;
+
+    if let Some(screen) = &state.image_screen {
+        screen_upload(screen.as_ref(), &decoded, &state, &user, &context).await?;
+    }
+
+    // Re-encoding an image that decoded is our work, not the upload's, so a
+    // failure here is ours to report rather than the person's to fix.
+    let optimized = tokio::task::spawn_blocking(move || optimize(&decoded))
+        .await
+        .map_err(log_internal)?
+        .map_err(log_internal)?;
 
     let etag = format!("\"{}\"", URL_SAFE_NO_PAD.encode(Sha256::digest(&optimized)));
+    let version = version_from_etag(&etag);
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    diesel::insert_into(user_avatars::table)
-        .values((
-            user_avatars::user_id.eq(user.id),
-            user_avatars::image.eq(&optimized),
-            user_avatars::content_type.eq("image/jpeg"),
-            user_avatars::etag.eq(&etag),
-        ))
-        .on_conflict(user_avatars::user_id)
-        .do_update()
-        .set((
-            user_avatars::image.eq(&optimized),
-            user_avatars::content_type.eq("image/jpeg"),
-            user_avatars::etag.eq(&etag),
-        ))
-        .execute(&mut connection)
+    // The picture and its record commit together. The version it replaced is
+    // read in the same transaction but not locked, because there may be no row
+    // to lock: two uploads racing for one account both store atomically
+    // through the upsert, and at worst both records name the same predecessor.
+    connection
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            let replaced = stored_version(transaction, user.id).await?;
+
+            diesel::insert_into(user_avatars::table)
+                .values((
+                    user_avatars::user_id.eq(user.id),
+                    user_avatars::image.eq(&optimized),
+                    user_avatars::content_type.eq("image/jpeg"),
+                    user_avatars::etag.eq(&etag),
+                ))
+                .on_conflict(user_avatars::user_id)
+                .do_update()
+                .set((
+                    user_avatars::image.eq(&optimized),
+                    user_avatars::content_type.eq("image/jpeg"),
+                    user_avatars::etag.eq(&etag),
+                ))
+                .execute(transaction)
+                .await?;
+
+            audit::record(
+                transaction,
+                &context.by(&user),
+                &audit::Event::new(audit::AVATAR_UPLOADED, ACCOUNT_SUBJECT)
+                    .subject(user.id)
+                    .changes(audit::Changes::new().field("version", replaced, version.clone())),
+            )
+            .await?;
+            Ok(())
+        })
         .await
         .map_err(log_internal)?;
 
     Ok(Json(AvatarBody {
-        avatar_url: format!("/users/{}/avatar?v={}", user.id, version_from_etag(&etag)),
+        avatar_url: format!("/users/{}/avatar?v={version}", user.id),
     }))
+}
+
+/// Answers an upload that would not decode within the limits.
+///
+/// The bytes are the uploader's, so this is a `400` that says what to send
+/// instead; the decoder's own detail goes to the debug log, never the body.
+fn undecodable(error: &images::DecodeError, limits: &AvatarConfig) -> ApiError {
+    tracing::debug!(
+        error.message = %error,
+        "avatar upload rejected: {{error.message}}",
+    );
+
+    if error.is_over_budget() {
+        // Tenths of a megapixel in integer arithmetic, rounded down so the
+        // sentence never promises more than the budget admits.
+        let tenths = limits.decode.max_pixels / 100_000;
+        return ApiError::validation(format!(
+            "That image is too large. Upload one no wider or taller than {} pixels and no \
+             larger than {}.{} megapixels.",
+            limits.decode.max_edge,
+            tenths / 10,
+            tenths % 10,
+        ));
+    }
+    ApiError::validation("That image could not be read. Upload a JPEG, PNG, WebP, or GIF.")
+}
+
+/// Asks the application's screen about `decoded`, refusing the upload unless
+/// it accepts.
+///
+/// A refusal is recorded against the account and answered with
+/// [`IMAGE_REFUSED`]. A screen that failed to decide is logged at `ERROR`,
+/// which error reporting files, and answered with [`IMAGE_SCREEN_UNAVAILABLE`]:
+/// it has not said yes, so nothing is stored, and the person may try again.
+///
+/// # Errors
+/// The [`ApiError`] the upload answers with whenever the verdict is not
+/// [`Verdict::Accept`].
+async fn screen_upload(
+    screen: &dyn ImageScreen,
+    decoded: &DecodedImage,
+    state: &AuthState,
+    user: &User,
+    context: &audit::Context,
+) -> Result<(), ApiError> {
+    match screen.screen(decoded).await {
+        Ok(Verdict::Accept) => Ok(()),
+        Ok(Verdict::Refuse) => {
+            tracing::info!(
+                user.id = %user.id,
+                "avatar upload refused by the image screen for {{user.id}}",
+            );
+            record_refusal(state, user, context).await;
+            Err(ApiError::validation(REFUSED_MESSAGE).with_code(IMAGE_REFUSED))
+        }
+        Err(error) => {
+            tracing::error!(
+                error.message = %error,
+                "avatar image screen failed, refusing the upload: {{error.message}}",
+            );
+            Err(ApiError::unavailable(SCREEN_UNAVAILABLE_MESSAGE)
+                .with_code(IMAGE_SCREEN_UNAVAILABLE))
+        }
+    }
+}
+
+/// Records that the screen refused `user`'s upload, with nothing of the image.
+///
+/// A failure to record does not turn the refusal into an acceptance or into a
+/// `500`: the person still reads that the picture can't be used, and the lost
+/// record is logged at `ERROR`, which error reporting files.
+async fn record_refusal(state: &AuthState, user: &User, context: &audit::Context) {
+    let recorded = match state.pool.get().await {
+        Ok(mut connection) => audit::record(
+            &mut connection,
+            &context.by(user),
+            &audit::Event::new(audit::AVATAR_REFUSED, ACCOUNT_SUBJECT).subject(user.id),
+        )
+        .await
+        .map(drop)
+        .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+
+    if let Err(error) = recorded {
+        tracing::error!(
+            error.message = %error,
+            "a refused avatar upload could not be audited: {{error.message}}",
+        );
+    }
 }
 
 async fn delete_avatar(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    context: audit::Context,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    diesel::delete(user_avatars::table.filter(user_avatars::user_id.eq(user.id)))
-        .execute(&mut connection)
+    // Removing a picture that is not there changes nothing, so it records
+    // nothing either: the log holds acts, not requests.
+    connection
+        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+            let removed: Option<String> =
+                diesel::delete(user_avatars::table.filter(user_avatars::user_id.eq(user.id)))
+                    .returning(user_avatars::etag)
+                    .get_result(transaction)
+                    .await
+                    .optional()?;
+
+            let Some(etag) = removed else {
+                return Ok(());
+            };
+
+            audit::record(
+                transaction,
+                &context.by(&user),
+                &audit::Event::new(audit::AVATAR_REMOVED, ACCOUNT_SUBJECT)
+                    .subject(user.id)
+                    .changes(audit::Changes::new().field(
+                        "version",
+                        version_from_etag(&etag),
+                        serde_json::Value::Null,
+                    )),
+            )
+            .await?;
+            Ok(())
+        })
         .await
         .map_err(log_internal)?;
 
@@ -260,14 +429,8 @@ pub(crate) async fn stored_version(
 }
 
 /// Center-crops, resizes, flattens transparency, and re-encodes as JPEG.
-fn optimize(raw: &[u8]) -> Result<Vec<u8>, image::ImageError> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(raw)).with_guessed_format()?;
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_SOURCE_PIXELS);
-    limits.max_image_height = Some(MAX_SOURCE_PIXELS);
-    reader.limits(limits);
-
-    let decoded = reader.decode()?;
+fn optimize(decoded: &DecodedImage) -> Result<Vec<u8>, image::ImageError> {
+    let decoded = decoded.source();
 
     let edge = TARGET_EDGE
         .min(decoded.width())
@@ -320,9 +483,15 @@ mod tests {
     use image::codecs::png::PngEncoder;
 
     use super::{
-        BARE_CACHE_CONTROL, VERSION_CHARS, VERSIONED_CACHE_CONTROL, cache_policy, optimize,
-        version_from_etag,
+        BARE_CACHE_CONTROL, VERSION_CHARS, VERSIONED_CACHE_CONTROL, cache_policy, version_from_etag,
     };
+    use crate::images::{DecodeLimits, decode};
+
+    /// Decodes under the default limits and optimizes, as an upload does.
+    fn optimize(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let decoded = decode(raw, &DecodeLimits::default()).map_err(|error| error.to_string())?;
+        super::optimize(&decoded).map_err(|error| error.to_string())
+    }
 
     fn png_bytes(image: &image::DynamicImage) -> Vec<u8> {
         let mut bytes = Vec::new();

@@ -18,6 +18,25 @@ const TOO_MANY_REQUESTS = 429
 export const PASSWORD_CHANGE_REQUIRED = 'password_change_required'
 
 /**
+ * The code a `400` carries when the application's image screen refused an
+ * upload, such as an avatar.
+ *
+ * Nothing was stored and the previous picture stays. The message says only
+ * that the image can't be used, never why, so show it as it is and offer to
+ * choose another picture rather than retrying the same one.
+ */
+export const IMAGE_REFUSED = 'image_refused'
+
+/**
+ * The code a `503` carries when the image screen failed to decide.
+ *
+ * Nothing was stored, because a screen that could not look has not said yes.
+ * The failure is the server's, so the same picture may succeed if the person
+ * tries again in a moment.
+ */
+export const IMAGE_SCREEN_UNAVAILABLE = 'image_screen_unavailable'
+
+/**
  * Extracts the backend's user-safe error message from a failed request.
  *
  * Anubis endpoints answer errors as `{"message": "..."}`, which ky pre-parses

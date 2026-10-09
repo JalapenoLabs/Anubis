@@ -8,6 +8,8 @@ import ky from 'ky'
 
 // Misc
 import {
+  IMAGE_REFUSED,
+  IMAGE_SCREEN_UNAVAILABLE,
   PASSWORD_CHANGE_REQUIRED,
   getApiErrorCode,
   getApiErrorMessage,
@@ -107,7 +109,23 @@ describe('getApiErrorCode', () => {
     expect(getApiErrorCode(new Error('the network went away'))).toBeNull()
   })
 
-  it('should keep the code the backend sends', () => {
+  it('should read the code a screened image upload is refused with', async () => {
+    const refused = await failedRequest(400, {}, {
+      message: 'That image can\'t be used. Choose a different picture.',
+      code: IMAGE_REFUSED,
+    })
+    const unscreened = await failedRequest(503, {}, {
+      message: 'We couldn\'t check that image just now. Try again in a moment.',
+      code: IMAGE_SCREEN_UNAVAILABLE,
+    })
+
+    expect(getApiErrorCode(refused)).toBe(IMAGE_REFUSED)
+    expect(getApiErrorCode(unscreened)).toBe(IMAGE_SCREEN_UNAVAILABLE)
+  })
+
+  it('should keep the codes the backend sends', () => {
     expect(PASSWORD_CHANGE_REQUIRED).toBe('password_change_required')
+    expect(IMAGE_REFUSED).toBe('image_refused')
+    expect(IMAGE_SCREEN_UNAVAILABLE).toBe('image_screen_unavailable')
   })
 })

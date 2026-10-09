@@ -105,8 +105,10 @@ Every error, on every route, is `{"message": "..."}` with the status that classi
 | Code | Status | Meaning |
 |---|---|---|
 | `password_change_required` | `403` | The account is signed in on a temporary password and must change it first |
+| `image_refused` | `400` | The application's image screen refused an uploaded image; nothing was stored |
+| `image_screen_unavailable` | `503` | The image screen failed to decide, so the upload was refused; trying again may succeed |
 
-A handler adds one with `ApiError::with_code`, and an application declares its own codes the same way, as `snake_case` constants it never renames. `getApiErrorCode(error)` in `@jalapenolabs/anubis` reads it, and `PASSWORD_CHANGE_REQUIRED` is the framework's code as a constant. The `/api/v1` bearer-token surface declares none today, so `ErrorV1` documents only the message.
+A handler adds one with `ApiError::with_code`, and an application declares its own codes the same way, as `snake_case` constants it never renames. `getApiErrorCode(error)` in `@jalapenolabs/anubis` reads it, and `PASSWORD_CHANGE_REQUIRED`, `IMAGE_REFUSED` and `IMAGE_SCREEN_UNAVAILABLE` are the framework's codes as constants. The `/api/v1` bearer-token surface declares none today, so `ErrorV1` documents only the message.
 
 ## Rate limiting
 
@@ -169,9 +171,48 @@ A new upload changes the version in the profile payload, so the next profile ref
 
 The bare URL is the one to hand to external consumers, email included: it names the account, stays valid forever, and costs one revalidation per hour.
 
+**What an upload may cost.** A compressed image is a promise about memory rather than a measure of it: a few megabytes of PNG can declare hundreds of megabytes of pixels. So an upload is bounded twice, by its body and by what that body decodes to, and both pixel limits are read from the image's header and enforced **before the decoder allocates the pixel buffer**. An image refused for its size costs a header parse.
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `AVATAR_MAX_UPLOAD_BYTES` | `5242880` (5 MiB) | The request body |
+| `AVATAR_MAX_EDGE` | `8192` | The longest width or height, in pixels |
+| `AVATAR_MAX_PIXELS` | `16777216` (4096 squared) | Width times height |
+
+The pixel budget is the one that sets memory: an upload in flight holds about four bytes a pixel while it is decoded, so the default caps one near 64 MiB. Derive it from the instance rather than from the largest photo anybody might send. An image past either pixel limit answers `400` with a sentence saying it is too large; one that is not a JPEG, PNG, WebP or GIF, or is damaged, answers `400` saying so. The decoder is `anubis::images::decode`, public so an application bounds its own uploads with the same code.
+
+**Every avatar change is audited** against the account: `avatar.uploaded` and `avatar.removed` carry the `version` that moved, and `avatar.refused` records that a screen refused one. None carries the image. See [audit.md](audit.md#actions).
+
 Recovery codes appear exactly once, on the step after a confirmed enrollment, with a copy affordance. The server stores only their hashes, so there is no second chance to show them and the screen says so.
 
 WebAuthn needs binary where JSON has none, so the package exports the conversion both ceremonies need: `toCredentialCreationOptions` and `toCredentialRequestOptions` decode a challenge into what `navigator.credentials` accepts, `serializeRegistrationCredential` and `serializeAuthenticationCredential` encode the authenticator's answer back, and `base64UrlToArrayBuffer` and `arrayBufferToBase64Url` are the pair underneath. The serializers take `unknown` and validate, because an authenticator's answer is as much a runtime boundary as an HTTP response.
+
+### Screening uploaded images
+
+An application can look at every uploaded avatar before it is stored, typically to refuse explicit content with a classifier it runs in process. It implements `anubis::images::ImageScreen` and mounts the auth routes with `router_with` instead of `router`:
+
+```rust
+.nest(
+    "/auth",
+    anubis::auth::router_with(
+        pool.clone(),
+        mailer.clone(),
+        &config,
+        &rate_limit,
+        anubis::auth::Options::new().image_screen(screen),
+    ),
+)
+```
+
+`router` is `router_with` with `Options::default()`, so an application that sets no screen behaves exactly as before. The contract:
+
+- **When it runs.** Once per upload, after the image decoded within the limits above and before anything is written. An image refused for its size or its bytes never reaches it.
+- **What it sees.** An `anubis::images::DecodedImage`: the source as uploaded, uncropped and at full resolution (the first frame of an animation), with its `width()`, `height()` and the `format()` read off its bytes. `to_rgba8()` hands over the pixels as 8-bit RGBA, row-major from the top-left, `width * height * 4` bytes, transparency kept. The conversion happens on that call, so a screen copies once and runs its model on the copy; nothing decodes twice. Its `Debug` names the shape and never the pixels.
+- **What it answers.** `Ok(Verdict::Accept)` stores the picture as usual. `Ok(Verdict::Refuse)` answers `400` with the code `image_refused` and a sentence that says only that the image can't be used, never why or which check fired, and records `avatar.refused` against the account. `Err(ScreenError)` refuses too: a `503` with the code `image_screen_unavailable`, the error logged at `ERROR` (which error reporting files), and nothing recorded against the person, because the failure is the server's. **A screen that could not decide has not said yes**, so there is no path by which an unscreened image is stored while a screen is configured. In every refusal the account keeps the picture it had.
+- **How it is written.** `screen(&self, image: &DecodedImage) -> ScreenFuture<'_>`, a boxed future for the same dyn-compatibility reason as `mail::Transport`. Inference is CPU-bound: copy the pixels out with `to_rgba8()` and run the model under `tokio::task::spawn_blocking` rather than on a runtime thread. Load the model once at boot; `Arc<impl ImageScreen>` is itself a screen, so one loaded classifier can serve the avatar route and the application's own uploads. A `ScreenError` message is logged, so it describes the failure and never the image.
+- **How long it may take.** The request's own timeout bounds it, 30 seconds by default (see [server.md](server.md)); a screen that overruns it is answered `503` with nothing stored, like any other request that ran out of time.
+
+An application screening uploads of its own runs the same two steps: `anubis::images::decode(bytes, &limits)`, then its screen, answering with the same two codes so a client handles every surface alike.
 
 ### The TypeScript client
 
