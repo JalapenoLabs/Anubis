@@ -101,6 +101,9 @@ async fn main() {
             "/account",
             anubis::audit::router(pool.clone(), roles.clone()),
         )
+        // To look at every uploaded avatar before it is stored (an explicit
+        // content classifier, say), mount `anubis::auth::router_with` with
+        // `anubis::auth::Options::new().image_screen(..)`; see docs/api.md.
         .nest(
             "/auth",
             anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),

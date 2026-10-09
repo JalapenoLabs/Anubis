@@ -35,6 +35,6 @@ pub use extract::{CurrentUser, PASSWORD_CHANGE_REQUIRED, SignedIn};
 pub use model::{User, UserResponse};
 pub(crate) use policy::{check_password_policy, normalize_email};
 #[doc(inline)]
-pub use routes::router;
+pub use routes::{Options, router, router_with};
 #[doc(inline)]
 pub use session::{SESSION_COOKIE, SESSION_TTL_DAYS, SignInMethod};

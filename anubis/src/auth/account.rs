@@ -12,6 +12,8 @@
 //! | `DELETE /sessions/{session_id}` | Revoke one session |
 //! | `DELETE /account` | Delete the account (password-confirmed) |
 
+use std::num::NonZero;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -40,9 +42,11 @@ use crate::schema::{sessions, users};
 /// later on the profile are held to the same bound.
 pub(crate) const MAX_FIELD_CHARS: usize = 100;
 
-pub(crate) fn router() -> Router<AuthState> {
+/// The account routes, with the avatar upload's body capped at
+/// `max_avatar_bytes`.
+pub(crate) fn router(max_avatar_bytes: NonZero<usize>) -> Router<AuthState> {
     Router::new()
-        .merge(crate::auth::avatar::account_routes())
+        .merge(crate::auth::avatar::account_routes(max_avatar_bytes))
         .route("/profile", patch(update_profile))
         .route("/change-password", post(change_password))
         .route("/change-email/request", post(request_email_change))

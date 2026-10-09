@@ -85,6 +85,9 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `PASSKEY_REMOVED` | `passkey.removed` | An account removes a passkey |
 | `SESSION_REVOKED` | `session.revoked` | An account signs one of its sessions out |
 | `ACCOUNT_DELETED` | `account.deleted` | An account is deleted |
+| `AVATAR_UPLOADED` | `avatar.uploaded` | An account stores a new profile picture; `version` moves from the one replaced (or null) to the new one |
+| `AVATAR_REMOVED` | `avatar.removed` | An account removes its profile picture; `version` moves to null |
+| `AVATAR_REFUSED` | `avatar.refused` | An application's image screen refuses a profile picture, so nothing is stored; see [api.md](api.md#screening-uploaded-images) |
 | `SESSION_CREATED` | `session.created` | An account signs in, by any path |
 | `OAUTH_GRANTED` | `oauth.granted` | An account approves a connecting client; see [oauth-server.md](oauth-server.md#audit) |
 | `OAUTH_REVOKED` | `oauth.revoked` | A connection ends, from account settings, by the client's own revocation, or with every other connection when a temporary password is set or a password reset completes |
@@ -112,6 +115,8 @@ The change set carries one field, `method`, from nothing to one of `anubis::auth
 `Changes` never carries one, and not because anything strips it afterwards.
 
 A scaffolded model's change set is computed by `Changes::between` from the serialized record, which is the same shape the REST API answers with and so holds nothing secret to begin with. This is also why no generated model needs per-field audit code: the diff is taken from the record itself, so a column `anubis scaffold field` adds is audited the moment it exists. The timestamps the database maintains are left out, since they move on every update and answer a question `created_at` already answers.
+
+The avatar events follow the same rule. Their change set is the `version` token profile payloads already carry, never the image, and a refusal records an empty set: that a screen refused a picture is the record, and why is the application's to log, not the framework's.
 
 The framework's own credential events record an empty change set. That a password changed is the whole of what an auditor needs; the password is not, and neither is the TOTP seed, the recovery codes, or the passkey. **The rule is that a secret is never serialized into a change set, not that it is removed from one.**
 

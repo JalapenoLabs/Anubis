@@ -131,6 +131,23 @@ pub const PASSKEY_REMOVED: &str = "passkey.removed";
 pub const SESSION_REVOKED: &str = "session.revoked";
 /// An account was deleted, along with the tenancy it left behind.
 pub const ACCOUNT_DELETED: &str = "account.deleted";
+/// An account stored a new profile picture.
+///
+/// The change set carries one field, `version`, from the picture it replaced
+/// (null when there was none) to the one now served: the same token profile
+/// payloads carry as `avatar_version`. Never the image.
+pub const AVATAR_UPLOADED: &str = "avatar.uploaded";
+/// An account removed its profile picture.
+///
+/// The change set carries `version` from the picture removed to null.
+pub const AVATAR_REMOVED: &str = "avatar.removed";
+/// An application's image screen refused a profile picture, so nothing was
+/// stored.
+///
+/// The change set is empty. The record is that a refusal happened and to whom;
+/// the image is never kept, and why the screen refused it is the
+/// application's to log, never the framework's. See [`crate::images`].
+pub const AVATAR_REFUSED: &str = "avatar.refused";
 /// An account signed in, by any path, and a browser session began.
 ///
 /// Recorded by every path that issues a session: registering, a password, a
@@ -232,9 +249,10 @@ pub async fn record(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCOUNT_DELETED, INVITATION_RESENT, MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED,
-        OAUTH_REFRESH_REUSED, OAUTH_REVOKED, ORGANIZATION_RENAMED, PASSWORD_CHANGED,
-        PASSWORD_TEMPORARY_SET, SESSION_CREATED, TEAM_RENAMED,
+        ACCOUNT_DELETED, AVATAR_REFUSED, AVATAR_REMOVED, AVATAR_UPLOADED, INVITATION_RESENT,
+        MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED, OAUTH_REFRESH_REUSED, OAUTH_REVOKED,
+        ORGANIZATION_RENAMED, PASSWORD_CHANGED, PASSWORD_TEMPORARY_SET, SESSION_CREATED,
+        TEAM_RENAMED,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -254,6 +272,9 @@ mod tests {
             OAUTH_REVOKED,
             OAUTH_CODE_REUSED,
             OAUTH_REFRESH_REUSED,
+            AVATAR_UPLOADED,
+            AVATAR_REMOVED,
+            AVATAR_REFUSED,
         ] {
             let (noun, verb) = action
                 .split_once('.')
