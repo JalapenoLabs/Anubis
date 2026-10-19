@@ -8,7 +8,7 @@ anubis::server::serve(app, pool, &config).await?;
 
 `main` composes routers; the framework owns everything that turns a router into a server people can deploy. That split is deliberate: production behavior nobody has to remember to add is the only kind every application actually has.
 
-`serve` mounts the probes, applies the middleware stack, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal.
+`serve` mounts the probes, applies the middleware stack, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal. `serve_with` and `harden_with` take a `Hardening` beside the router, which is where an application declares the routes the request timeout leaves alone (below).
 
 ## The middleware stack
 
@@ -22,7 +22,7 @@ Layers, outermost first. The order is the design:
 | Security headers | The response policy below |
 | CORS | Only when `CORS_ALLOWED_ORIGINS` names origins; otherwise absent entirely |
 | Compression | Brotli or gzip, when the client accepts one |
-| Request timeout | 30 seconds, innermost |
+| Request timeout | 30 seconds, innermost; skipped for a route the application declared untimed |
 
 The request id is outermost so every later layer logs under it. The timeout is innermost so the response it produces still leaves with an id and the security headers on it.
 
@@ -66,6 +66,24 @@ Compressed responses carry `vary: accept-encoding`, so a shared cache never hand
 30 seconds per request, answered as `503 Service Unavailable` in the standard error shape. The value is a backstop against a request that will never finish, not a latency budget: an avatar upload decodes and re-encodes an image, and the file handling that follows will be slower still. Lower it below the slowest legitimate handler and a slow success becomes a failure.
 
 `503` rather than `408`, because `408` says the *client* was too slow to send its request, which is the opposite of what happened. `503` says this server could not answer in time and the caller may retry, which is exactly the situation. Dropping the handler's future is what a timeout means in async Rust: the work stops at its next await point and any open transaction rolls back when its connection returns to the pool.
+
+#### Untimed routes
+
+The timeout assumes a request is mostly the server's work. An upload is the opposite: the handler spends its time waiting for the client's bytes, and how long that takes is the client's uplink. Held to the timeout, a large upload over a slow connection is abandoned part way with a `503` that blames the server, which is wrong twice.
+
+So an application declares, per route, that the request's duration is the client's:
+
+```rust
+use anubis::server::{serve_with, Hardening};
+use axum::http::Method;
+
+let hardening = Hardening::new()
+    .untimed(Method::POST, "/account/submissions")
+    .untimed(Method::PUT, "/account/uploads/{upload_id}");
+serve_with(app, pool, &config, hardening).await?;
+```
+
+The route is the path as the router matches it, parameters included and the full path under any nesting; only a request matched to exactly that route and method is untimed. Everything else in the stack still applies to it. What bounds such a route is everything but a clock: the size its handler accepts, the piece at a time it reads, and the [drain window](#graceful-shutdown) a stopping server gives it. That is why the declaration is per route and the timeout itself has no knob: a handler that reads a bounded body in bounded pieces is safe without a clock, and nothing else is. Declare only those.
 
 ### Graceful shutdown
 
@@ -198,7 +216,7 @@ Allowed requests may carry `Authorization`, `Content-Type` and `X-Reported-Locat
 | `TRUSTED_PROXY_HEADER` | unset | Forwarding header naming the client address; see [rate limiting](api.md#rate-limiting) |
 | `SPA_DIR` | unset | Directory of built frontend assets; see [architecture](architecture.md#deployment) |
 
-The timeout, the drain window, and the readiness timeout are constants rather than variables. They are properties of the deployment shape the framework targets, and a knob per timeout is a knob nobody tunes correctly and everybody has to understand.
+The timeout, the drain window, and the readiness timeout are constants rather than variables. They are properties of the deployment shape the framework targets, and a knob per timeout is a knob nobody tunes correctly and everybody has to understand. The one thing an application may say about the timeout is which routes it does not apply to, and only because an upload's duration is not the server's to bound.
 
 ## Behind a proxy
 

@@ -41,7 +41,28 @@
 //! 6. **Compression.** Responses a client said it accepts compressed are
 //!    compressed, brotli or gzip; see below.
 //! 7. **Request timeout**, innermost, so the response it produces still
-//!    receives an id and the security headers on its way out.
+//!    receives an id and the security headers on its way out. A route an
+//!    application declared untimed through [`Hardening::untimed`] is passed
+//!    through without it; see below.
+//!
+//! # Untimed routes
+//!
+//! The timeout is a backstop against a handler that never finishes, and it
+//! assumes a request is mostly the server's work. An upload is the opposite:
+//! the handler spends its time waiting for the client's bytes, and how long
+//! that takes is the client's uplink, not the server's doing. Held to the
+//! timeout, a large upload over a slow connection is abandoned part way with a
+//! `503` blaming the server, which is wrong twice.
+//!
+//! So an application may declare, per route, that the request's duration is
+//! the client's: [`Hardening::untimed`] names a method and the route as the
+//! router matched it (`POST` and `/account/submissions`, say), and
+//! [`harden_with`] or [`serve_with`] carries the list. Such a route is still
+//! bounded, by everything else: the size the handler accepts, the chunk at a
+//! time it reads, and the [`SHUTDOWN_DRAIN`] a stopping server gives it. What
+//! it is not bounded by is a clock, which is why the declaration is per route
+//! and never a knob on the timeout itself: a handler that reads a bounded body
+//! in bounded pieces is safe without one, and nothing else is.
 //!
 //! # Compression
 //!
@@ -92,9 +113,11 @@ use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use axum::Router;
-use axum::extract::Request;
-use axum::http::{HeaderName, HeaderValue, Response};
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, Response};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use tokio::net::TcpListener;
@@ -188,7 +211,20 @@ impl Display for RequestId {
 /// Returns an [`Error`] when the address cannot be bound, or when the accept
 /// loop fails.
 pub async fn serve(router: Router, pool: DbPool, config: &AppConfig) -> Result<(), Error> {
-    let app = harden(router, pool, config);
+    serve_with(router, pool, config, Hardening::default()).await
+}
+
+/// [`serve`], with what [`harden_with`] takes beyond the router.
+///
+/// # Errors
+/// As [`serve`].
+pub async fn serve_with(
+    router: Router,
+    pool: DbPool,
+    config: &AppConfig,
+    hardening: Hardening,
+) -> Result<(), Error> {
+    let app = harden_with(router, pool, config, hardening);
 
     let configured = config.server.socket_addr();
     let listener = TcpListener::bind(configured)
@@ -279,18 +315,100 @@ pub async fn serve_with_shutdown(
     }
 }
 
+/// What an application tells [`harden_with`] beyond its router.
+///
+/// Today that is the routes whose duration is the client's rather than the
+/// server's, which the request timeout leaves alone; see the module docs.
+/// [`Hardening::default`] declares none, which is what [`harden`] and
+/// [`serve`] use.
+#[derive(Debug, Clone, Default)]
+pub struct Hardening {
+    untimed: Vec<Untimed>,
+    /// The timeout every timed route is held to; [`REQUEST_TIMEOUT`] outside
+    /// the tests that prove the untimed path by making the timed one short.
+    timeout: Option<Duration>,
+}
+
+impl Hardening {
+    /// No untimed routes: the stack as [`serve`] applies it.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declares a route the request timeout leaves alone.
+    ///
+    /// `route` is the path as the router matches it, parameters included
+    /// (`/account/uploads/{upload_id}`), and the full path under any nesting.
+    /// Only a request the router matched to exactly that route and `method`
+    /// is untimed; a near miss is timed like any other.
+    ///
+    /// Declare only a route that reads a bounded body in bounded pieces: the
+    /// clock is the one bound such a route gives up, so it has to keep the
+    /// others.
+    #[must_use]
+    pub fn untimed(mut self, method: Method, route: impl Into<String>) -> Self {
+        self.untimed.push(Untimed {
+            method,
+            route: route.into(),
+        });
+        self
+    }
+
+    /// Whether the timeout leaves this request alone.
+    fn leaves_alone(&self, request: &Request) -> bool {
+        let Some(matched) = request.extensions().get::<MatchedPath>() else {
+            return false;
+        };
+        self.untimed
+            .iter()
+            .any(|untimed| untimed.method == request.method() && untimed.route == matched.as_str())
+    }
+
+    /// Holds timed routes to `timeout` instead of [`REQUEST_TIMEOUT`].
+    ///
+    /// For the tests alone: a proof that an untimed route outlives the timeout
+    /// has to be able to wait the timeout out, and thirty seconds per test is
+    /// not a proof anybody runs.
+    #[cfg(test)]
+    fn timed_at(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+}
+
+/// One route the request timeout leaves alone.
+#[derive(Debug, Clone)]
+struct Untimed {
+    method: Method,
+    route: String,
+}
+
 /// Wraps an application's router in the framework's production middleware.
 ///
 /// Mounts the probes described in the module docs and applies the middleware
 /// stack listed there. [`serve`] calls this; call it directly only to drive the
 /// same application from somewhere else, such as an integration test.
 pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
+    harden_with(router, pool, config, Hardening::default())
+}
+
+/// [`harden`], with what an application declares beyond its router.
+pub fn harden_with(
+    router: Router,
+    pool: DbPool,
+    config: &AppConfig,
+    hardening: Hardening,
+) -> Router {
     // Each call wraps what came before, so the last layer is the outermost.
     // The stack is documented outermost-first in the module docs; read this
     // bottom to top to match it.
     let app = router
         .merge(health::router(pool))
-        .layer(axum::middleware::from_fn(enforce_timeout))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(hardening),
+            enforce_timeout,
+        ))
         // Above the timeout so it covers every route, including the SPA
         // fallback, and below the header layers so a compressed response is
         // stamped like any other. See the module docs for what it skips.
@@ -328,17 +446,31 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response<axum::b
     response
 }
 
-/// Abandons a request that has run longer than [`REQUEST_TIMEOUT`].
+/// Abandons a request that has run longer than [`REQUEST_TIMEOUT`], unless
+/// its route was declared untimed.
 ///
 /// Dropping the handler's future is what a timeout means in async Rust: the
 /// work stops at its next await point, and any open transaction rolls back
 /// when its connection returns to the pool.
-async fn enforce_timeout(request: Request, next: Next) -> Response<axum::body::Body> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(request)).await {
+///
+/// The route is read off the request as the router matched it, which is why
+/// this layer sits inside the router rather than around it: an untimed route
+/// is named by its pattern, and a layer outside the router sees only the path
+/// a client typed.
+async fn enforce_timeout(
+    State(hardening): State<Arc<Hardening>>,
+    request: Request,
+    next: Next,
+) -> Response<axum::body::Body> {
+    if hardening.leaves_alone(&request) {
+        return next.run(request).await;
+    }
+    let timeout = hardening.timeout.unwrap_or(REQUEST_TIMEOUT);
+    match tokio::time::timeout(timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_elapsed) => {
             tracing::warn!(
-                http.request.timeout_ms = REQUEST_TIMEOUT.as_millis(),
+                http.request.timeout_ms = timeout.as_millis(),
                 "the request exceeded the {{http.request.timeout_ms}}ms timeout and was abandoned",
             );
             // 503 rather than 408: 408 says the *client* was too slow to send
@@ -489,7 +621,101 @@ impl std::error::Error for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN};
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::routing::{get, post};
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use diesel_async::pooled_connection::deadpool::Pool;
+    use tower::ServiceExt as _;
+
+    use super::{Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with};
+    use crate::config::AppConfig;
+    use crate::db::DbPool;
+
+    /// A pool that never reaches a database; building one performs no I/O.
+    fn unreachable_pool() -> DbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody:nobody@127.0.0.1:1/unreachable",
+        );
+        Pool::builder(manager)
+            .build()
+            .expect("a pool builds without connecting")
+    }
+
+    fn config() -> AppConfig {
+        AppConfig::from_lookup(|_name| None).expect("the defaults parse")
+    }
+
+    /// A handler that takes longer than the test's timeout.
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        "done"
+    }
+
+    async fn status_of(app: &Router, method: Method, path: &str) -> StatusCode {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("a well-formed request");
+        app.clone()
+            .oneshot(request)
+            .await
+            .expect("the service answers")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn an_untimed_route_outlives_the_timeout_and_nothing_else_does() {
+        let router = Router::new()
+            .route("/slow", get(slow))
+            .route("/uploads/{upload_id}", post(slow).get(slow))
+            .nest("/account", Router::new().route("/entries", post(slow)));
+        let hardening = Hardening::new()
+            .untimed(Method::POST, "/uploads/{upload_id}")
+            .untimed(Method::POST, "/account/entries")
+            .timed_at(Duration::from_millis(30));
+        let app = harden_with(router, unreachable_pool(), &config(), hardening);
+
+        // The declared route and method, under nesting too.
+        assert_eq!(
+            status_of(&app, Method::POST, "/uploads/abc").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, Method::POST, "/account/entries").await,
+            StatusCode::OK
+        );
+        // The same route under another method, and any other route, are timed.
+        assert_eq!(
+            status_of(&app, Method::GET, "/uploads/abc").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_of(&app, Method::GET, "/slow").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_nobody_declared_is_timed_by_default() {
+        let router = Router::new().route("/slow", get(slow));
+        let app = harden_with(
+            router,
+            unreachable_pool(),
+            &config(),
+            Hardening::new().timed_at(Duration::from_millis(30)),
+        );
+
+        assert_eq!(
+            status_of(&app, Method::GET, "/slow").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     #[test]
     fn ids_are_unique_and_render_as_they_are_logged() {
