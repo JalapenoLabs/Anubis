@@ -9,7 +9,7 @@ on:
 jobs:
   rust:
     name: Rust
-    runs-on: [self-hosted, rocky9, earthly, docker]
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:17.6
@@ -18,8 +18,8 @@ jobs:
           POSTGRES_PASSWORD: anubis
           POSTGRES_DB: anubis_test
         ports:
-          # Ephemeral host port: concurrent runs (and stale containers) on a
-          # shared self-hosted runner can never collide on a fixed port.
+          # Ephemeral host port, read back through job.services, so no step
+          # depends on a particular port being free.
           - 5432
         options: >-
           --health-cmd "pg_isready -U anubis"
@@ -41,11 +41,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The toolchain version matches rust-toolchain.toml. Self-hosted runners
-      # keep the cargo registry and target dir warm, so no cache step is needed.
+      # The toolchain version matches rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
+
+      # Hosted runners start cold every run, so restore the cargo registry, the
+      # compiled dependencies, and ~/.cargo/bin instead of rebuilding them.
+      - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -93,9 +96,9 @@ jobs:
             --out starter/frontend/src/api/v1.generated.ts
           git diff --exit-code starter/frontend/src/api/v1.generated.ts
 
-      # The runner keeps ~/.cargo/bin between runs, so only the first run on a
-      # fresh runner pays the few minutes cargo-audit takes to compile. Failing
-      # to install it must not fail the job while the audit itself is advisory.
+      # The cache restores ~/.cargo/bin, so only a run without a cache hit pays
+      # the few minutes cargo-audit takes to compile. Failing to install it must
+      # not fail the job while the audit itself is advisory.
       - name: Install cargo-audit
         continue-on-error: true
         run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
@@ -111,7 +114,7 @@ jobs:
 
   frontend:
     name: Frontend
-    runs-on: [self-hosted, rocky9, earthly, docker]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -151,7 +154,7 @@ jobs:
   # Blocking from day one, because template rot is exactly what it catches.
   scaffold:
     name: Scaffold
-    runs-on: [self-hosted, rocky9, earthly, docker]
+    runs-on: ubuntu-24.04
     services:
       # Postgres only. The generated narratives are the only tests this job
       # runs, and none of them touches the Redis fanout.
@@ -170,17 +173,15 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      # `clean: true` is the default, and it is spelled out because this is the
-      # job that dirties its own workspace: it scaffolds into the starter tree
-      # and never reverts. A failed run must not leak generated models into the
-      # next one, which the proof would refuse to start against.
       - uses: actions/checkout@v4
-        with:
-          clean: true
 
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
+
+      # Hosted runners start cold every run, so restore the cargo registry, the
+      # compiled dependencies, and ~/.cargo/bin instead of rebuilding them.
+      - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-node@v4
         with:
@@ -201,22 +202,15 @@ jobs:
   # Browser-level proof that the starter's screens work against the real stack:
   # Postgres, the Rust backend, and Vite, driven by Chromium.
   #
-  # Advisory. Playwright's browsers need system libraries the self-hosted
-  # Rocky 9 runners are not guaranteed to carry, and Playwright installs them
-  # through the system package manager as root, which a runner may refuse; a
-  # missing libatk must not block unrelated work from merging. Flip
-  # continue-on-error to false once a run on a fresh runner provisions its
-  # browser cleanly, the same convention the audits above use.
+  # Advisory until it has run green on the hosted runners, the same convention
+  # the audits above use: flip continue-on-error to false once it has.
   e2e:
     name: E2E
-    runs-on: [self-hosted, rocky9, earthly, docker]
+    runs-on: ubuntu-24.04
     continue-on-error: true
     # The backend binds 3000 and Vite binds 5173, because Vite proxies to a
     # fixed backend address and the browser has to reach the origin APP_URL
-    # names. Fixed ports cannot be shared, so runs queue behind each other
-    # rather than colliding on a runner that hosts several at once.
-    concurrency:
-      group: anubis-e2e
+    # names. Every job gets its own machine, so the fixed ports never collide.
     services:
       postgres:
         image: postgres:17.6
@@ -237,6 +231,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.96.0
 
+      # Hosted runners start cold every run, so restore the cargo registry, the
+      # compiled dependencies, and ~/.cargo/bin instead of rebuilding them.
+      - uses: Swatinem/rust-cache@v2
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24.13.0
@@ -252,20 +250,13 @@ jobs:
       - name: Build the backend
         run: cargo build -p anubis-starter
 
-      # The system libraries Chromium links against are the runner's to carry,
-      # and Playwright installs them through the system package manager as
-      # root, which these Rocky 9 runners have no apt-get for. Asking for them
-      # separately is what keeps that refusal from taking the browser download
-      # with it: a runner that already carries the libraries runs the suite
-      # either way, and the failure is worth seeing in the log.
+      # The system libraries Chromium links against, installed through apt.
       - name: Install Chromium system dependencies
-        continue-on-error: true
         run: yarn workspace anubis-starter-frontend exec playwright install-deps chromium
 
-      # Idempotent: the runner keeps ~/.cache/ms-playwright between runs, so
-      # only a fresh runner pays the download. A browser that will not download
-      # fails the step, because every spec after it fails on a missing
-      # executable and says nothing about the application.
+      # A browser that will not download fails the step, because every spec
+      # after it fails on a missing executable and says nothing about the
+      # application.
       - name: Install Chromium
         run: yarn workspace anubis-starter-frontend exec playwright install chromium
 

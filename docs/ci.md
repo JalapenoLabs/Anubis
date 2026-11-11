@@ -1,6 +1,6 @@
 # CI
 
-CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with the labels `[self-hosted, rocky9, earthly, docker]`. The runners persist the cargo registry, target dir, and yarn cache between runs, so workflows carry no cache save/restore steps.
+CI runs on GitHub Actions on GitHub-hosted `ubuntu-24.04` runners, which are free for a public repository. Every job starts on a fresh machine, so each Rust job restores the cargo registry, its compiled dependencies, and `~/.cargo/bin` with `Swatinem/rust-cache`. The automated review is the one workflow on a self-hosted runner; see [PR review](#pr-review).
 
 ## Workflow
 
@@ -11,7 +11,7 @@ CI runs on GitHub Actions using Jalapeno Labs self-hosted runners, targeted with
 - **Scaffold job**: `scripts/ci-scaffold-proof.sh`, which generates a domain into the starter with every scaffolder and holds the output to both jobs' gates.
 - **E2E job**: builds the backend, provisions Chromium, starts the backend and Vite, and runs the starter's Playwright specs against them.
 
-The Rust job runs two service containers on ephemeral host ports, so concurrent runs on a shared runner never collide: Postgres, which every integration test needs through `DATABASE_URL`, and Redis, which only the realtime fanout test needs through `REDIS_URL`. Tests gate on those variables and skip without them, so a local run needs neither, while CI covers both fanout backends. See [realtime.md](realtime.md).
+The Rust job runs two service containers on ephemeral host ports, which the job reads back through `job.services`: Postgres, which every integration test needs through `DATABASE_URL`, and Redis, which only the realtime fanout test needs through `REDIS_URL`. Tests gate on those variables and skip without them, so a local run needs neither, while CI covers both fanout backends. See [realtime.md](realtime.md).
 
 ## Drift checks
 
@@ -61,27 +61,27 @@ Read the dry run first: the clean removes every untracked file under those paths
 
 Point it at a database nothing else is using. A development server running beside it shares more than rows: its job worker drains the webhook deliveries the generated narratives assert on, and the narratives then read a delivery as failed that they left pending. CI gives the job its own Postgres for exactly that reason.
 
-The job is blocking from its first day. Template rot is precisely what it catches, and an advisory alarm is one nobody reads. On a warm machine it costs about eight minutes: three for the sequence itself, since each command runs the CLI through cargo and formats what it writes, one for fmt and clippy, one for the generated narratives, and three for the frontend gates. A cold runner pays the workspace compile once and keeps the target dir afterwards. The checkout is explicit about `clean: true`, which is the default: this is the one job that dirties its own workspace and never reverts, so a failed run must not leak generated models into the next.
+The job is blocking from its first day. Template rot is precisely what it catches, and an advisory alarm is one nobody reads. With a warm cache it costs about eight minutes: three for the sequence itself, since each command runs the CLI through cargo and formats what it writes, one for fmt and clippy, one for the generated narratives, and three for the frontend gates. A run without a cache hit pays the workspace compile first. The job dirties its own workspace and never reverts it, which is safe because every job starts on a fresh machine.
 
 ## The end-to-end job
 
 The E2E job runs the three Playwright specs the starter ships, against the same three processes `yarn dev` starts: Postgres from a service container, the backend binary, and Vite. Playwright waits for the stack itself, so the job starts both servers, runs the specs, and stops them on the way out however the run ended. On a failure it uploads `starter/frontend/playwright-report`, which carries the trace, screenshot, and DOM snapshot of the failed step. See [testing.md](testing.md#end-to-end-tests).
 
-The backend binds 3000 and Vite binds 5173, because Vite proxies to a fixed backend address and the browser has to reach the origin `APP_URL` names. Fixed ports cannot be shared on a runner that hosts several jobs at once, so the job takes the `anubis-e2e` concurrency group: a second run queues behind the first rather than colliding with it.
+The backend binds 3000 and Vite binds 5173, because Vite proxies to a fixed backend address and the browser has to reach the origin `APP_URL` names. Every job gets its own machine, so the fixed ports never collide.
 
-The job is advisory (`continue-on-error: true`) to start with, for one reason: `playwright install --with-deps` shells out to the system package manager as root to install the libraries Chromium links against, and a self-hosted Rocky 9 runner may refuse. A missing `libatk` must not block unrelated work from merging. Flip it to blocking once a run on a fresh runner provisions its browser cleanly, the same convention the audits use.
+The job is advisory (`continue-on-error: true`) until it has run green on the hosted runners, the same convention the audits use. Flip it to blocking once it has.
 
 ## Dependency audit
 
 The Rust and Frontend jobs each end with a vulnerability audit: `cargo audit` against RustSec advisories, and `yarn npm audit --all --recursive` against npm's. Both run `continue-on-error: true`, so a fresh advisory published overnight reports on every push without blocking unrelated work from merging. Flip both to blocking once the reports are routinely empty and a new advisory is something the team wants to fix before merging.
 
-`cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The runners keep `~/.cargo/bin` between runs, so only the first run on a fresh runner pays the few minutes it takes to compile.
+`cargo-audit` is installed idempotently (`command -v cargo-audit || cargo install cargo-audit --locked`). The Rust job's cache restores `~/.cargo/bin`, so only a run without a cache hit pays the few minutes it takes to compile.
 
 ## PR review
 
 Every pull request from a branch of this repository gets an automated Claude and Codex review. `.github/workflows/pull-review.yml` is the organization's standard consumer file, identical in every JalapenoLabs repository, and holds no review logic: it checks out the pull request, checks out the private [JalapenoLabs/github-actions](https://github.com/JalapenoLabs/github-actions) repository into `.reviewer/` for the length of the job, and runs its `review-pr` action. Nothing from that repository is committed here, and the pipeline, its models, and its review policy live there.
 
-It is the one workflow that does not run on the build pool. It targets `[self-hosted, reviewer]`, a dedicated runner holding the reviewers' credentials, and takes every credential from organization secrets and variables, so this repository configures nothing. It checks out no submodules: `bullet_train/bullet_train` is reference material rather than code this repository builds.
+It is the one workflow on a self-hosted runner. It targets `[self-hosted, reviewer]`, a dedicated runner holding the reviewers' credentials, and takes every credential from organization secrets and variables, so this repository configures nothing. It checks out no submodules: `bullet_train/bullet_train` is reference material rather than code this repository builds.
 
 **Fork pull requests are not reviewed**, with one exception. This repository is public and that runner holds credentials, so an untrusted fork's code must never be checked out on it. The job-level `if:` guard is what enforces that; do not remove it. The exception is a fork owned by an account listed in the organization variable `REVIEWER_TRUSTED_FORK_OWNERS`, a JSON array of logins such as `["alex-mooreslab"]`. The guard matches the fork's owner, not the pull request's author, because the owner controls what lands on the branch. Listing an account trusts everyone who can push to its fork with the reviewer's credentials, so list only accounts you would give write access to this repository. Unset or empty, no fork is reviewed. A listed fork's open pull requests are picked up on their next push; re-running a skipped run does not re-evaluate the guard.
 
@@ -148,14 +148,13 @@ bash scripts/vendor-starter.sh --clean
 
 ## CI for stamped applications
 
-`anubis new` stamps `.github/workflows/ci.yml` from `anubis/templates/new/github-ci.yml`, so an application arrives with the same bar the framework holds itself to. Two things differ, both because a stamped app is not on the Jalapeno Labs fleet:
+`anubis new` stamps `.github/workflows/ci.yml` from `anubis/templates/new/github-ci.yml`, so an application arrives with the same bar the framework holds itself to, on the same `ubuntu-24.04` runners with the same `Swatinem/rust-cache` step. One thing differs:
 
-- `runs-on: ubuntu-latest`, with `Swatinem/rust-cache` standing in for the warm target dir a self-hosted runner keeps.
 - The drift checks run the `anubis` CLI, installed with `cargo install anubis-framework --git https://github.com/JalapenoLabs/Anubis.git --locked`, because the CLI is a framework binary rather than one of the application's. `cargo install` takes the crate name and installs the binaries the crate declares, so the command names `anubis-framework` and the tool it puts on `PATH` is `anubis`. It becomes `cargo install anubis-framework --version <x>` once the crate is published.
 
 The application's drift checks are the three that belong to it: `frontend/src/roles.generated.ts` from its own `config/roles.yml`, `frontend/src/plans.generated.ts` from its own `config/billing.yml`, and `frontend/src/api/v1.generated.ts` from the document its binary exports. A test asserts the template runs every generator the framework's own workflow does, so a fourth one cannot be added here and forgotten there. Its Postgres service is named after the app and takes an ephemeral host port, exactly as the framework's does.
 
-A stamped application also gets the E2E job, and there it is blocking rather than advisory: `ubuntu-latest` installs Chromium's system libraries without argument, so a failure there is the application's, not the runner's. A test asserts the template provisions a browser and runs `test:e2e`, so the specs are covered where they run.
+A stamped application also gets the E2E job, and there it is blocking: `ubuntu-24.04` installs Chromium's system libraries without argument, so a failure there is the application's, not the runner's. A test asserts the template provisions a browser and runs `test:e2e`, so the specs are covered where they run.
 
 A test pins the template's tool versions to this repository's workflow, so bumping Postgres, Rust, Node, or Yarn here reaches every application stamped afterwards.
 
@@ -163,10 +162,7 @@ A test pins the template's tool versions to this repository's workflow, so bumpi
 
 Every toolchain version is pinned and must stay in sync:
 
+- Runner image: `ubuntu-24.04` in every workflow and in the stamped template, never `ubuntu-latest`.
 - Rust: `rust-toolchain.toml` and the `dtolnay/rust-toolchain` tag in the workflow.
 - Node: pinned in the workflow's `setup-node` step.
 - Yarn: `packageManager` in package.json and an explicit `corepack prepare` in the workflow.
-
-## Earthly note
-
-The runners carry the `earthly` label and Earthfiles remain welcome tooling, but api.earthly.dev is offline (the hosted Earthly service is sunsetted). Never rely on Earthly-hosted secrets or authentication; connection errors to api.earthly.dev at the start of runs are benign.

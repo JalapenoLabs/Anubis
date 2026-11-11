@@ -152,7 +152,7 @@ fn new_stamps_ci_and_development_configuration() {
     );
 
     let workflow = read(&app.join(".github/workflows/ci.yml"));
-    assert!(workflow.contains("runs-on: ubuntu-latest"), "{workflow}");
+    assert!(workflow.contains("runs-on: ubuntu-24.04"), "{workflow}");
     assert!(
         workflow.contains("POSTGRES_DB: acme_books_test"),
         "{workflow}"

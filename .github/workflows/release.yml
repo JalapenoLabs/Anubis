@@ -27,10 +27,9 @@ concurrency:
 jobs:
   release:
     name: Release
-    # The same fleet CI runs on. The registry tokens are repository-scoped
-    # secrets on a private fleet, which is the trust boundary CI already has,
-    # and the warm target dir keeps a release from recompiling the world.
-    runs-on: [self-hosted, rocky9, earthly, docker]
+    # The same hosted image CI runs on. No build cache: a release compiles from
+    # source alone, and releases are rare enough that the cold build is cheap.
+    runs-on: ubuntu-24.04
     permissions:
       # For `gh release create`.
       contents: write
@@ -42,7 +41,7 @@ jobs:
           POSTGRES_PASSWORD: anubis
           POSTGRES_DB: anubis_release
         ports:
-          # Ephemeral host port, for the same reason CI uses one.
+          # Ephemeral host port, read back through job.services, as in CI.
           - 5432
         options: >-
           --health-cmd "pg_isready -U anubis"
@@ -199,9 +198,8 @@ jobs:
         run: yarn workspace @jalapenolabs/anubis npm publish --access public
 
       # Both registries carry the version by now, so the release names one
-      # version. The REST API rather than the `gh` CLI, which a self-hosted
-      # runner is not guaranteed to carry; the notes are GitHub's own, drawn
-      # from the commits since the previous tag.
+      # version. The notes are GitHub's own, drawn from the commits since the
+      # previous tag.
       - name: Create the GitHub Release
         if: env.PUBLISHING == 'true' && github.event_name == 'push'
         uses: actions/github-script@v7
@@ -214,10 +212,3 @@ jobs:
               name: process.env.GITHUB_REF_NAME,
               generate_release_notes: true,
             })
-
-      # The runners share a workspace between workflows. Checkout cleans it,
-      # but a build that found a stale copy would embed a stale template, so
-      # the copy never outlives the job that made it, however the job ended.
-      - name: Clean up the vendored template
-        if: always()
-        run: bash scripts/vendor-starter.sh --clean
