@@ -200,14 +200,11 @@ jobs:
         run: bash scripts/ci-scaffold-proof.sh
 
   # Browser-level proof that the starter's screens work against the real stack:
-  # Postgres, the Rust backend, and Vite, driven by Chromium.
-  #
-  # Advisory until it has run green on the hosted runners, the same convention
-  # the audits above use: flip continue-on-error to false once it has.
+  # Postgres, the Rust backend, and Vite, driven by Chromium. Blocking, like the
+  # scaffold proof: a screen that no longer works fails CI.
   e2e:
     name: E2E
     runs-on: ubuntu-24.04
-    continue-on-error: true
     # The backend binds 3000 and Vite binds 5173, because Vite proxies to a
     # fixed backend address and the browser has to reach the origin APP_URL
     # names. Every job gets its own machine, so the fixed ports never collide.

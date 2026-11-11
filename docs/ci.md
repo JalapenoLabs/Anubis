@@ -69,7 +69,7 @@ The E2E job runs the three Playwright specs the starter ships, against the same 
 
 The backend binds 3000 and Vite binds 5173, because Vite proxies to a fixed backend address and the browser has to reach the origin `APP_URL` names. Every job gets its own machine, so the fixed ports never collide.
 
-The job is advisory (`continue-on-error: true`) until it has run green on the hosted runners, the same convention the audits use. Flip it to blocking once it has.
+The job is blocking, like the Scaffold job: a screen that no longer works fails CI. Chromium's system libraries install through `apt` on the hosted image, so a failure here is the application's, not the runner's.
 
 ## Dependency audit
 
