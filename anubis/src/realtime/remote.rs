@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::try_join_all;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSubSink};
+use redis::aio::{ConnectionManager, PubSubSink};
 use redis::{Client, ErrorKind, RedisError, RedisResult, Script};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -68,7 +68,8 @@ const KEY_PREFIX: &str = "{anubis:realtime}:";
 /// milliseconds; the slowest honest call is a stream opening that reads every
 /// kept event of a few dozen backfill channels, which can run past a second.
 /// Ten seconds is past that by far, and matches how long a stream waits to
-/// open, so a call that runs out of it means Redis is gone rather than busy.
+/// open, so a call that runs out of it means Redis is gone rather than busy;
+/// the session store's single-key commands get a second.
 /// The cost is that a publish to a Redis that went dark holds its caller this
 /// long before failing, well inside the request timeout.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -138,11 +139,12 @@ impl Remote {
     /// what it carries on; the pump follows it to decide what Redis should
     /// deliver here.
     ///
-    /// The connection is made, one empty snapshot read, and one message
-    /// published, here rather than lazily: a deployment that names a Redis it
-    /// cannot reach, or one whose user may not do what realtime does, has a
-    /// configuration problem, and finding out at the first publish would mean
-    /// losing events to discover it. The scripts ask Redis which run it is on
+    /// The shared recipe opens the command connection lazily, so one empty
+    /// snapshot read and one message published make it here, rather than at
+    /// the first publish: a deployment that names a Redis it cannot reach, or
+    /// one whose user may not do what realtime does, has a configuration
+    /// problem, and finding out at the first publish would mean losing events
+    /// to discover it. The scripts ask Redis which run it is on
     /// with `INFO`, which a user restricted with `-@dangerous` may not run, and
     /// Redis 7 gives a new user no pub/sub channels at all, so this is where
     /// either shows. The message goes to the bare prefix, a channel no stream
@@ -158,9 +160,10 @@ impl Remote {
         interest: UnboundedReceiver<Interest>,
         registry: Weak<Registry>,
     ) -> Result<Self, RedisError> {
+        // Commands go over the framework's shared recipe; the subscriber
+        // connection the pump holds is its own.
         let client = Client::open(url)?;
-        let config = ConnectionManagerConfig::new().set_response_timeout(Some(COMMAND_TIMEOUT));
-        let connection = ConnectionManager::new_with_config(client.clone(), config).await?;
+        let connection = crate::redis_connection::open(url, COMMAND_TIMEOUT)?;
         let remote = Self {
             connection,
             publish: Script::new(PUBLISH_SCRIPT),
