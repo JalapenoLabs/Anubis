@@ -528,7 +528,7 @@ impl Subscriptions {
                 }
                 if !matches!(request, Request::Nothing) {
                     record(
-                        connection, context, &held, subject, &intent, &current, &answered,
+                        connection, context, &held, subject, intent, &current, &answered,
                     )
                     .await?;
                 }

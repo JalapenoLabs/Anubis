@@ -4,7 +4,7 @@
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
-//! | `GET /organizations/{organization_id}` | org member | The plan in force, every live subscription with its items, and the seats in use |
+//! | `GET /organizations/{organization_id}` | org member | The plan in force, the plan subscription, the seats in use, and, for admin or billing, every live subscription with its items |
 //! | `POST /organizations/{organization_id}/checkout` | org admin or billing | Opens a Stripe Checkout session and answers with its URL |
 //! | `POST /organizations/{organization_id}/portal` | org admin or billing | Opens the Stripe customer portal and answers with its URL |
 //! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscriptions this application shows |
