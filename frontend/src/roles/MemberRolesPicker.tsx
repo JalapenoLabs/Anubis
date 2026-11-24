@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Role, TenantAccess } from '../api/types'
+import type { GrantTier, Role, TenantAccess } from '../api/types'
 import type { AssignabilityRefusal } from './permissions'
 
 // User interface
@@ -27,6 +27,8 @@ type Props = {
   roles: Role[]
   /** The viewer's standing where the roles are granted. */
   viewer: TenantAccess
+  /** Where the roles are granted. */
+  tier: GrantTier
   /** The ids ticked now. */
   value: string[]
   onChange: (roleIds: string[]) => void
@@ -37,6 +39,7 @@ type Props = {
 const DEFAULT_LABELS: MemberRolesPickerLabels = {
   roles: 'Roles',
   refusals: {
+    'wrong-tier': 'Granted at another level',
     'outranked': 'Ranks at or above your highest role',
     'lacks-permissions': 'Carries permissions you do not hold',
   },
@@ -69,7 +72,7 @@ export function MemberRolesPicker(props: Props) {
   >
     {
       offered.map((role) => {
-        const refusal = assignability(props.viewer, role)
+        const refusal = assignability(props.viewer, role, props.tier)
         // Unticking a held role is a revocation, which the hierarchy alone
         // decides; ticking one is a grant, which must carry nothing new.
         const mayUntick = held.has(role.id) && outranks(props.viewer, role)

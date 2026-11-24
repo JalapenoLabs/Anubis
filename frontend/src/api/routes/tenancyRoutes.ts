@@ -3,6 +3,7 @@
 import type {
   ClaimedInvitation,
   CreatedOrganization,
+  GrantTier,
   InviteMemberRequest,
   MembershipsOverview,
   OrganizationRosterMember,
@@ -64,6 +65,7 @@ type WireRole = {
   customized: boolean
   is_default: boolean
   is_administrator: boolean
+  grantable_at: GrantTier[]
 }
 
 type WireRoleCatalog = {
@@ -92,6 +94,7 @@ function toRole(wire: WireRole): Role {
     customized: wire.customized,
     isDefault: wire.is_default,
     isAdministrator: wire.is_administrator,
+    grantableAt: wire.grantable_at,
   }
 }
 

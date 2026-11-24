@@ -120,10 +120,7 @@ pub(crate) fn require_assignable(
             "Everybody holds the default role already, so it is never granted.",
         ));
     }
-    if let Some(key) = role.key.as_deref()
-        && !role.is_administrator()
-        && !roles.is_grantable_at(key, tier)
-    {
+    if !role.is_grantable_at(tier, roles) {
         return Err(ApiError::validation(format!(
             "The {} role cannot be granted at the {} level.",
             role.display_name(roles),

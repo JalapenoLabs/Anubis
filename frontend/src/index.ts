@@ -16,6 +16,7 @@ export type {
   ConnectedClient,
   CreatedOrganization,
   Credentials,
+  GrantTier,
   EmailChangeRequest,
   InvitationAcceptance,
   InvitationPreview,

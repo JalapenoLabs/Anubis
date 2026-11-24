@@ -57,6 +57,7 @@ function wireRole(id: string, name: string, position: number, permissions: strin
     customized: true,
     is_default: false,
     is_administrator: false,
+    grantable_at: [ 'organization', 'sub_tenant', 'team' ],
   }
 }
 

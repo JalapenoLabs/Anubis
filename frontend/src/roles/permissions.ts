@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Role, RoleSummary, TenantAccess } from '../api/types'
+import type { GrantTier, Role, RoleSummary, TenantAccess } from '../api/types'
 
 /**
  * The framework's own permission subjects, spelled as `roles.yml` and the
@@ -26,7 +26,7 @@ export type PermissionGroup = {
 }
 
 /** Why a role cannot be granted by somebody, or `null` when it can. */
-export type AssignabilityRefusal = 'default' | 'outranked' | 'lacks-permissions'
+export type AssignabilityRefusal = 'default' | 'wrong-tier' | 'outranked' | 'lacks-permissions'
 
 /** Whether `access` allows `action` on `subject`. */
 export function allows(
@@ -67,15 +67,23 @@ export function holdsAll(viewer: TenantAccess, permissions: readonly string[]): 
 }
 
 /**
- * Why `viewer` may not hand `role` to somebody, or `null` when they may.
+ * Why `viewer` may not hand `role` to somebody at `tier`, or `null` when they may.
  *
- * The same three questions the server asks of a grant or an invitation: the
- * default role is everybody's already, the role must sit below the viewer,
- * and it must carry nothing the viewer does not hold.
+ * The same questions the server asks of a grant or an invitation: the default
+ * role is everybody's already, the role must be grantable at that tier, it
+ * must sit below the viewer, and it must carry nothing the viewer does not
+ * hold.
  */
-export function assignability(viewer: TenantAccess, role: Role): AssignabilityRefusal | null {
+export function assignability(
+  viewer: TenantAccess,
+  role: Role,
+  tier: GrantTier,
+): AssignabilityRefusal | null {
   if (role.isDefault) {
     return 'default'
+  }
+  if (!role.grantableAt.includes(tier)) {
+    return 'wrong-tier'
   }
   if (!outranks(viewer, role)) {
     return 'outranked'

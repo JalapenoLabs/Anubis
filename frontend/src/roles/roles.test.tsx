@@ -25,6 +25,7 @@ function role(id: string, position: number, overrides: Partial<Role> = {}): Role
     customized: true,
     isDefault: false,
     isAdministrator: false,
+    grantableAt: [ 'organization', 'sub_tenant', 'team' ],
     ...overrides,
   }
 }
@@ -51,6 +52,7 @@ describe('MemberRolesPicker', () => {
       <MemberRolesPicker
         roles={ladder}
         viewer={moderator}
+        tier='team'
         value={[]}
         onChange={vi.fn()}
       />
@@ -70,6 +72,7 @@ describe('MemberRolesPicker', () => {
       <MemberRolesPicker
         roles={ladder}
         viewer={moderator}
+        tier='team'
         value={[ 'Billing' ]}
         onChange={onChange}
       />

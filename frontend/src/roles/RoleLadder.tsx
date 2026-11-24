@@ -134,7 +134,7 @@ export function RoleLadder(props: Props) {
             }
           }}
           onDrop={(event) => onDrop(event, index)}
-          className={`flex items-center gap-3 rounded-medium border border-default-200 px-3 py-2 ${
+          className={`flex min-h-12 items-center gap-3 rounded-medium border border-default-200 px-3 py-2 ${
             dragging === role.id ? 'opacity-50' : ''
           }`}
         >

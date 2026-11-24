@@ -327,7 +327,12 @@ export type Role = {
   isDefault: boolean
   /** The administrator role at the top. */
   isAdministrator: boolean
+  /** The tiers it may be granted at; empty for the default role, which is everybody's. */
+  grantableAt: GrantTier[]
 }
+
+/** A tier a role is granted at. */
+export type GrantTier = 'organization' | 'sub_tenant' | 'team'
 
 /** An organization's roles, the vocabulary they draw from, and the viewer's standing. */
 export type RoleCatalog = {

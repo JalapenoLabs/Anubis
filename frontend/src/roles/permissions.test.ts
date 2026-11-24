@@ -26,6 +26,7 @@ function role(overrides: Partial<Role>): Role {
     customized: true,
     isDefault: false,
     isAdministrator: false,
+    grantableAt: [ 'organization', 'sub_tenant', 'team' ],
     ...overrides,
   }
 }
@@ -74,11 +75,13 @@ describe('holdsAll', () => {
 
 describe('assignability', () => {
   it('names why a role cannot be handed out', () => {
-    expect(assignability(moderator, role({ isDefault: true, position: 0 }))).toBe('default')
-    expect(assignability(moderator, role({ position: 3 }))).toBe('outranked')
-    expect(assignability(moderator, role({ position: 1, permissions: [ 'Project.update' ]})))
+    expect(assignability(moderator, role({ isDefault: true, position: 0 }), 'team')).toBe('default')
+    expect(assignability(moderator, role({ position: 1, grantableAt: [ 'organization' ]}), 'team'))
+      .toBe('wrong-tier')
+    expect(assignability(moderator, role({ position: 3 }), 'team')).toBe('outranked')
+    expect(assignability(moderator, role({ position: 1, permissions: [ 'Project.update' ]}), 'team'))
       .toBe('lacks-permissions')
-    expect(assignability(moderator, role({ position: 1, permissions: [ 'Project.read' ]})))
+    expect(assignability(moderator, role({ position: 1, permissions: [ 'Project.read' ]}), 'team'))
       .toBeNull()
   })
 })

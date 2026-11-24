@@ -215,6 +215,7 @@ export function TeamRosterCard(props: Props) {
         email={editing ? editing.email ?? '' : null}
         heldRoleIds={editing?.roles.map((role) => role.id) ?? []}
         catalog={props.catalog}
+        tier='team'
         onSave={onSaveRoles}
         onClose={() => setEditing(null)}
       />

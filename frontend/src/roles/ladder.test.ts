@@ -19,6 +19,7 @@ function role(id: string, position: number, overrides: Partial<Role> = {}): Role
     customized: true,
     isDefault: false,
     isAdministrator: false,
+    grantableAt: [ 'organization', 'sub_tenant', 'team' ],
     ...overrides,
   }
 }

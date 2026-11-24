@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { RoleCatalog } from '@jalapenolabs/anubis'
+import type { GrantTier, RoleCatalog } from '@jalapenolabs/anubis'
 
 // Core
 import { useState } from 'react'
@@ -27,6 +27,8 @@ type Props = {
   heldRoleIds: string[]
   /** The organization's roles, with the viewer's standing where they are granted. */
   catalog: RoleCatalog | undefined
+  /** Where the roles are granted. */
+  tier: GrantTier
   onSave: (roleIds: string[]) => Promise<void>
   onClose: () => void
 }
@@ -81,6 +83,7 @@ export function EditMemberRolesModal(props: Props) {
           ? <MemberRolesPicker
               roles={props.catalog.roles}
               viewer={props.catalog.viewer}
+              tier={props.tier}
               value={selected}
               onChange={setSelected}
               isDisabled={isSaving}

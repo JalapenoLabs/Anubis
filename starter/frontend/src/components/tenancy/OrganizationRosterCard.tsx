@@ -201,6 +201,7 @@ export function OrganizationRosterCard(props: Props) {
         email={editing ? editing.email : null}
         heldRoleIds={editing?.roles.map((role) => role.id) ?? []}
         catalog={props.catalog}
+        tier='organization'
         onSave={onSaveRoles}
         onClose={() => setEditing(null)}
       />

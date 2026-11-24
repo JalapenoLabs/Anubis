@@ -57,6 +57,7 @@ export function useRoleLabels() {
   const picker: MemberRolesPickerLabels = {
     roles: t('roles.picker.label'),
     refusals: {
+      'wrong-tier': t('roles.picker.wrongTier'),
       'outranked': t('roles.picker.outranked'),
       'lacks-permissions': t('roles.picker.lacksPermissions'),
     },

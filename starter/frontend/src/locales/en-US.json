@@ -508,6 +508,7 @@
     },
     "picker": {
       "label": "Roles",
+      "wrongTier": "Granted at another level",
       "outranked": "Ranks at or above your highest role",
       "lacksPermissions": "Carries permissions you do not hold"
     },

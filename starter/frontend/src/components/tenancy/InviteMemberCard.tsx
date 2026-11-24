@@ -43,8 +43,11 @@ export function InviteMemberCard(props: Props) {
   const [ outcome, setOutcome ] = useState<string | null>(null)
 
   const { catalog } = props
+  const tier = props.teamId
+    ? 'team'
+    : 'organization'
   const offered = catalog
-    ? catalog.roles.filter((candidate) => assignability(catalog.viewer, candidate) === null)
+    ? catalog.roles.filter((candidate) => assignability(catalog.viewer, candidate, tier) === null)
     : []
   const defaultRole = catalog?.roles.find((candidate) => candidate.isDefault)
 

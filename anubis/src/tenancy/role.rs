@@ -38,7 +38,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::roles::{
-    ADMIN_ROLE, Action, DEFAULT_ROLE, MEMBERSHIP, Permission, ROLE, RoleSet, SUBSCRIPTION,
+    ADMIN_ROLE, Action, DEFAULT_ROLE, MEMBERSHIP, Permission, ROLE, RoleSet, SUBSCRIPTION, Scope,
 };
 use crate::schema::{organizations, roles as role_rows};
 
@@ -140,6 +140,23 @@ impl Role {
         }
     }
 
+    /// Returns `true` when the role may be granted at `tier`.
+    ///
+    /// The default role is everybody's and never granted. The administrator
+    /// role and a role the organization made reach every tenancy tier. A seeded
+    /// role reaches the tiers `roles.yml` scopes its key to, and none once the
+    /// key has left the file.
+    #[must_use]
+    pub fn is_grantable_at(&self, tier: Scope, roles: &RoleSet) -> bool {
+        if self.is_default() || !Scope::TENANCY.contains(&tier) {
+            return false;
+        }
+        match self.key.as_deref() {
+            Some(key) if !self.is_administrator() => roles.is_grantable_at(key, tier),
+            _custom_or_administrator => true,
+        }
+    }
+
     /// The role as a screen shows it, everything resolved.
     #[must_use]
     pub fn view(&self, roles: &RoleSet) -> RoleView {
@@ -157,6 +174,11 @@ impl Role {
             customized: self.is_customized(),
             is_default: self.is_default(),
             is_administrator: self.is_administrator(),
+            grantable_at: Scope::TENANCY
+                .into_iter()
+                .filter(|tier| self.is_grantable_at(*tier, roles))
+                .map(Scope::as_str)
+                .collect(),
         }
     }
 
@@ -208,6 +230,8 @@ pub struct RoleView {
     pub is_default: bool,
     /// Whether this is the administrator role.
     pub is_administrator: bool,
+    /// The tiers it may be granted at: `organization`, `sub_tenant`, `team`.
+    pub grantable_at: Vec<&'static str>,
 }
 
 /// A role as a roster or a membership names it.
@@ -428,7 +452,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::Role;
-    use crate::roles::{Action, MEMBERSHIP, Permission, ROLE, RoleSet};
+    use crate::roles::{Action, MEMBERSHIP, Permission, ROLE, RoleSet, Scope};
 
     const ROLES: &str = "
 roles:
@@ -496,6 +520,27 @@ roles:
             orphaned.permissions(&roles).is_empty(),
             "a key that left roles.yml grants nothing",
         );
+    }
+
+    #[test]
+    fn a_role_is_grantable_where_its_key_is_scoped() {
+        let roles = RoleSet::from_yaml(
+            "roles:\n  default: {}\n  billing:\n    scopes: [organization]\n  admin: {}\n",
+        )
+        .expect("roles must parse");
+
+        let billing = role(Some("billing"), None);
+        assert!(billing.is_grantable_at(Scope::Organization, &roles));
+        assert!(!billing.is_grantable_at(Scope::Team, &roles));
+
+        assert!(role(Some("admin"), None).is_grantable_at(Scope::Team, &roles));
+        assert!(role(None, Some(&[])).is_grantable_at(Scope::Team, &roles));
+        assert!(!role(Some("default"), None).is_grantable_at(Scope::Organization, &roles));
+        assert!(
+            !role(Some("removed"), None).is_grantable_at(Scope::Team, &roles),
+            "a key that left roles.yml is grantable nowhere",
+        );
+        assert!(!billing.is_grantable_at(Scope::Platform, &roles));
     }
 
     #[test]
