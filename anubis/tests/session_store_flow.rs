@@ -109,6 +109,84 @@ async fn sessions_behave_the_same_in_redis() {
     .await;
 }
 
+#[tokio::test]
+async fn a_sign_out_everywhere_ends_the_sessions_of_both_stores() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping session_store_flow cross-store test: REDIS_URL is not set");
+        return;
+    };
+    let Some(database) = TestDatabase::create("session_store_both").await else {
+        return;
+    };
+    let client = redis::Client::open(redis_url.as_str()).expect("REDIS_URL must parse");
+    let connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    let redis_store = Store::Redis {
+        url: redis_url,
+        connection,
+    };
+
+    // One database, served once through each store: what a deployment that
+    // switched SESSION_STORE, and might switch back, leaves behind.
+    let in_postgres = Deployment::boot(&database, &Store::Postgres).await;
+    let in_redis = Deployment::boot(&database, &redis_store).await;
+    let email = format!("switching-{}@example.com", Uuid::new_v4());
+    let postgres_session = support::register(&in_postgres.router, &email).await;
+    let redis_session = sign_in(&in_redis.router, &email, PASSWORD).await;
+    assert_eq!(in_postgres.whoami(&postgres_session).await, StatusCode::OK);
+    assert_eq!(in_redis.whoami(&redis_session).await, StatusCode::OK);
+
+    // A reset under Redis never touches the sessions table, and the session
+    // there still ends: switching back cannot revive it.
+    reset_password(&in_redis, &email, RESET_PASSWORD).await;
+    assert_eq!(
+        in_postgres.whoami(&postgres_session).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        in_redis.whoami(&redis_session).await,
+        StatusCode::UNAUTHORIZED,
+    );
+
+    // And the other way round.
+    let postgres_session = sign_in(&in_postgres.router, &email, RESET_PASSWORD).await;
+    let redis_session = sign_in(&in_redis.router, &email, RESET_PASSWORD).await;
+    reset_password(&in_postgres, &email, CHANGED_PASSWORD).await;
+    assert_eq!(
+        in_redis.whoami(&redis_session).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        in_postgres.whoami(&postgres_session).await,
+        StatusCode::UNAUTHORIZED,
+    );
+}
+
+/// Resets `email`'s password to `password` through `deployment`'s routes.
+async fn reset_password(deployment: &Deployment, email: &str, password: &str) {
+    let (status, _headers, _body) = send(
+        &deployment.router,
+        "POST",
+        "/auth/password-reset/request",
+        Some(&json!({ "email": email })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let reset = deployment.reset_token(email);
+    let (status, _headers, body) = send(
+        &deployment.router,
+        "POST",
+        "/auth/password-reset/confirm",
+        Some(&json!({ "token": reset, "password": password })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
 /// The store a run configures, and the direct reads that prove it is used.
 enum Store {
     Postgres,
@@ -286,6 +364,111 @@ impl Store {
             }
         }
     }
+
+    /// Drops the user's index, the key a Redis under memory pressure evicts
+    /// first, because only signing in and the account's own pages touch it.
+    ///
+    /// A sign-out-everywhere then finds nothing to delete, and the session
+    /// keys it should have deleted live on. The table cannot lose track of its
+    /// rows that way, so for Postgres this does nothing.
+    async fn evict_index(&self, user_id: Uuid) {
+        if let Self::Redis { connection, .. } = self {
+            let mut connection = connection.clone();
+            connection
+                .del(format!("{USER_KEY_PREFIX}{user_id}"))
+                .await
+                .expect("Redis must answer");
+        }
+    }
+
+    /// Copies the session behind `token` exactly as the store holds it, to
+    /// put back after it has ended.
+    async fn remember(&self, pool: &DbPool, token: &str) -> Leftover {
+        let token_hash = hash(token);
+        match self {
+            Self::Postgres => {
+                let mut connection = pool.get().await.expect("a connection");
+                let row = sessions::table
+                    .filter(sessions::token_hash.eq(&token_hash))
+                    .select((
+                        sessions::id,
+                        sessions::user_id,
+                        sessions::created_at,
+                        sessions::expires_at,
+                        sessions::generation,
+                    ))
+                    .first(&mut connection)
+                    .await
+                    .expect("the session must be a row");
+                Leftover::Row { token_hash, row }
+            }
+            Self::Redis { connection, .. } => {
+                let mut connection = connection.clone();
+                let stored = connection
+                    .get(format!("{TOKEN_KEY_PREFIX}{token_hash}"))
+                    .await
+                    .expect("Redis must answer")
+                    .expect("the session must be a key");
+                Leftover::Key { token_hash, stored }
+            }
+        }
+    }
+
+    /// Puts a remembered session back, index entry and all, the way a store
+    /// restored from a snapshot taken before it ended would.
+    async fn bring_back(&self, pool: &DbPool, leftover: Leftover) {
+        match (self, leftover) {
+            (Self::Postgres, Leftover::Row { token_hash, row }) => {
+                let (id, user_id, created_at, expires_at, generation) = row;
+                let mut connection = pool.get().await.expect("a connection");
+                diesel::insert_into(sessions::table)
+                    .values((
+                        sessions::id.eq(id),
+                        sessions::user_id.eq(user_id),
+                        sessions::token_hash.eq(token_hash),
+                        sessions::created_at.eq(created_at),
+                        sessions::expires_at.eq(expires_at),
+                        sessions::generation.eq(generation),
+                    ))
+                    .execute(&mut connection)
+                    .await
+                    .expect("the row must go back");
+            }
+            (Self::Redis { connection, .. }, Leftover::Key { token_hash, stored }) => {
+                let session: Value = serde_json::from_str(&stored).expect("a session is JSON");
+                let user_id = session["user_id"].as_str().expect("a user id");
+                let ends_at: DateTime<Utc> =
+                    serde_json::from_value(session["expires_at"].clone()).expect("an end");
+                let mut connection = connection.clone();
+                redis::pipe()
+                    .cmd("SET")
+                    .arg(format!("{TOKEN_KEY_PREFIX}{token_hash}"))
+                    .arg(&stored)
+                    .arg("EXAT")
+                    .arg(ends_at.timestamp())
+                    .cmd("ZADD")
+                    .arg(format!("{USER_KEY_PREFIX}{user_id}"))
+                    .arg(ends_at.timestamp())
+                    .arg(&token_hash)
+                    .exec_async(&mut connection)
+                    .await
+                    .expect("the session must go back");
+            }
+            _ => unreachable!("a leftover goes back to the store it came from"),
+        }
+    }
+}
+
+/// A session copied out of its store, as [`Store::remember`] found it.
+enum Leftover {
+    Row {
+        token_hash: String,
+        row: (Uuid, Uuid, DateTime<Utc>, DateTime<Utc>, i64),
+    },
+    Key {
+        token_hash: String,
+        stored: String,
+    },
 }
 
 /// The token hash a store keys a session by.
@@ -532,6 +715,7 @@ async fn narrative(database: &TestDatabase, store: Store) {
         current[0]["id"], listed[0]["id"],
         "the first session asked, so it is the current one",
     );
+    let first_id = listed_id(&listed, 0);
     let newest_id = listed_id(&listed, 2);
 
     // ---- Signing one session out from the list ends that one alone.
@@ -632,6 +816,11 @@ async fn narrative(database: &TestDatabase, store: Store) {
     assert_eq!(listed[0]["current"], json!(true));
 
     // ---- A password reset signs out everywhere, this browser included.
+    // The store loses track of the first session beforehand, the way an
+    // evicted index does, so the cleanup cannot reach it; ending it has to be
+    // decided in Postgres or it survives.
+    let leftover = store.remember(&deployment.pool, &first).await;
+    store.evict_index(user_id).await;
     let (status, _headers, _body) = send(
         router,
         "POST",
@@ -654,8 +843,36 @@ async fn narrative(database: &TestDatabase, store: Store) {
     assert_eq!(deployment.whoami(&first).await, StatusCode::UNAUTHORIZED);
     store.assert_holds_none(&deployment.pool, user_id).await;
 
+    // A store restored from a snapshot taken before the reset brings the
+    // session's data back, and still nobody is signed in by it.
+    store.bring_back(&deployment.pool, leftover).await;
+    assert_eq!(
+        deployment.whoami(&first).await,
+        StatusCode::UNAUTHORIZED,
+        "a session a sign-out-everywhere ended stays ended, whatever the store still holds",
+    );
+
     // ---- An operator's temporary password signs out everywhere too.
     let rescued = sign_in(router, &email, RESET_PASSWORD).await;
+    let listed = deployment.listed(&rescued).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "an ended session the store brought back is not listed: {listed:?}",
+    );
+    let (status, _headers, _body) = send(
+        router,
+        "DELETE",
+        &format!("/auth/sessions/{first_id}"),
+        None,
+        Some(&rescued),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an ended session cannot be signed out again",
+    );
     let also_rescued = sign_in(router, &email, RESET_PASSWORD).await;
     let (status, _headers, body) = send(
         router,

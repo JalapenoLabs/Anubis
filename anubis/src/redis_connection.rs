@@ -1,11 +1,12 @@
 //! The one recipe for connecting to the optional Redis.
 //!
-//! Every Redis-backed feature that serves requests opens its connection through
-//! [`open`], so the timeouts and the reconnection policy that bound a request
-//! waiting on Redis are decided once rather than per feature. The session
-//! store is the first such feature: it sits on the path of every authenticated
-//! request, so a Redis that stops answering must turn into a prompt error, not
-//! a request that hangs until the server's own timeout gives up on it.
+//! [`open`] is the recipe for a Redis connection that serves requests: the
+//! timeouts and the reconnection policy that bound a request waiting on Redis,
+//! decided once. The session store opens through it today; the realtime
+//! fanout still opens its own. The session store sits on the path of every
+//! authenticated request, so a Redis that stops answering must turn into a
+//! prompt error, not a request that hangs until the server's own timeout gives
+//! up on it.
 //!
 //! The connection is a [`ConnectionManager`]: one multiplexed connection,
 //! cheap to clone and safe to share across tasks, that reconnects on its own

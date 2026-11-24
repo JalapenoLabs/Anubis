@@ -809,9 +809,14 @@ async fn a_redis_session_store_that_answers_lets_the_boot_through() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let still_serving = !serving.is_finished();
+    if serving.is_finished() {
+        // The boot stopped; say why, rather than blaming whichever assertion
+        // below would trip first. The port, picked and released above, may
+        // also have been taken in between.
+        let outcome = serving.await.expect("the serving task must not panic");
+        panic!("a Redis that answers must not stop the boot: {outcome:?}");
+    }
     serving.abort();
-    assert!(still_serving, "a Redis that answers must not stop the boot");
     let response = answered.expect("the served application must answer its probe");
     assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 }

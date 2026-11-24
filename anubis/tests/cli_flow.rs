@@ -393,10 +393,12 @@ fn doctor_names_postgres_as_the_session_store_by_default() {
 fn doctor_fails_a_session_store_the_server_would_refuse() {
     for (store, redis_url, expected) in [
         ("memcached", None, "[FAIL] invalid value for SESSION_STORE"),
+        ("redis", None, "[FAIL] REDIS_URL is not set"),
         (
             "redis",
-            None,
-            "[FAIL] SESSION_STORE is redis, and REDIS_URL is not set",
+            // A client opens it, and the server's configuration refuses it.
+            Some("unix:///var/run/redis.sock"),
+            "[FAIL] invalid value for REDIS_URL",
         ),
         (
             "redis",
@@ -424,9 +426,9 @@ fn doctor_fails_a_session_store_the_server_would_refuse() {
 }
 
 #[test]
-fn doctor_reports_how_a_redis_session_store_persists() {
+fn doctor_asks_a_redis_session_store_what_the_boot_asks() {
     let Ok(redis_url) = std::env::var("REDIS_URL") else {
-        eprintln!("skipping the doctor's Redis persistence check: REDIS_URL is not set");
+        eprintln!("skipping the doctor's Redis session store check: REDIS_URL is not set");
         return;
     };
     let output = Command::new(ANUBIS)
@@ -437,21 +439,25 @@ fn doctor_reports_how_a_redis_session_store_persists() {
         .expect("the anubis binary runs");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The verdict depends on how that Redis was started, so any of the three
-    // readings is right; what must not happen is no reading at all.
-    let line = stdout
-        .lines()
-        .find(|line| line.contains("sessions are kept in Redis"))
-        .unwrap_or_else(|| panic!("doctor must report the Redis store: {stdout}"));
+    assert!(
+        stdout.contains("sessions are kept in Redis"),
+        "doctor must report the Redis store: {stdout}",
+    );
+    // The verdicts depend on how that Redis was started, so any reading is
+    // right; what must not happen is no reading at all.
+    assert!(
+        stdout.contains("evict"),
+        "doctor must say whether Redis may evict sessions: {stdout}",
+    );
     assert!(
         ["append-only file", "RDB snapshots", "persists nothing"]
             .iter()
-            .any(|verdict| line.contains(verdict)),
-        "doctor must say how Redis persists: {line}",
+            .any(|verdict| stdout.contains(verdict)),
+        "doctor must say how Redis persists: {stdout}",
     );
     assert!(
-        !line.contains(&redis_url),
-        "the URL, which may carry a password, is never echoed: {line}",
+        !stdout.contains(&redis_url),
+        "the URL, which may carry a password, is never echoed: {stdout}",
     );
 }
 

@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::SignInMethod;
@@ -124,6 +124,17 @@ struct MfaChallengeBody {
     mfa_token: String,
 }
 
+/// What a submitted code led to, decided inside one transaction.
+enum CodeOutcome {
+    /// The code did not match, or no code was live.
+    Refused,
+    /// The code matched an account with a confirmed second factor, which is
+    /// asked for next with this challenge token.
+    SecondFactor(String),
+    /// The code matched and a session was created.
+    SignedIn(Box<(User, axum_extra::extract::CookieJar)>),
+}
+
 async fn verify_code(
     State(state): State<AuthState>,
     sessions: Sessions,
@@ -146,58 +157,71 @@ async fn verify_code(
         return Err(invalid_code());
     };
 
-    let accepted = user_token::verify_short_code(
-        &mut connection,
-        user.id,
-        TokenPurpose::EmailSignIn,
-        &body.code,
-    )
-    .await
-    .map_err(log_internal)?;
-    if !accepted {
-        return Err(invalid_code());
-    }
+    // Spending the code and signing in are one unit: when the session store
+    // fails, the code is not spent. A wrong code commits, because the attempt
+    // it costs is what keeps a six-digit code from being guessed.
+    let outcome = connection
+        .transaction::<_, ApiError, _>(async |transaction| {
+            let accepted = user_token::verify_short_code(
+                transaction,
+                user.id,
+                TokenPurpose::EmailSignIn,
+                &body.code,
+            )
+            .await?;
+            if !accepted {
+                return Ok(CodeOutcome::Refused);
+            }
 
-    // Proving inbox control also proves the address; mark it verified.
-    let user = if user.email_verified_at.is_none() {
-        diesel::update(users::table.find(user.id))
-            .set(users::email_verified_at.eq(chrono::Utc::now()))
-            .returning(User::as_returning())
-            .get_result(&mut connection)
-            .await
-            .map_err(log_internal)?
-    } else {
-        user
+            // Proving inbox control also proves the address; mark it verified.
+            let user = if user.email_verified_at.is_none() {
+                diesel::update(users::table.find(user.id))
+                    .set(users::email_verified_at.eq(chrono::Utc::now()))
+                    .returning(User::as_returning())
+                    .get_result(transaction)
+                    .await?
+            } else {
+                user.clone()
+            };
+
+            // An inbox alone never bypasses a confirmed second factor.
+            if mfa::confirmed_secret(transaction, &state.secret_key, user.id)
+                .await?
+                .is_some()
+            {
+                let mfa_token =
+                    user_token::issue(transaction, user.id, TokenPurpose::MfaChallenge).await?;
+                return Ok(CodeOutcome::SecondFactor(mfa_token));
+            }
+
+            let jar = signed_in_jar(
+                &state,
+                &sessions,
+                transaction,
+                &context,
+                &user,
+                SignInMethod::EmailCode,
+            )
+            .await?;
+            Ok(CodeOutcome::SignedIn(Box::new((user, jar))))
+        })
+        .await?;
+
+    let (user, jar) = match outcome {
+        CodeOutcome::Refused => return Err(invalid_code()),
+        CodeOutcome::SecondFactor(mfa_token) => {
+            return Ok((
+                StatusCode::OK,
+                Json(MfaChallengeBody {
+                    mfa_required: true,
+                    mfa_token,
+                }),
+            )
+                .into_response());
+        }
+        CodeOutcome::SignedIn(signed_in) => *signed_in,
     };
 
-    // An inbox alone never bypasses a confirmed second factor.
-    if mfa::confirmed_secret(&mut connection, &state.secret_key, user.id)
-        .await
-        .map_err(log_internal)?
-        .is_some()
-    {
-        let mfa_token = user_token::issue(&mut connection, user.id, TokenPurpose::MfaChallenge)
-            .await
-            .map_err(log_internal)?;
-        return Ok((
-            StatusCode::OK,
-            Json(MfaChallengeBody {
-                mfa_required: true,
-                mfa_token,
-            }),
-        )
-            .into_response());
-    }
-
-    let jar = signed_in_jar(
-        &state,
-        &sessions,
-        &mut connection,
-        &context,
-        &user,
-        SignInMethod::EmailCode,
-    )
-    .await?;
     let response_body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await

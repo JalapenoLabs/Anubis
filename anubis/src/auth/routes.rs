@@ -48,7 +48,7 @@ use crate::auth::secret_box::SecretKey;
 use crate::auth::session::{Sessions, SignInMethod};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
-use crate::config::{AppConfig, AvatarConfig, Environment};
+use crate::config::{AppConfig, AvatarConfig, Environment, SessionStore};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::images::ImageScreen;
@@ -146,6 +146,7 @@ pub fn router_with(
         hasher: password::Hasher::new(config.password_hash_concurrency),
         avatar: config.avatar,
         image_screen: options.image_screen,
+        session_store: config.session_store,
     };
 
     Router::new()
@@ -199,6 +200,9 @@ pub(crate) struct AuthState {
     pub(crate) avatar: AvatarConfig,
     /// The application's look at an uploaded image before it is stored.
     pub(crate) image_screen: Option<Arc<dyn ImageScreen>>,
+    /// The store `SESSION_STORE` chose, which every request these routes
+    /// answer must carry; see [`crate::auth::session`].
+    pub(crate) session_store: SessionStore,
 }
 
 #[derive(Deserialize)]
@@ -417,9 +421,8 @@ async fn logout(
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
     if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
-        let mut connection = state.pool.get().await.map_err(log_internal)?;
         sessions
-            .revoke(&mut connection, cookie.value())
+            .revoke(&state.pool, cookie.value())
             .await
             .map_err(log_internal)?;
     }
@@ -620,18 +623,27 @@ async fn confirm_password_reset(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let (user_id, _payload) =
-        user_token::consume(&mut connection, &body.token, TokenPurpose::PasswordReset)
-            .await
-            .map_err(log_internal)?
-            .ok_or_else(expired_link)?;
+    // Looked at, not spent: a link that was never good costs no argon2 run,
+    // and a good one is spent below, inside the transaction that uses it, so
+    // a failure there leaves it usable for another try.
+    user_token::peek(&mut connection, &body.token, TokenPurpose::PasswordReset)
+        .await
+        .map_err(log_internal)?
+        .ok_or_else(expired_link)?;
 
     let password_hash = state.hasher.hash(body.password).await?;
 
-    // The session store's error type, because the revocation below may be a
-    // Redis write; it converts from every Diesel error the rest raises.
-    connection
-        .transaction::<(), session::Error, _>(async |transaction| {
+    // The session store's error type, because ending the sessions is one of
+    // its operations; it converts from every Diesel error the rest raises.
+    let revocation = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
+            let Some((user_id, _payload)) =
+                user_token::consume(transaction, &body.token, TokenPurpose::PasswordReset).await?
+            else {
+                // Spent by a request that raced this one since the look above.
+                return Ok(None);
+            };
+
             // A password the account chose through its own inbox replaces any
             // temporary one an operator set, so the flag goes with it.
             let user: User = diesel::update(users::table.find(user_id))
@@ -644,18 +656,22 @@ async fn confirm_password_reset(
                 .await?;
 
             // A reset proves the old credentials may be compromised: no
-            // session created under them survives, and neither does any
-            // program connected under them. The account is the actor, since
-            // it proved itself through its inbox. Revoking before the commit
-            // means a store that cannot sign everyone out leaves the old
-            // password in place rather than the old sessions.
-            sessions.revoke_all(transaction, user_id).await?;
+            // program connected under them survives, and no session created
+            // under them does either. The account is the actor, since it
+            // proved itself through its inbox. Ending the sessions is the last
+            // statement, so they end exactly when the new password commits.
             crate::oauth_server::revoke_every_grant(transaction, &context.by(&user), user_id)
                 .await?;
-            Ok(())
+            Ok(Some(sessions.revoke_all(transaction, user_id).await?))
         })
         .await
         .map_err(log_internal)?;
+    let revocation = revocation.ok_or_else(expired_link)?;
+
+    // After the commit and with the connection back in the pool, so a slow
+    // store never holds either; see `crate::auth::session`.
+    drop(connection);
+    sessions.sweep(revocation).await;
 
     Ok(Json(MessageBody {
         message: "Your password has been reset. Sign in with your new password.",

@@ -91,9 +91,10 @@
 //! request, once, for every router the application composed, so the session
 //! cookie means the same thing on every route: Postgres by default, Redis when
 //! configured. That is the whole of opting in; no router is built differently.
-//! A Redis store connects on its first command, so [`serve`] asks it for its
-//! version before binding and refuses to start, naming `SESSION_STORE`, when
-//! Redis does not answer or is older than 7.0. A deployment that cannot check a
+//! A Redis store connects on its first command, so [`serve`] asks it whether it
+//! can hold sessions before binding, and refuses to start, naming
+//! `SESSION_STORE`, when Redis does not answer, is older than 7.0, or may evict
+//! keys; it logs a warning when Redis persists less than an append-only file. A deployment that cannot check a
 //! session cannot serve anyone signed in, and finding out at the first request
 //! would mean every sign-in failing instead of one boot. An application that
 //! pairs [`harden`] with [`serve_with_shutdown`] skips that check, and its
@@ -660,24 +661,42 @@ pub struct Error {
 enum ErrorSource {
     /// Binding or accepting failed.
     Io(std::io::Error),
-    /// The configured session store did not answer at boot.
+    /// The configured session store did not answer at boot, or cannot hold
+    /// sessions.
     Sessions(session::Error),
+}
+
+impl ErrorSource {
+    /// The underlying error, whichever kind it is.
+    fn as_error(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Io(source) => source,
+            Self::Sessions(source) => source,
+        }
+    }
 }
 
 impl Error {
     fn new(context: &'static str, source: ErrorSource) -> Self {
+        // A session store error carries its own backtrace and prints it, so
+        // capturing a second one here would print two, back to back.
+        let backtrace = match source {
+            ErrorSource::Io(_) => Backtrace::capture(),
+            ErrorSource::Sessions(_) => Backtrace::disabled(),
+        };
         Self {
             context,
             source,
-            backtrace: Backtrace::capture(),
+            backtrace,
         }
     }
 
     /// Returns `true` when the boot stopped because the session store the
-    /// configuration chose did not answer.
+    /// configuration chose did not answer, or cannot hold sessions.
     ///
-    /// A deployment problem: `REDIS_URL` names a Redis that is down or
-    /// unreachable from here, while `SESSION_STORE` keeps sessions there.
+    /// A deployment problem: `REDIS_URL` names a Redis that is down,
+    /// unreachable from here, older than 7.0, or free to evict keys, while
+    /// `SESSION_STORE` keeps sessions there.
     #[must_use]
     pub fn is_session_store(&self) -> bool {
         matches!(self.source, ErrorSource::Sessions(_))
@@ -686,10 +705,7 @@ impl Error {
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.source {
-            ErrorSource::Io(source) => write!(f, "{}: {source}", self.context)?,
-            ErrorSource::Sessions(source) => write!(f, "{}: {source}", self.context)?,
-        }
+        write!(f, "{}: {}", self.context, self.source.as_error())?;
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
         }
@@ -699,10 +715,7 @@ impl Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.source {
-            ErrorSource::Io(source) => Some(source),
-            ErrorSource::Sessions(source) => Some(source),
-        }
+        Some(self.source.as_error())
     }
 }
 

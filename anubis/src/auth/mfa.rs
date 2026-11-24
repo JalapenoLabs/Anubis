@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use data_encoding::BASE32_NOPAD;
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -271,43 +271,45 @@ async fn verify_challenge(
             ApiError::unauthorized("That sign-in attempt has expired. Sign in again.")
         })?;
 
-    let accepted = code_matches(
-        &mut connection,
-        &state.secret_key,
-        peeked.user_id,
-        &body.code,
-    )
-    .await
-    .map_err(log_internal)?;
-    if !accepted {
+    // Spending the code, spending the challenge, and signing in are one unit:
+    // when the session store fails, all three roll back, so a recovery code is
+    // never spent on a sign-in that did not happen. A wrong code commits, so
+    // a TOTP enrollment discarded on the way stays discarded, and its failure
+    // is counted against the challenge only once the transaction is over.
+    let signed_in = connection
+        .transaction::<_, ApiError, _>(async |transaction| {
+            if !code_matches(transaction, &state.secret_key, peeked.user_id, &body.code).await? {
+                return Ok(None);
+            }
+
+            user_token::delete_by_id(transaction, peeked.id).await?;
+            let user: crate::auth::User = users::table
+                .find(peeked.user_id)
+                .select(crate::auth::User::as_select())
+                .first(transaction)
+                .await?;
+            let jar = crate::auth::routes::signed_in_jar(
+                &state,
+                &sessions,
+                transaction,
+                &context,
+                &user,
+                crate::auth::SignInMethod::SecondFactor,
+            )
+            .await?;
+            Ok(Some((user, jar)))
+        })
+        .await?;
+
+    let Some((user, jar)) = signed_in else {
         user_token::record_failure(&mut connection, peeked.id)
             .await
             .map_err(log_internal)?;
         return Err(ApiError::unauthorized(
             "That code didn't match. Try again or use a recovery code.",
         ));
-    }
+    };
 
-    user_token::delete_by_id(&mut connection, peeked.id)
-        .await
-        .map_err(log_internal)?;
-
-    let user: crate::auth::User = users::table
-        .find(peeked.user_id)
-        .select(crate::auth::User::as_select())
-        .first(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
-    let jar = crate::auth::routes::signed_in_jar(
-        &state,
-        &sessions,
-        &mut connection,
-        &context,
-        &user,
-        crate::auth::SignInMethod::SecondFactor,
-    )
-    .await?;
     let response_body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await

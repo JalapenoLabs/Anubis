@@ -181,8 +181,8 @@ async fn change_password(
     // change is exactly the gap an audit log exists to close. The change set
     // stays empty, because the fact is the whole of what an auditor needs and
     // neither password belongs in a table anybody can read.
-    connection
-        .transaction::<(), session::Error, _>(async |transaction| {
+    let revocation = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
             diesel::update(users::table.find(user.id))
                 .set((
                     users::password_hash.eq(&password_hash),
@@ -199,17 +199,25 @@ async fn change_password(
             .await?;
 
             // Other browsers sign out; the one that made the change stays in.
-            // Inside the transaction, so a store that cannot sign them out
-            // leaves the old password in place rather than the old sessions.
-            if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
-                sessions
-                    .revoke_all_except(transaction, user.id, cookie.value())
-                    .await?;
-            }
-            Ok(())
+            // The last statement, so the others end exactly when the new
+            // password commits.
+            let Some(cookie) = jar.get(session::SESSION_COOKIE) else {
+                return Ok(None);
+            };
+            let revocation = sessions
+                .revoke_all_except(transaction, user.id, cookie.value())
+                .await?;
+            Ok(Some(revocation))
         })
         .await
         .map_err(log_internal)?;
+
+    // After the commit and with the connection back in the pool; see
+    // `crate::auth::session`.
+    drop(connection);
+    if let Some(revocation) = revocation {
+        sessions.sweep(revocation).await;
+    }
 
     Ok(Json(MessageBody {
         message: "Your password has been changed. Other sessions were signed out.",
@@ -338,9 +346,8 @@ async fn list_sessions(
 ) -> Result<impl IntoResponse, ApiError> {
     let current_token = jar.get(session::SESSION_COOKIE).map(Cookie::value);
 
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
     let listed = sessions
-        .list(&mut connection, user.id, current_token)
+        .list(&state.pool, user.id, current_token)
         .await
         .map_err(log_internal)?;
 
@@ -354,15 +361,16 @@ async fn revoke_session(
     context: audit::Context,
     Path(session_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
     let revoked = sessions
-        .revoke_by_id(&mut connection, user.id, session_id)
+        .revoke_by_id(&state.pool, user.id, session_id)
         .await
         .map_err(log_internal)?;
 
     if !revoked {
         return Err(ApiError::not_found());
     }
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
 
     audit::record(
         &mut connection,
@@ -397,8 +405,8 @@ async fn delete_account(
     verify_password_or_reject(&state.hasher, &user, body.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    connection
-        .transaction::<(), session::Error, _>(async |transaction| {
+    let revocation = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
             // Recorded before the account goes, and it outlives it: the row's
             // `user_id` is set to null by the delete while `actor_name` keeps
             // who this was, which is the whole reason the name is copied.
@@ -412,16 +420,19 @@ async fn delete_account(
             .await?;
 
             crate::tenancy::settle_departure(transaction, user.id).await?;
-            // The `sessions` foreign key would cascade on its own, but a Redis
-            // store has no foreign key, so every store is told explicitly.
-            sessions.revoke_all(transaction, user.id).await?;
             diesel::delete(users::table.find(user.id))
                 .execute(transaction)
                 .await?;
-            Ok(())
+            // The account's sessions end with it, since every lookup reads the
+            // account; this hands the store what is left of them to sweep, which
+            // a Redis store needs because it has no foreign key to cascade.
+            sessions.revoke_all(transaction, user.id).await
         })
         .await
         .map_err(log_internal)?;
+
+    drop(connection);
+    sessions.sweep(revocation).await;
 
     let removal = Cookie::build((session::SESSION_COOKIE, ""))
         .path("/")
