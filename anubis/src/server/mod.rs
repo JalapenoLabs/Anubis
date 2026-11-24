@@ -88,10 +88,10 @@
 //!
 //! What is left alone is as deliberate as what is not. Responses under 32
 //! bytes, where a compression header costs more than the body saves; images and
-//! anything else already compressed; server-sent event streams, which must
-//! flush per event; and websocket upgrades, whose `101` carries no body at all.
-//! A response that arrives already encoded, a precompressed file straight off
-//! disk among them, passes through untouched.
+//! anything else already compressed; and server-sent event streams, which must
+//! flush per event, the realtime streams among them. A response that arrives
+//! already encoded, a precompressed file straight off disk among them, passes
+//! through untouched.
 //!
 //! # Shutdown
 //!

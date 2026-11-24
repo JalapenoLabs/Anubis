@@ -56,8 +56,7 @@ What it leaves alone is as deliberate as what it compresses:
 |---|---|
 | Bodies under 32 bytes | The headers cost more than the body saves |
 | Images, and anything already encoded | Compressed twice is larger, not smaller |
-| `text/event-stream` | A stream must flush per event, not per buffer |
-| Websocket upgrades | A `101` carries no body at all, so the socket upgrades untouched |
+| `text/event-stream` | A stream must flush per event, not per buffer; see [realtime.md](realtime.md) |
 
 Compressed responses carry `vary: accept-encoding`, so a shared cache never hands brotli to a client that asked for none. `cache-control` is untouched: a hashed asset keeps its year.
 
@@ -85,9 +84,11 @@ serve_with(app, pool, &config, hardening).await?;
 
 The route is the path as the router matches it, parameters included and the full path under any nesting; only a request matched to exactly that route and method is untimed. Everything else in the stack still applies to it. What bounds such a route is everything but a clock: the size its handler accepts, the piece at a time it reads, and the [drain window](#graceful-shutdown) a stopping server gives it. That is why the declaration is per route and the timeout itself has no knob: a handler that reads a bounded body in bounded pieces is safe without a clock, and nothing else is. Declare only those.
 
+An event stream needs no declaration. The timeout clocks the handler, which for an upload includes reading the client's body and for a stream ends the moment the stream is open and its head is sent. The body that follows is never timed, so a [realtime stream](realtime.md) lives as long as its client listens, while its opening (the session check, the authorization, the replay read) stays bounded like any other request. A test pins that a streamed body outlives the timeout, so a change that made the timeout clock bodies would fail the build rather than cut every stream thirty seconds in.
+
 ### Graceful shutdown
 
-`SIGTERM`, the signal an orchestrator sends before it kills a container, and ctrl-c both start a drain: the listener stops accepting immediately and in-flight requests get 25 seconds to finish, after which the process exits anyway. Twenty-five seconds fits inside Kubernetes' default 30-second `terminationGracePeriodSeconds`, so the process exits on its own terms instead of being killed mid-response. A request that started just before the signal and wants the full 30-second timeout is therefore cut short, which is the intended trade: by then the traffic gate has already stopped sending work, and a deploy that waits on one straggler is a deploy that hangs.
+`SIGTERM`, the signal an orchestrator sends before it kills a container, and ctrl-c both start a drain: the listener stops accepting immediately and in-flight requests get 25 seconds to finish, after which the process exits anyway. Requests can hear the drain start, and a realtime stream ends at that moment, because a stream is never finishing and would otherwise hold the drain for its whole window; its client resumes against whichever instance answers next. Twenty-five seconds fits inside Kubernetes' default 30-second `terminationGracePeriodSeconds`, so the process exits on its own terms instead of being killed mid-response. A request that started just before the signal and wants the full 30-second timeout is therefore cut short, which is the intended trade: by then the traffic gate has already stopped sending work, and a deploy that waits on one straggler is a deploy that hangs.
 
 Windows has no `SIGTERM`, so ctrl-c is the whole story there.
 
@@ -125,7 +126,7 @@ One policy, rendered once at startup and sent with every response:
 
 ```
 default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
-img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss://app.example.com;
+img-src 'self' data: blob:; font-src 'self'; connect-src 'self';
 base-uri 'self'; form-action 'self'; frame-ancestors 'none'
 ```
 
@@ -138,7 +139,7 @@ It is derived from what the Vite build emits and what the running application lo
 | `style-src` | `'self' 'unsafe-inline'` | See below |
 | `img-src` | `'self' data: blob:` | Avatars and the TOTP QR code are served by this binary. The avatar picker previews the chosen file through `URL.createObjectURL`, which is a `blob:` URL. `data:` rides along because it is how a canvas or an inline SVG hands a browser an image, and because it names no origin, so configuration could not add it later |
 | `font-src` | `'self'` | The build self-hosts every face; nothing reaches a font CDN |
-| `connect-src` | `'self'` and the websocket origin of `APP_URL` | Every fetch goes to this server's own API, and the realtime channel is a websocket to it. CSP level 3 has `'self'` cover `ws:` on the same host, but browsers implemented that late, and a realtime channel that dies silently in one of them is the worst kind of bug |
+| `connect-src` | `'self'` | Every fetch goes to this server's own API, the realtime event stream included: it is an ordinary same-origin `fetch`, so it needs no origin of its own |
 | `base-uri` | `'self'` | An injected `<base>` repoints every relative URL on the page, the ones the SPA fetches with included |
 | `form-action` | `'self'` | A form may only post back here. The directive does not fall back to `default-src`, so leaving it out would allow every destination |
 | `frame-ancestors` | `'none'` | The modern spelling of `X-Frame-Options`; both ship, because browsers still disagree about which they honor |

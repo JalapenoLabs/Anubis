@@ -11,7 +11,7 @@ CI runs on GitHub Actions on GitHub-hosted `ubuntu-24.04` runners, which are fre
 - **Scaffold job**: `scripts/ci-scaffold-proof.sh`, which generates a domain into the starter with every scaffolder and holds the output to both jobs' gates.
 - **E2E job**: builds the backend, provisions Chromium, starts the backend and Vite, and runs the starter's Playwright specs against them.
 
-The Rust job runs two service containers on ephemeral host ports, which the job reads back through `job.services`: Postgres, which every integration test needs through `DATABASE_URL`, and Redis, which only the realtime fanout test needs through `REDIS_URL`. Tests gate on those variables and skip without them, so a local run needs neither, while CI covers both fanout backends. See [realtime.md](realtime.md).
+The Rust job runs two service containers on ephemeral host ports, which the job reads back through `job.services`: Postgres, which every integration test needs through `DATABASE_URL`, and Redis, which only the realtime tests need through `REDIS_URL`. Tests gate on those variables and skip without them, so a local run needs neither, while CI covers both realtime backends: `realtime_flow` runs one narrative against each, and its Redis-only tests take numbered Redis databases of their own, because they empty one and squeeze another's budget. See [realtime.md](realtime.md).
 
 ## Drift checks
 

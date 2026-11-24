@@ -68,6 +68,8 @@ The framework implements the convention once: handlers take `anubis::http::ListP
 
 Every response, on every route, carries an `x-request-id` and the framework's security headers, and every request runs under a timeout. Cross-origin access is off until `CORS_ALLOWED_ORIGINS` names exact origins; the `/api/v1` bearer-token surface is what that exists for, since session cookies stay same-origin. [The server](server.md) covers the whole serve path, the headers, and the liveness and readiness probes.
 
+A route may also answer with a Server-Sent Events stream of its own, such as a record's log tail under `/api/v1`, through `anubis::realtime::Channels::stream` and the `Subscriber` extractor. Such a stream is session-authenticated, because a browser is what reads it, and it resumes, heartbeats, and drains exactly as `/realtime` does; [realtime.md](realtime.md#serving-a-stream-of-your-own) has the handler.
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.
