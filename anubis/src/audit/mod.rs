@@ -160,8 +160,10 @@ pub const AVATAR_REFUSED: &str = "avatar.refused";
 pub const SESSION_CREATED: &str = "session.created";
 /// A person approved a client on the consent screen, creating a grant.
 ///
-/// The subject is the grant, labeled with the client's name, and the change set
-/// carries the scopes approved. See `docs/oauth-server.md`.
+/// Recorded alike for a client that was redirected to the screen and for a
+/// device whose user code the person entered. The subject is the grant,
+/// labeled with the client's name, and the change set carries the scopes
+/// approved. See `docs/oauth-server.md`.
 pub const OAUTH_GRANTED: &str = "oauth.granted";
 /// A grant ended: the person revoked the connection, or the client revoked its
 /// own refresh token.
@@ -190,6 +192,15 @@ pub const SUBSCRIPTION_ITEMS_CHANGED: &str = "subscription.items_changed";
 /// The change set says which way: `cancel_at_period_end` moving to `true`, or
 /// `status` moving to `canceled` for a cancellation that took effect at once.
 pub const SUBSCRIPTION_CANCELED: &str = "subscription.canceled";
+/// A device code was presented again after it was exchanged, so its grant was
+/// revoked.
+///
+/// The device code is the program's credential for the device grant (RFC 8628)
+/// and is exchanged once. Presented a second time, it is either held by a
+/// second party or retried by a program whose first answer was lost, which
+/// the server cannot tell apart, so both are treated exactly as a replayed
+/// authorization code is.
+pub const OAUTH_DEVICE_CODE_REUSED: &str = "oauth.device_code_reused";
 
 /// Writes one audit event through `connection`, returning its id.
 ///

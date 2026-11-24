@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type {
+  AuthorizationDelivery,
   AuthorizationRequest,
   ConnectedClient,
   OauthClient,
@@ -16,11 +17,14 @@ type WireClient = {
   client_uri: string | null
 }
 
+type WireDelivery =
+  | { kind: 'redirect', host: string, is_loopback: boolean }
+  | { kind: 'device' }
+
 type WireAuthorizationRequest = {
   id: string
   client: WireClient
-  redirect_host: string
-  redirect_is_loopback: boolean
+  delivery: WireDelivery
   scopes: OauthScope[]
   expires_at: string
 }
@@ -43,15 +47,44 @@ function toClient(wire: WireClient): OauthClient {
   }
 }
 
+function toDelivery(wire: WireDelivery): AuthorizationDelivery {
+  if (wire.kind === 'device') {
+    return { kind: 'device' }
+  }
+
+  return {
+    kind: 'redirect',
+    host: wire.host,
+    isLoopback: wire.is_loopback,
+  }
+}
+
 /**
  * The account's side of the OAuth authorization server.
  *
- * The consent screen reads a request and records the person's decision; the
- * settings screen lists the clients they connected and revokes one. The
- * protocol endpoints themselves (`/oauth/authorize`, `/oauth/token`) belong to
- * the connecting program, never to the browser, so nothing here calls them.
+ * The code-entry page turns a device's user code into a request, the consent
+ * screen reads a request and records the person's decision, and the settings
+ * screen lists the clients they connected and revokes one. The protocol
+ * endpoints themselves (`/oauth/authorize`, `/oauth/device_authorization`,
+ * `/oauth/token`) belong to the connecting program, never to the browser, so
+ * nothing here calls them.
  */
 export function createOauthRoutes(client: KyInstance) {
+  /**
+   * The request a device's user code names, answering its id for the consent
+   * screen.
+   *
+   * Every code that names nothing waiting, whether mistyped, expired, or
+   * already decided, answers the same `400`, and a code entered too often
+   * answers `429` with the wait.
+   */
+  async function verifyUserCode(userCode: string): Promise<string> {
+    const response = await client
+      .post('oauth/device_verification', { json: { user_code: userCode }})
+      .json<{ request_id: string }>()
+    return response.request_id
+  }
+
   /** What the person is being asked to approve. `404` once it expired or was decided. */
   async function getAuthorizationRequest(requestId: string): Promise<AuthorizationRequest> {
     const wire = await client
@@ -60,8 +93,7 @@ export function createOauthRoutes(client: KyInstance) {
     return {
       id: wire.id,
       client: toClient(wire.client),
-      redirectHost: wire.redirect_host,
-      redirectIsLoopback: wire.redirect_is_loopback,
+      delivery: toDelivery(wire.delivery),
       scopes: wire.scopes,
       expiresAt: wire.expires_at,
     }
@@ -70,9 +102,10 @@ export function createOauthRoutes(client: KyInstance) {
   /**
    * Approves or denies a request, answering where to send the browser.
    *
-   * The destination is the client's redirect URI carrying a code or an error,
-   * so the caller navigates there with `window.location.assign`; it is a
-   * different program's address, not a route in this application.
+   * For a redirecting client the destination is its redirect URI carrying a
+   * code or an error, a different program's address; for a device it is this
+   * application's code-entry page, saying how it went. The caller navigates
+   * there with `window.location.assign` either way.
    */
   async function decideAuthorizationRequest(requestId: string, approve: boolean): Promise<string> {
     const response = await client
@@ -100,6 +133,7 @@ export function createOauthRoutes(client: KyInstance) {
   }
 
   return {
+    verifyUserCode,
     getAuthorizationRequest,
     decideAuthorizationRequest,
     listConnectedClients,

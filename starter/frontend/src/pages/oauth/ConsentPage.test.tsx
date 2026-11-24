@@ -35,8 +35,7 @@ const REQUEST = {
     verified_host: 'claude.ai',
     client_uri: 'https://claude.ai',
   },
-  redirect_host: 'localhost',
-  redirect_is_loopback: true,
+  delivery: { kind: 'redirect', host: 'localhost', is_loopback: true },
   scopes: [{ name: 'samples:read', description: 'Browse the sample library' }],
   expires_at: '2026-10-06T00:10:00Z',
 }
@@ -82,6 +81,24 @@ describe('ConsentPage', () => {
     expect(screen.getByText(/That address is a program on this computer/)).toBeTruthy()
     expect(screen.getByText('Browse the sample library')).toBeTruthy()
     expect(await screen.findByText('You are signed in as ada@example.com.')).toBeTruthy()
+  })
+
+  it('should warn that a device request reaches a device, and name no address', async () => {
+    stubFetch({
+      '/auth/me': { status: 200, body: ME },
+      '/oauth/requests/request-1': {
+        status: 200,
+        body: { ...REQUEST, client: { ...REQUEST.client, name: 'Server agent' }, delivery: { kind: 'device' }},
+      },
+    })
+
+    renderWithProviders(<ConsentPage requestId='request-1' />, '/consent?request=request-1')
+
+    expect(await screen.findByText('Connect Server agent')).toBeTruthy()
+    // Somebody else's device sending its code is how this flow is abused.
+    expect(screen.getByText(/If someone sent you the code, deny it/)).toBeTruthy()
+    expect(screen.queryByText(/you go back to/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Allow' })).toBeTruthy()
   })
 
   it('should record an approval and send the browser to the client', async () => {

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import {
   UrlTree,
   getCreativeConceptUrl,
+  getConsentRequestUrl,
   getOauthStartUrl,
   getUrlWithDestination,
   sanitizeDestination,
@@ -76,6 +77,13 @@ describe('getOauthStartUrl', () => {
 
   it('should drop a destination that leaves the app', () => {
     expect(getOauthStartUrl('google', '//evil.example')).toBe('/auth/oauth/google/start')
+  })
+})
+
+describe('getConsentRequestUrl', () => {
+  it('should name the request the consent screen reads', () => {
+    expect(getConsentRequestUrl('5f0c2a1e-0000-4000-8000-000000000001'))
+      .toBe('/consent?request=5f0c2a1e-0000-4000-8000-000000000001')
   })
 })
 

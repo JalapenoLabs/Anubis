@@ -1,10 +1,11 @@
 //! The error shape OAuth clients read: `{"error": ..., "error_description": ...}`.
 //!
-//! The token, revocation, and registration endpoints answer machines that
-//! branch on the `error` code RFC 6749 section 5.2 and RFC 7591 section 3.2.2
-//! define, not on the framework's `{"message": ...}` shape, so they speak this
-//! one. Every response carries `Cache-Control: no-store`, which RFC 6749
-//! requires of anything a token might pass through.
+//! The token, revocation, registration, and device authorization endpoints
+//! answer machines that branch on the `error` code RFC 6749 section 5.2, RFC
+//! 7591 section 3.2.2, and RFC 8628 section 3.5 define, not on the
+//! framework's `{"message": ...}` shape, so they speak this one. Every
+//! response carries `Cache-Control: no-store`, which RFC 6749 requires of
+//! anything a token might pass through.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -24,6 +25,18 @@ impl OauthError {
     /// `invalid_request`: something required is missing or malformed.
     pub(crate) fn invalid_request(description: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", description)
+    }
+
+    /// `invalid_client`: no client by that id, or one whose metadata document
+    /// failed its checks. RFC 6749 section 5.2 allows `401` here, and a client
+    /// cannot authenticate any other way, so nothing else would be truer.
+    pub(crate) fn invalid_client(description: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "invalid_client", description)
+    }
+
+    /// `unauthorized_client`: the client exists but never declared this grant.
+    pub(crate) fn unauthorized_client(description: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "unauthorized_client", description)
     }
 
     /// `invalid_grant`: the code or refresh token is unknown, spent, expired,
@@ -48,7 +61,45 @@ impl OauthError {
         Self::new(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "Only authorization_code and refresh_token are supported.",
+            "Only authorization_code, refresh_token, and \
+             urn:ietf:params:oauth:grant-type:device_code are supported.",
+        )
+    }
+
+    /// `authorization_pending`: the person has not decided yet; poll again.
+    pub(crate) fn authorization_pending() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "authorization_pending",
+            "The person has not approved this device yet.",
+        )
+    }
+
+    /// `slow_down`: still pending, and the poll came too soon. The interval
+    /// has already grown by the five seconds RFC 8628 section 3.5 requires.
+    pub(crate) fn slow_down() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "slow_down",
+            "Polling too quickly. Wait five seconds longer between requests.",
+        )
+    }
+
+    /// `access_denied`: the person refused the device.
+    pub(crate) fn access_denied() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "access_denied",
+            "The person denied this device.",
+        )
+    }
+
+    /// `expired_token`: the device code lapsed before it was exchanged.
+    pub(crate) fn expired_token() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "expired_token",
+            "The device code expired. Start again.",
         )
     }
 

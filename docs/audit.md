@@ -89,10 +89,11 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `AVATAR_REMOVED` | `avatar.removed` | An account removes its profile picture; `version` moves to null |
 | `AVATAR_REFUSED` | `avatar.refused` | An application's image screen refuses a profile picture, so nothing is stored; see [api.md](api.md#screening-uploaded-images) |
 | `SESSION_CREATED` | `session.created` | An account signs in, by any path |
-| `OAUTH_GRANTED` | `oauth.granted` | An account approves a connecting client; see [oauth-server.md](oauth-server.md#audit) |
+| `OAUTH_GRANTED` | `oauth.granted` | An account approves a connecting client, redirected to the consent screen or arriving with a device's code; see [oauth-server.md](oauth-server.md#audit) |
 | `OAUTH_REVOKED` | `oauth.revoked` | A connection ends, from account settings, by the client's own revocation, or with every other connection when a temporary password is set or a password reset completes |
 | `OAUTH_CODE_REUSED` | `oauth.code_reused` | A spent authorization code is presented again, revoking its grant |
 | `OAUTH_REFRESH_REUSED` | `oauth.refresh_reused` | A rotated-away refresh token is presented again, revoking its grant |
+| `OAUTH_DEVICE_CODE_REUSED` | `oauth.device_code_reused` | A device code is polled again after its exchange, revoking its grant |
 | `SUBSCRIPTION_ITEMS_CHANGED` | `subscription.items_changed` | An application adds, resizes, or removes line items on a record's subscription through `billing::Subscriptions`; the change set carries `items` before and after as `{price, quantity}`. See [billing.md](billing.md#subscriptions-per-record) |
 | `SUBSCRIPTION_CANCELED` | `subscription.canceled` | An application cancels a record's subscription; the change set is `cancel_at_period_end` or `status` |
 

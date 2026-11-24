@@ -25,8 +25,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::audit;
-use crate::auth::User;
 use crate::auth::password::Hasher;
+use crate::auth::{User, token};
 use crate::config::AppConfig;
 use crate::guard::PlatformMember;
 use crate::http::ApiError;
@@ -205,35 +205,11 @@ impl TemporaryPassword {
     /// Panics when the operating system has no random source, which is a
     /// broken host rather than a condition anything could recover from.
     fn generate() -> Self {
-        // The largest multiple of the alphabet's size that fits in a byte;
-        // a byte at or above it would favour the first few characters.
-        const REJECTION_THRESHOLD: u8 = 248;
-
-        let length = Self::GROUPS * Self::GROUP_LENGTH;
-        let mut password = Zeroizing::new(String::with_capacity(length + Self::GROUPS));
-        let mut drawn = 0;
-        // One draw usually covers the whole password; a draw whose bytes were
-        // mostly rejected is simply followed by another.
-        let mut entropy = Zeroizing::new([0u8; 32]);
-        while drawn < length {
-            getrandom::fill(entropy.as_mut()).expect("the OS random source must be available");
-            for &byte in entropy.iter() {
-                if drawn == length {
-                    break;
-                }
-                if byte >= REJECTION_THRESHOLD {
-                    continue;
-                }
-
-                if drawn > 0 && drawn % Self::GROUP_LENGTH == 0 {
-                    password.push('-');
-                }
-                let index = usize::from(byte) % Self::ALPHABET.len();
-                password.push(char::from(Self::ALPHABET[index]));
-                drawn += 1;
-            }
-        }
-        Self(password)
+        Self(token::readable(
+            Self::ALPHABET,
+            Self::GROUPS,
+            Self::GROUP_LENGTH,
+        ))
     }
 
     /// The password itself, for the one response that hands it over.

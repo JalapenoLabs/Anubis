@@ -29,6 +29,7 @@ import { SignUpPage } from './pages/auth/SignUpPage'
 import { VerifyEmailPage } from './pages/auth/VerifyEmailPage'
 import { ConsentErrorPage } from './pages/oauth/ConsentErrorPage'
 import { ConsentPage } from './pages/oauth/ConsentPage'
+import { DeviceVerificationPage } from './pages/oauth/DeviceVerificationPage'
 // 🐺 anubis:page-imports
 
 // Misc
@@ -240,6 +241,14 @@ export function App() {
     <Route
       path={UrlTree.consent}
       element={<ConsentRoute />}
+    />
+    <Route
+      path={UrlTree.deviceVerification}
+      element={
+        <RequireAuth>
+          <DeviceVerificationPage />
+        </RequireAuth>
+      }
     />
     <Route
       path={UrlTree.signIn}

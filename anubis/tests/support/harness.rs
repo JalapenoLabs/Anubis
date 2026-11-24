@@ -331,6 +331,19 @@ pub async fn register(router: &Router, email: &str) -> String {
     session_token(&headers)
 }
 
+/// Signs an existing account in again, answering the new session's token: a
+/// second browser, signed in to the same account.
+///
+/// # Panics
+/// Panics when the sign-in is refused.
+pub async fn sign_in(router: &Router, email: &str) -> String {
+    let credentials = json!({ "email": email, "password": PASSWORD });
+    let (status, headers, body) =
+        send(router, "POST", "/auth/login", Some(&credentials), None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    session_token(&headers)
+}
+
 /// Reads the token out of the invitation email sent to `email`.
 ///
 /// Matched on the subject as well as the recipient, because an account that

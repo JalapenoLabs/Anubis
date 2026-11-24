@@ -365,7 +365,8 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         area: "notifications",
     },
     // The OAuth authorization server for connected clients: discovery,
-    // registration, consent, tokens, and the account's connections.
+    // registration, consent, the device grant, tokens, and the account's
+    // connections.
     RouteEntry {
         method: "GET",
         path: "/.well-known/oauth-authorization-server",
@@ -389,6 +390,16 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "GET",
         path: "/oauth/authorize",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/device_authorization",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/device_verification",
         area: "oauth_server",
     },
     RouteEntry {

@@ -19,8 +19,9 @@ use std::time::Duration;
 use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
-    dead_jobs, jobs as jobs_table, sessions, team_memberships, teams, user_avatars,
-    webhook_deliveries, webhook_endpoints,
+    audit_events, dead_jobs, jobs as jobs_table, oauth_authorization_requests, oauth_device_codes,
+    oauth_grants, sessions, team_memberships, teams, user_avatars, webhook_deliveries,
+    webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -35,8 +36,10 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use support::oauth::{MetadataDocument, device_codes, mcp, poll, request_for_code};
 use support::{
-    Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, stream,
+    Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, sign_in,
+    stream,
 };
 
 /// How many racers a test fires at once.
@@ -787,4 +790,188 @@ async fn concurrent_emissions_deliver_exactly_the_committed_writes() {
         .await
         .expect("count must run");
     assert_eq!(queued, committed, "one delivery job per delivery row");
+}
+
+// ---------------------------------------------------------------------------
+// The device grant
+// ---------------------------------------------------------------------------
+
+/// Polls the token endpoint with a device code on a task of its own.
+fn spawn_poll(
+    harness: &Harness,
+    client_id: &str,
+    device_code: &str,
+) -> JoinHandle<(StatusCode, Value)> {
+    let router = harness.router.clone();
+    let client_id = client_id.to_owned();
+    let device_code = device_code.to_owned();
+    tokio::spawn(async move { poll(&router, &client_id, &device_code).await })
+}
+
+/// A program polling with several requests at once after the person approved
+/// gets one token set. A device code is exchanged once, and the polls behind
+/// it find it spent, which is how a copied device code looks, so the grant
+/// those tokens came from ends and the arrival is recorded once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn polls_racing_after_an_approval_mint_one_token_set() {
+    let Some(database) = TestDatabase::create("concurrency_device_polls").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let cookie = register(&harness.router, "device-polls@example.com").await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(&harness.router, &program.client_id, "").await;
+    let request_id = request_for_code(&harness.router, &cookie, &codes.user_code).await;
+    support::oauth::decide(&harness.router, &cookie, &request_id, true).await;
+
+    // Every poll queues behind the row lock the handlers take, so all of them
+    // are in flight before any one decides.
+    let mut blocker = harness.pool.get().await.expect("connection");
+    let racers = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            oauth_device_codes::table
+                .select(oauth_device_codes::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_racer| spawn_poll(&harness, &program.client_id, &codes.device_code))
+                .collect();
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(racers)
+        })
+        .await
+        .expect("holding the device code lock must succeed");
+    drop(blocker);
+
+    let mut answers = Vec::new();
+    for racer in racers {
+        answers.push(racer.await.expect("the poll task must not panic"));
+    }
+    let exchanged: Vec<&Value> = answers
+        .iter()
+        .filter(|(status, _body)| *status == StatusCode::OK)
+        .map(|(_status, body)| body)
+        .collect();
+    assert_eq!(exchanged.len(), 1, "one token set is minted: {answers:?}");
+    assert!(
+        answers
+            .iter()
+            .filter(|(status, _body)| *status != StatusCode::OK)
+            .all(|(_status, body)| body["error"] == "invalid_grant"),
+        "every other poll is refused: {answers:?}",
+    );
+
+    let access_token = exchanged[0]["access_token"]
+        .as_str()
+        .expect("an access token");
+    let (status, _headers, _answer) = mcp(
+        &harness.router,
+        Some(access_token),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}}}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the spent code's arrival ended the grant"
+    );
+    let mut connection = harness.pool.get().await.expect("connection");
+    let reused: i64 = audit_events::table
+        .filter(audit_events::action.eq(anubis::audit::OAUTH_DEVICE_CODE_REUSED))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(reused, 1, "the revocation is recorded once");
+}
+
+/// Two browsers signed in to one account entered one user code and decided at
+/// the same instant, one approving and one denying. The request they share is
+/// consumed once, so exactly one decision lands on the device and the program
+/// reads that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_and_a_refusal_of_one_device_decide_once() {
+    let Some(database) = TestDatabase::create("concurrency_device_decisions").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let approver = register(&harness.router, "device-decider@example.com").await;
+    let refuser = sign_in(&harness.router, "device-decider@example.com").await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(&harness.router, &program.client_id, "").await;
+    let request_id = request_for_code(&harness.router, &approver, &codes.user_code).await;
+    let seen_by_refuser = request_for_code(&harness.router, &refuser, &codes.user_code).await;
+    assert_eq!(request_id, seen_by_refuser, "one code names one request");
+    let request_uuid: Uuid = request_id.parse().expect("a request id is a UUID");
+
+    let decide = |cookie: &str, approve: bool| {
+        let router = harness.router.clone();
+        let cookie = cookie.to_owned();
+        let path = format!("/oauth/requests/{request_id}");
+        tokio::spawn(async move {
+            let (status, _headers, _body) = send(
+                &router,
+                "POST",
+                &path,
+                Some(&json!({ "approve": approve })),
+                Some(&cookie),
+            )
+            .await;
+            status
+        })
+    };
+    let mut blocker = harness.pool.get().await.expect("connection");
+    let racing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            oauth_authorization_requests::table
+                .find(request_uuid)
+                .select(oauth_authorization_requests::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let racing = (decide(&approver, true), decide(&refuser, false));
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(racing)
+        })
+        .await
+        .expect("holding the request lock must succeed");
+    drop(blocker);
+
+    let approval = racing.0.await.expect("the approval task must not panic");
+    let refusal = racing.1.await.expect("the refusal task must not panic");
+    let outcomes = [approval, refusal];
+    assert_eq!(
+        outcomes.iter().filter(|status| status.is_success()).count(),
+        1,
+        "exactly one decision lands: {outcomes:?}",
+    );
+    assert!(
+        outcomes.contains(&StatusCode::NOT_FOUND),
+        "the other finds the request gone: {outcomes:?}",
+    );
+
+    let mut connection = harness.pool.get().await.expect("connection");
+    let grants: i64 = oauth_grants::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    let (status, body) = poll(&harness.router, &program.client_id, &codes.device_code).await;
+    if approval.is_success() {
+        assert_eq!(grants, 1);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the approval is what the program reads: {body}"
+        );
+    } else {
+        assert_eq!(grants, 0, "a refusal grants nothing");
+        assert_eq!(
+            body["error"], "access_denied",
+            "the refusal is what it reads: {body}"
+        );
+    }
 }
