@@ -56,12 +56,15 @@
 //! | Team | The team membership's team-wide grants, and its grants on the records in hand |
 //!
 //! An organization-wide grant does not reach into a team: a team's roles are
-//! the team's to grant, which is what a team administrator has always meant.
-//! And a grant on one record reaches that record and the records nested under
-//! it, never the team, so a narrow grant can never raise anybody's standing in
-//! a wider place. Permission is monotone in the roles held, so the union is
-//! exactly the strongest standing the caller holds there, and rank (see
-//! [`Access::rank`]) is the highest of their roles there.
+//! the team's to grant. A grant on one record reaches that record and the
+//! records nested under it, never the team. And in a sub-tenant, a team's
+//! grants add their permissions but never rank: rank and the administrator
+//! role there come from the organization and sub-tenant grants alone, since
+//! administering one team is not administering the sub-tenant. So a narrow
+//! grant can never raise anybody's standing in a wider place. Permission is
+//! monotone in the roles held, so the union is exactly the strongest standing
+//! the caller holds there, and rank (see [`Access::rank`]) is the highest of
+//! the roles that rank there.
 
 use std::collections::BTreeSet;
 
@@ -94,6 +97,7 @@ pub struct Access {
     roles: Vec<RoleSummary>,
     permissions: BTreeSet<Permission>,
     administrator: bool,
+    rank: i32,
 }
 
 impl Access {
@@ -101,7 +105,21 @@ impl Access {
     ///
     /// The same role reached along two paths counts once.
     pub(crate) fn from_roles(held: Vec<Role>, roles: &RoleSet) -> Self {
-        let mut held = held;
+        Self::ranked(held, Vec::new(), roles)
+    }
+
+    /// Resolves `ranking` and `narrower` together, ranked by `ranking` alone.
+    ///
+    /// Both add their permissions, but only `ranking` counts toward rank and
+    /// the administrator role: the roles a narrower place granted reach here
+    /// without making their holder senior here, which is what keeps a narrow
+    /// grant from raising anybody's standing in a wider place.
+    pub(crate) fn ranked(ranking: Vec<Role>, narrower: Vec<Role>, roles: &RoleSet) -> Self {
+        let rank = ranking.iter().map(|role| role.position).max().unwrap_or(0);
+        let administrator = ranking.iter().any(Role::is_administrator);
+
+        let mut held = ranking;
+        held.extend(narrower);
         held.sort_by_key(|role| std::cmp::Reverse(role.position));
         held.dedup_by_key(|role| role.id);
 
@@ -111,9 +129,10 @@ impl Access {
         }
 
         Self {
-            administrator: held.iter().any(Role::is_administrator),
             roles: held.iter().map(|role| role.summary(roles)).collect(),
             permissions,
+            administrator,
+            rank,
         }
     }
 
@@ -164,18 +183,15 @@ impl Access {
         self.administrator
     }
 
-    /// The position of the highest role that applies here.
+    /// The position of the highest role that ranks here.
     ///
     /// The role hierarchy is measured with it: nobody edits, grants, or
     /// revokes a role at or above their own rank, and the administrator is
     /// exempt. The default role always applies, so the lowest rank is `0`.
+    /// In a sub-tenant, a team's grants add permissions without ranking.
     #[must_use]
     pub fn rank(&self) -> i32 {
-        self.roles
-            .iter()
-            .map(|role| role.position)
-            .max()
-            .unwrap_or(0)
+        self.rank
     }
 
     /// The roles that apply here, highest first.
@@ -479,11 +495,11 @@ pub async fn resolve_sub_tenant_access(
 
     let organization_membership_id = organization_membership.as_ref().map(|held| held.id);
     let sub_tenant_membership_id = membership.as_ref().map(|held| held.id);
-    // Every grant any of those memberships holds, each tagged with whether it
-    // came through the organization: whether those apply here is the rules'
-    // decision, not the query's. Grants on single records are left out,
-    // because a record is never the sub-tenant.
-    let granted: Vec<(Option<Uuid>, Role)> = role_grants::table
+    // Every grant any of those memberships holds, each tagged with the tier it
+    // came through: whether those apply here, and whether they rank here, is
+    // the rules' decision, not the query's. Grants on single records are left
+    // out, because a record is never the sub-tenant.
+    let granted: Vec<(Option<Uuid>, Option<Uuid>, Role)> = role_grants::table
         .inner_join(role_rows::table)
         .filter(
             role_grants::organization_membership_id
@@ -493,7 +509,11 @@ pub async fn resolve_sub_tenant_access(
                     .eq_any(&team_membership_ids)
                     .and(role_grants::resource_id.is_null())),
         )
-        .select((role_grants::organization_membership_id, Role::as_select()))
+        .select((
+            role_grants::organization_membership_id,
+            role_grants::sub_tenant_membership_id,
+            Role::as_select(),
+        ))
         .load(connection)
         .await?;
 
@@ -505,12 +525,13 @@ pub async fn resolve_sub_tenant_access(
         .await?;
 
     let mut organization_roles = Vec::new();
-    let mut other_roles = Vec::new();
-    for (through_organization, role) in granted {
-        if through_organization.is_some() {
-            organization_roles.push(role);
-        } else {
-            other_roles.push(role);
+    let mut sub_tenant_roles = Vec::new();
+    let mut team_roles = Vec::new();
+    for (through_organization, through_sub_tenant, role) in granted {
+        match (through_organization, through_sub_tenant) {
+            (Some(_membership), _) => organization_roles.push(role),
+            (None, Some(_membership)) => sub_tenant_roles.push(role),
+            (None, None) => team_roles.push(role),
         }
     }
 
@@ -518,18 +539,19 @@ pub async fn resolve_sub_tenant_access(
         organization_membership: organization_membership.as_ref(),
         organization_roles,
         membership: membership.as_ref(),
-        other_roles,
+        sub_tenant_roles,
+        team_roles,
         team_member: !team_membership_ids.is_empty(),
     };
     let Some((reach, mut held)) = apply_sub_tenant_rules(standing) else {
         return Ok(None);
     };
 
-    held.push(default_role);
+    held.ranking.push(default_role);
     let access = SubTenantAccess {
         organization_membership,
         membership,
-        access: Access::from_roles(held, roles),
+        access: held.access(roles),
         reach,
     };
     Ok(Some((sub_tenant, access)))
@@ -541,10 +563,27 @@ struct Standing<'a> {
     /// Roles granted through the organization membership.
     organization_roles: Vec<Role>,
     membership: Option<&'a SubTenantMembership>,
-    /// Roles granted through the sub-tenant membership and reaching teams.
-    other_roles: Vec<Role>,
+    /// Roles granted through the sub-tenant membership.
+    sub_tenant_roles: Vec<Role>,
+    /// Roles granted team-wide in the teams that reach the sub-tenant.
+    team_roles: Vec<Role>,
     /// Whether the caller belongs to a team that reaches the sub-tenant.
     team_member: bool,
+}
+
+/// The roles that apply in a sub-tenant, split by whether they rank there.
+struct SubTenantRoles {
+    /// Organization-wide grants that cascade here, and this sub-tenant's own.
+    ranking: Vec<Role>,
+    /// Team-wide grants of the teams that reach here: they add permissions,
+    /// but administering one team is not administering the sub-tenant.
+    narrower: Vec<Role>,
+}
+
+impl SubTenantRoles {
+    fn access(self, roles: &RoleSet) -> Access {
+        Access::ranked(self.ranking, self.narrower, roles)
+    }
 }
 
 /// Applies the module's rules to what a caller holds near one sub-tenant.
@@ -552,7 +591,7 @@ struct Standing<'a> {
 /// Split out from the queries so the rules are testable without a database,
 /// and so the resolver reads as "gather the grants" and this as "apply them".
 /// Returns the reach and the roles that apply, the default role aside.
-fn apply_sub_tenant_rules(standing: Standing<'_>) -> Option<(Reach, Vec<Role>)> {
+fn apply_sub_tenant_rules(standing: Standing<'_>) -> Option<(Reach, SubTenantRoles)> {
     let suspended = standing
         .organization_membership
         .is_some_and(|held| held.suspended_at.is_some())
@@ -564,7 +603,7 @@ fn apply_sub_tenant_rules(standing: Standing<'_>) -> Option<(Reach, Vec<Role>)> 
     }
 
     let mut reach = None;
-    let mut held = Vec::new();
+    let mut ranking = Vec::new();
 
     if let Some(organization_membership) = standing.organization_membership {
         let administrator = standing
@@ -577,7 +616,7 @@ fn apply_sub_tenant_rules(standing: Standing<'_>) -> Option<(Reach, Vec<Role>)> 
             } else {
                 Reach::Organization
             }));
-            held.extend(standing.organization_roles);
+            ranking.extend(standing.organization_roles);
         }
     }
 
@@ -596,8 +635,14 @@ fn apply_sub_tenant_rules(standing: Standing<'_>) -> Option<(Reach, Vec<Role>)> 
 
     // Only memberships that reach the sub-tenant were asked about, so every
     // one of these applies.
-    held.extend(standing.other_roles);
-    Some((reach, held))
+    ranking.extend(standing.sub_tenant_roles);
+    Some((
+        reach,
+        SubTenantRoles {
+            ranking,
+            narrower: standing.team_roles,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -673,13 +718,14 @@ roles:
             organization_membership: Some(&organization),
             organization_roles: vec![role("editor", 1)],
             membership: None,
-            other_roles: Vec::new(),
+            sub_tenant_roles: Vec::new(),
+            team_roles: Vec::new(),
             team_member: false,
         })
         .expect("a full member reaches every sub-tenant");
 
         assert_eq!(reach, Reach::Organization);
-        assert_eq!(keys(&held), ["editor"]);
+        assert_eq!(keys(&held.ranking), ["editor"]);
     }
 
     #[test]
@@ -689,7 +735,8 @@ roles:
             organization_membership: Some(&organization),
             organization_roles: vec![role("admin", 2)],
             membership: None,
-            other_roles: Vec::new(),
+            sub_tenant_roles: Vec::new(),
+            team_roles: Vec::new(),
             team_member: false,
         })
         .expect("an administrator reaches every sub-tenant");
@@ -707,7 +754,8 @@ roles:
             organization_membership: Some(&organization),
             organization_roles: vec![role("admin", 2)],
             membership: None,
-            other_roles: Vec::new(),
+            sub_tenant_roles: Vec::new(),
+            team_roles: Vec::new(),
             team_member: false,
         })
         .expect("the administrator role outranks the guest marker");
@@ -723,7 +771,8 @@ roles:
                 organization_membership: Some(&organization),
                 organization_roles: vec![role("editor", 1)],
                 membership: None,
-                other_roles: Vec::new(),
+                sub_tenant_roles: Vec::new(),
+                team_roles: Vec::new(),
                 team_member: false,
             })
             .is_none(),
@@ -739,14 +788,15 @@ roles:
             organization_membership: Some(&organization),
             organization_roles: vec![role("editor", 1)],
             membership: Some(&membership),
-            other_roles: Vec::new(),
+            sub_tenant_roles: Vec::new(),
+            team_roles: Vec::new(),
             team_member: false,
         })
         .expect("an explicit grant admits a guest");
 
         assert_eq!(reach, Reach::Grant);
         assert!(
-            held.is_empty(),
+            held.ranking.is_empty() && held.narrower.is_empty(),
             "the organization role must not cascade to a guest",
         );
     }
@@ -759,14 +809,15 @@ roles:
             organization_membership: None,
             organization_roles: Vec::new(),
             membership: None,
-            other_roles: Vec::new(),
+            sub_tenant_roles: Vec::new(),
+            team_roles: Vec::new(),
             team_member: true,
         })
         .expect("a team member reaches the sub-tenant");
 
         assert_eq!(reach, Reach::Team);
         assert!(
-            held.is_empty(),
+            held.ranking.is_empty() && held.narrower.is_empty(),
             "reach comes from belonging, not from the roles held",
         );
     }
@@ -781,7 +832,8 @@ roles:
                 organization_membership: Some(&suspended),
                 organization_roles: vec![role("admin", 2)],
                 membership: Some(&membership),
-                other_roles: vec![role("editor", 1)],
+                sub_tenant_roles: vec![role("editor", 1)],
+                team_roles: vec![role("editor", 1)],
                 team_member: true,
             })
             .is_none(),
@@ -796,7 +848,8 @@ roles:
                 organization_membership: Some(&organization),
                 organization_roles: vec![role("admin", 2)],
                 membership: Some(&suspended_here),
-                other_roles: vec![role("editor", 1)],
+                sub_tenant_roles: vec![role("editor", 1)],
+                team_roles: vec![role("editor", 1)],
                 team_member: true,
             })
             .is_none(),
@@ -811,11 +864,38 @@ roles:
                 organization_membership: None,
                 organization_roles: Vec::new(),
                 membership: None,
-                other_roles: Vec::new(),
+                sub_tenant_roles: Vec::new(),
+                team_roles: Vec::new(),
                 team_member: false,
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_team_grant_adds_permissions_in_a_sub_tenant_but_never_rank() {
+        let roles = RoleSet::from_yaml(ROLES).expect("roles must parse");
+        let organization = organization_membership(OrganizationAccess::Full);
+        let (_reach, held) = apply_sub_tenant_rules(Standing {
+            organization_membership: Some(&organization),
+            organization_roles: vec![role("default", 0)],
+            membership: None,
+            sub_tenant_roles: Vec::new(),
+            team_roles: vec![role("admin", 2)],
+            team_member: true,
+        })
+        .expect("a full member reaches the sub-tenant");
+        let access = held.access(&roles);
+
+        assert!(
+            access.can(Action::Destroy, "Project"),
+            "the team's grants still add what they carry",
+        );
+        assert!(
+            !access.is_administrator(),
+            "administering one team is not administering the sub-tenant",
+        );
+        assert_eq!(access.rank(), 0, "a team grant never raises rank here");
     }
 
     #[test]

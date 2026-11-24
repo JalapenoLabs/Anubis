@@ -6,7 +6,8 @@
 //! `anubis::tenancy::resolve_sub_tenant_access` has a step here, and the ones
 //! that matter most are the refusals: a guest who was granted one sub-tenant
 //! must not see the other, a team scoped to a sub-tenant must not leak out of
-//! it, a suspension must beat every grant including an administrator's, and a
+//! it, a team's administrator must not rank as the sub-tenant's, a suspension
+//! must beat every grant including an administrator's, and a
 //! sub-tenant the caller cannot reach must be indistinguishable from one that
 //! does not exist.
 //!
@@ -70,6 +71,8 @@ async fn sub_tenant_probe(member: SubTenantMember) -> Result<impl IntoResponse, 
         "roles": roles,
         "reach": format!("{:?}", member.access.reach),
         "can_update": member.can(Action::Update, "Probe"),
+        "rank": member.access.access.rank(),
+        "is_administrator": member.access.access.is_administrator(),
     })))
 }
 
@@ -633,6 +636,45 @@ async fn sub_tenant_access_resolves_across_every_tier() {
         body["reach"],
         json!("Organization"),
         "and the broadest path is the one reported",
+    );
+    let editor_position: i32 = roles::table
+        .filter(roles::organization_id.eq(organization))
+        .filter(roles::key.eq("editor"))
+        .select(roles::position)
+        .first(&mut connection)
+        .await
+        .expect("the editor role must exist");
+    assert_eq!(
+        body["rank"],
+        json!(editor_position),
+        "rank comes from the sub-tenant grant, never from the team's billing role above it",
+    );
+
+    // Administering a team that reaches the sub-tenant adds the team's
+    // permissions there, but administering one team is not administering
+    // the sub-tenant.
+    join_team(
+        &mut connection,
+        organization,
+        atlas_crew,
+        polyglot_id,
+        &["admin"],
+    )
+    .await;
+    let (status, _headers, body) = send(
+        &router,
+        "GET",
+        &sub_tenant_path(atlas),
+        None,
+        Some(&polyglot),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["is_administrator"], json!(false));
+    assert_eq!(
+        body["rank"],
+        json!(editor_position),
+        "a team's administrator role never ranks in the sub-tenant",
     );
 
     // Both team members can reach their teams before anything is suspended,

@@ -50,9 +50,9 @@ Otherwise a path admits the caller when any of these hold, and the caller's role
 | Full organization member | `access = full` cascades into every sub-tenant, with the organization-wide grants |
 | Guest | `access = guest` cascades into nothing, and reaches only what was granted by name |
 | Sub-tenant membership | An explicit grant, applying to full members and guests alike, since it can only add |
-| Team | An organization-level team is inherited by every sub-tenant, with its team-wide grants; a scoped team reaches only its own |
+| Team | An organization-level team is inherited by every sub-tenant, with its team-wide grants; a scoped team reaches only its own. Those grants add their permissions but never rank |
 
-Two consequences are worth stating rather than leaving to be discovered. An organization membership marked `guest` that also holds the administrator role is a contradiction an administrator can write, and the administrator role wins. And a team membership grants reach whatever the member's organization access says, because putting somebody on a team is itself the explicit act: an administrator confining a guest to one sub-tenant scopes the team to it rather than leaving the team organization-level.
+Three consequences are worth stating rather than leaving to be discovered. An organization membership marked `guest` that also holds the administrator role is a contradiction an administrator can write, and the administrator role wins. A team membership grants reach whatever the member's organization access says, because putting somebody on a team is itself the explicit act: an administrator confining a guest to one sub-tenant scopes the team to it rather than leaving the team organization-level. And rank in a sub-tenant, with the administrator role there, comes from the organization-wide and sub-tenant grants alone: a team's grants add what they carry, but administering one team is not administering the sub-tenant, so a team administrator's rank there is what their wider grants give them.
 
 The `SubTenantMember` guard is the first caller. It resolves the route's `{sub_tenant_id}` and answers `404` for a sub-tenant that does not exist and for one the caller cannot reach, byte-identical, so probing ids reveals nothing.
 
@@ -224,7 +224,7 @@ Three functions decide reach and permissions, each answering `None` for a tenant
 | `resolve_sub_tenant_access` | One sub-tenant and the work it owns, under the rules above |
 | `resolve_team_access` | One team, narrowed to the records in hand |
 
-Each returns an `Access`: the roles that apply there, highest first, the permissions they carry, `rank()` (the position of the highest), and `can`, `require`, and `require_administrator`. The guards carry it (`OrganizationMember::access`, `TeamMember::access`, `SubTenantMember::access`), and a scaffolded model's `load_for_member` resolves the team with the record and its parents as the records in hand, so a role granted on a record reaches it and everything nested under it. `GET /tenancy/memberships` answers each organization and team with the same resolved access, which is what the browser draws its affordances from.
+Each returns an `Access`: the roles that apply there, highest first, the permissions they carry, `rank()` (the position of the highest that ranks there, which in a sub-tenant leaves out the team grants), and `can`, `require`, and `require_administrator`. The guards carry it (`OrganizationMember::access`, `TeamMember::access`, `SubTenantMember::access`), and a scaffolded model's `load_for_member` resolves the team with the record and its parents as the records in hand, so a role granted on a record reaches it and everything nested under it. `GET /tenancy/memberships` answers each organization and team with the same resolved access, which is what the browser draws its affordances from.
 
 The platform tier is separate: a platform role is a key held on the account and asked about through `RoleSet::can`, and a platform application's token acts with the compiled `admin` grants.
 
@@ -247,7 +247,7 @@ Holding a role-management permission lets somebody change what others may do, so
 | Editing the default role, which everybody holds, to raise everybody | Rule 2 limits the edit to what the editor holds; and a member whose highest role is the default role ranks `0`, so a management permission on it grants, revokes, edits, removes, and revokes the invitations of nobody. `Tenancy::Membership.create` there still lets every member invite people into the default role, which is the organization's choice to make |
 | Freezing the top: nobody may touch a role at or above their own | The administrator role is exempt, and appoints the next administrator |
 | Removing the last holder of role management | The administrator role holds every framework permission, cannot be deleted, and always keeps a holder |
-| Raising organization-wide rank through a team or record grant | Rank is measured where the change happens; a narrow grant never reaches wider |
+| Raising organization-wide or sub-tenant rank through a team or record grant | Rank is measured where the change happens; a narrow grant never reaches wider, and a team's grants never rank in a sub-tenant |
 | Naming another organization's role, team, or membership | `404`, byte-identical to an id that does not exist |
 | Two managers editing one role, or reordering, at once | Every role and grant change locks the organization row first and reads the actor's standing again under it, so the second is judged against what the first left behind |
 
