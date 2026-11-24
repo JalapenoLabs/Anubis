@@ -16,11 +16,12 @@
 //!   the last one, and brings back sessions signed out one at a time since
 //!   then. An append-only file loses about a second at most.
 //!
-//! Each reading is a pure function of the settings Redis reports, so every
-//! verdict is unit-tested without a Redis. Managed Redis often refuses
-//! `CONFIG`; the eviction policy is then unreadable, and persistence falls back
-//! to `INFO persistence`, which can confirm an append-only file but not the
-//! snapshot schedule.
+//! Each reading is a pure function of what Redis reports, so every verdict is
+//! unit-tested without a Redis. Eviction is read from `INFO memory`, which
+//! reports `maxmemory` and `maxmemory_policy` and which managed Redis answers
+//! even where it refuses `CONFIG`. Persistence is read with `CONFIG GET`, and
+//! a Redis that refuses it falls back to `INFO persistence`, which can confirm
+//! an append-only file but not the snapshot schedule.
 
 use std::collections::HashMap;
 
@@ -65,7 +66,7 @@ pub enum Eviction {
         /// The `maxmemory-policy` Redis reported.
         policy: String,
     },
-    /// Redis refused `CONFIG GET`.
+    /// `INFO memory` did not report the limit and the policy.
     Unreadable,
 }
 
@@ -100,8 +101,9 @@ pub async fn inspect_redis(url: &str) -> Result<RedisInspection, RedisError> {
 /// Asks the Redis behind `connection` everything a session store needs.
 ///
 /// # Errors
-/// Returns the Redis error when Redis cannot be reached or does not answer.
-/// A refused `CONFIG GET` is not an error: it makes the settings unreadable.
+/// Returns the Redis error when Redis cannot be reached or does not answer
+/// `INFO`. A refused `CONFIG GET` is not an error: persistence is then read
+/// from `INFO persistence` instead.
 pub(crate) async fn inspect(
     connection: &mut (impl ConnectionLike + Send),
 ) -> Result<RedisInspection, RedisError> {
@@ -111,22 +113,25 @@ pub(crate) async fn inspect(
         .await?;
     let version = reported_version(&server).map(str::to_owned);
 
+    let memory: String = redis::cmd("INFO")
+        .arg("memory")
+        .query_async(connection)
+        .await?;
+    let eviction = eviction_from_info(&memory);
+
     let settings = (
-        config_value(connection, "maxmemory").await,
-        config_value(connection, "maxmemory-policy").await,
         config_value(connection, "appendonly").await,
         config_value(connection, "save").await,
     );
-    let (eviction, persistence) =
-        if let (Ok(limit), Ok(policy), Ok(appendonly), Ok(save)) = settings {
-            (eviction(&limit, &policy), persistence(&appendonly, &save))
-        } else {
-            let info: String = redis::cmd("INFO")
-                .arg("persistence")
-                .query_async(connection)
-                .await?;
-            (Eviction::Unreadable, persistence_from_info(&info))
-        };
+    let persistence = if let (Ok(appendonly), Ok(save)) = settings {
+        persistence(&appendonly, &save)
+    } else {
+        let info: String = redis::cmd("INFO")
+            .arg("persistence")
+            .query_async(connection)
+            .await?;
+        persistence_from_info(&info)
+    };
 
     Ok(RedisInspection {
         version,
@@ -148,18 +153,34 @@ async fn config_value(
     Ok(settings.remove(name).unwrap_or_default())
 }
 
-/// The version `INFO server` reports, when it reports one.
-fn reported_version(info: &str) -> Option<&str> {
-    info.lines()
-        .find_map(|line| line.trim().strip_prefix("redis_version:"))
+/// The value of the `name:value` line `name` in an `INFO` section.
+fn info_field<'info>(info: &'info str, name: &str) -> Option<&'info str> {
+    info.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(':'))
+    })
 }
 
-/// The verdict from `CONFIG GET maxmemory` and `CONFIG GET maxmemory-policy`.
+/// The version `INFO server` reports, when it reports one.
+fn reported_version(info: &str) -> Option<&str> {
+    info_field(info, "redis_version")
+}
+
+/// The verdict from `INFO memory`'s `maxmemory` and `maxmemory_policy`.
 ///
-/// A `maxmemory` of 0 is no limit, so no policy ever fires.
-fn eviction(limit: &str, policy: &str) -> Eviction {
-    let policy = policy.trim();
-    if limit.trim() == "0" || policy.eq_ignore_ascii_case("noeviction") {
+/// A `maxmemory` of 0 is no limit, so no policy ever fires. A section missing
+/// either line, or reporting an empty one, is unreadable rather than a guess.
+fn eviction_from_info(info: &str) -> Eviction {
+    let limit = info_field(info, "maxmemory").map(str::trim);
+    let policy = info_field(info, "maxmemory_policy").map(str::trim);
+    let (Some(limit), Some(policy)) = (limit, policy) else {
+        return Eviction::Unreadable;
+    };
+    if limit.is_empty() || policy.is_empty() {
+        return Eviction::Unreadable;
+    }
+    if limit == "0" || policy.eq_ignore_ascii_case("noeviction") {
         return Eviction::Never;
     }
     Eviction::Evicts {
@@ -197,8 +218,8 @@ fn persistence_from_info(info: &str) -> Persistence {
 #[cfg(test)]
 mod tests {
     use super::{
-        Eviction, Persistence, RedisInspection, eviction, persistence, persistence_from_info,
-        reported_version,
+        Eviction, Persistence, RedisInspection, eviction_from_info, persistence,
+        persistence_from_info, reported_version,
     };
 
     /// The snapshot schedule a stock `redis-server` runs with.
@@ -225,15 +246,41 @@ mod tests {
         assert_eq!(reporting(None).supports_version(), None);
     }
 
+    /// An `INFO memory` section with the two lines that matter, beside the
+    /// human-readable one that shares `maxmemory`'s prefix and must not be
+    /// mistaken for it.
+    fn memory(limit: &str, policy: &str) -> String {
+        format!(
+            "# Memory\r\nused_memory:1024\r\nmaxmemory_human:4.00M\r\nmaxmemory:{limit}\r\n\
+             maxmemory_policy:{policy}\r\n"
+        )
+    }
+
     #[test]
     fn only_a_memory_limit_with_an_evicting_policy_evicts() {
-        assert_eq!(eviction("0", "allkeys-lru"), Eviction::Never);
-        assert_eq!(eviction("4194304", "noeviction"), Eviction::Never);
         assert_eq!(
-            eviction("4194304", "volatile-lru"),
+            eviction_from_info(&memory("0", "allkeys-lru")),
+            Eviction::Never
+        );
+        assert_eq!(
+            eviction_from_info(&memory("4194304", "noeviction")),
+            Eviction::Never,
+        );
+        assert_eq!(
+            eviction_from_info(&memory("4194304", "volatile-lru")),
             Eviction::Evicts {
                 policy: "volatile-lru".to_owned(),
             },
+        );
+    }
+
+    #[test]
+    fn a_memory_section_that_does_not_say_is_unreadable_not_evicting() {
+        assert_eq!(eviction_from_info("# Memory\r\n"), Eviction::Unreadable);
+        assert_eq!(eviction_from_info(&memory("", "")), Eviction::Unreadable);
+        assert_eq!(
+            eviction_from_info("# Memory\r\nmaxmemory:0\r\n"),
+            Eviction::Unreadable,
         );
     }
 

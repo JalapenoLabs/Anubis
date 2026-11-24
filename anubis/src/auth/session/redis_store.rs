@@ -258,7 +258,20 @@ impl RedisSessions {
             return Ok(());
         };
 
-        let session: StoredSession = serde_json::from_str(&removed).map_err(Error::corrupt)?;
+        // The key is gone either way, so a value that does not parse still
+        // signs this browser out; only its index entry cannot be named, and
+        // every read skips an entry whose key is gone.
+        let session: StoredSession = match serde_json::from_str(&removed) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    error.message = %error,
+                    "a sign-out removed a session whose stored value does not parse, and left \
+                     its index entry behind: {{error.message}}",
+                );
+                return Ok(());
+            }
+        };
         redis_connection
             .zrem(format!("{USER_KEY_PREFIX}{}", session.user_id), &token_hash)
             .await?;
@@ -293,26 +306,40 @@ impl RedisSessions {
         Ok(())
     }
 
-    /// Deletes the keys of every session the user has, except the one behind
-    /// `kept_hash`.
+    /// Deletes the keys of every session the user has that is not stamped
+    /// with `generation`.
     ///
     /// Housekeeping after a sign-out-everywhere has committed: those sessions
-    /// ended when the account's generation moved, so this only stops them
-    /// taking up memory until they expire. It removes exactly the sessions it
-    /// read from the index, so a session created while it runs keeps its
-    /// index entry.
-    pub(super) async fn sweep(&self, user_id: Uuid, kept_hash: Option<&str>) -> Result<(), Error> {
+    /// ended when the account moved to `generation`, so this only stops them
+    /// taking up memory until they expire. A session stamped with
+    /// `generation`, one created since the commit or the one a password change
+    /// kept, stays, and so does its index entry. With no generation, the
+    /// account is gone and everything goes.
+    pub(super) async fn sweep(&self, user_id: Uuid, generation: Option<i64>) -> Result<(), Error> {
         let user_key = format!("{USER_KEY_PREFIX}{user_id}");
         let mut redis_connection = self.connection.clone();
         let indexed = redis_connection.zrange(&user_key, 0, -1).await?;
+        if indexed.is_empty() {
+            return Ok(());
+        }
+        let token_keys: Vec<String> = indexed
+            .iter()
+            .map(|token_hash| format!("{TOKEN_KEY_PREFIX}{token_hash}"))
+            .collect();
+        let stored = redis_connection.mget(token_keys.clone()).await?;
 
         let mut swept_hashes = Vec::with_capacity(indexed.len());
         let mut swept_keys = Vec::with_capacity(indexed.len());
-        for token_hash in indexed {
-            if kept_hash == Some(token_hash.as_str()) {
+        for ((token_hash, token_key), stored) in indexed.into_iter().zip(token_keys).zip(stored) {
+            // A key that is gone or does not parse ends with the rest; only a
+            // session carrying the new generation is still alive.
+            let stamp = stored
+                .and_then(|stored| serde_json::from_str::<StoredSession>(&stored).ok())
+                .map(|session| session.generation);
+            if generation.is_some() && stamp == generation {
                 continue;
             }
-            swept_keys.push(format!("{TOKEN_KEY_PREFIX}{token_hash}"));
+            swept_keys.push(token_key);
             swept_hashes.push(token_hash);
         }
         if swept_hashes.is_empty() {

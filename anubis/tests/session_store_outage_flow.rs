@@ -1,8 +1,9 @@
 //! A session store that fails spends nothing a person needs to get back in.
 //!
-//! Signing in with a recovery code, an emailed code, or a passkey spends the
-//! code or the ceremony in the same transaction that writes the session, so a
-//! store that cannot write it rolls everything back. A password reset ends sessions in
+//! Registering creates the account in the same transaction that writes its
+//! first session, and signing in with a recovery code, an emailed code, or a
+//! passkey spends the code or the ceremony in that transaction too, so a store
+//! that cannot write the session rolls everything back. A password reset ends sessions in
 //! Postgres and only sweeps the store after the commit, so it completes while
 //! the store is down. Each scenario runs two deployments over one database: a
 //! healthy one on the Postgres store, and one whose Redis store points at a
@@ -40,13 +41,14 @@ struct Deployments {
     healthy: Router,
     healthy_outbox: TestOutbox,
     failing: Router,
+    failing_outbox: TestOutbox,
 }
 
 impl Deployments {
     async fn boot(database: &TestDatabase) -> Self {
         let pool = database.pool().await;
         let (healthy, healthy_outbox) = deployment(&pool, &[]);
-        let (failing, _failing_outbox) = deployment(
+        let (failing, failing_outbox) = deployment(
             &pool,
             &[("SESSION_STORE", "redis"), ("REDIS_URL", UNREACHABLE_REDIS)],
         );
@@ -54,6 +56,7 @@ impl Deployments {
             healthy,
             healthy_outbox,
             failing,
+            failing_outbox,
         }
     }
 
@@ -110,6 +113,42 @@ fn after(text: &str, marker: &str) -> String {
         .next()
         .expect("the value ends at whitespace")
         .to_owned()
+}
+
+#[tokio::test]
+async fn a_sign_up_leaves_no_account_behind_when_the_session_store_fails() {
+    let Some(database) = TestDatabase::create("session_store_outage_sign_up").await else {
+        return;
+    };
+    let deployments = Deployments::boot(&database).await;
+    let email = format!("signing-up-{}@example.com", Uuid::new_v4());
+    let credentials = json!({ "email": email, "password": PASSWORD });
+
+    let (status, _headers, _body) = send(
+        &deployments.failing,
+        "POST",
+        "/auth/register",
+        Some(&credentials),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        deployments.failing_outbox.emails().is_empty(),
+        "a sign-up that failed mails nobody",
+    );
+
+    // Nothing of the failed attempt stands, so the address is still free.
+    let (status, headers, body) = send(
+        &deployments.healthy,
+        "POST",
+        "/auth/register",
+        Some(&credentials),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    session_token(&headers);
 }
 
 #[tokio::test]

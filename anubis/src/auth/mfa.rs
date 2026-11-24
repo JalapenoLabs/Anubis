@@ -255,6 +255,21 @@ struct UserBody {
     user: UserResponse,
 }
 
+/// What answering a challenge led to, decided inside one transaction.
+enum ChallengeOutcome {
+    /// The account signed out everywhere after the challenge was issued.
+    Expired,
+    /// The code matched neither the TOTP nor an unused recovery code.
+    Refused,
+    /// The code matched and a session was created.
+    SignedIn(Box<(crate::auth::User, axum_extra::extract::CookieJar)>),
+}
+
+/// The answer for a challenge that can no longer be completed.
+fn expired_challenge() -> ApiError {
+    ApiError::unauthorized("That sign-in attempt has expired. Sign in again.")
+}
+
 /// Exchanges a login challenge plus a TOTP or recovery code for a session.
 async fn verify_challenge(
     State(state): State<AuthState>,
@@ -267,27 +282,44 @@ async fn verify_challenge(
     let peeked = user_token::peek(&mut connection, &body.mfa_token, TokenPurpose::MfaChallenge)
         .await
         .map_err(log_internal)?
-        .ok_or_else(|| {
-            ApiError::unauthorized("That sign-in attempt has expired. Sign in again.")
-        })?;
+        .ok_or_else(expired_challenge)?;
+
+    // The session generation the first factor was checked under, which the
+    // challenge carries. A session is stamped with it, not with the one the
+    // account has by the time the second factor answers, so a reset in
+    // between ends this sign-in rather than being outlived by it.
+    let Some(checked_generation) = peeked
+        .payload
+        .as_deref()
+        .and_then(|payload| payload.parse::<i64>().ok())
+    else {
+        tracing::debug!("an MFA challenge carried no session generation; asking for a new sign-in");
+        return Err(expired_challenge());
+    };
 
     // Spending the code, spending the challenge, and signing in are one unit:
     // when the session store fails, all three roll back, so a recovery code is
     // never spent on a sign-in that did not happen. A wrong code commits, so
     // a TOTP enrollment discarded on the way stays discarded, and its failure
     // is counted against the challenge only once the transaction is over.
-    let signed_in = connection
+    let outcome = connection
         .transaction::<_, ApiError, _>(async |transaction| {
-            if !code_matches(transaction, &state.secret_key, peeked.user_id, &body.code).await? {
-                return Ok(None);
-            }
-
-            user_token::delete_by_id(transaction, peeked.id).await?;
+            // Read before anything is spent: a challenge the account has
+            // signed out everywhere since answers nothing and spends nothing.
             let user: crate::auth::User = users::table
                 .find(peeked.user_id)
                 .select(crate::auth::User::as_select())
                 .first(transaction)
                 .await?;
+            if user.session_generation != checked_generation {
+                return Ok(ChallengeOutcome::Expired);
+            }
+
+            if !code_matches(transaction, &state.secret_key, peeked.user_id, &body.code).await? {
+                return Ok(ChallengeOutcome::Refused);
+            }
+
+            user_token::delete_by_id(transaction, peeked.id).await?;
             let jar = crate::auth::routes::signed_in_jar(
                 &state,
                 &sessions,
@@ -297,17 +329,27 @@ async fn verify_challenge(
                 crate::auth::SignInMethod::SecondFactor,
             )
             .await?;
-            Ok(Some((user, jar)))
+            Ok(ChallengeOutcome::SignedIn(Box::new((user, jar))))
         })
         .await?;
 
-    let Some((user, jar)) = signed_in else {
-        user_token::record_failure(&mut connection, peeked.id)
-            .await
-            .map_err(log_internal)?;
-        return Err(ApiError::unauthorized(
-            "That code didn't match. Try again or use a recovery code.",
-        ));
+    let (user, jar) = match outcome {
+        ChallengeOutcome::SignedIn(signed_in) => *signed_in,
+        ChallengeOutcome::Expired => {
+            tracing::debug!(
+                user.id = %peeked.user_id,
+                "an MFA challenge for {{user.id}} predates a sign-out-everywhere",
+            );
+            return Err(expired_challenge());
+        }
+        ChallengeOutcome::Refused => {
+            user_token::record_failure(&mut connection, peeked.id)
+                .await
+                .map_err(log_internal)?;
+            return Err(ApiError::unauthorized(
+                "That code didn't match. Try again or use a recovery code.",
+            ));
+        }
     };
 
     let response_body = UserBody {

@@ -133,7 +133,6 @@ pub(crate) async fn issue_with_payload(
 pub(crate) struct PeekedToken {
     pub id: Uuid,
     pub user_id: Uuid,
-    #[expect(dead_code, reason = "read by the passkey flow, landing next")]
     pub payload: Option<String>,
 }
 

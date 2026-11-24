@@ -40,7 +40,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use redis::AsyncTypedCommands;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -162,6 +162,269 @@ async fn a_sign_out_everywhere_ends_the_sessions_of_both_stores() {
         in_postgres.whoami(&postgres_session).await,
         StatusCode::UNAUTHORIZED,
     );
+}
+
+#[tokio::test]
+async fn a_stamp_no_generation_was_given_stays_dead_in_postgres() {
+    let Some(database) = TestDatabase::create("session_store_stamp_postgres").await else {
+        return;
+    };
+    stamp_left_behind(&database, &Store::Postgres).await;
+}
+
+#[tokio::test]
+async fn a_stamp_no_generation_was_given_stays_dead_in_redis() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping session_store_flow Redis stamp test: REDIS_URL is not set");
+        return;
+    };
+    let Some(database) = TestDatabase::create("session_store_stamp_redis").await else {
+        return;
+    };
+    let client = redis::Client::open(redis_url.as_str()).expect("REDIS_URL must parse");
+    let connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    let store = Store::Redis {
+        url: redis_url,
+        connection,
+    };
+    stamp_left_behind(&database, &store).await;
+}
+
+/// What a password change leaves behind when its re-stamp of the kept browser
+/// reached the store and its commit never did: a session stamped with a
+/// generation drawn for the account and never taken by it. That session is
+/// out at once, and must stay out after the next sign-out-everywhere, even
+/// when the store keeps it, because the next generation must not be the value
+/// it carries.
+async fn stamp_left_behind(database: &TestDatabase, store: &Store) {
+    let deployment = Deployment::boot(database, store).await;
+    let router = &deployment.router;
+    let email = format!("rolled-back-{}@example.com", Uuid::new_v4());
+    let session = support::register(router, &email).await;
+    let user_id = deployment.user_id(&email).await;
+
+    // Drawn from the same sequence a real password change draws from, and so
+    // exactly the value a rolled-back change would have left.
+    let drawn = draw_generation(&deployment.pool).await;
+    store.stamp(&deployment.pool, &session, drawn).await;
+    assert_eq!(
+        deployment.whoami(&session).await,
+        StatusCode::UNAUTHORIZED,
+        "a stamp the account never took signs nobody in",
+    );
+
+    // The store loses track of the session and gets it back after the reset,
+    // so nothing but the generation can keep it out.
+    let leftover = store.remember(&deployment.pool, &session).await;
+    store.evict_index(user_id).await;
+    reset_password(&deployment, &email, RESET_PASSWORD).await;
+    store.bring_back(&deployment.pool, leftover).await;
+    assert_eq!(
+        deployment.whoami(&session).await,
+        StatusCode::UNAUTHORIZED,
+        "the next sign-out-everywhere never takes a value a rolled-back change drew",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_racing_a_reset_never_overwrites_it() {
+    let Some(database) = TestDatabase::create("session_store_change_race").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database, &Store::Postgres).await;
+    let email = format!("racing-{}@example.com", Uuid::new_v4());
+    let session = support::register(&deployment.router, &email).await;
+    let user_id = deployment.user_id(&email).await;
+
+    // The test holds the account's row, lets the change get past its session
+    // check and its argon2 runs to the update it makes, and only then commits
+    // what a reset commits: a new generation and a new password. Without the
+    // hold, the scheduler usually finishes one request before the other
+    // starts, and the race this test is named for never runs.
+    let mut blocker = deployment.pool.get().await.expect("a connection");
+    let changing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            users::table
+                .find(user_id)
+                .select(users::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+
+            let router = deployment.router.clone();
+            let change = tokio::spawn(async move {
+                let (status, _headers, _body) = send(
+                    &router,
+                    "POST",
+                    "/auth/change-password",
+                    Some(&json!({
+                        "current_password": PASSWORD,
+                        "new_password": CHANGED_PASSWORD,
+                    })),
+                    Some(&session),
+                )
+                .await;
+                status
+            });
+            wait_for_a_lock_wait(&deployment.pool).await;
+
+            diesel::update(users::table.find(user_id))
+                .set((
+                    users::session_generation.eq(nextval("session_generations")),
+                    users::password_hash.eq(RESET_HASH_MARKER),
+                ))
+                .execute(transaction)
+                .await?;
+            Ok(change)
+        })
+        .await
+        .expect("holding the account must succeed");
+    drop(blocker);
+
+    let status = changing.await.expect("the change must not panic");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a change checked under the old generation is refused",
+    );
+    let mut connection = deployment.pool.get().await.expect("a connection");
+    let password_hash: String = users::table
+        .find(user_id)
+        .select(users::password_hash)
+        .first(&mut connection)
+        .await
+        .expect("the account exists");
+    assert_eq!(
+        password_hash, RESET_HASH_MARKER,
+        "the reset's password survives the change that raced it",
+    );
+}
+
+/// What the racing reset sets the password hash to, so the test can tell
+/// whether the change overwrote it. Never a hash anything verifies against.
+const RESET_HASH_MARKER: &str = "set-by-the-racing-reset";
+
+/// Waits until a backend in this test's database is waiting on a lock, which
+/// is how the race test knows its racer reached the row it holds.
+async fn wait_for_a_lock_wait(pool: &DbPool) {
+    #[derive(QueryableByName)]
+    struct Waiting {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        waiting: i64,
+    }
+
+    let mut connection = pool.get().await.expect("a connection");
+    for _attempt in 0..600 {
+        let waiting: Waiting = diesel::sql_query(
+            "SELECT count(*) AS waiting FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .get_result(&mut connection)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if waiting.waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the racing request never reached the account's row");
+}
+
+#[tokio::test]
+async fn a_second_factor_answering_a_challenge_from_before_a_reset_signs_nobody_in() {
+    let Some(database) = TestDatabase::create("session_store_challenge").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database, &Store::Postgres).await;
+    let router = &deployment.router;
+    let email = format!("two-factor-{}@example.com", Uuid::new_v4());
+    let cookie = support::register(router, &email).await;
+
+    let (status, _headers, body) =
+        send(router, "POST", "/auth/mfa/totp/setup", None, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let secret = body["secret"].as_str().expect("a secret").to_owned();
+    let (status, _headers, body) = send(
+        router,
+        "POST",
+        "/auth/mfa/totp/confirm",
+        Some(&json!({ "code": totp_now(&secret) })),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The password is checked and a challenge issued; then the account is
+    // reset before the second factor answers.
+    let stale_challenge = challenge(router, &email, PASSWORD).await;
+    reset_password(&deployment, &email, RESET_PASSWORD).await;
+    let (status, headers, body) = send(
+        router,
+        "POST",
+        "/auth/mfa/verify",
+        Some(&json!({ "mfa_token": stale_challenge, "code": totp_now(&secret) })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert!(
+        headers.get(axum::http::header::SET_COOKIE).is_none(),
+        "no session is issued for a challenge the reset ended",
+    );
+
+    // The new password and the same second factor still sign in.
+    let fresh_challenge = challenge(router, &email, RESET_PASSWORD).await;
+    let (status, headers, body) = send(
+        router,
+        "POST",
+        "/auth/mfa/verify",
+        Some(&json!({ "mfa_token": fresh_challenge, "code": totp_now(&secret) })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    session_token(&headers);
+}
+
+/// Signs in with a password on an account with a second factor, answering
+/// the challenge token the second factor must complete.
+async fn challenge(router: &Router, email: &str, password: &str) -> String {
+    let (status, _headers, body) = send(
+        router,
+        "POST",
+        "/auth/login",
+        Some(&json!({ "email": email, "password": password })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["mfa_token"]
+        .as_str()
+        .expect("a second factor is asked for")
+        .to_owned()
+}
+
+/// The TOTP code for `secret` right now.
+fn totp_now(secret: &str) -> String {
+    let now = u64::try_from(Utc::now().timestamp()).expect("a sane clock");
+    anubis::auth::totp::code_at(secret, now).expect("the secret decodes")
+}
+
+diesel::define_sql_function! {
+    /// Postgres's `nextval`, for drawing from the generation sequence.
+    fn nextval(sequence: diesel::sql_types::Text) -> diesel::sql_types::BigInt;
+}
+
+/// Draws the next value of the sequence session generations come from.
+async fn draw_generation(pool: &DbPool) -> i64 {
+    let mut connection = pool.get().await.expect("a connection");
+    diesel::select(nextval("session_generations"))
+        .get_result(&mut connection)
+        .await
+        .expect("the sequence must draw")
 }
 
 /// Resets `email`'s password to `password` through `deployment`'s routes.
@@ -363,6 +626,60 @@ impl Store {
                     .expect("the session must be rewritten");
             }
         }
+    }
+
+    /// Rewrites the generation the session behind `token` is stamped with.
+    async fn stamp(&self, pool: &DbPool, token: &str, generation: i64) {
+        let token_hash = hash(token);
+        match self {
+            Self::Postgres => {
+                let mut connection = pool.get().await.expect("a connection");
+                let updated =
+                    diesel::update(sessions::table.filter(sessions::token_hash.eq(&token_hash)))
+                        .set(sessions::generation.eq(generation))
+                        .execute(&mut connection)
+                        .await
+                        .expect("the row must update");
+                assert_eq!(updated, 1);
+            }
+            Self::Redis { connection, .. } => {
+                let mut connection = connection.clone();
+                let key = format!("{TOKEN_KEY_PREFIX}{token_hash}");
+                let stored = connection
+                    .get(&key)
+                    .await
+                    .expect("Redis must answer")
+                    .expect("the session must exist");
+                let mut session: Value = serde_json::from_str(&stored).expect("a session is JSON");
+                session["generation"] = json!(generation);
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg(session.to_string())
+                    .arg("KEEPTTL")
+                    .exec_async(&mut connection)
+                    .await
+                    .expect("the session must be rewritten");
+            }
+        }
+    }
+
+    /// Overwrites the session behind `token` with a value that is not a
+    /// session, the way a foreign writer or a future format would. Only Redis
+    /// holds a value that can stop parsing, so for Postgres this answers
+    /// `false` and does nothing.
+    async fn corrupt(&self, token: &str) -> bool {
+        let Self::Redis { connection, .. } = self else {
+            return false;
+        };
+        let mut connection = connection.clone();
+        redis::cmd("SET")
+            .arg(format!("{TOKEN_KEY_PREFIX}{}", hash(token)))
+            .arg("this is not a session")
+            .arg("KEEPTTL")
+            .exec_async(&mut connection)
+            .await
+            .expect("the session must be overwritten");
+        true
     }
 
     /// Drops the user's index, the key a Redis under memory pressure evicts
@@ -781,6 +1098,32 @@ async fn narrative(database: &TestDatabase, store: Store) {
     store.assert_gone(&deployment.pool, user_id, &second).await;
     assert_eq!(deployment.listed(&first).await.len(), 1);
 
+    // A stored session that no longer parses still signs its browser out:
+    // the key is gone either way, so the sign-out answers as one that worked.
+    let unreadable = sign_in(router, &email, PASSWORD).await;
+    if store.corrupt(&unreadable).await {
+        let (status, headers, _body) =
+            send(router, "POST", "/auth/logout", None, Some(&unreadable)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            headers
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .any(|cookie| cookie
+                    .to_str()
+                    .is_ok_and(|value| value.contains("Max-Age=0"))),
+            "the cookie is cleared: {headers:?}",
+        );
+        assert_eq!(
+            deployment.whoami(&unreadable).await,
+            StatusCode::UNAUTHORIZED
+        );
+    } else {
+        let (status, _headers, _body) =
+            send(router, "POST", "/auth/logout", None, Some(&unreadable)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
     // ---- Changing the password keeps this browser and signs out the rest.
     let elsewhere = sign_in(router, &email, PASSWORD).await;
     let (status, _headers, body) = send(
@@ -917,8 +1260,8 @@ async fn narrative(database: &TestDatabase, store: Store) {
     let sign_ins = deployment.audited(user_id, audit::SESSION_CREATED).await;
     assert_eq!(
         sign_ins.len(),
-        9,
-        "registration and eight password sign-ins, each recorded once",
+        10,
+        "registration and nine password sign-ins, each recorded once",
     );
 
     let (status, _headers, body) = send(

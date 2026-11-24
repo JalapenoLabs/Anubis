@@ -17,22 +17,44 @@
 //! and every session is stamped with the generation it was created under. A
 //! session signs nobody in unless its stamp equals the account's current
 //! generation, which every lookup reads beside the account itself. Signing out
-//! everywhere advances the generation, in the same transaction as the
-//! credential change that called for it, so the sessions end the moment that
-//! transaction commits and not a moment before, in either store. Deleting
-//! them afterwards is housekeeping, done after the commit by
+//! everywhere moves the account to a new generation, in the same transaction
+//! as the credential change that called for it, so the sessions end the
+//! moment that transaction commits and not a moment before, in either store.
+//! Deleting them afterwards is housekeeping, done after the commit by
 //! [`Sessions::sweep`]: a store that loses those deletes, evicts the keys that
 //! would have found them, comes back from an older snapshot, or was the other
 //! store when `SESSION_STORE` changed, cannot bring an ended session back.
 //!
-//! The stamp is compared for equality, not order. A password change keeps the
-//! browser that made it by re-stamping that session with the new generation
-//! before the commit; in Redis that write cannot roll back, so if the commit
-//! then fails the kept session carries a stamp one ahead of the account, and
-//! equality signs it out rather than letting it outlive the next
-//! sign-out-everywhere. The price is a few milliseconds, between that
-//! re-stamp and the commit, in which another request from the same browser
+//! A new generation is drawn from the `session_generations` sequence, never
+//! computed from the old one, because a sequence never hands a value out
+//! twice, not even one a rolled-back transaction drew. That matters for the
+//! one write that cannot roll back: a password change keeps the browser that
+//! made it by re-stamping that session with the new generation before the
+//! commit, and in Redis that write stands if the commit then fails. The
+//! re-stamped session then carries a value the account never takes, so it is
+//! signed out at once and stays out; a generation computed as the old one plus
+//! one would hand that very value to the next sign-out-everywhere and bring
+//! the session back. Stamps are compared for equality because a stamp means
+//! exactly one generation; drawn values only identify, so nothing relies on
+//! their order. The price of the re-stamp coming first is a few milliseconds,
+//! between it and the commit, in which another request from the same browser
 //! is answered `401`.
+//!
+//! The stamp is the generation read together with the credentials the
+//! sign-in checked, which [`crate::auth::User`] carries, never one read
+//! afterwards. Creating the session then reads the account's generation again
+//! under a `FOR SHARE` lock and refuses the sign-in when it moved: a password
+//! sign-in whose argon2 check finished after a reset committed, or a second
+//! factor answering a challenge issued before one, is told to sign in again
+//! rather than issued a session the reset should have ended. Under the lock,
+//! a sign-out-everywhere arriving later waits for the sign-in to commit and
+//! then ends it. A sign-in racing a sign-out-everywhere therefore always
+//! loses.
+//!
+//! A credential change made through a session, the password change, is held
+//! to the generation that session was validated under, and refused when a
+//! sign-out-everywhere committed in between, so it can never overwrite a reset
+//! that was meant to lock its session out.
 //!
 //! Signing one session out, from the list or by signing out, deletes that
 //! session from its store and moves no generation, so it is only as durable as
@@ -66,9 +88,9 @@
 //!   browser ever holds a session the audit log does not know about. A commit
 //!   that fails after the write leaves a session no browser holds, which ends
 //!   with its expiry.
-//! - **Signing out everywhere** advances the generation inside the
-//!   transaction, as its last statement, and sweeps the store after the
-//!   commit. Nothing there waits on Redis while holding the account's row.
+//! - **Signing out everywhere** moves the generation inside the transaction,
+//!   as its last statement, and sweeps the store after the commit. Nothing
+//!   there waits on Redis while holding the account's row.
 
 mod inspection;
 mod postgres_store;
@@ -175,8 +197,10 @@ pub(crate) struct ListedSession {
 #[must_use = "sweep the ended sessions once the transaction has committed"]
 pub(crate) struct Revocation {
     user_id: Uuid,
-    /// The hash of the session a password change kept, which the sweep spares.
-    kept_hash: Option<String>,
+    /// The account's new generation, which the sweep spares sessions stamped
+    /// with: a session created since the commit, or the one a password change
+    /// kept. `None` when the account is gone and every session goes.
+    generation: Option<i64>,
 }
 
 /// Where browser sessions are kept, and every way to read or change them.
@@ -264,29 +288,42 @@ impl Sessions {
         }
     }
 
-    /// Creates a session for `user_id` and returns the raw token for the cookie.
+    /// Creates a session for `user` and returns the raw token for the cookie.
     ///
-    /// Stamps it with the account's current session generation, read on
-    /// `connection`. Call it as the last step of the transaction that records
-    /// the sign-in; see the module docs.
+    /// Stamps it with the generation `user` carries, the one read together
+    /// with the credentials the sign-in checked. The account's generation is
+    /// read again on `connection` under a `FOR SHARE` lock, and a sign-in
+    /// whose generation moved since is refused; see the module docs. Call it
+    /// as the last step of the transaction that records the sign-in.
     ///
     /// # Errors
-    /// Returns an [`Error`] when the account cannot be read or the store
-    /// cannot be written.
+    /// Returns an [`Error`] for which [`Error::is_stale`] holds when a
+    /// sign-out-everywhere committed after the credentials were checked, and
+    /// an [`Error`] when the account cannot be read or the store cannot be
+    /// written.
     pub(crate) async fn create(
         &self,
         connection: &mut AsyncPgConnection,
-        user_id: Uuid,
+        user: &User,
     ) -> Result<String, Error> {
-        let generation: i64 = users::table
-            .find(user_id)
+        let current: i64 = users::table
+            .find(user.id)
             .select(users::session_generation)
+            .for_share()
             .first(connection)
             .await?;
+        if current != user.session_generation {
+            tracing::debug!(
+                user.id = %user.id,
+                "a sign-in for {{user.id}} was refused: the account signed out everywhere after \
+                 its credentials were checked",
+            );
+            return Err(Error::new(ErrorKind::Stale));
+        }
 
         match &self.store {
-            Store::Postgres => Ok(postgres_store::create(connection, user_id, generation).await?),
-            Store::Redis(redis) => redis.create(user_id, generation).await,
+            Store::Postgres => Ok(postgres_store::create(connection, user.id, current).await?),
+            Store::Redis(redis) => redis.create(user.id, current).await,
         }
     }
 
@@ -335,11 +372,11 @@ impl Sessions {
 
     /// Ends every session the user has, signing out all of their browsers.
     ///
-    /// Advances the account's session generation on `connection`, which is
-    /// what ends them; call it as the last statement of the transaction that
-    /// changes the credentials, and hand the [`Revocation`] to
+    /// Moves the account to a new session generation on `connection`, which
+    /// is what ends them; call it as the last statement of the transaction
+    /// that changes the credentials, and hand the [`Revocation`] to
     /// [`Sessions::sweep`] once that transaction commits. An account that no
-    /// longer exists, one being deleted, has no generation to advance and
+    /// longer exists, one being deleted, has no generation to move and
     /// nothing to fail.
     ///
     /// # Errors
@@ -349,22 +386,23 @@ impl Sessions {
         connection: &mut AsyncPgConnection,
         user_id: Uuid,
     ) -> Result<Revocation, Error> {
-        advance_generation(connection, user_id).await?;
+        let generation = advance_generation(connection, user_id).await?;
         if let Store::Postgres = self.store {
             postgres_store::delete_all(connection, user_id).await?;
         }
         Ok(Revocation {
             user_id,
-            kept_hash: None,
+            generation,
         })
     }
 
     /// Ends every session the user has except the one behind `keep_token`.
     ///
-    /// Called inside a signed-in password change: the generation advances and
-    /// the kept session is re-stamped with it, so other browsers sign out and
-    /// the browser that made the change stays signed in. Hand the
-    /// [`Revocation`] to [`Sessions::sweep`] once the transaction commits.
+    /// Called inside a signed-in password change: the account moves to a new
+    /// generation and the kept session is re-stamped with it, so other
+    /// browsers sign out and the browser that made the change stays signed
+    /// in. Hand the [`Revocation`] to [`Sessions::sweep`] once the transaction
+    /// commits.
     ///
     /// # Errors
     /// Returns an [`Error`] when the database cannot be written, or the Redis
@@ -376,18 +414,18 @@ impl Sessions {
         user_id: Uuid,
         keep_token: &str,
     ) -> Result<Revocation, Error> {
-        let keep_hash = token::hash(keep_token);
         let Some(generation) = advance_generation(connection, user_id).await? else {
             tracing::debug!(
                 user.id = %user_id,
-                "a password change for {{user.id}} found no account to advance",
+                "a password change for {{user.id}} found no account to move",
             );
             return Ok(Revocation {
                 user_id,
-                kept_hash: Some(keep_hash),
+                generation: None,
             });
         };
 
+        let keep_hash = token::hash(keep_token);
         match &self.store {
             Store::Postgres => {
                 postgres_store::keep_only(connection, user_id, &keep_hash, generation).await?;
@@ -396,7 +434,7 @@ impl Sessions {
         }
         Ok(Revocation {
             user_id,
-            kept_hash: Some(keep_hash),
+            generation: Some(generation),
         })
     }
 
@@ -406,15 +444,14 @@ impl Sessions {
     /// nothing left to do. The Redis store deletes the keys now, after the
     /// commit, so a Redis that is slow or away never holds the account's row
     /// or a connection; a failure only means the ended sessions take up memory
-    /// until they expire, so it is logged and not returned.
+    /// until they expire, so it is logged and not returned. Only sessions
+    /// stamped with something other than the new generation go, so a session
+    /// created since the commit, or kept by a password change, stays.
     pub(crate) async fn sweep(&self, revocation: Revocation) {
         let Store::Redis(redis) = &self.store else {
             return;
         };
-        if let Err(error) = redis
-            .sweep(revocation.user_id, revocation.kept_hash.as_deref())
-            .await
-        {
+        if let Err(error) = redis.sweep(revocation.user_id, revocation.generation).await {
             tracing::warn!(
                 error.message = %error,
                 user.id = %revocation.user_id,
@@ -516,15 +553,27 @@ async fn current_generation(
         .optional()
 }
 
-/// Advances the account's session generation, ending every session stamped
-/// with an older one, and answers the new generation, or `None` when the
-/// account is gone.
+/// The sequence every session generation is drawn from; see the module docs.
+const GENERATION_SEQUENCE: &str = "session_generations";
+
+diesel::define_sql_function! {
+    /// Postgres's `nextval`, which draws the next value of a sequence and
+    /// never draws it again, whether or not the drawing transaction commits.
+    fn nextval(sequence: diesel::sql_types::Text) -> diesel::sql_types::BigInt;
+}
+
+/// Moves the account to a new session generation, ending every session
+/// stamped with any other, and answers it, or `None` when the account is gone.
+///
+/// The value is drawn from [`GENERATION_SEQUENCE`] rather than computed from
+/// the current one, so a value a rolled-back transaction drew is never the
+/// account's; see the module docs.
 async fn advance_generation(
     connection: &mut AsyncPgConnection,
     user_id: Uuid,
 ) -> Result<Option<i64>, diesel::result::Error> {
     diesel::update(users::table.find(user_id))
-        .set(users::session_generation.eq(users::session_generation + 1))
+        .set(users::session_generation.eq(nextval(GENERATION_SEQUENCE)))
         .returning(users::session_generation)
         .get_result(connection)
         .await
@@ -557,6 +606,10 @@ enum ErrorKind {
     Unsupported(String),
     /// A Redis that may evict keys, with the policy it reported.
     Evicting(String),
+    /// The account signed out everywhere after the sign-in checked its
+    /// credentials, so the sign-in is refused rather than issued a session
+    /// that sign-out should have ended.
+    Stale,
 }
 
 impl Error {
@@ -577,6 +630,15 @@ impl Error {
 
     fn evicting(policy: &str) -> Self {
         Self::new(ErrorKind::Evicting(policy.to_owned()))
+    }
+
+    /// Returns `true` when a sign-in was refused because the account signed
+    /// out everywhere after its credentials were checked.
+    ///
+    /// The one error that is the caller's to act on, by signing in again, so
+    /// the sign-in routes answer it with `401` rather than `500`.
+    pub(crate) fn is_stale(&self) -> bool {
+        matches!(self.kind, ErrorKind::Stale)
     }
 }
 
@@ -619,6 +681,9 @@ impl Display for Error {
                 "the Redis session store needs a Redis that never evicts keys, and this one has \
                  a memory limit with maxmemory-policy {policy}; set noeviction",
             )?,
+            ErrorKind::Stale => f.write_str(
+                "the account signed out everywhere after the sign-in checked its credentials",
+            )?,
         }
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
@@ -634,7 +699,7 @@ impl std::error::Error for Error {
             ErrorKind::Pool(source) => Some(source),
             ErrorKind::Redis(source) => Some(source),
             ErrorKind::Corrupt(source) => Some(source),
-            ErrorKind::Unsupported(_) | ErrorKind::Evicting(_) => None,
+            ErrorKind::Unsupported(_) | ErrorKind::Evicting(_) | ErrorKind::Stale => None,
         }
     }
 }

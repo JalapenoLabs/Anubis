@@ -268,10 +268,11 @@ async fn register(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    // One transaction creates the user and their personal organization, so a
-    // half-bootstrapped account can never exist.
-    let created: User = connection
-        .transaction(async |transaction| {
+    // One transaction creates the user, their personal organization, and their
+    // session, so a half-bootstrapped account can never exist, and a session
+    // store that fails leaves no account behind to answer the retry with 409.
+    let (created, jar) = connection
+        .transaction::<_, ApiError, _>(async |transaction| {
             let user: User = diesel::insert_into(users::table)
                 .values(NewUser {
                     email: &credentials.email,
@@ -281,31 +282,33 @@ async fn register(
                 })
                 .returning(User::as_returning())
                 .get_result(transaction)
-                .await?;
+                .await
+                .map_err(|error| match error {
+                    diesel::result::Error::DatabaseError(
+                        DatabaseErrorKind::UniqueViolation,
+                        _details,
+                    ) => ApiError::conflict("That email address is already registered."),
+                    other => log_internal(other),
+                })?;
 
             crate::tenancy::create_personal_organization(transaction, &user).await?;
 
-            Ok::<User, diesel::result::Error>(user)
+            let jar = signed_in_jar(
+                &state,
+                &sessions,
+                transaction,
+                &context,
+                &user,
+                SignInMethod::Registration,
+            )
+            .await?;
+            Ok((user, jar))
         })
-        .await
-        .map_err(|error| match error {
-            diesel::result::Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _details) => {
-                ApiError::conflict("That email address is already registered.")
-            }
-            other => log_internal(other),
-        })?;
+        .await?;
 
+    // After the commit, so a sign-up that failed mails nobody.
     send_verification_email(&state, &mut connection, &created).await;
 
-    let jar = signed_in_jar(
-        &state,
-        &sessions,
-        &mut connection,
-        &context,
-        &created,
-        SignInMethod::Registration,
-    )
-    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &created)
             .await
@@ -385,9 +388,17 @@ async fn login(
         .map_err(log_internal)?
         .is_some()
     {
-        let mfa_token = user_token::issue(&mut connection, user.id, TokenPurpose::MfaChallenge)
-            .await
-            .map_err(log_internal)?;
+        // The challenge carries the generation the password was checked
+        // under, so a reset committing before the second factor answers ends
+        // this sign-in too; see `crate::auth::mfa`.
+        let mfa_token = user_token::issue_with_payload(
+            &mut connection,
+            user.id,
+            TokenPurpose::MfaChallenge,
+            Some(&user.session_generation.to_string()),
+        )
+        .await
+        .map_err(log_internal)?;
         return Ok((
             StatusCode::OK,
             Json(MfaChallengeBody {
@@ -776,10 +787,18 @@ pub(crate) async fn signed_in_jar(
             .await?;
             // Last, because a Redis store cannot roll back: a session written
             // before a step that then failed would outlive its sign-in.
-            sessions.create(transaction, user.id).await
+            sessions.create(transaction, user).await
         })
         .await
-        .map_err(log_internal)?;
+        .map_err(|error| {
+            if error.is_stale() {
+                ApiError::unauthorized(
+                    "Your password changed while you were signing in. Sign in again.",
+                )
+            } else {
+                log_internal(error)
+            }
+        })?;
 
     let cookie = Cookie::build((session::SESSION_COOKIE, token))
         .http_only(true)

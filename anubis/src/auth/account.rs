@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
-use crate::auth::session::{ListedSession, Sessions};
+use crate::auth::session::{ListedSession, Revocation, Sessions};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{CurrentUser, SignedIn, password, session, user_token};
 use crate::http::ApiError;
@@ -150,6 +150,14 @@ struct ChangePasswordBody {
     new_password: String,
 }
 
+/// What a password change led to, decided inside one transaction.
+enum PasswordChange {
+    /// A sign-out-everywhere committed after the session was validated.
+    Interrupted,
+    /// The password changed, leaving the other sessions to sweep.
+    Changed(Option<Revocation>),
+}
+
 /// Rotates the password, which is also how a temporary one is replaced.
 ///
 /// Takes [`SignedIn`] rather than [`CurrentUser`]: an account on a temporary
@@ -181,15 +189,26 @@ async fn change_password(
     // change is exactly the gap an audit log exists to close. The change set
     // stays empty, because the fact is the whole of what an auditor needs and
     // neither password belongs in a table anybody can read.
-    let revocation = connection
+    let outcome = connection
         .transaction::<_, session::Error, _>(async |transaction| {
-            diesel::update(users::table.find(user.id))
-                .set((
-                    users::password_hash.eq(&password_hash),
-                    users::password_change_required.eq(false),
-                ))
-                .execute(transaction)
-                .await?;
+            // First, and only while the account is at the generation this
+            // session was validated under. A sign-out-everywhere that committed
+            // since then ended this session, and a password checked against
+            // the hash it replaced must not overwrite the one it set.
+            let changed = diesel::update(
+                users::table
+                    .find(user.id)
+                    .filter(users::session_generation.eq(user.session_generation)),
+            )
+            .set((
+                users::password_hash.eq(&password_hash),
+                users::password_change_required.eq(false),
+            ))
+            .execute(transaction)
+            .await?;
+            if changed == 0 {
+                return Ok(PasswordChange::Interrupted);
+            }
 
             audit::record(
                 transaction,
@@ -202,15 +221,27 @@ async fn change_password(
             // The last statement, so the others end exactly when the new
             // password commits.
             let Some(cookie) = jar.get(session::SESSION_COOKIE) else {
-                return Ok(None);
+                return Ok(PasswordChange::Changed(None));
             };
             let revocation = sessions
                 .revoke_all_except(transaction, user.id, cookie.value())
                 .await?;
-            Ok(Some(revocation))
+            Ok(PasswordChange::Changed(Some(revocation)))
         })
         .await
         .map_err(log_internal)?;
+
+    let revocation = match outcome {
+        PasswordChange::Changed(revocation) => revocation,
+        PasswordChange::Interrupted => {
+            tracing::debug!(
+                user.id = %user.id,
+                "a password change for {{user.id}} was refused: the account signed out \
+                 everywhere after its session was checked",
+            );
+            return Err(ApiError::unauthorized("You are not signed in."));
+        }
+    };
 
     // After the commit and with the connection back in the pool; see
     // `crate::auth::session`.

@@ -222,8 +222,8 @@ fn redis_session_checks(url: &str) -> Vec<Check> {
         },
         Eviction::Unreadable => Check {
             status: Status::Warn,
-            detail: "Redis refused CONFIG GET, so whether it may evict session keys is unknown \
-                     (managed Redis often refuses it); a session store needs noeviction"
+            detail: "Redis did not report its memory limit and policy in INFO memory, so whether \
+                     it may evict session keys is unknown; a session store needs noeviction"
                 .to_owned(),
         },
     };

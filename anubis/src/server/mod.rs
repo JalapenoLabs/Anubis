@@ -94,9 +94,10 @@
 //! A Redis store connects on its first command, so [`serve`] asks it whether it
 //! can hold sessions before binding, and refuses to start, naming
 //! `SESSION_STORE`, when Redis does not answer, is older than 7.0, or may evict
-//! keys; it logs a warning when Redis persists less than an append-only file. A deployment that cannot check a
-//! session cannot serve anyone signed in, and finding out at the first request
-//! would mean every sign-in failing instead of one boot. An application that
+//! keys; it logs a warning when Redis persists less than an append-only file.
+//! A deployment that cannot check a session cannot serve anyone signed in, and
+//! finding out at the first request would mean every sign-in failing instead
+//! of one boot. An application that
 //! pairs [`harden`] with [`serve_with_shutdown`] skips that check, and its
 //! Redis store connects on the first request that needs it. See
 //! `docs/sessions.md`.

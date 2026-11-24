@@ -3,3 +3,5 @@ ALTER TABLE sessions
 
 ALTER TABLE users
     DROP COLUMN session_generation;
+
+DROP SEQUENCE session_generations;

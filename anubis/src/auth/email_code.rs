@@ -189,8 +189,15 @@ async fn verify_code(
                 .await?
                 .is_some()
             {
-                let mfa_token =
-                    user_token::issue(transaction, user.id, TokenPurpose::MfaChallenge).await?;
+                // The challenge carries the generation the code was checked
+                // under; see `crate::auth::mfa`.
+                let mfa_token = user_token::issue_with_payload(
+                    transaction,
+                    user.id,
+                    TokenPurpose::MfaChallenge,
+                    Some(&user.session_generation.to_string()),
+                )
+                .await?;
                 return Ok(CodeOutcome::SecondFactor(mfa_token));
             }
 
