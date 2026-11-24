@@ -4,7 +4,7 @@
 import { useTranslation } from 'react-i18next'
 import { useParams } from 'react-router'
 import useSWR from 'swr'
-import { useAnubisApi, useCurrentUser } from '@jalapenolabs/anubis'
+import { MEMBERSHIP_SUBJECT, allows, useAnubisApi, useCurrentUser, useRoles } from '@jalapenolabs/anubis'
 import { useTeamContext } from '../../context/TeamProvider'
 
 // UI
@@ -18,8 +18,7 @@ import { OrganizationTeamsCard } from '../../components/tenancy/OrganizationTeam
 import { RenameTenantCard } from '../../components/tenancy/RenameTenantCard'
 
 // Misc
-import { ADMIN_ROLE } from '../../permissions'
-import { getOrganizationBillingUrl } from '../../urls'
+import { getOrganizationBillingUrl, getOrganizationRolesUrl } from '../../urls'
 
 /**
  * Administering one organization: its name, its people, and its teams.
@@ -39,15 +38,16 @@ export function OrganizationSettingsPage() {
     (candidate) => candidate.id === organizationId,
   )
 
-  // Somebody invited into a single team appears under its organization with no
-  // organization roles at all, and the organization's own surface is closed to
-  // them: asking for the roster would only earn a 404.
-  const isOrganizationMember = Boolean(organization?.roles.length)
+  // Somebody invited into a single team appears under its organization without
+  // an organization membership, and the organization's own surface is closed
+  // to them: asking for the roster would only earn a 404.
+  const isOrganizationMember = Boolean(organization?.isMember)
 
   const roster = useSWR(
     isOrganizationMember ? `organization-members/${organizationId}` : null,
     () => api.listOrganizationMembers(organizationId),
   )
+  const roles = useRoles(isOrganizationMember ? { organizationId } : null)
 
   // RequireAuth guarantees a user before this page renders.
   if (!user) {
@@ -65,7 +65,8 @@ export function OrganizationSettingsPage() {
     </AppShell>
   }
 
-  const isAdmin = organization.roles.includes(ADMIN_ROLE)
+  const isAdmin = organization.access.isAdministrator
+  const mayInvite = allows(organization.access, 'create', MEMBERSHIP_SUBJECT)
 
   return <AppShell
     user={user}
@@ -118,6 +119,34 @@ export function OrganizationSettingsPage() {
         </div>
       </CardBody>
     </Card>
+    { isOrganizationMember
+      ? <Card className='relaxed p-2'>
+          <CardBody>
+            <div className='level items-start'>
+              <div>
+                <h3 className='compact text-xl font-semibold'>{
+                    t('roles.cardTitle')
+                  }</h3>
+                <p className='opacity-70'>{
+                    t('roles.cardSubtitle')
+                  }</p>
+              </div>
+              <Button
+                as={Link}
+                to={getOrganizationRolesUrl(organization.id)}
+                color='primary'
+                variant='flat'
+                className='shrink-0'
+              >
+                <span>{
+                    t('roles.cardAction')
+                  }</span>
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+      : null
+    }
     <OrganizationTeamsCard
       organizationId={organization.id}
       teams={organization.teams}
@@ -129,20 +158,22 @@ export function OrganizationSettingsPage() {
           organizationId={organization.id}
           members={roster.data ?? []}
           isLoading={roster.isLoading}
-          canManage={isAdmin}
+          catalog={roles.catalog}
           currentUserEmail={user.email}
           onChanged={() => {
             void roster.mutate()
+            void memberships.refresh()
           }}
         />
       : <p className='relaxed opacity-70'>{
           t('organization.settings.teamMemberOnly')
         }</p>
     }
-    { isAdmin
+    { mayInvite
       ? <InviteMemberCard
           title={t('organization.settings.inviteTitle')}
           organizationId={organization.id}
+          catalog={roles.catalog}
           onInvited={() => {
             void roster.mutate()
           }}

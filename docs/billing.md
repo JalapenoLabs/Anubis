@@ -168,7 +168,7 @@ Two mounts, both in the application's `main.rs` and both listed by `anubis route
 | `POST /billing/organizations/{organization_id}/reconcile` | org `admin` or `billing` | Reads Stripe and corrects what this application shows |
 | `POST /webhooks/stripe-billing` | a Stripe signature | Stores one Stripe event and queues the job that acts on it |
 
-Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. Spending money takes the `admin` role or the `billing` role, which the starter's `roles.yml` ships described as "can manage billing and subscriptions"; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on all four, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
+Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. Spending money takes `Billing::Subscription.update`, which the administrator role always holds and the framework grants the `billing` key (the starter's `roles.yml` ships it described as "can manage billing and subscriptions"), and which an organization may hand to a role of its own; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on all four, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
 
 The receiver is the exception to all of that: it is mounted under `/webhooks` rather than `/billing`, carries no guard, and authenticates its caller with a signature. See [the lifecycle](#the-subscription-lifecycle).
 
@@ -386,7 +386,7 @@ It renders in one shape with a few states:
 | Over the seat limit | A warning line under the seat count, which is where a soft limit shows itself |
 | Back from Stripe | `?checkout=success` or `?checkout=canceled` opens the page with the matching sentence. Neither is trusted: the subscription appears when Stripe's event arrives |
 
-Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for `admin` or `billing`, read from the compiled `roles.generated.ts` through `permissions.ts`, which is the same authority the endpoints enforce.
+Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for a member whose resolved access allows `Billing::Subscription.update`, read from the membership overview, which is the same authority the endpoints enforce.
 
 The refresh action is `POST .../reconcile`. It exists on the screen because the one thing a customer does after paying is come back and look, and an event that has not landed yet is the one moment the page can be wrong.
 

@@ -1,12 +1,12 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { TeamRosterMember } from '@jalapenolabs/anubis'
+import type { RoleCatalog, TeamRosterMember } from '@jalapenolabs/anubis'
 import type { ReactNode } from 'react'
 
 // Core
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi } from '@jalapenolabs/anubis'
+import { MEMBERSHIP_SUBJECT, allows, outranksMember, useAnubisApi } from '@jalapenolabs/anubis'
 
 // UI
 import {
@@ -21,6 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from '@heroui/react'
+import { RoleChips } from '../roles/RoleChips'
 import { ConfirmActionModal } from './ConfirmActionModal'
 import { EditMemberRolesModal } from './EditMemberRolesModal'
 
@@ -34,8 +35,8 @@ type Props = {
   teamId: string
   members: TeamRosterMember[]
   isLoading: boolean
-  /** True for a team admin: the roster becomes editable. */
-  canManage: boolean
+  /** The organization's roles, with the viewer's standing in the team. */
+  catalog: RoleCatalog | undefined
   /** The signed-in user's address, so their own row offers no removal. */
   currentUserEmail: string
   /** Revalidates the roster after a change lands. */
@@ -45,11 +46,12 @@ type Props = {
 /**
  * The team roster: who is here, what they may do, and who is still invited.
  *
- * Every member reads it; only an admin edits it, and the controls simply are
- * not rendered otherwise. That mirrors rather than replaces the server's
- * answer: the endpoints behind each control refuse a non-admin with `403`, and
- * every edit and removal goes through a dialog that keeps the refusal on screen
- * when the current state is what says no.
+ * Every member reads it. A row offers what the viewer may do to that member:
+ * changing roles takes `Tenancy::Membership.update`, removing somebody
+ * `Tenancy::Membership.destroy`, and both only for a member ranking below the
+ * viewer. That mirrors rather than replaces the server's answer, and every
+ * edit and removal goes through a dialog that keeps a refusal on screen when
+ * the current state is what says no.
  */
 export function TeamRosterCard(props: Props) {
   const { t } = useTranslation()
@@ -58,13 +60,17 @@ export function TeamRosterCard(props: Props) {
   const [ editing, setEditing ] = useState<TeamRosterMember | null>(null)
   const [ confirming, setConfirming ] = useState<PendingConfirmation | null>(null)
 
-  async function onSaveRoles(roles: string[]) {
+  const viewer = props.catalog?.viewer
+  const mayEditRoles = allows(viewer, 'update', MEMBERSHIP_SUBJECT)
+  const mayRemove = allows(viewer, 'destroy', MEMBERSHIP_SUBJECT)
+
+  async function onSaveRoles(roleIds: string[]) {
     if (!editing) {
       console.debug('roles saved with nobody being edited')
       return
     }
 
-    await api.changeTeamMemberRoles(props.teamId, editing.membershipId, roles)
+    await api.changeTeamMemberRoles(props.teamId, editing.membershipId, roleIds)
     props.onChanged()
   }
 
@@ -94,9 +100,7 @@ export function TeamRosterCard(props: Props) {
     }
 
     if (columnKey === 'roles') {
-      // Role keys are the application's own vocabulary, from roles.yml, and are
-      // shown as declared rather than translated.
-      return member.roles.join(', ')
+      return <RoleChips roles={member.roles} />
     }
 
     if (columnKey === 'status') {
@@ -111,26 +115,32 @@ export function TeamRosterCard(props: Props) {
         }</Chip>
     }
 
-    // An admin edits their own roles like anyone's, and the server decides
-    // whether the team can spare them; only removing yourself has its own way
-    // out, which is the danger zone below.
+    const isSelf = member.email === props.currentUserEmail
+    const reachable = Boolean(viewer && outranksMember(viewer, member.roles, isSelf))
+    // Your own roles are edited like anyone's, and the server decides whether
+    // the team can spare you; only removing yourself has its own way out,
+    // which is the danger zone below.
     return <div className='level-left gap-2'>
-      {/* `flat` rather than `light`: a neutral row action with no background
-          and no color is indistinguishable from the cell text beside it. */}
-      <Button
-        size='sm'
-        variant='flat'
-        onPress={() => setEditing(member)}
-      >
-        <span>{
-            t('team.members.editRolesAction')
-          }</span>
-      </Button>
-      { member.email === props.currentUserEmail
+      { mayEditRoles && reachable
+        ? <Button
+            size='sm'
+            variant='flat'
+            onPress={() => setEditing(member)}
+          >
+            <span>{
+                t('team.members.editRolesAction')
+              }</span>
+          </Button>
+        : null
+      }
+      { isSelf
         ? <span className='opacity-60'>{
             t('team.members.you')
           }</span>
-        : <Button
+        : null
+      }
+      { !isSelf && mayRemove && reachable
+        ? <Button
             size='sm'
             variant='light'
             color='danger'
@@ -145,6 +155,7 @@ export function TeamRosterCard(props: Props) {
                   : t('team.members.removeAction')
               }</span>
           </Button>
+        : null
       }
     </div>
   }
@@ -154,7 +165,7 @@ export function TeamRosterCard(props: Props) {
     { key: 'roles', label: t('team.members.rolesHeader') },
     { key: 'status', label: t('team.members.status') },
   ]
-  if (props.canManage) {
+  if (mayEditRoles || mayRemove) {
     columns.push({ key: 'actions', label: t('common.actions') })
   }
 
@@ -200,7 +211,10 @@ export function TeamRosterCard(props: Props) {
         </TableBody>
       </Table>
       <EditMemberRolesModal
-        member={editing}
+        key={editing?.membershipId ?? 'nobody'}
+        email={editing ? editing.email ?? '' : null}
+        heldRoleIds={editing?.roles.map((role) => role.id) ?? []}
+        catalog={props.catalog}
         onSave={onSaveRoles}
         onClose={() => setEditing(null)}
       />

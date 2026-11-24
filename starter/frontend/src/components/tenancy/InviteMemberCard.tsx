@@ -1,15 +1,17 @@
 // Copyright © 2026 Jalapeno Labs
 
+import type { RoleCatalog } from '@jalapenolabs/anubis'
+
 // Core
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi, getApiErrorMessage } from '@jalapenolabs/anubis'
+import { assignability, getApiErrorMessage, useAnubisApi } from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Card, CardBody, Input, Select, SelectItem } from '@heroui/react'
 
-// Misc
-import { ROLE_OPTIONS } from '../../permissions'
+/** The select's value for "no role beyond the one everybody holds". */
+const DEFAULT_ROLE_CHOICE = 'default'
 
 type Props = {
   title: string
@@ -17,25 +19,34 @@ type Props = {
   teamId?: string
   /** The organization invited into. Set exactly one of the two targets. */
   organizationId?: string
+  /** The organization's roles, with the inviter's standing where they invite. */
+  catalog: RoleCatalog | undefined
   /** Revalidates the roster, where the invitation now holds a place. */
   onInvited: () => void
 }
 
 /**
- * Invites an address to a team or to an organization.
+ * Invites an address to a team or to an organization, offering one role.
  *
  * The invitation is the credential: the server mails a link, and the roster
- * shows the place it holds until somebody claims it. Only an admin sees this
- * card, so a failure here is a real one and is shown rather than swallowed.
+ * shows the place it holds until somebody claims it. Only roles the inviter
+ * may hand out are offered, because the server refuses the rest; everybody
+ * invited holds the default role whatever else they are offered.
  */
 export function InviteMemberCard(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
 
   const [ email, setEmail ] = useState('')
-  const [ role, setRole ] = useState('default')
+  const [ role, setRole ] = useState(DEFAULT_ROLE_CHOICE)
   const [ isInviting, setIsInviting ] = useState(false)
   const [ outcome, setOutcome ] = useState<string | null>(null)
+
+  const { catalog } = props
+  const offered = catalog
+    ? catalog.roles.filter((candidate) => assignability(catalog.viewer, candidate) === null)
+    : []
+  const defaultRole = catalog?.roles.find((candidate) => candidate.isDefault)
 
   async function onInvite(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -46,7 +57,9 @@ export function InviteMemberCard(props: Props) {
         email: email.trim(),
         teamId: props.teamId,
         organizationId: props.organizationId,
-        roles: [ role ],
+        roleIds: role === DEFAULT_ROLE_CHOICE
+          ? []
+          : [ role ],
       })
       setOutcome(t('team.members.inviteSent', { email: email.trim() }))
       setEmail('')
@@ -69,15 +82,18 @@ export function InviteMemberCard(props: Props) {
       <form onSubmit={onInvite}>
         <div className='level items-start'>
           <Input
+            id='invite-email'
             type='email'
+            autoComplete='email'
             label={t('common.email')}
             className='w-full'
             value={email}
             onChange={(event) => setEmail(event.currentTarget.value)}
           />
           <Select
+            id='invite-role'
             label={t('team.members.role')}
-            className='w-48 shrink-0'
+            className='w-56 shrink-0'
             selectedKeys={[ role ]}
             onSelectionChange={(keys) => {
               const [ first ] = Array.from(keys)
@@ -86,13 +102,16 @@ export function InviteMemberCard(props: Props) {
               }
             }}
           >
-            {
-              ROLE_OPTIONS.map((option) => (
-                <SelectItem key={option}>{
-                    option
+            {[
+              <SelectItem key={DEFAULT_ROLE_CHOICE}>{
+                  defaultRole?.name ?? t('roles.onlyDefault')
+                }</SelectItem>,
+              ...offered.map((option) => (
+                <SelectItem key={option.id}>{
+                    option.name
                   }</SelectItem>
-              ))
-            }
+              )),
+            ]}
           </Select>
           <Button
             type='submit'

@@ -56,7 +56,7 @@ Notifying several people is a loop, and two helpers name the usual audiences: `n
 |---|---|---|
 | `INVITATION_RECEIVED` | `invitation.received` | The invitee, when the invited address already has an account |
 | `INVITATION_CLAIMED` | `invitation.claimed` | The admins of the team or organization that was joined |
-| `MEMBERSHIP_ROLES_CHANGED` | `membership.roles_changed` | The member whose roles changed |
+| `MEMBERSHIP_ROLES_CHANGED` | `membership.roles_changed` | The member whose roles changed, and every holder of a role that was deleted |
 | `WEBHOOK_DELIVERY_FAILED` | `webhook.delivery_failed` | The team's admins, when a delivery runs out of attempts |
 
 An invitation to an address with no account writes nothing: there is no inbox yet, and the email carries the invitation either way. The claim token stays in that email and never reaches a notification, because a token is a credential and the row would be holding it in the clear, so the notice says where to accept rather than linking to it.

@@ -8,6 +8,7 @@ import {
   UrlTree,
   getCreativeConceptUrl,
   getOauthStartUrl,
+  getOrganizationRoleUrl,
   getUrlWithDestination,
   sanitizeDestination,
 } from './urls'
@@ -81,6 +82,13 @@ describe('getOauthStartUrl', () => {
 
 // The link factory a model scaffold writes above the `url-factories` anchor.
 // Every generated page navigates through one, so the shape is worth pinning.
+describe('getOrganizationRoleUrl', () => {
+  it('should fill both the organization and the role', () => {
+    expect(getOrganizationRoleUrl('organization-1', 'role-2'))
+      .toBe('/organizations/organization-1/roles/role-2')
+  })
+})
+
 describe('getCreativeConceptUrl', () => {
   it('should fill the record id into the show route', () => {
     expect(getCreativeConceptUrl('9f8b7c6d')).toBe('/creative-concepts/9f8b7c6d')

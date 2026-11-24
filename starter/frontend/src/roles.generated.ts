@@ -46,17 +46,17 @@ export type RoleKey =
 export const RoleGrants = {
   admin: {
     'Billing::Subscription': [ 'update' ],
-    CreativeConcept: [ 'read', 'create', 'update', 'destroy' ],
-    GranularDetail: [ 'read', 'create', 'update', 'destroy' ],
-    PeripheralNotion: [ 'read', 'create', 'update', 'destroy' ],
-    TangibleThing: [ 'read', 'create', 'update', 'destroy' ],
+    'CreativeConcept': [ 'read', 'create', 'update', 'destroy' ],
+    'GranularDetail': [ 'read', 'create', 'update', 'destroy' ],
+    'PeripheralNotion': [ 'read', 'create', 'update', 'destroy' ],
+    'TangibleThing': [ 'read', 'create', 'update', 'destroy' ],
   },
   billing: {
     'Billing::Subscription': [ 'update' ],
-    CreativeConcept: [ 'read' ],
-    GranularDetail: [ 'read' ],
-    PeripheralNotion: [ 'read' ],
-    TangibleThing: [ 'read' ],
+    'CreativeConcept': [ 'read' ],
+    'GranularDetail': [ 'read' ],
+    'PeripheralNotion': [ 'read' ],
+    'TangibleThing': [ 'read' ],
   },
   default: {
     CreativeConcept: [ 'read' ],

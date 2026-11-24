@@ -152,7 +152,7 @@ let accepted = signature::verify(
 
 **Server-side request forgery.** A delivery is a request this server makes on a user's instruction, which is SSRF by construction. What is bounded today is the scheme, the absence of embedded credentials, the ten-second timeout, and the refusal to follow redirects. What is **not** bounded is a hostname that resolves to a private address, or one that resolves differently on the second lookup than on the first (DNS rebinding). Closing that needs resolution and connection to happen under one policy, and it is on the roadmap; an application on a network where reaching an internal address is dangerous should egress through a proxy that enforces the boundary. The gap is asserted rather than assumed: `webhook_endpoints_may_still_name_an_address_inside_the_network` in the adversarial suite subscribes a link-local address and expects it to be accepted, so the day the gap closes, the test fails and gets rewritten.
 
-**Authorization.** The management endpoints are team-scoped through the `TeamMember` guard and require the admin role, for the same reason platform applications do: a subscription decides where a team's records are sent. Another tenant's endpoint answers `404`, identically to one that does not exist.
+**Authorization.** The management endpoints are team-scoped through the `TeamMember` guard and require the administrator role, for the same reason platform applications do: a subscription decides where a team's records are sent, every model's payload included, so a role that could subscribe one could read through it what it may not read itself. Another tenant's endpoint answers `404`, identically to one that does not exist.
 
 **What a payload carries** is exactly what the team's own API answers with for that record. There is no wider view: a webhook cannot leak a column `/api/v1` does not serve.
 
@@ -173,7 +173,7 @@ Team-scoped, under `/developers`, beside the platform applications described in 
 
 The starter owns a Developers page per team, at `/teams/{teamId}/developers`. It is not at `/developers`, which the backend reserves for the API itself: a client route under a reserved prefix answers JSON on a cold load.
 
-The page hosts one card today. It lists the team's endpoints with their events and an active switch, subscribes new ones, and shows the signing secret in a modal that has to be dismissed, because there is no second chance to read it. Each row opens a delivery log showing the event, the status, the attempt count, the response code, the last error, and a redeliver button. A member without the admin role sees the list and no form, which mirrors the `403` the server would answer anyway.
+The page hosts one card today. It lists the team's endpoints with their events and an active switch, subscribes new ones, and shows the signing secret in a modal that has to be dismissed, because there is no second chance to read it. Each row opens a delivery log showing the event, the status, the attempt count, the response code, the last error, and a redeliver button. A member without the administrator role sees the list and no form, which mirrors the `403` the server would answer anyway.
 
 ## Incoming: receiving a third party's events
 

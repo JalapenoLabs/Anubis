@@ -33,7 +33,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 
 Mounting is one call. `anubis::api::v1::router_with(pool, application_router, document)` serves the framework's endpoints, the application's, the merged document at `/api/v1/openapi.json`, and the Scalar docs at `/api/v1/docs`.
 
-**What a token may do.** A platform application is created by a team admin, belongs to the team rather than to any member, and therefore acts with that team's full rights: `ApiCaller::require` authorizes against the compiled `roles.yml` holding the `admin` role, exactly as Bullet Train scopes a team token. Authorization is still the one permissions module, so a model no role may touch is refused on the API too, and a future per-application scope narrows the role list rather than introducing a second permission system. The token's team is the whole ownership chain: a record belonging to another team answers `404`, identically to one that does not exist.
+**What a token may do.** A platform application is created by a team administrator, belongs to the team rather than to any member, and therefore acts with that team's full rights: `ApiCaller::require` authorizes against the compiled `admin` grants of `roles.yml`, exactly as Bullet Train scopes a team token. It never reads the organization's runtime roles, because a token has no rank on the organization's ladder and no hierarchy to answer to; that is also why minting one stays with the administrator role. Authorization is still the one permissions module, so a model no role may touch is refused on the API too, and a future per-application scope narrows the role list rather than introducing a second permission system. The token's team is the whole ownership chain: a record belonging to another team answers `404`, identically to one that does not exist.
 
 **One serializer, two surfaces.** The generated handlers share the account handlers' request bodies and their `View` struct, so a column added by `anubis scaffold field` reaches the published contract with no second declaration. The `serde(flatten)` in the view reaches OpenAPI as a composition of the record's own schema, and the generated TypeScript renders it as an intersection.
 
@@ -90,9 +90,9 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 - **Invitations from an operator**: `POST /auth/invitations/lookup` (`{token}`) answers `{email, expires_at}` for a live link, and `POST /auth/invitations/accept` (`{token, password, time_zone?, locale?}`) creates the invited account with its address verified and signs it in, answering `201` with the user like registration does. Every unusable token, whether unknown, used, revoked, or expired, answers the same `400` with the same sentence; an address that gained an account after the invitation went out answers `409`. The operator's half is `anubis::platform::Accounts`, behind the application's own routes. See [tenancy.md](tenancy.md#bringing-people-in).
 - **Temporary passwords**: an account an operator gave a temporary password signs in normally, and its user carries `password_change_required: true`. Until it changes its password, every authenticated route except `GET /auth/me` and `POST /auth/change-password` answers `403` with the code `password_change_required`; `POST /auth/logout` was never gated. Setting the temporary password also revokes every OAuth grant the account held, and so does completing a password reset; a voluntary password change keeps them (see [oauth-server.md](oauth-server.md#when-the-password-is-replaced)). A connected client's bearer token on `/mcp` is otherwise answered with the same `403`. Changing the password refuses a new one equal to the current one, and clears the flag. See [tenancy.md](tenancy.md#temporary-passwords).
 - **Preferences at sign-up**: `POST /auth/register` takes an optional `time_zone` and `locale` beside the credentials, so an account starts in the person's own zone rather than `UTC`. `register()` in `@jalapenolabs/anubis` sends the browser's zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) unless the caller names one, and sends a locale only when the application passes it, because only the application knows which languages it ships. Both are held to the bound `PATCH /auth/profile` applies, and a value outside it is dropped for the column default rather than refusing the sign-up: the browser chose it, not the person.
-- **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the admin role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch, and `ApiCaller::require` authorizes the token's roles the way `TeamMember::require` authorizes a member's. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; framework API serializers live in the version module (`TeamV1`) and freeze with it, and an application's live in each model's own module.
+- **API**: per-team Platform Applications, each issuing bearer access tokens (Doorkeeper's role in Bullet Train). Tokens follow the framework discipline (256-bit, SHA-256 at rest, shown exactly once at creation or rotation) and do not expire; rotation and application deletion are the revocation paths. Management endpoints live under `/developers/teams/{team_id}/platform-applications` (create, list, delete, rotate-token), team-scoped through the `TeamMember` guard and restricted to the administrator role. The `ApiCaller` extractor resolves `Authorization: Bearer` to the owning application and team, which scopes everything a v1 handler may touch, and `ApiCaller::require` authorizes the token's roles the way `TeamMember::require` authorizes a member's. The framework ships `GET /api/v1/team` as the pattern's reference endpoint; framework API serializers live in the version module (`TeamV1`) and freeze with it, and an application's live in each model's own module.
 
-Authorization is identical in both paths: the compiled `roles.yml` permissions module authorizes every request against the membership's roles and the resource's ownership chain.
+Authorization follows the same vocabulary in both paths: a session is authorized against the permissions the caller's roles carry where the resource sits (see [tenancy.md](tenancy.md#roles-and-permissions)), a token against the compiled `admin` grants, and both walk the resource's ownership chain.
 
 ## Errors
 
@@ -272,23 +272,30 @@ The framework mounts the tenancy surface under `/tenancy`. These are account (br
 | `GET /tenancy/memberships` | signed in | Everything the caller belongs to, grouped by organization |
 | `GET /tenancy/teams/{team_id}/members` | team member | The team roster, pending invitations included |
 | `GET /tenancy/organizations/{organization_id}/members` | org member | The organization roster, pending invitations included |
-| `POST /tenancy/invitations` | admin on the target | Invite an email to a team or an organization |
+| `POST /tenancy/invitations` | `Tenancy::Membership.create` on the target | Invite an email to a team or an organization, offering roles by id |
 | `POST /tenancy/invitations/claim` | signed in | Claim an invitation token |
 | `POST /tenancy/organizations` | signed in | Create an organization with its default team |
-| `PATCH /tenancy/organizations/{organization_id}` | org admin | Rename the organization |
-| `DELETE /tenancy/organizations/{organization_id}` | org admin | Delete the organization and everything under it |
-| `POST /tenancy/organizations/{organization_id}/teams` | org admin | Create a team |
-| `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org admin | Delete a team and its records |
-| `DELETE /tenancy/organizations/{organization_id}/members/{membership_id}` | org admin | Remove an organization member |
+| `PATCH /tenancy/organizations/{organization_id}` | org administrator | Rename the organization |
+| `DELETE /tenancy/organizations/{organization_id}` | org administrator | Delete the organization and everything under it |
+| `POST /tenancy/organizations/{organization_id}/teams` | org administrator | Create a team |
+| `DELETE /tenancy/organizations/{organization_id}/teams/{team_id}` | org administrator | Delete a team and its records |
+| `PATCH /tenancy/organizations/{organization_id}/members/{membership_id}` | `Tenancy::Membership.update` | Replace a member's organization-wide roles |
+| `DELETE /tenancy/organizations/{organization_id}/members/{membership_id}` | `Tenancy::Membership.destroy` | Remove an organization member |
 | `POST /tenancy/organizations/{organization_id}/leave` | org member | Leave the organization |
-| `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | org admin | Revoke a pending invitation in the organization |
-| `PATCH /tenancy/teams/{team_id}` | team admin | Rename the team |
-| `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | team admin | Replace a member's roles |
-| `DELETE /tenancy/teams/{team_id}/members/{membership_id}` | team admin | Remove a member |
+| `DELETE /tenancy/organizations/{organization_id}/invitations/{invitation_id}` | `Tenancy::Membership.destroy` | Revoke a pending invitation in the organization |
+| `GET /tenancy/organizations/{organization_id}/roles` | org member | The organization's roles, the permission vocabulary, and the caller's standing |
+| `POST /tenancy/organizations/{organization_id}/roles` | `Tenancy::Role.create` | Make a role |
+| `PATCH /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.update` | Rename, recolour, or change a role's permissions; `permissions: null` returns a seeded role to following `roles.yml` |
+| `DELETE /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.destroy` | Delete a role, revoking it from everybody |
+| `PUT /tenancy/organizations/{organization_id}/role-order` | `Tenancy::Role.update` | Put every role but the two structural ones in a new order, highest first |
+| `PATCH /tenancy/teams/{team_id}` | team administrator | Rename the team |
+| `GET /tenancy/teams/{team_id}/roles` | team member | The organization's roles, with the caller's standing in the team |
+| `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | `Tenancy::Membership.update` | Replace a member's roles in the team, or with `resource_id` on one record of it |
+| `DELETE /tenancy/teams/{team_id}/members/{membership_id}` | `Tenancy::Membership.destroy` | Remove a member |
 | `POST /tenancy/teams/{team_id}/leave` | team member | Leave the team |
-| `DELETE /tenancy/teams/{team_id}/invitations/{invitation_id}` | team admin | Revoke a pending team invitation |
+| `DELETE /tenancy/teams/{team_id}/invitations/{invitation_id}` | `Tenancy::Membership.destroy` | Revoke a pending team invitation |
 
-Guarded routes answer `401` when signed out, `404` when the caller is not a member of the named tenant, and `403` when a member lacks the role. A request that only the current state refuses, such as demoting a team's last admin, answers `409 Conflict`.
+Guarded routes answer `401` when signed out, `404` when the caller is not a member of the named tenant (and for any id of another organization), and `403` when a member lacks the permission or the [role hierarchy](tenancy.md#the-hierarchy) refuses. A request that only the current state refuses, such as taking a team's last administrator's role, answers `409 Conflict`.
 
 ### The tenancy screens
 
@@ -297,9 +304,12 @@ Two screens cover the surface above, in the settings style the identity screens 
 | Screen | Route | What it does |
 |---|---|---|
 | Team settings | `/teams/{teamId}/settings` | Rename the team, edit the roster (roles, removal, revoking an invitation), invite, leave, and delete the team |
-| Organization settings | `/organizations/{organizationId}/settings` | Rename the organization, list and create and delete its teams, edit its roster, invite, leave, and delete the organization |
+| Organization settings | `/organizations/{organizationId}/settings` | Rename the organization, list and create and delete its teams, edit its roster and members' roles, invite, leave, and delete the organization |
+| Roles | `/organizations/{organizationId}/roles` | The ladder, highest first, reordered by dragging or with the move buttons |
+| New role | `/organizations/{organizationId}/roles/new` | Name, colour, and permission switches; a draft survives a reload |
+| Role | `/organizations/{organizationId}/roles/{roleId}` | Rename, recolour, and switch permissions, saved in the top right; return to the recommended permissions; delete |
 
-Affordances come from the compiled role set rather than from hand-written role strings: `roles.generated.ts` types the admin key the management endpoints ask for, so a member without it sees the roster read-only and no danger zone. The screen only mirrors the server, which still answers `403`, and the refusals worth reading (`409` for the last admin, `400` for removing yourself instead of leaving) are surfaced verbatim where the action was taken.
+Affordances come from the access the server resolved, never from role names: `GET /tenancy/memberships` answers each organization and team with the roles that apply, their permission keys, the rank, and whether the administrator role applies, and the screens draw a control only when that allows it. The package's `outranks`, `assignability`, and `outranksMember` mirror the hierarchy, so a role the viewer may not hand out is shown locked with the reason beneath it rather than offered and refused. The screens only mirror the server, which still answers `403`, and the refusals worth reading (`409` for the last administrator, `400` for removing yourself instead of leaving) are surfaced verbatim where the action was taken.
 
 Creating and dissolving tenants revalidates the membership overview, which is the switcher's own source, so a new team appears and a deleted one disappears everywhere at once; a selection that no longer resolves falls back to a team the user still belongs to.
 
@@ -310,8 +320,8 @@ The framework mounts the billing surface under `/billing`, beside tenancy and fo
 | Route | Guard | Effect |
 |---|---|---|
 | `GET /billing/organizations/{organization_id}` | org member | The plan in force, the subscription behind it, and whether billing is configured |
-| `POST /billing/organizations/{organization_id}/checkout` | org `admin` or `billing` | Opens a Stripe Checkout session, answers with its URL |
-| `POST /billing/organizations/{organization_id}/portal` | org `admin` or `billing` | Opens the Stripe customer portal, answers with its URL |
+| `POST /billing/organizations/{organization_id}/checkout` | `Billing::Subscription.update` | Opens a Stripe Checkout session, answers with its URL |
+| `POST /billing/organizations/{organization_id}/portal` | `Billing::Subscription.update` | Opens the Stripe customer portal, answers with its URL |
 
 The two write routes answer `503` when `STRIPE_SECRET_KEY` is unset, naming the variable, and `409` when the request collides with the current state (a second subscription, or a portal for an organization that has never bought anything). Reading works either way, because an application with no Stripe account is on the free plan and that is a complete answer.
 

@@ -149,7 +149,7 @@ Application migrations live in `starter/backend/migrations/`, are embedded with 
 
 ### Authorization in generated handlers
 
-Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts`) and use the `TeamMember` guard directly. Member routes are shallow (`/account/creative-concepts/{id}`, `/account/tangible-things/{id}`, `/account/granular-details/{id}`), so they resolve the chain with the model's own `load_for_member`, then authorize against the compiled `RoleSet` held in router state. Both paths answer `404` for records the caller cannot reach, so an id probe cannot tell a missing record from another tenant's.
+Collection routes hang off the team (`/account/teams/{team_id}/creative-concepts`) and use the `TeamMember` guard directly. Member routes are shallow (`/account/creative-concepts/{id}`, `/account/tangible-things/{id}`, `/account/granular-details/{id}`), so they resolve the chain with the model's own `load_for_member`, which ends in `anubis::tenancy::resolve_team_access` with the record and every parent of it as the records in hand, and authorize with the `Access` it answers: `access.require(Action::Update, MODEL)`. A role granted on the record, or on a record it is nested under, applies there and nowhere wider (see [tenancy.md](tenancy.md#grants-and-their-scope)). Both paths answer `404` for records the caller cannot reach, so an id probe cannot tell a missing record from another tenant's.
 
 The `/api/v1` handlers answer the same questions with a bearer token instead of a session: `ApiCaller` resolves the token to its team, `load_for_team` walks the chain in one comparison, and `ApiCaller::require` authorizes against the same `RoleSet`. [api.md](api.md#application-models) states what a token's roles are and why.
 
@@ -278,7 +278,7 @@ One run produces, on the backend:
 
 and on the frontend:
 
-- the ky route module (`frontend/src/api/routes/<model>Routes.ts`) with the wire type, the permission model key, and one function per endpoint
+- the ky route module (`frontend/src/api/routes/<model>Routes.ts`) with the wire type, the permission model key, and one function per endpoint; the pages ask `can(team.access.permissions, action, MODEL)`, the permissions the server resolved for the team
 - the form component (`frontend/src/components/<Model>Form.tsx`), one field component per attribute, creating or editing
 - the model's locale file (`frontend/src/locales/models/<models>.en-US.json`), and its import and spread in `i18n.ts`
 - the show page (`frontend/src/pages/<Model>Page.tsx`), its `UrlTree` entry and link factory in `urls.ts`, and its import and `<Route>` element in `App.tsx`

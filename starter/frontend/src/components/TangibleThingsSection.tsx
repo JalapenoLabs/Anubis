@@ -65,9 +65,9 @@ export function TangibleThingsSection(props: Props) {
     }),
   )
 
-  const heldRoles = current?.team.roles ?? []
-  const mayWrite = can(heldRoles, 'create', TANGIBLE_THING_MODEL)
-  const mayDestroy = can(heldRoles, 'destroy', TANGIBLE_THING_MODEL)
+  const permissions = current?.team.access.permissions ?? []
+  const mayWrite = can(permissions, 'create', TANGIBLE_THING_MODEL)
+  const mayDestroy = can(permissions, 'destroy', TANGIBLE_THING_MODEL)
   const pagination = tangibleThings.data?.pagination
 
   return <section>

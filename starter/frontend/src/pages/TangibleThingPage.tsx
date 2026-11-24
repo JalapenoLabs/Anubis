@@ -72,9 +72,9 @@ export function TangibleThingPage() {
   // Read once: the form writes into this team, and a scaffolded child's
   // association options are scoped to it.
   const teamId = parent?.team_id ?? ''
-  const heldRoles = current?.team.roles ?? []
-  const mayUpdate = can(heldRoles, 'update', TANGIBLE_THING_MODEL)
-  const mayDestroy = can(heldRoles, 'destroy', TANGIBLE_THING_MODEL)
+  const permissions = current?.team.access.permissions ?? []
+  const mayUpdate = can(permissions, 'update', TANGIBLE_THING_MODEL)
+  const mayDestroy = can(permissions, 'destroy', TANGIBLE_THING_MODEL)
 
   const breadcrumbs = [
     {

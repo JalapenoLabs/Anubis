@@ -63,14 +63,24 @@ pub(crate) fn render(set: &RoleSet) -> String {
             continue;
         }
         let _ = writeln!(out, "  {}: {{", key(role));
+        // The house lint quotes either every key of an object or none, and a
+        // namespaced subject (`Billing::Subscription`) always needs quotes.
+        let quote_all = grants
+            .iter()
+            .any(|(model, _actions)| key(model).as_str() != model.as_str());
         for (model, actions) in grants {
             let rendered_actions = actions
                 .iter()
                 .map(|action| format!("'{}'", action.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let rendered_key = if quote_all {
+                format!("'{}'", escape(model))
+            } else {
+                key(model)
+            };
             // House style pads array literals: `[ 'read' ]`, not `['read']`.
-            let _ = writeln!(out, "    {}: [ {rendered_actions} ],", key(model));
+            let _ = writeln!(out, "    {rendered_key}: [ {rendered_actions} ],");
         }
         out.push_str("  },\n");
     }
@@ -175,12 +185,34 @@ roles:
             rendered.contains("'Billing::Subscription': [ 'update' ],"),
             "the framework's grant to the billing key is visible, got:\n{rendered}"
         );
+
         assert!(rendered.contains("operator: {},"), "got:\n{rendered}");
         assert!(
             rendered.contains("export function can("),
             "got:\n{rendered}"
         );
         assert!(!rendered.contains(';'), "no semicolons, got:\n{rendered}");
+    }
+
+    #[test]
+    fn an_object_holding_one_quoted_key_quotes_them_all() {
+        let yaml = "
+roles:
+  billing:
+    models:
+      Project: [read]
+";
+        let set = RoleSet::from_yaml(yaml).expect("must parse");
+        let rendered = set.to_typescript();
+
+        assert!(
+            rendered.contains("    'Billing::Subscription': [ 'update' ],"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    'Project': [ 'read' ],"),
+            "the house lint quotes every key or none, got:\n{rendered}"
+        );
     }
 
     #[test]

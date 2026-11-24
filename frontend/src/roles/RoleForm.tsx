@@ -57,6 +57,8 @@ type Props = {
   /** The role being edited, or nothing for a new one. */
   role?: Role
   isDisabled?: boolean
+  /** Puts the cursor in the name field when the form appears. */
+  autoFocus?: boolean
   /**
    * How a subject reads. The framework's own subjects and the application's
    * models are identifiers; the page turns them into words.
@@ -118,6 +120,7 @@ export function RoleForm(props: Props) {
         label={labels.name}
         isRequired
         isDisabled={props.isDisabled}
+        autoFocus={props.autoFocus}
       />
       <ColorPickerField
         control={props.control}

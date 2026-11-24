@@ -78,7 +78,7 @@ export function CreativeConceptsPage() {
     </AppShell>
   }
 
-  const mayCreate = can(current.team.roles, 'create', CREATIVE_CONCEPT_MODEL)
+  const mayCreate = can(current.team.access.permissions, 'create', CREATIVE_CONCEPT_MODEL)
   const pagination = creativeConcepts.data?.pagination
 
   return <AppShell user={user} breadcrumbs={breadcrumbs}>
