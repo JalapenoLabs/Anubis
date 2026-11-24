@@ -64,6 +64,7 @@ The tier's foundation is the schema, the model, the resolution function, the gua
 - Management endpoints and screens for creating, renaming, and deleting a sub-tenant, managing its roster, scoping a team to it, and setting `access` and `suspended_at`. Until they exist, an application writes those columns itself.
 - The membership overview (`GET /tenancy/memberships`) does not yet group teams by sub-tenant.
 - The last-admin invariant does not yet cover suspension, because nothing in the framework creates one. The endpoint that does must take the same organization lock the other membership changes take.
+- Role grants at sub-tenant scope are read by the resolver and refused across organizations by the schema, but no endpoint writes them yet: they arrive with the sub-tenant roster endpoints. Until then an application writes `role_grants` rows naming the sub-tenant membership itself.
 
 ## The platform tier
 

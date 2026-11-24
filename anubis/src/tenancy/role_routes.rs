@@ -306,14 +306,15 @@ async fn update_role(
                 return Ok(current);
             }
 
-            let stored: Option<Vec<String>> = match &change {
-                PermissionsChange::Keep => current.permissions.clone(),
-                PermissionsChange::Follow => None,
-                PermissionsChange::Replace(after) => {
-                    Some(after.iter().map(ToString::to_string).collect())
-                }
+            // Null returns the role to following roles.yml; a set is its own.
+            let written = match &change {
+                PermissionsChange::Keep => None,
+                PermissionsChange::Follow => Some(None),
+                PermissionsChange::Replace(after) => Some(Some(
+                    after.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                )),
             };
-            if !matches!(change, PermissionsChange::Keep) {
+            if let Some(stored) = written {
                 diesel::update(role_rows::table.find(current.id))
                     .set(role_rows::permissions.eq(stored))
                     .execute(transaction)
