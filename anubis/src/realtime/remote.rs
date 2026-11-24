@@ -66,9 +66,11 @@ const KEY_PREFIX: &str = "{anubis:realtime}:";
 ///
 /// Both scripts are bounded per call, so a healthy Redis answers in a few
 /// milliseconds; the slowest honest call is a stream opening that reads every
-/// kept event of a few dozen backfill channels. Ten seconds is past that by
-/// far, and matches how long a stream waits to open, so a call that runs out
-/// of it means Redis is gone rather than busy.
+/// kept event of a few dozen backfill channels, which can run past a second.
+/// Ten seconds is past that by far, and matches how long a stream waits to
+/// open, so a call that runs out of it means Redis is gone rather than busy.
+/// The cost is that a publish to a Redis that went dark holds its caller this
+/// long before failing, well inside the request timeout.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the pump waits before its first reconnection attempt.

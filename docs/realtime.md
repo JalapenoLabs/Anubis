@@ -146,7 +146,7 @@ A stream answers with `Cache-Control: no-cache, no-transform` and `X-Accel-Buffe
 
 **Production must serve the application over HTTP/2.** Over HTTP/1.1 a browser opens at most six connections to one origin, counted across every tab on it, and an open stream holds one of them for as long as it is open. Every tab holds at least its `/realtime` stream, so with six tabs open a seventh has no connection left for its page, its API calls, or its own stream, and hangs until a tab closes. Over HTTP/2 every stream and request from every tab shares one connection, and the limit does not apply. The server itself speaks HTTP/1.1 and expects what is in front of it to terminate TLS and HTTP/2, which every common proxy, load balancer, and tunnel does: nginx with `http2 on`, Caddy, Cloudflare and its tunnels, and the cloud load balancers. Browsers speak HTTP/2 only over TLS, so a plain `http://` deployment cannot reach it.
 
-The Vite dev server proxies over HTTP/1.1, so development holds the same six connections per origin: past five tabs or so, close one, or open the next on another origin, such as `127.0.0.1` beside `localhost`, which keeps a separate pool and a separate sign-in.
+The Vite dev server proxies over HTTP/1.1, so development holds the same six connections per origin, and past six tabs of the application the next one waits for another to close.
 
 ## Why a fetch rather than EventSource
 

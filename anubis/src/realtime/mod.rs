@@ -624,13 +624,15 @@ impl ChannelsBuilder {
 
     /// Builds channels kept and fanned out through the Redis at `url`.
     ///
-    /// Redis is contacted here rather than at the first publish, so a
-    /// deployment that names an unreachable Redis fails at startup instead of
-    /// silently losing events.
+    /// Redis is contacted here rather than at the first publish, and the
+    /// snapshot script run once, so a deployment that names an unreachable
+    /// Redis, or one whose user may not run what the scripts run, fails at
+    /// startup instead of losing events. See `docs/realtime.md` for what the
+    /// Redis has to allow.
     ///
     /// # Errors
-    /// Returns an [`Error`] when the URL does not parse or Redis cannot be
-    /// reached.
+    /// Returns an [`Error`] when the URL does not parse, Redis cannot be
+    /// reached, or the scripts cannot run there.
     pub async fn build_redis(self, url: &str) -> Result<Channels, Error> {
         // The registry announces what this process carries, and the pump
         // follows those announcements. The pump holds only a weak handle on
@@ -656,7 +658,8 @@ impl ChannelsBuilder {
     /// choosing the backend is a deployment decision rather than a code change.
     ///
     /// # Errors
-    /// Returns an [`Error`] when a configured Redis cannot be reached.
+    /// Returns an [`Error`] when a configured Redis cannot be reached, or the
+    /// scripts cannot run there.
     pub async fn build(self, config: &AppConfig) -> Result<Channels, Error> {
         match &config.redis {
             Some(redis) => self.build_redis(redis.url()).await,
@@ -693,9 +696,10 @@ impl Error {
         }
     }
 
-    /// Returns `true` when the configured Redis could not be reached at all.
+    /// Returns `true` when the configured Redis could not be used at all.
     ///
-    /// This is a deployment problem: the URL is wrong, or Redis is not there.
+    /// This is a deployment problem: the URL is wrong, Redis is not there, or
+    /// its user may not run what the scripts run, such as `INFO`.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
         matches!(self.kind, ErrorKind::Configuration(_))

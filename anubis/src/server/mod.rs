@@ -198,6 +198,7 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(25);
 /// stream is dropped. Sixty seconds is nginx's `send_timeout`, the bound a
 /// proxied deployment already lives under, and far past any client that is
 /// reading at all.
+#[cfg(target_os = "linux")]
 const WRITE_STALL_LIMIT: Duration = Duration::from_mins(1);
 
 /// The header carrying a request's id back to the caller.
