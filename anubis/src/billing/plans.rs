@@ -39,10 +39,20 @@
 //!
 //! # The free plan
 //!
-//! Exactly one plan carries no prices, and that is the free plan. It is what
-//! an organization with no subscription resolves to, which makes plan
-//! resolution total: every organization is always on a plan, and no code path
-//! has to answer "what does an unsubscribed organization get".
+//! Exactly one plan carries no prices, leaving aside the plan `paid_plan`
+//! names, and that is the free plan. It is what an organization paying for
+//! nothing resolves to, which makes plan resolution total: every organization
+//! is always on a plan, and no code path has to answer "what does an
+//! unsubscribed organization get".
+//!
+//! # The paid plan and the wallet
+//!
+//! Two optional top-level keys sit beside `plans`. `paid_plan` names the plan
+//! an organization without a plan subscription is on while it pays for
+//! anything else, a subscription for one of its records or credit in its
+//! wallet; it may sell no prices of its own, and it is never the free plan.
+//! `wallet` is the [`WalletTerms`] prepaid credit is sold on. Absent, both
+//! leave plan resolution and billing exactly as they are without them.
 //!
 //! # Plans do not inherit
 //!

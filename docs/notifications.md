@@ -127,7 +127,7 @@ It is one component and one hook. `useNotifications` fetches the first page with
 
 The package imports no i18next and no router, so the bell takes its four strings as `labels` (English defaults) and its navigation as `onNavigate`, the same shape the field components use. Without a `RealtimeProvider` above it the bell still works; it just waits for its next fetch rather than being pushed.
 
-Because the framework stores rendered notices, it also has to name the screens its own notices point at: `/teams/{id}/settings` and `/teams/{id}/developers`. Those paths are a contract with the stamped application's `UrlTree`, the same one `anubis::billing` relies on when it hands Stripe a return URL. An application that renames the route updates both.
+Because the framework stores rendered notices, it also has to name the screens its own notices point at: `/teams/{id}/settings`, `/teams/{id}/developers`, and, for the wallet's notices, `/organizations/{id}/billing`. Those paths are a contract with the stamped application's `UrlTree`, the same one `anubis::billing` relies on when it hands Stripe a return URL. An application that renames the route updates both.
 
 ## What this deliberately leaves out
 

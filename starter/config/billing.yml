@@ -8,8 +8,8 @@
 #
 # Rules the validator enforces:
 #
-#   - Exactly one plan sells no prices. That is the free plan, and it is what an
-#     organization with no subscription is on.
+#   - Exactly one plan sells no prices, leaving aside the `paid_plan` below. That
+#     is the free plan, and it is what an organization paying for nothing is on.
 #   - Plan keys and limit names are lowercase letters, digits, and underscores:
 #     they are stored on subscriptions and read by the frontend.
 #   - A Stripe price belongs to one plan, because a price is what identifies the

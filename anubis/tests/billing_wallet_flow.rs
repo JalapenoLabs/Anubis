@@ -1373,3 +1373,136 @@ async fn a_top_up_while_stripe_is_unreachable_answers_unavailable() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
     assert!(scene.entries().await.is_empty(), "nothing is credited");
 }
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one narrative: a recharge's job and its events, landing in every order"
+)]
+async fn a_recharge_reaches_the_ledger_once_whichever_of_its_job_and_events_lands_first() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    let armed_attempt = || async {
+        let mut connection = scene.connection().await;
+        wallets::table
+            .find(scene.organization_id)
+            .select(wallets::recharge_attempt_id)
+            .first::<Option<Uuid>>(&mut connection)
+            .await
+            .expect("the wallet must read")
+    };
+    let recharge_metadata = |attempt: Uuid| {
+        json!({
+            "organization_id": scene.organization_id.to_string(),
+            "wallet": "recharge",
+            "recharge_attempt": attempt.to_string(),
+        })
+    };
+
+    // The job charges first; the payment's own event, delivered twice after
+    // it, credits nothing more.
+    scene.spend(6 * DOLLAR, "dip-1").await.expect("covered");
+    scene.recharge().await.expect("the recharge runs");
+    let charged = scene
+        .mock
+        .ledger()
+        .payments
+        .values()
+        .find(|payment| payment["metadata"]["wallet"] == "recharge")
+        .cloned()
+        .expect("the job charged the card");
+    scene
+        .deliver("evt_recharge_after", "payment_intent.succeeded", &charged)
+        .await;
+    scene
+        .deliver("evt_recharge_again", "payment_intent.succeeded", &charged)
+        .await;
+    assert_eq!(scene.balance().await, 14 * DOLLAR);
+    assert_eq!(scene.audited("wallet.recharged").await, 1);
+
+    // The charge's event lands before the job writes anything, as when the
+    // job's worker died after Stripe charged: the event credits and settles
+    // the attempt, and the job then finds nothing armed and charges nothing.
+    scene.spend(10 * DOLLAR, "dip-2").await.expect("covered");
+    let attempt = armed_attempt().await.expect("the dip armed an attempt");
+    scene.mock.pay(
+        "pi_recharge_first",
+        &scene.customer,
+        &recharge_metadata(attempt),
+        1_000,
+        &json!({ "payment_method": "pm_card_visa" }),
+    );
+    let early = scene.mock.payment("pi_recharge_first");
+    scene
+        .deliver("evt_recharge_first", "payment_intent.succeeded", &early)
+        .await;
+    assert_eq!(armed_attempt().await, None, "the event settled the attempt");
+    let charges_before = scene.mock.ledger().charges;
+    scene.recharge().await.expect("nothing armed");
+    assert_eq!(
+        scene.mock.ledger().charges,
+        charges_before,
+        "the job charged nothing"
+    );
+    assert_eq!(scene.balance().await, 14 * DOLLAR);
+    assert_eq!(scene.audited("wallet.recharged").await, 2);
+
+    // A decline, then its own failure event: one notice, one audit row.
+    scene.mock.ledger().next_update = Mishap::Decline;
+    scene.spend(10 * DOLLAR, "dip-3").await.expect("covered");
+    scene
+        .recharge()
+        .await
+        .expect("a decline is not a job failure");
+    let declined = scene
+        .mock
+        .ledger()
+        .payments
+        .values()
+        .find(|payment| payment["status"] == "requires_payment_method")
+        .cloned()
+        .expect("Stripe kept the declined payment");
+    scene
+        .deliver("evt_declined", "payment_intent.payment_failed", &declined)
+        .await;
+    assert_eq!(scene.notified("wallet.recharge_failed").await, 1);
+    assert_eq!(scene.audited("wallet.auto_recharge_failed").await, 1);
+
+    // A failure event landing before its job: the event ends the attempt and
+    // turns auto-recharge off, and the job finds nothing to do.
+    scene.top_up("pi_card_again", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    scene.spend(10 * DOLLAR, "dip-4").await.expect("covered");
+    let attempt = armed_attempt().await.expect("the dip armed an attempt");
+    scene.mock.pay(
+        "pi_recharge_refused",
+        &scene.customer,
+        &recharge_metadata(attempt),
+        1_000,
+        &json!({ "status": "requires_payment_method", "amount_received": 0 }),
+    );
+    let refused = scene.mock.payment("pi_recharge_refused");
+    scene
+        .deliver(
+            "evt_refused_first",
+            "payment_intent.payment_failed",
+            &refused,
+        )
+        .await;
+    assert_eq!(armed_attempt().await, None);
+    let charges_before = scene.mock.ledger().charges;
+    scene.recharge().await.expect("nothing armed");
+    assert_eq!(scene.mock.ledger().charges, charges_before);
+    assert_eq!(
+        scene.notified("wallet.recharge_failed").await,
+        2,
+        "one notice per failed attempt"
+    );
+    let (_status, body) = scene.billing_body(&scene.owner).await;
+    assert_eq!(body["wallet"]["auto_recharge"], Value::Null);
+    assert_eq!(scene.balance().await, scene.ledger_sum().await);
+}
