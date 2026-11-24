@@ -8,10 +8,11 @@
 //! caller's connection, exactly as it writes the row, and a [`Pinger`]
 //! registered on a worker publishes it once the transaction has committed.
 //!
-//! Nothing durable rides the socket. The frame carries the recipient and the
-//! word `created`, and the browser answers by reading `/account/notifications`
-//! again, so a client that was disconnected is never out of step for longer
-//! than its next fetch.
+//! Nothing durable rides the stream. The event carries the word `created` and
+//! an empty payload, and the browser answers by reading
+//! `/account/notifications` again. A browser that was disconnected hears the
+//! pings it missed from the replay log when it resumes, or a reset when the
+//! log no longer holds them, and refetches either way.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -143,8 +144,8 @@ mod tests {
             .expect("publishing in process never fails");
 
         // Nobody was listening, which is the common case and not a failure.
-        // What the frame says is asserted in `notifications_flow`, over a real
-        // socket; here the contract is that the event name never drifts.
+        // What the event says is asserted in `notifications_flow`, over a real
+        // stream; here the contract is that the event name never drifts.
         assert_eq!(EVENT, "created");
     }
 }

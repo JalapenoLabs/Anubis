@@ -64,6 +64,14 @@
 //! and never a knob on the timeout itself: a handler that reads a bounded body
 //! in bounded pieces is safe without one, and nothing else is.
 //!
+//! An event stream needs no declaration. The timeout clocks the handler,
+//! which for an upload includes reading the client's body, and for a stream
+//! ends the moment the stream is open and its head is sent. The body that
+//! follows is never timed, so a stream lives as long as its client listens,
+//! while its opening (the session check, the authorization, the replay read)
+//! stays bounded like any other request. The stream bounds itself from there:
+//! a lifetime, a heartbeat, and the drain below.
+//!
 //! # Compression
 //!
 //! One layer covers everything the server sends: the JavaScript bundle and the
@@ -92,6 +100,11 @@
 //! requests get [`SHUTDOWN_DRAIN`] to finish. Windows has no `SIGTERM`, so
 //! ctrl-c is the whole story there.
 //!
+//! A long-lived response would hold the drain for its whole window, so the
+//! moment it starts, [`serve_with_shutdown`] tells every request it serves:
+//! an open [`crate::realtime::EventStream`] ends at once, and its client
+//! resumes against whichever instance answers next.
+//!
 //! Applications that must coordinate shutdown with something else, a
 //! [`crate::jobs::Worker`] above all, drive both from one signal with
 //! [`serve_with_shutdown`].
@@ -115,13 +128,13 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, Response};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::{Extension, Router};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
@@ -252,6 +265,8 @@ pub async fn serve_with(
 ///
 /// Once `shutdown` resolves the listener closes at once and in-flight requests
 /// get [`SHUTDOWN_DRAIN`] to finish, after which the server returns anyway.
+/// Every request it serves can hear that moment, so an open event stream ends
+/// then rather than holding the drain until the window runs out.
 ///
 /// ```no_run
 /// # async fn boot(app: axum::Router, listener: tokio::net::TcpListener) {
@@ -275,6 +290,8 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Error> {
     let (drain_started, drain_starts) = oneshot::channel();
+    let (draining, drain) = watch::channel(false);
+    let app = app.layer(Extension(Drain(drain)));
 
     // Connect info, not just the router: the framework's rate limits charge
     // each request to the address it arrived from, which only the accept loop
@@ -285,6 +302,9 @@ pub async fn serve_with_shutdown(
     )
     .with_graceful_shutdown(async move {
         shutdown.await;
+        // Long-lived responses end first, so the drain below waits on the
+        // requests that are actually finishing rather than on open streams.
+        draining.send_replace(true);
         // The receiver is gone only if the server already stopped, in which
         // case there is nothing left to drain.
         let _ignored = drain_started.send(());
@@ -312,6 +332,24 @@ pub async fn serve_with_shutdown(
             );
             Ok(())
         }
+    }
+}
+
+/// The server's word that it has started to drain.
+///
+/// [`serve_with_shutdown`] puts one on every request it serves. A response
+/// that lives as long as its client wants, an event stream above all, listens
+/// for it and ends, because the drain exists for requests that are finishing
+/// and a stream is never finishing. A router served some other way carries
+/// none, and its streams end the way the connection does.
+#[derive(Debug, Clone)]
+pub(crate) struct Drain(watch::Receiver<bool>);
+
+impl Drain {
+    /// Resolves once the server has stopped accepting and begun its drain.
+    pub(crate) async fn started(&mut self) {
+        // A sender that is gone is a server that is gone, which is a drain too.
+        let _started = self.0.wait_for(|started| *started).await;
     }
 }
 
@@ -632,7 +670,10 @@ mod tests {
     use diesel_async::pooled_connection::deadpool::Pool;
     use tower::ServiceExt as _;
 
-    use super::{Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with};
+    use super::{
+        Drain, Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with,
+        serve_with_shutdown,
+    };
     use crate::config::AppConfig;
     use crate::db::DbPool;
 
@@ -699,6 +740,100 @@ mod tests {
             status_of(&app, Method::GET, "/slow").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// A body that keeps arriving for four times the test's timeout.
+    async fn trickle() -> Body {
+        let chunks = futures_util::stream::unfold(0_u8, |sent| async move {
+            if sent == 4 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((
+                Ok::<_, std::convert::Infallible>(vec![b'a' + sent]),
+                sent + 1,
+            ))
+        });
+        Body::from_stream(chunks)
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_outlives_the_timeout_without_a_declaration() {
+        // The timeout clocks the handler, and a stream's handler answers at
+        // once. What an event stream relies on, pinned: were the timeout ever
+        // to clock bodies, every stream would be cut thirty seconds in.
+        let router = Router::new().route("/stream", get(trickle));
+        let app = harden_with(
+            router,
+            unreachable_pool(),
+            &config(),
+            Hardening::new().timed_at(Duration::from_millis(30)),
+        );
+
+        let request = Request::builder()
+            .uri("/stream")
+            .body(Body::empty())
+            .expect("a well-formed request");
+        let response = app.oneshot(request).await.expect("the service answers");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the whole body arrives")
+            .to_bytes();
+        assert_eq!(&*body, b"abcd");
+    }
+
+    /// Waits for the server to start draining, then says so.
+    async fn wait_for_drain(axum::Extension(mut drain): axum::Extension<Drain>) -> &'static str {
+        drain.started().await;
+        "drained"
+    }
+
+    #[tokio::test]
+    async fn a_request_hears_the_drain_start_and_the_server_stops_without_waiting_it_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port must be available");
+        let address = listener.local_addr().expect("the listener is bound");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(serve_with_shutdown(
+            listener,
+            Router::new().route("/wait", get(wait_for_drain)),
+            async move {
+                let _stopped = stopped.await;
+            },
+        ));
+
+        let mut connection = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the server accepts");
+        connection
+            .write_all(b"GET /wait HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .expect("the request is written");
+        // Give the request time to reach its handler before shutdown starts.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _stopping = stop.send(());
+
+        let mut answer = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), connection.read_to_end(&mut answer)).await;
+        assert!(
+            read.is_ok(),
+            "the response must not wait out the drain window"
+        );
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.contains("drained"), "got: {answer}");
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the server stops well inside its drain window");
+        finished
+            .expect("the serve task does not panic")
+            .expect("the server stops cleanly");
     }
 
     #[tokio::test]

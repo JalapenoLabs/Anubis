@@ -55,11 +55,8 @@ export default defineConfig({
       '/users': 'http://127.0.0.1:3000',
       '/healthz': 'http://127.0.0.1:3000',
       '/readyz': 'http://127.0.0.1:3000',
-      // The realtime channel socket, which needs an explicit upgrade.
-      '/realtime': {
-        target: 'ws://127.0.0.1:3000',
-        ws: true,
-      },
+      // The realtime event stream: a long-lived GET like any other request.
+      '/realtime': 'http://127.0.0.1:3000',
     },
   },
 })

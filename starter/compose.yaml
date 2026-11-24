@@ -22,7 +22,8 @@ services:
       timeout: 5s
       retries: 15
 
-  # Realtime fanout across several instances. Off unless asked for:
+  # Realtime across several instances: the event sequence, the replay
+  # buffers, and the fanout. Off unless asked for:
   # `docker compose -f starter/compose.yaml --profile realtime up -d --wait`,
   # then run the server with REDIS_URL=redis://localhost:63790. Development
   # needs none of it, since realtime channels are served in process by

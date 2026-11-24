@@ -48,7 +48,7 @@
 //! [`PingRecipient`] job so a [`Pinger`] can publish on the recipient's
 //! `user:{user_id}:notifications` channel once the transaction commits; see
 //! [`ping`] for why a publish cannot happen where the row is written. Nothing
-//! durable rides the socket: the ping says "look again", and the browser does.
+//! durable rides the stream: the ping says "look again", and the browser does.
 //!
 //! [`webhooks::emit`]: crate::webhooks::emit
 

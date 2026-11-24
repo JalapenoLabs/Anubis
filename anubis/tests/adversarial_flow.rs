@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use support::{Harness, TestDatabase, register, send, socket};
+use support::{Harness, TestDatabase, register, send, stream};
 
 // ---------------------------------------------------------------------------
 // Request bodies
@@ -208,76 +208,116 @@ async fn fetch(app: &Router, path: &str) -> (StatusCode, String) {
 }
 
 // ---------------------------------------------------------------------------
-// The realtime socket
+// The realtime stream
 // ---------------------------------------------------------------------------
 
-/// The socket parses attacker-controlled text on an authenticated connection,
-/// so every malformed shape has to end in an answer or a close, never in a
-/// buffer the client chose the size of.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_realtime_socket_refuses_frames_no_client_would_send() {
+/// A stream reads channel names from a query string and a cursor from a
+/// header, both attacker-controlled on an authenticated request, so every
+/// malformed shape has to end in a refusal or a reset, never in a stream that
+/// carries more than it should or a cursor the server trusts.
+#[tokio::test]
+async fn the_realtime_stream_refuses_what_no_client_would_send() {
     let Some(database) = TestDatabase::create("adversarial_flow").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
-    let address = harness.serve();
+    let router = harness.router.clone();
+    let cookie = register(&router, "prober@example.com").await;
+    let (status, _headers, me) = send(&router, "GET", "/auth/me", None, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mine = format!("user:{}:inbox", me["user"]["id"].as_str().expect("an id"));
+    let stranger = format!("user:{}:inbox", Uuid::new_v4());
 
-    let cookie = register(&harness.router, "prober@example.com").await;
-    let mut probe = socket::connect(address, &cookie).await;
+    // Names that are not names, beside one that is: each is refused on its
+    // own, and the stream still carries the one that may be heard.
+    let garbage = [
+        "plain text",
+        "team:not-a-uuid:projects",
+        "organization:00000000-0000-0000-0000-000000000000:audits",
+        "user:00000000-0000-0000-0000-000000000000:Upper",
+    ];
+    let mut names: Vec<&str> = garbage.to_vec();
+    names.push(&mine);
+    let mut probe = stream::connect(&router, &stream::path(&names, &[]), &cookie, None).await;
+    let opening = probe.opening().await;
+    for name in garbage {
+        let refused = opening
+            .refusal(name)
+            .unwrap_or_else(|| panic!("{name:?} must be refused: {opening:?}"));
+        assert_eq!(refused.frame["code"], json!("invalid_channel"), "{name:?}");
+    }
+    assert_eq!(opening.resets(), vec![mine.as_str()]);
+    drop(probe);
 
-    // Text that is not a frame at all.
-    socket::send(&mut probe, &json!("plain text")).await;
-    let reply = socket::next_frame(&mut probe).await;
-    assert_eq!(reply["code"], json!("invalid_frame"), "reply: {reply}");
+    // Somebody else's user channel is refused as absent, which is the
+    // stream's form of the `404` the ownership guards answer.
+    let mut probe = stream::connect(&router, &stream::path(&[&stranger], &[]), &cookie, None).await;
+    let opening = probe.opening().await;
+    let refused = opening
+        .refusal(&stranger)
+        .expect("a stranger's inbox is refused");
+    assert_eq!(refused.frame["code"], json!("not_found"));
+    assert!(opening.resets().is_empty());
+    drop(probe);
 
-    // A frame naming a type the protocol does not have.
-    socket::send(&mut probe, &json!({ "type": "publish", "channel": "x" })).await;
-    let reply = socket::next_frame(&mut probe).await;
-    assert_eq!(reply["code"], json!("invalid_frame"), "reply: {reply}");
-
-    // A channel name that is not one.
-    let reply = socket::subscribe(&mut probe, "team:not-a-uuid:projects").await;
-    assert_eq!(reply["code"], json!("invalid_frame"), "reply: {reply}");
-
-    // Somebody else's user channel: refused as absent, which is the socket's
-    // form of the `404` the ownership guards answer.
-    let stranger = Uuid::new_v4();
-    let reply = socket::subscribe(&mut probe, &format!("user:{stranger}:inbox")).await;
-    assert_eq!(reply["code"], json!("not_found"), "reply: {reply}");
-
-    // Unsubscribing from something never held is satisfied, not an error: the
-    // client's intent holds either way.
-    socket::send(
-        &mut probe,
-        &json!({ "type": "unsubscribe", "channel": format!("user:{stranger}:inbox") }),
+    // A name given twice is carried once, so it cannot be delivered twice.
+    let mut probe = stream::connect(
+        &router,
+        &stream::path(&[&mine, &mine, &mine], &[]),
+        &cookie,
+        None,
     )
     .await;
-    let reply = socket::next_frame(&mut probe).await;
-    assert_eq!(reply["type"], json!("unsubscribed"), "reply: {reply}");
+    assert_eq!(probe.opening().await.resets(), vec![mine.as_str()]);
+    drop(probe);
 
-    // A binary frame is not part of the protocol, and is dropped rather than
-    // ending the conversation: the next text frame still gets its answer.
-    socket::send_binary(&mut probe, vec![0xFF; 1024]).await;
-    socket::send(
-        &mut probe,
-        &json!({ "type": "unsubscribe", "channel": "user:x:y" }),
-    )
-    .await;
-    let reply = socket::next_frame(&mut probe).await;
-    assert_eq!(
-        reply["type"],
-        json!("unsubscribed"),
-        "a binary frame must not derail the socket: {reply}",
-    );
+    // A cursor the server never sent, in shapes from plausible to absurd,
+    // is never resumed from: the channel resets and nothing is replayed.
+    let huge = "9".repeat(4096);
+    for cursor in [
+        "0000000000000000-18446744073709551616",
+        "ffffffffffffffff-18446744073709551615",
+        "-1",
+        huge.as_str(),
+    ] {
+        let mut probe =
+            stream::connect(&router, &stream::path(&[&mine], &[]), &cookie, Some(cursor)).await;
+        let opening = probe.opening().await;
+        assert_eq!(opening.resets(), vec![mine.as_str()], "cursor {cursor:?}");
+        assert!(opening.of_kind("event").is_empty(), "cursor {cursor:?}");
+    }
 
-    // A frame past the incoming limit ends the connection instead of being
-    // buffered, which is the whole point of setting one.
-    let huge = "a".repeat(16 * 1024);
-    socket::send(&mut probe, &json!({ "type": "subscribe", "channel": huge })).await;
-    assert!(
-        socket::is_closed(&mut probe).await,
-        "an oversized frame must close the socket, not be read",
-    );
+    // A header that is not text at all is no cursor either.
+    let request = Request::builder()
+        .uri(stream::path(&[&mine], &[]))
+        .header(COOKIE, format!("anubis_session={cookie}"))
+        .header(
+            "last-event-id",
+            axum::http::HeaderValue::from_bytes(&[0xFF, 0xFE]).expect("opaque bytes are allowed"),
+        )
+        .body(Body::empty())
+        .expect("the request must build");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router must answer");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A channel list past the limit is refused before any stream exists,
+    // and so is one that names nothing at all.
+    let many: Vec<String> = (0..65)
+        .map(|index| format!("user:{}:t{index}", Uuid::new_v4()))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let (status, _body) = stream::open(&router, &stream::path(&many, &[]), Some(&cookie), None)
+        .await
+        .expect_err("too many channels must be refused");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _body) = stream::open(&router, "/realtime?channels=,,,", Some(&cookie), None)
+        .await
+        .expect_err("no channels must be refused");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------

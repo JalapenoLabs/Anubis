@@ -18,24 +18,20 @@ use anubis::server;
 use axum::Router;
 use axum::body::Body;
 use axum::http::header::{
-    ACCEPT_ENCODING, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
-    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD,
-    CONTENT_ENCODING, CONTENT_SECURITY_POLICY, ORIGIN, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
-    VARY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_ENCODING,
+    CONTENT_SECURITY_POLICY, ORIGIN, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, VARY,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::get;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as ClientMessage;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 /// The header the framework returns every request's id in.
@@ -210,7 +206,7 @@ async fn every_response_carries_the_security_headers() {
         Some(
             "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
              img-src 'self' data: blob:; font-src 'self'; \
-             connect-src 'self' ws://127.0.0.1:3000; base-uri 'self'; form-action 'self'; \
+             connect-src 'self'; base-uri 'self'; form-action 'self'; \
              frame-ancestors 'none'"
         ),
     );
@@ -245,11 +241,8 @@ async fn the_single_page_application_shell_carries_the_whole_policy() {
         policy.contains("img-src 'self' data: blob:;"),
         "got: {policy}"
     );
-    // The realtime channel, named rather than left to `'self'` matching.
-    assert!(
-        policy.contains("connect-src 'self' wss://app.example.com;"),
-        "got: {policy}",
-    );
+    // The realtime stream is a same-origin fetch, so `'self'` covers it.
+    assert!(policy.contains("connect-src 'self';"), "got: {policy}");
     assert!(policy.contains("default-src 'none';"), "got: {policy}");
     assert!(policy.contains("base-uri 'self';"), "got: {policy}");
     assert!(policy.contains("form-action 'self';"), "got: {policy}");
@@ -281,7 +274,7 @@ async fn an_application_adds_its_own_sources_without_losing_the_frameworks() {
         "got: {policy}",
     );
     assert!(
-        policy.contains("connect-src 'self' wss://app.example.com https://plausible.io;"),
+        policy.contains("connect-src 'self' https://plausible.io;"),
         "got: {policy}",
     );
 }
@@ -516,12 +509,13 @@ async fn a_tiny_body_is_not_worth_compressing() {
     );
 }
 
-/// The realtime socket runs through the same stack the compression layer is
-/// in, and a `101` carries no body to compress. Proven over a real connection,
-/// because an upgrade is one of the few things `oneshot` cannot show.
+/// An event stream runs through the same stack the compression layer is in,
+/// and a compressor that waited to fill a window would hold every event back.
+/// Proven over a real connection, because what matters is when each event
+/// reaches the wire, which `oneshot` cannot show.
 #[tokio::test]
-async fn a_websocket_still_upgrades_through_the_hardened_stack() {
-    use axum::extract::ws::{Message as ServerMessage, WebSocket, WebSocketUpgrade};
+async fn an_event_stream_leaves_the_hardened_stack_event_by_event_and_uncompressed() {
+    use axum::response::sse::{Event, Sse};
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -530,64 +524,65 @@ async fn a_websocket_still_upgrades_through_the_hardened_stack() {
         .local_addr()
         .expect("a bound listener has an address");
 
-    let sockets = Router::new().route(
+    // One event now and one a long while later: the first must arrive while
+    // the second is still pending.
+    let streams = Router::new().route(
         "/realtime",
-        get(|upgrade: WebSocketUpgrade| async move {
-            upgrade.on_upgrade(|mut socket: WebSocket| async move {
-                while let Some(Ok(message)) = socket.recv().await {
-                    if let ServerMessage::Text(text) = message {
-                        let _ignored = socket.send(ServerMessage::Text(text)).await;
+        get(|| async {
+            let events = futures_util::stream::unfold(0_u8, |sent| async move {
+                match sent {
+                    0 => Some((
+                        Ok::<_, std::convert::Infallible>(Event::default().data("first")),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_mins(1)).await;
+                        Some((Ok(Event::default().data("never")), 2))
                     }
+                    _ => None,
                 }
-            })
+            });
+            Sse::new(events)
         }),
     );
 
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let app = app(&config(&[]), sockets);
-    let serving = tokio::spawn(server::serve_with_shutdown(listener, app, async {
-        let _stopped = stopped.await;
-    }));
+    let app = app(&config(&[]), streams);
+    let serving = tokio::spawn(server::serve_with_shutdown(
+        listener,
+        app,
+        std::future::pending(),
+    ));
 
-    let mut request = format!("ws://{address}/realtime")
-        .into_client_request()
-        .expect("the websocket URL must parse");
-    // The header that would tempt a compression layer to touch the upgrade.
-    request.headers_mut().insert(
-        ACCEPT_ENCODING,
-        axum::http::HeaderValue::from_static("br, gzip"),
-    );
-
-    let (mut socket, response) = connect_async(request)
+    let mut connection = TcpStream::connect(address)
         .await
-        .expect("the upgrade must succeed");
-    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        .expect("the server must accept");
+    // The header that would tempt a compression layer to touch the stream.
+    connection
+        .write_all(b"GET /realtime HTTP/1.1\r\nhost: test\r\naccept-encoding: br, gzip\r\n\r\n")
+        .await
+        .expect("the request must be written");
+
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !String::from_utf8_lossy(&received).contains("data: first") {
+        let read = tokio::time::timeout(Duration::from_secs(5), connection.read(&mut chunk))
+            .await
+            .expect("the first event must reach the wire on its own")
+            .expect("the connection must be readable");
+        assert!(read > 0, "the stream closed early");
+        received.extend_from_slice(&chunk[..read]);
+    }
+    let head = String::from_utf8_lossy(&received).to_lowercase();
+    assert!(head.contains("content-type: text/event-stream"), "{head}");
     assert!(
-        response.headers().get(CONTENT_ENCODING).is_none(),
-        "an upgrade must not be encoded",
+        !head.contains("content-encoding"),
+        "an event stream must not be compressed: {head}",
     );
 
-    socket
-        .send(ClientMessage::text("ping"))
-        .await
-        .expect("the socket must accept a frame");
-    let echoed = socket
-        .next()
-        .await
-        .expect("the echo must arrive")
-        .expect("the socket must stay open")
-        .into_text()
-        .expect("the echo is a text frame");
-    assert_eq!(echoed.as_str(), "ping");
-
-    let _closed = socket.close(None).await;
-    stop.send(()).expect("the server must still be listening");
-    let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
-        .await
-        .expect("the server must exit once the socket closes");
-    outcome
-        .expect("the serving task must not panic")
-        .expect("a drained shutdown is a clean exit");
+    // This stream does not listen for a drain, so the test ends the server
+    // outright rather than wait out its window; `realtime_flow` proves the
+    // framework's own streams end on the drain.
+    serving.abort();
 }
 
 /// The clock is paused, so tokio advances it to the timeout rather than

@@ -1,467 +1,748 @@
-//! Realtime channels over a real websocket, against a real Postgres database.
+//! Realtime over Server-Sent Events, end to end, in both backends.
 //!
-//! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
-//! always provides one. The Redis-backed test additionally requires
-//! `REDIS_URL` and skips on its own when that is absent, so a machine without
-//! Redis still runs everything the in-process backend covers.
+//! One narrative, run twice: once with everything in process, and once with
+//! the sequence, the replay log, and the fanout in Redis, where the stream is
+//! served by one instance, the events are published through a second, and the
+//! client resumes on a third. It covers what a stream may carry (who may open
+//! one and which channels it is refused), what it carries (payloads, exactly
+//! as published, with ids), and how it picks up after a drop (an exact replay,
+//! and a reset wherever an exact replay is no longer possible).
+//!
+//! Beside it, what only Redis can lose (its data, and with it the epoch) and
+//! what only a running server can do (drain), each in a test of its own.
+//!
+//! Requires `DATABASE_URL`; the Redis tests also require `REDIS_URL`. Each
+//! logs a skip and passes without them. CI provides both.
 
-use std::net::SocketAddr;
+mod support;
+
 use std::time::Duration;
 
-use anubis::realtime::{ChannelName, Channels};
-use anubis::schema::{team_memberships, teams, users};
-use axum::Router;
-use axum::body::Body;
-use axum::http::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use anubis::realtime::{ChannelName, Channels, ChannelsBuilder};
+use anubis::schema::organization_memberships;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::{HeaderValue, StatusCode};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use futures_util::{SinkExt, StreamExt};
-use http_body_util::BodyExt;
-use serde_json::{Value, json};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tower::ServiceExt;
+use serde_json::json;
+use support::stream::{self, Opening, Received};
+use support::{Harness, TestDatabase, register, send};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-/// The starter's roles, trimmed to what tenancy bootstrapping needs.
-const ROLES_YML: &str = "
-roles:
-  default:
-    models: {}
-  admin:
-    includes: [default]
-    models:
-      Team: [manage]
-";
+/// A topic whose channels keep two events, so a test can outrun its buffer.
+const SHORT_TOPIC: &str = "burst";
 
-/// How long a test waits for a frame before calling the socket broken.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// A topic that keeps more events than a stream may fall behind by, so a
+/// stream cut for falling behind can resume exactly.
+const LONG_TOPIC: &str = "flood";
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// How many events the stalled stream is sent: more than its queue holds.
+const FLOOD: usize = 300;
 
-/// The composed application, served on a real port so websockets can connect.
-struct TestServer {
-    router: Router,
-    address: SocketAddr,
-    channels: Channels,
-    pool: anubis::db::DbPool,
+/// How many events one stream's queue holds before it is cut.
+const BACKLOG: usize = 256;
+
+/// One deployment's realtime, as the narrative sees it.
+struct Deployment {
+    /// The instance the browser streams from first.
+    serving: Harness,
+    /// What the application publishes through.
+    publishing: Channels,
+    /// The instance the browser resumes on.
+    resuming: Harness,
 }
 
-impl TestServer {
-    /// Boots the framework routers over `database_url`, with `channels`.
-    async fn start(database_url: &str, channels: Channels) -> Self {
-        anubis::db::run_pending_migrations(database_url)
-            .await
-            .expect("migrations must apply");
-        let pool = anubis::db::connect(database_url)
-            .await
-            .expect("database must be reachable");
-
-        let config = anubis::config::AppConfig::from_lookup(|name| match name {
-            "ANUBIS_ENV" => Some("test".to_owned()),
-            _ => None,
-        })
-        .expect("test config must parse");
-        let roles = anubis::roles::RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
-        let (mailer, _outbox) = anubis::mail::Mailer::test();
-        let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
-
-        let router = Router::new()
-            .merge(anubis::realtime::router(pool.clone(), channels.clone()))
-            .nest(
-                "/auth",
-                anubis::auth::router(pool.clone(), mailer.clone(), &config, &rate_limit),
-            )
-            .nest(
-                "/tenancy",
-                anubis::tenancy::router(
-                    pool.clone(),
-                    mailer,
-                    roles.clone(),
-                    None,
-                    &config,
-                    &rate_limit,
-                ),
-            )
-            .layer(anubis::guard::layer(pool.clone(), roles));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port must be available");
-        let address = listener.local_addr().expect("the listener must be bound");
-
-        let serving = router.clone();
-        tokio::spawn(async move {
-            let _served = axum::serve(
-                listener,
-                serving.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await;
-        });
-
-        Self {
-            router,
-            address,
-            channels,
-            pool,
-        }
-    }
-
-    /// Registers a user and returns their session token.
-    async fn register(&self, email: &str) -> String {
-        let credentials = json!({ "email": email, "password": "correct horse battery staple" });
-        let request = Request::builder()
-            .method("POST")
-            .uri("/auth/register")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&credentials).expect("credentials serialize"),
-            ))
-            .expect("request must build");
-
-        let response = self
-            .router
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("registration must complete");
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body must collect")
-            .to_bytes();
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "body: {}",
-            String::from_utf8_lossy(&body),
-        );
-
-        session_token(&headers)
-    }
-
-    /// Opens a websocket carrying `session`, or returns the refusal status.
-    async fn connect(&self, session: Option<&str>) -> Result<Socket, StatusCode> {
-        let mut request = format!("ws://{}/realtime", self.address)
-            .into_client_request()
-            .expect("the URL must be a valid websocket request");
-        if let Some(token) = session {
-            request.headers_mut().insert(
-                COOKIE,
-                HeaderValue::from_str(&format!("anubis_session={token}"))
-                    .expect("a token is a valid header value"),
-            );
-        }
-
-        match connect_async(request).await {
-            Ok((socket, _response)) => Ok(socket),
-            Err(WsError::Http(response)) => Err(response.status()),
-            Err(other) => panic!("the upgrade failed for the wrong reason: {other}"),
-        }
-    }
-}
-
-fn session_token(headers: &HeaderMap) -> String {
-    for value in headers.get_all(SET_COOKIE) {
-        if let Some(rest) = value
-            .to_str()
-            .ok()
-            .and_then(|rendered| rendered.strip_prefix("anubis_session="))
-        {
-            let token = rest.split(';').next().unwrap_or_default();
-            if !token.is_empty() {
-                return token.to_owned();
-            }
-        }
-    }
-    panic!("no session cookie in response");
-}
-
-/// Sends one client frame.
-async fn send(socket: &mut Socket, frame: &Value) {
-    socket
-        .send(Message::Text(frame.to_string().into()))
-        .await
-        .expect("the socket must accept a frame");
-}
-
-/// Reads the next server frame, ignoring the heartbeat traffic around it.
-async fn next(socket: &mut Socket) -> Value {
-    let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
-    loop {
-        let message = tokio::time::timeout_at(deadline, socket.next())
-            .await
-            .expect("a frame must arrive before the timeout")
-            .expect("the socket must stay open")
-            .expect("the frame must be readable");
-
-        match message {
-            Message::Text(text) => {
-                return serde_json::from_str(&text).expect("server frames are JSON");
-            }
-            Message::Ping(_) | Message::Pong(_) => {}
-            other => panic!("unexpected websocket message: {other:?}"),
-        }
-    }
-}
-
-/// The team the freshly registered user was bootstrapped into.
-async fn bootstrapped_team(pool: &anubis::db::DbPool, email: &str) -> (Uuid, Uuid) {
-    let mut connection = pool.get().await.expect("connection must be available");
-    let user_id: Uuid = users::table
-        .filter(users::email.eq(email))
-        .select(users::id)
-        .first(&mut connection)
-        .await
-        .expect("the user must exist");
-    let team_id: Uuid = teams::table
-        .inner_join(
-            team_memberships::table.on(team_memberships::team_id
-                .eq(teams::id)
-                .and(team_memberships::user_id.eq(user_id))),
-        )
-        .select(teams::id)
-        .first(&mut connection)
-        .await
-        .expect("the bootstrapped team must exist");
-
-    (user_id, team_id)
+/// The retention every instance in these tests builds with.
+fn retention() -> ChannelsBuilder {
+    Channels::builder()
+        .retain(SHORT_TOPIC, 2)
+        .retain(LONG_TOPIC, 1_024)
 }
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one linear end-to-end narrative over a single websocket flow"
-)]
-async fn realtime_channels_authorize_subscribers_and_deliver_events() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skipping realtime_flow test: DATABASE_URL is not set");
+async fn in_process_streams_authorize_deliver_and_resume() {
+    let Some(database) = TestDatabase::create("realtime_flow in process").await else {
+        return;
+    };
+    let channels = retention().build_in_process();
+    let harness = Harness::boot_with_channels(&database, channels.clone()).await;
+
+    narrative(Deployment {
+        serving: harness.clone(),
+        publishing: channels,
+        resuming: harness,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn redis_streams_authorize_deliver_and_resume_across_instances() {
+    let Some(redis_url) = redis_url("realtime_flow redis") else {
+        return;
+    };
+    let Some(database) = TestDatabase::create("realtime_flow redis").await else {
         return;
     };
 
-    let server = TestServer::start(&database_url, Channels::in_process()).await;
+    // Three independent handles on one Redis stand in for three instances:
+    // nothing but Redis can carry an event, or a replay, between them.
+    let mut instances = Vec::new();
+    for _instance in 0..3 {
+        let channels = retention()
+            .build_redis(&redis_url)
+            .await
+            .expect("REDIS_URL must name a reachable Redis");
+        instances.push(channels);
+    }
+    let [serving, publishing, resuming]: [Channels; 3] =
+        instances.try_into().expect("three instances were built");
 
-    let run = Uuid::new_v4();
-    let member_email = format!("realtime-member-{run}@example.com");
-    let outsider_email = format!("realtime-outsider-{run}@example.com");
-    let member_session = server.register(&member_email).await;
-    let outsider_session = server.register(&outsider_email).await;
-    let (member_id, team_id) = bootstrapped_team(&server.pool, &member_email).await;
-    let (outsider_id, _outsider_team) = bootstrapped_team(&server.pool, &outsider_email).await;
+    narrative(Deployment {
+        serving: Harness::boot_with_channels(&database, serving).await,
+        publishing,
+        resuming: Harness::boot_with_channels(&database, resuming).await,
+    })
+    .await;
+}
 
-    let projects = ChannelName::team(team_id, "projects");
-    let inbox = ChannelName::user(member_id, "inbox");
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear story: who may stream, what a stream carries, and how it resumes"
+)]
+async fn narrative(deployment: Deployment) {
+    let router = deployment.serving.router.clone();
+    let resuming = deployment.resuming.router.clone();
+    let publishing = &deployment.publishing;
 
-    // An upgrade without a session never becomes a websocket.
-    let refused = server
-        .connect(None)
+    let member = register(&router, "member@realtime.test").await;
+    let outsider = register(&router, "outsider@realtime.test").await;
+    let member_id = user_id(&router, &member).await;
+    let outsider_id = user_id(&router, &outsider).await;
+    let team_id = deployment.serving.bootstrapped_team(&member).await;
+
+    let projects = ChannelName::team(team_id, "projects").to_string();
+    let inbox = ChannelName::user(member_id, "inbox").to_string();
+
+    // ------------------------------------------------------------------
+    // Who may open a stream at all.
+    // ------------------------------------------------------------------
+    let (status, _body) = stream::open(&router, &stream::path(&[&projects], &[]), None, None)
         .await
-        .expect_err("an anonymous upgrade must be refused");
-    assert_eq!(refused, StatusCode::UNAUTHORIZED);
+        .expect_err("a stream without a session must be refused");
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let mut socket = server
-        .connect(Some(&member_session))
+    let (status, body) = stream::open(&router, "/realtime", Some(&member), None)
         .await
-        .expect("a session must be enough to upgrade");
+        .expect_err("a stream of nothing must be refused");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 
-    // A member may listen to their team.
-    send(
-        &mut socket,
-        &json!({ "type": "subscribe", "channel": projects.to_string() }),
+    let many: Vec<String> = (0..65)
+        .map(|index| ChannelName::user(member_id, format!("topic{index}")).to_string())
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let (status, body) = stream::open(&router, &stream::path(&many, &[]), Some(&member), None)
+        .await
+        .expect_err("a stream past its channel limit must be refused");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    // ------------------------------------------------------------------
+    // What a stream may carry: each channel is authorized on its own.
+    // ------------------------------------------------------------------
+    let stranger = ChannelName::user(outsider_id, "inbox").to_string();
+    let ghost = ChannelName::team(Uuid::new_v4(), "projects").to_string();
+    let record = ChannelName::resource(team_id, "logs").to_string();
+    let malformed = "team:not-a-uuid:projects";
+
+    let mut listening = stream::connect(
+        &router,
+        &stream::path(
+            &[&projects, &inbox, &stranger, &ghost, &record, malformed],
+            &[],
+        ),
+        &member,
+        None,
     )
     .await;
     assert_eq!(
-        next(&mut socket).await,
-        json!({ "type": "subscribed", "channel": projects.to_string() }),
+        listening
+            .headers
+            .get(CACHE_CONTROL)
+            .map(HeaderValue::as_bytes),
+        Some(b"no-cache, no-transform".as_slice()),
+    );
+    assert_eq!(
+        listening
+            .headers
+            .get("x-accel-buffering")
+            .map(HeaderValue::as_bytes),
+        Some(b"no".as_slice()),
+        "a buffering proxy must be told to pass events straight through",
     );
 
-    // What the server publishes arrives on the socket.
-    server
-        .channels
-        .publish(&projects, "created", json!({ "id": 7, "name": "Apollo" }))
+    let opening = listening.opening().await;
+    // With no cursor, a channel opens with a reset: read the state once live.
+    assert_eq!(opening.resets(), vec![projects.as_str(), inbox.as_str()]);
+    let refusals = [&stranger, &ghost, &record].map(|channel| refusal(&opening, channel));
+    for refused in &refusals {
+        assert_eq!(refused.frame["code"], json!("not_found"), "{refused:?}");
+    }
+    assert!(
+        refusals
+            .iter()
+            .all(|refused| refused.frame["message"] == refusals[0].frame["message"]),
+        "another user's channel, a team that does not exist, and a resource must read alike",
+    );
+    assert_eq!(
+        refusal(&opening, malformed).frame["code"],
+        json!("invalid_channel"),
+    );
+
+    // A non-member is refused the member's team exactly as a team that does
+    // not exist, so a stream can never confirm that a team is there.
+    let mut prying = stream::connect(
+        &router,
+        &stream::path(&[&projects, &ghost], &[]),
+        &outsider,
+        None,
+    )
+    .await;
+    let pried = prying.opening().await;
+    assert!(
+        pried.resets().is_empty(),
+        "nothing was the outsider's to hear"
+    );
+    let not_a_member = refusal(&pried, &projects).frame.clone();
+    let no_such_team = refusal(&pried, &ghost).frame.clone();
+    assert_eq!(not_a_member["code"], no_such_team["code"]);
+    assert_eq!(not_a_member["message"], no_such_team["message"]);
+    drop(prying);
+
+    // ------------------------------------------------------------------
+    // What a stream carries: every event, exactly as published, with its id.
+    // ------------------------------------------------------------------
+    let payload = json!({
+        "id": 7,
+        "name": "Apollo \u{1f680} \"quoted\"\nsecond line",
+        "tags": ["a", "b"],
+        "nested": { "ratio": 0.25, "missing": null },
+    });
+    let published = publishing
+        .publish(&parse(&projects), "created", payload.clone())
         .await
         .expect("publishing must succeed");
+    let created = listening.next().await;
+    assert_eq!(created.id, Some(published.to_string()));
     assert_eq!(
-        next(&mut socket).await,
+        created.frame,
         json!({
             "type": "event",
-            "channel": projects.to_string(),
+            "channel": projects,
             "event": "created",
-            "payload": { "id": 7, "name": "Apollo" },
+            "payload": payload,
         }),
     );
 
-    // A user channel is self-only, and needs no membership at all.
-    send(
-        &mut socket,
-        &json!({ "type": "subscribe", "channel": inbox.to_string() }),
-    )
-    .await;
-    assert_eq!(
-        next(&mut socket).await,
-        json!({ "type": "subscribed", "channel": inbox.to_string() }),
-    );
-
-    let stranger = ChannelName::user(outsider_id, "inbox");
-    send(
-        &mut socket,
-        &json!({ "type": "subscribe", "channel": stranger.to_string() }),
-    )
-    .await;
-    let refused = next(&mut socket).await;
-    assert_eq!(refused["type"], json!("error"));
-    assert_eq!(refused["code"], json!("not_found"));
-
-    // Unsubscribing stops delivery. The subscribe reply that follows the
-    // publish proves nothing was delivered in between.
-    send(
-        &mut socket,
-        &json!({ "type": "unsubscribe", "channel": projects.to_string() }),
-    )
-    .await;
-    assert_eq!(
-        next(&mut socket).await,
-        json!({ "type": "unsubscribed", "channel": projects.to_string() }),
-    );
-    server
-        .channels
-        .publish(&projects, "created", json!({ "id": 8 }))
+    let published = publishing
+        .publish(&parse(&inbox), "created", json!({ "unread": 1 }))
         .await
         .expect("publishing must succeed");
-    send(
-        &mut socket,
-        &json!({ "type": "subscribe", "channel": projects.to_string() }),
-    )
-    .await;
-    assert_eq!(
-        next(&mut socket).await,
-        json!({ "type": "subscribed", "channel": projects.to_string() }),
-        "an event published while unsubscribed must not have been delivered",
-    );
+    let pinged = listening.next().await;
+    assert_eq!(pinged.id, Some(published.to_string()));
+    assert_eq!(pinged.channel(), inbox);
 
-    // A frame the protocol does not define is named as such rather than
-    // silently ignored.
-    send(
-        &mut socket,
-        &json!({ "type": "publish", "channel": projects.to_string() }),
-    )
-    .await;
-    let refused = next(&mut socket).await;
-    assert_eq!(refused["type"], json!("error"));
-    assert_eq!(refused["code"], json!("invalid_frame"));
-
-    // A non-member is refused exactly as a nonexistent team is.
-    let mut outsider_socket = server
-        .connect(Some(&outsider_session))
-        .await
-        .expect("any session may open a socket");
-    send(
-        &mut outsider_socket,
-        &json!({ "type": "subscribe", "channel": projects.to_string() }),
-    )
-    .await;
-    let not_a_member = next(&mut outsider_socket).await;
-
-    let ghost = ChannelName::team(Uuid::new_v4(), "projects");
-    send(
-        &mut outsider_socket,
-        &json!({ "type": "subscribe", "channel": ghost.to_string() }),
-    )
-    .await;
-    let no_such_team = next(&mut outsider_socket).await;
-
-    assert_eq!(not_a_member["code"], json!("not_found"));
-    assert_eq!(
-        not_a_member["message"], no_such_team["message"],
-        "a team you may not see must answer exactly as one that does not exist",
-    );
-
-    // In-process fanout reaches every socket listening to the channel.
-    let mut second_socket = server
-        .connect(Some(&member_session))
-        .await
-        .expect("a session may open more than one socket");
-    send(
-        &mut second_socket,
-        &json!({ "type": "subscribe", "channel": projects.to_string() }),
-    )
-    .await;
-    assert_eq!(next(&mut second_socket).await["type"], json!("subscribed"));
-
-    server
-        .channels
-        .publish(&projects, "updated", json!({ "id": 9 }))
+    // Nothing for a channel the stream was refused ever arrives on it.
+    publishing
+        .publish(&parse(&stranger), "created", json!({}))
         .await
         .expect("publishing must succeed");
-    for listener in [&mut socket, &mut second_socket] {
-        let event = next(listener).await;
-        assert_eq!(event["type"], json!("event"));
-        assert_eq!(event["event"], json!("updated"));
-        assert_eq!(event["payload"], json!({ "id": 9 }));
+    assert!(
+        listening.stays_quiet(Duration::from_millis(300)).await,
+        "a refused channel must deliver nothing",
+    );
+
+    // ------------------------------------------------------------------
+    // Resume: what was missed while away arrives, in order, with no reset.
+    // ------------------------------------------------------------------
+    let cursor = pinged.id.clone().expect("an event carries its id");
+    drop(listening);
+
+    let mut missed = Vec::new();
+    for (channel, event) in [
+        (&projects, "updated"),
+        (&inbox, "read"),
+        (&projects, "deleted"),
+    ] {
+        let id = publishing
+            .publish(&parse(channel), event, json!({ "event": event }))
+            .await
+            .expect("publishing must succeed");
+        missed.push((id.to_string(), channel.clone(), event.to_owned()));
+    }
+
+    let mut resumed = stream::connect(
+        &resuming,
+        &stream::path(&[&projects, &inbox], &[]),
+        &member,
+        Some(&cursor),
+    )
+    .await;
+    let opening = resumed.opening().await;
+    assert!(
+        opening.resets().is_empty(),
+        "an exact replay needs no reset: {opening:?}"
+    );
+    let replayed: Vec<(String, String, String)> = opening
+        .of_kind("event")
+        .into_iter()
+        .map(|event| {
+            (
+                event.id.clone().unwrap_or_default(),
+                event.channel().to_owned(),
+                event.frame["event"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        replayed, missed,
+        "the replay is every missed event, in order"
+    );
+
+    // And the resumed stream is live.
+    let published = publishing
+        .publish(&parse(&projects), "created", json!({ "id": 10 }))
+        .await
+        .expect("publishing must succeed");
+    let live = resumed.next().await;
+    assert_eq!(live.id, Some(published.to_string()));
+    let cursor = live.id.clone().expect("an event carries its id");
+    drop(resumed);
+
+    // ------------------------------------------------------------------
+    // A channel joining a stream does not inherit its cursor.
+    // ------------------------------------------------------------------
+    // The view that wants this channel fetched its state just now, so an
+    // event published before that must not be replayed onto it, however old
+    // the cursor the stream resumes from.
+    let alerts = ChannelName::user(member_id, "alerts").to_string();
+    publishing
+        .publish(
+            &parse(&alerts),
+            "created",
+            json!({ "before": "the view fetched" }),
+        )
+        .await
+        .expect("publishing must succeed");
+    let mut widened = stream::connect(
+        &resuming,
+        &stream::path(&[&projects, &inbox, &alerts], &[&alerts]),
+        &member,
+        Some(&cursor),
+    )
+    .await;
+    let opening = widened.opening().await;
+    assert_eq!(
+        opening.resets(),
+        vec![alerts.as_str()],
+        "the joining channel opens live with a reset; the others resume",
+    );
+    assert!(opening.of_kind("event").is_empty(), "{opening:?}");
+    drop(widened);
+
+    // ------------------------------------------------------------------
+    // Past the buffer: a reset, never a quiet gap.
+    // ------------------------------------------------------------------
+    let burst = ChannelName::team(team_id, SHORT_TOPIC).to_string();
+    let mut short = stream::connect(&router, &stream::path(&[&burst], &[]), &member, None).await;
+    let cursor = short.opening().await.cursor;
+    drop(short);
+    for round in 0..3 {
+        publishing
+            .publish(&parse(&burst), "tick", json!({ "round": round }))
+            .await
+            .expect("publishing must succeed");
+    }
+    let mut outrun = stream::connect(
+        &resuming,
+        &stream::path(&[&burst, &inbox], &[]),
+        &member,
+        Some(&cursor),
+    )
+    .await;
+    let opening = outrun.opening().await;
+    assert_eq!(
+        opening.resets(),
+        vec![burst.as_str()],
+        "the channel that dropped a missed event resets; the other replays exactly",
+    );
+    assert!(opening.of_kind("event").is_empty(), "{opening:?}");
+    drop(outrun);
+
+    // ------------------------------------------------------------------
+    // A cursor this deployment never minted resets everything it names.
+    // ------------------------------------------------------------------
+    let foreign_epoch = other_epoch(&cursor);
+    for hostile in ["not-an-id", "00000000000000ab-1-2", foreign_epoch.as_str()] {
+        let mut wary = stream::connect(
+            &resuming,
+            &stream::path(&[&projects, &inbox], &[]),
+            &member,
+            Some(hostile),
+        )
+        .await;
+        let opening = wary.opening().await;
+        assert_eq!(
+            opening.resets(),
+            vec![projects.as_str(), inbox.as_str()],
+            "{hostile:?} must not be resumed from",
+        );
+        assert!(
+            opening.of_kind("event").is_empty(),
+            "{hostile:?}: {opening:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A stream that falls behind is cut, and resumes exactly.
+    // ------------------------------------------------------------------
+    let flood = ChannelName::team(team_id, LONG_TOPIC).to_string();
+    let mut stalled = stream::connect(&router, &stream::path(&[&flood], &[]), &member, None).await;
+    let _opened = stalled.opening().await;
+    // Nothing reads the stalled stream while these publish, which is exactly
+    // what a client on a stuck connection looks like to the server.
+    for round in 0..FLOOD {
+        publishing
+            .publish(&parse(&flood), "tick", json!({ "round": round }))
+            .await
+            .expect("publishing must succeed");
+    }
+    let heard = stalled.until_end().await;
+    assert_eq!(
+        heard.len(),
+        BACKLOG,
+        "the queue drains, then the stream ends"
+    );
+    assert_rounds(&heard, 0);
+    let cursor = heard
+        .last()
+        .and_then(|event| event.id.clone())
+        .expect("an event carries its id");
+
+    let mut caught_up = stream::connect(
+        &resuming,
+        &stream::path(&[&flood], &[]),
+        &member,
+        Some(&cursor),
+    )
+    .await;
+    let opening = caught_up.opening().await;
+    assert!(
+        opening.resets().is_empty(),
+        "the buffer still holds what was cut"
+    );
+    let rest: Vec<Received> = opening.of_kind("event").into_iter().cloned().collect();
+    assert_eq!(rest.len(), FLOOD - BACKLOG);
+    assert_rounds(&rest, BACKLOG);
+    drop(caught_up);
+
+    // ------------------------------------------------------------------
+    // A suspension closes the team's channels, as it closes its routes.
+    // ------------------------------------------------------------------
+    let mut connection = deployment
+        .serving
+        .pool
+        .get()
+        .await
+        .expect("a connection must be available");
+    diesel::update(
+        organization_memberships::table.filter(organization_memberships::user_id.eq(member_id)),
+    )
+    .set(organization_memberships::suspended_at.eq(diesel::dsl::now))
+    .execute(&mut connection)
+    .await
+    .expect("the suspension must apply");
+    drop(connection);
+
+    let mut suspended =
+        stream::connect(&router, &stream::path(&[&projects], &[]), &member, None).await;
+    let opening = suspended.opening().await;
+    assert!(
+        opening.resets().is_empty(),
+        "a suspended member hears nothing of the team"
+    );
+    assert_eq!(
+        refusal(&opening, &projects).frame["message"],
+        no_such_team["message"],
+        "a suspension reads exactly like a team that does not exist",
+    );
+}
+
+/// A Redis that lost its data starts a new epoch, and every stream and cursor
+/// from the old one is told to read its state again.
+#[tokio::test]
+async fn a_redis_that_lost_its_data_resumes_every_client_with_a_reset() {
+    let Some(redis_url) = redis_url("realtime_flow epoch") else {
+        return;
+    };
+    let Some(database) = TestDatabase::create("realtime_flow epoch").await else {
+        return;
+    };
+    // A database of the test's own, because this test empties it.
+    let isolated = redis_database(&redis_url, 15);
+    flush(&isolated).await;
+
+    let channels = Channels::redis(&isolated)
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    let harness = Harness::boot_with_channels(&database, channels.clone()).await;
+    let member = register(&harness.router, "epoch@realtime.test").await;
+    let inbox = ChannelName::user(user_id(&harness.router, &member).await, "inbox");
+    let path = stream::path(&[&inbox.to_string()], &[]);
+
+    let mut listening = stream::connect(&harness.router, &path, &member, None).await;
+    let cursor = listening.opening().await.cursor;
+
+    flush(&isolated).await;
+    channels
+        .publish(&inbox, "created", json!({}))
+        .await
+        .expect("publishing after the loss starts a new epoch");
+
+    // The open stream hears an event from an epoch it did not start in, so it
+    // ends rather than deliver it after a gap it cannot see.
+    assert!(listening.until_end().await.is_empty());
+
+    let mut resumed = stream::connect(&harness.router, &path, &member, Some(&cursor)).await;
+    let opening = resumed.opening().await;
+    assert_eq!(opening.resets(), vec![inbox.to_string().as_str()]);
+    assert_ne!(
+        epoch_of(&opening.cursor),
+        epoch_of(&cursor),
+        "the loss is a new epoch",
+    );
+}
+
+/// Under a byte budget, Redis lets go of whole channels, least recently
+/// published first, and resuming on one that was let go is a reset.
+#[tokio::test]
+async fn the_redis_budget_lets_go_of_whole_channels_and_says_so() {
+    let Some(redis_url) = redis_url("realtime_flow budget") else {
+        return;
+    };
+    let Some(database) = TestDatabase::create("realtime_flow budget").await else {
+        return;
+    };
+    // A database of the test's own: a budget this small would let go of
+    // every other test's buffers too.
+    let isolated = redis_database(&redis_url, 14);
+    flush(&isolated).await;
+
+    let channels = Channels::builder()
+        .replay_budget(4 * 1024)
+        .build_redis(&isolated)
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    let harness = Harness::boot_with_channels(&database, channels.clone()).await;
+    let member = register(&harness.router, "budget@realtime.test").await;
+    let member_id = user_id(&harness.router, &member).await;
+    let oldest = ChannelName::user(member_id, "oldest").to_string();
+    let quiet = ChannelName::user(member_id, "quiet").to_string();
+
+    let mut first = stream::connect(
+        &harness.router,
+        &stream::path(&[&oldest], &[]),
+        &member,
+        None,
+    )
+    .await;
+    let before = first.opening().await.cursor;
+    drop(first);
+
+    channels
+        .publish(&parse(&oldest), "created", json!({}))
+        .await
+        .expect("publishing must succeed");
+    // Enough other channels, each published once, to push the oldest out.
+    for index in 0..16 {
+        channels
+            .publish(
+                &ChannelName::user(member_id, format!("crowd{index}")),
+                "created",
+                json!({ "index": index }),
+            )
+            .await
+            .expect("publishing must succeed");
+    }
+
+    let mut resumed = stream::connect(
+        &harness.router,
+        &stream::path(&[&oldest], &[]),
+        &member,
+        Some(&before),
+    )
+    .await;
+    assert_eq!(
+        resumed.opening().await.resets(),
+        vec![oldest.as_str()],
+        "the event the client missed was let go with its channel",
+    );
+
+    // A cursor from after everything that was let go resumes exactly, even
+    // on a channel that never had a buffer.
+    let mut later = stream::connect(
+        &harness.router,
+        &stream::path(&[&quiet], &[]),
+        &member,
+        None,
+    )
+    .await;
+    let after = later.opening().await.cursor;
+    drop(later);
+    let mut exact = stream::connect(
+        &harness.router,
+        &stream::path(&[&quiet], &[]),
+        &member,
+        Some(&after),
+    )
+    .await;
+    let opening = exact.opening().await;
+    assert!(opening.resets().is_empty(), "{opening:?}");
+    assert!(opening.of_kind("event").is_empty(), "{opening:?}");
+}
+
+/// A server that starts draining ends its open streams at once, rather than
+/// holding the drain for its whole window.
+#[tokio::test]
+async fn a_draining_server_ends_its_streams_and_stops_without_waiting_them_out() {
+    let Some(database) = TestDatabase::create("realtime_flow drain").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let member = register(&harness.router, "drain@realtime.test").await;
+    let inbox = ChannelName::user(user_id(&harness.router, &member).await, "inbox");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port must be available");
+    let address = listener.local_addr().expect("the listener is bound");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(anubis::server::serve_with_shutdown(
+        listener,
+        harness.router.clone(),
+        async move {
+            let _stopped = stopped.await;
+        },
+    ));
+
+    let mut connection = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("the server accepts");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nhost: test\r\ncookie: anubis_session={member}\r\n\r\n",
+        stream::path(&[&inbox.to_string()], &[]),
+    );
+    connection
+        .write_all(request.as_bytes())
+        .await
+        .expect("the request is written");
+
+    // Read until the stream is live, so shutdown meets an open stream.
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !String::from_utf8_lossy(&received).contains(r#""type":"live""#) {
+        let read = tokio::time::timeout(Duration::from_secs(5), connection.read(&mut chunk))
+            .await
+            .expect("the stream opens")
+            .expect("the connection is readable");
+        assert!(read > 0, "the stream closed before it was live");
+        received.extend_from_slice(&chunk[..read]);
+    }
+
+    let _stopping = stop.send(());
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        connection.read_to_end(&mut received),
+    )
+    .await;
+    assert!(ended.is_ok(), "the stream must end when the drain starts");
+
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("the server stops well inside its drain window")
+        .expect("the serve task does not panic")
+        .expect("the server stops cleanly");
+}
+
+/// `REDIS_URL`, or a logged skip naming `narrative`.
+fn redis_url(narrative: &str) -> Option<String> {
+    let url = std::env::var("REDIS_URL").ok();
+    if url.is_none() {
+        eprintln!("skipping {narrative}: REDIS_URL is not set");
+    }
+    url
+}
+
+/// The same Redis, numbered database `index`.
+fn redis_database(url: &str, index: u8) -> String {
+    let mut parsed = url::Url::parse(url).expect("REDIS_URL must be a URL");
+    parsed.set_path(&format!("/{index}"));
+    parsed.to_string()
+}
+
+/// Empties one Redis database, as a Redis restarted without persistence is.
+async fn flush(url: &str) {
+    let client = redis::Client::open(url).expect("the Redis URL must parse");
+    let mut connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Redis must be reachable");
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut connection)
+        .await
+        .expect("the database must flush");
+}
+
+/// The channel name a test wrote out, as the publisher takes it.
+fn parse(channel: &str) -> ChannelName {
+    channel.parse().expect("the test names valid channels")
+}
+
+/// The refusal an opening carries for `channel`.
+fn refusal<'opening>(opening: &'opening Opening, channel: &str) -> &'opening Received {
+    opening
+        .refusal(channel)
+        .unwrap_or_else(|| panic!("{channel} must be refused: {opening:?}"))
+}
+
+/// Asserts `events` are consecutive rounds, counting up from `first`.
+fn assert_rounds(events: &[Received], first: usize) {
+    for (offset, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.frame["payload"]["round"],
+            json!(first + offset),
+            "rounds must arrive in order and complete: {event:?}",
+        );
     }
 }
 
-#[tokio::test]
-async fn redis_fanout_carries_events_between_instances() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skipping realtime_flow Redis test: DATABASE_URL is not set");
-        return;
-    };
-    let Ok(redis_url) = std::env::var("REDIS_URL") else {
-        eprintln!("skipping realtime_flow Redis test: REDIS_URL is not set");
-        return;
-    };
+/// The epoch half of an id.
+fn epoch_of(id: &str) -> &str {
+    id.split_once('-').map_or(id, |(epoch, _sequence)| epoch)
+}
 
-    // Two independent handles on the same Redis stand in for two instances:
-    // the socket is served by the first, and the publish goes through the
-    // second, so nothing but Redis can carry the event between them.
-    let serving = Channels::redis(&redis_url)
-        .await
-        .expect("REDIS_URL must name a reachable Redis");
-    let publishing = Channels::redis(&redis_url)
-        .await
-        .expect("REDIS_URL must name a reachable Redis");
+/// A well-formed id from an epoch other than `id`'s: its first digit flipped.
+fn other_epoch(id: &str) -> String {
+    let (epoch, sequence) = id.split_once('-').expect("an id is epoch-sequence");
+    let flipped = if epoch.starts_with('0') { '1' } else { '0' };
+    format!("{flipped}{}-{sequence}", &epoch[1..])
+}
 
-    let server = TestServer::start(&database_url, serving).await;
-
-    let run = Uuid::new_v4();
-    let member_email = format!("realtime-redis-{run}@example.com");
-    let member_session = server.register(&member_email).await;
-    let (_member_id, team_id) = bootstrapped_team(&server.pool, &member_email).await;
-    let projects = ChannelName::team(team_id, "projects");
-
-    let mut socket = server
-        .connect(Some(&member_session))
-        .await
-        .expect("a session must be enough to upgrade");
-    send(
-        &mut socket,
-        &json!({ "type": "subscribe", "channel": projects.to_string() }),
-    )
-    .await;
-    assert_eq!(next(&mut socket).await["type"], json!("subscribed"));
-
-    // The subscribe reply is sent before the pump has necessarily told Redis
-    // about the channel, so publish until one lands rather than racing it.
-    let event = loop {
-        publishing
-            .publish(&projects, "created", json!({ "id": 11 }))
-            .await
-            .expect("publishing through Redis must succeed");
-
-        match tokio::time::timeout(Duration::from_millis(250), next(&mut socket)).await {
-            Ok(frame) => break frame,
-            Err(_elapsed) => {}
-        }
-    };
-
-    assert_eq!(event["type"], json!("event"));
-    assert_eq!(event["channel"], json!(projects.to_string()));
-    assert_eq!(event["payload"], json!({ "id": 11 }));
+/// The signed-in user's own id.
+async fn user_id(router: &axum::Router, cookie: &str) -> Uuid {
+    let (status, _headers, body) = send(router, "GET", "/auth/me", None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["user"]["id"]
+        .as_str()
+        .expect("a signed-in user has an id")
+        .parse()
+        .expect("a user id is a UUID")
 }
