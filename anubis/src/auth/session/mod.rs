@@ -60,8 +60,8 @@
 //! that transaction, so callers order their work to keep failures safe:
 //!
 //! - **Creating** a session is the last step inside the transaction that
-//!   records the sign-in, and anything spent to sign in, a reset link or a
-//!   recovery code, is spent in that same transaction. A Redis failure rolls
+//!   records the sign-in, and anything spent to sign in, a recovery code, an
+//!   emailed code, a passkey ceremony, is spent in that same transaction. A Redis failure rolls
 //!   all of it back, and the cookie is only issued after the commit, so no
 //!   browser ever holds a session the audit log does not know about. A commit
 //!   that fails after the write leaves a session no browser holds, which ends

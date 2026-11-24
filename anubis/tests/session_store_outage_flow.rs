@@ -1,8 +1,8 @@
 //! A session store that fails spends nothing a person needs to get back in.
 //!
-//! Signing in with a recovery code or an emailed code spends that code in the
-//! same transaction that writes the session, so a store that cannot write it
-//! rolls the code back with everything else. A password reset ends sessions in
+//! Signing in with a recovery code, an emailed code, or a passkey spends the
+//! code or the ceremony in the same transaction that writes the session, so a
+//! store that cannot write it rolls everything back. A password reset ends sessions in
 //! Postgres and only sweeps the store after the commit, so it completes while
 //! the store is down. Each scenario runs two deployments over one database: a
 //! healthy one on the Postgres store, and one whose Redis store points at a
@@ -19,12 +19,18 @@ use axum::Router;
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde_json::json;
-use support::{PASSWORD, TestDatabase, register, send, session_token};
+use support::{PASSWORD, SoftAuthenticator, TestDatabase, register, send, session_token};
 use uuid::Uuid;
 
 /// A Redis store that can never be reached: nothing listens on the discard
 /// port, so every connection is refused at once.
 const UNREACHABLE_REDIS: &str = "redis://127.0.0.1:9";
+
+/// Where the deployments say they are served from.
+///
+/// A passkey's relying party is `APP_URL`'s host, and a browser refuses a
+/// ceremony at a bare IP address, which is what the default would be.
+const ORIGIN: &str = "http://localhost:3000";
 
 /// The password a reset through the failing deployment sets.
 const RESET_PASSWORD: &str = "a passphrase set while the store was down";
@@ -71,6 +77,7 @@ fn deployment(pool: &anubis::db::DbPool, variables: &[(&str, &str)]) -> (Router,
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .chain([
             ("ANUBIS_ENV".to_owned(), "test".to_owned()),
+            ("APP_URL".to_owned(), ORIGIN.to_owned()),
             ("RATE_LIMIT_DISABLED".to_owned(), "true".to_owned()),
         ])
         .collect();
@@ -207,6 +214,73 @@ async fn an_emailed_code_survives_a_session_store_that_fails() {
         "POST",
         "/auth/email-code/verify",
         Some(&answer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    session_token(&headers);
+}
+
+#[tokio::test]
+async fn a_passkey_ceremony_survives_a_session_store_that_fails() {
+    let Some(database) = TestDatabase::create("session_store_outage_passkey").await else {
+        return;
+    };
+    let deployments = Deployments::boot(&database).await;
+    let healthy = &deployments.healthy;
+    let email = format!("passkey-{}@example.com", Uuid::new_v4());
+    let cookie = register(healthy, &email).await;
+    let mut device = SoftAuthenticator::new(ORIGIN);
+
+    let (status, _headers, body) = send(
+        healthy,
+        "POST",
+        "/auth/passkeys/register/start",
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let registration = json!({
+        "state_token": body["state_token"],
+        "credential": device.create(&body["creation_options"]),
+        "name": "Password manager",
+    });
+    let (status, _headers, body) = send(
+        healthy,
+        "POST",
+        "/auth/passkeys/register/finish",
+        Some(&registration),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    let (status, _headers, body) =
+        send(healthy, "POST", "/auth/passkeys/login/start", None, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let login = json!({
+        "state_token": body["state_token"],
+        "credential": device.get(&body["request_options"]),
+    });
+
+    let (status, _headers, _body) = send(
+        &deployments.failing,
+        "POST",
+        "/auth/passkeys/login/finish",
+        Some(&login),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The very same signed assertion finishes the very same ceremony, so
+    // neither the ceremony nor the credential's counter moved for the failure.
+    let (status, headers, body) = send(
+        healthy,
+        "POST",
+        "/auth/passkeys/login/finish",
+        Some(&login),
         None,
     )
     .await;

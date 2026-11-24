@@ -20,7 +20,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use webauthn_rs::prelude::{
@@ -333,66 +333,89 @@ async fn login_finish(
     let webauthn = relying_party(&state)?;
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let (_state_user, authentication_state): (Option<Uuid>, DiscoverableAuthentication) =
-        take_state(&mut connection, PURPOSE_AUTHENTICATION, &body.state_token).await?;
+    // Spending the ceremony, recording the credential's use, and signing in are
+    // one unit: when the session store fails, all of it rolls back and the
+    // browser can finish the same ceremony again. A credential that does not
+    // verify commits the spent ceremony, so a state token is single-use
+    // whatever the outcome.
+    let signed_in = connection
+        .transaction::<_, ApiError, _>(async |transaction| {
+            let (_state_user, authentication_state): (Option<Uuid>, DiscoverableAuthentication) =
+                take_state(transaction, PURPOSE_AUTHENTICATION, &body.state_token).await?;
 
-    // The discoverable credential names its user; load that user's keys.
-    let (user_id, _credential_id) = webauthn
-        .identify_discoverable_authentication(&body.credential)
-        .map_err(|_error| invalid_passkey())?;
+            // The discoverable credential names its user; load that user's keys.
+            let Ok((user_id, _credential_id)) =
+                webauthn.identify_discoverable_authentication(&body.credential)
+            else {
+                tracing::debug!("passkey login rejected: the credential names no user");
+                return Ok(None);
+            };
 
-    let stored = load_passkeys(&mut connection, user_id).await?;
-    if stored.is_empty() {
-        return Err(invalid_passkey());
-    }
-    let discoverable: Vec<DiscoverableKey> = stored
-        .iter()
-        .map(|(_row_id, passkey)| DiscoverableKey::from(passkey))
-        .collect();
+            let stored = load_passkeys(transaction, user_id).await?;
+            if stored.is_empty() {
+                tracing::debug!("passkey login rejected: the named user has no passkeys");
+                return Ok(None);
+            }
+            let discoverable: Vec<DiscoverableKey> = stored
+                .iter()
+                .map(|(_row_id, passkey)| DiscoverableKey::from(passkey))
+                .collect();
 
-    let result = webauthn
-        .finish_discoverable_authentication(&body.credential, authentication_state, &discoverable)
-        .map_err(|error| {
-            tracing::debug!(
-                error.message = %error,
-                "passkey login rejected: {{error.message}}",
-            );
-            invalid_passkey()
-        })?;
+            let result = match webauthn.finish_discoverable_authentication(
+                &body.credential,
+                authentication_state,
+                &discoverable,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::debug!(
+                        error.message = %error,
+                        "passkey login rejected: {{error.message}}",
+                    );
+                    return Ok(None);
+                }
+            };
 
-    // Persist any counter/backup-state updates on the used credential.
-    for (row_id, mut passkey) in stored {
-        if passkey.cred_id() == result.cred_id() {
-            passkey.update_credential(&result);
-            let updated_json = serde_json::to_value(&passkey).map_err(log_internal)?;
-            diesel::update(user_passkeys::table.find(row_id))
-                .set((
-                    user_passkeys::credential.eq(&updated_json),
-                    user_passkeys::last_used_at.eq(Utc::now()),
-                ))
-                .execute(&mut connection)
+            // Persist any counter/backup-state updates on the used credential.
+            for (row_id, mut passkey) in stored {
+                if passkey.cred_id() == result.cred_id() {
+                    passkey.update_credential(&result);
+                    let updated_json = serde_json::to_value(&passkey).map_err(log_internal)?;
+                    diesel::update(user_passkeys::table.find(row_id))
+                        .set((
+                            user_passkeys::credential.eq(&updated_json),
+                            user_passkeys::last_used_at.eq(Utc::now()),
+                        ))
+                        .execute(transaction)
+                        .await
+                        .map_err(log_internal)?;
+                }
+            }
+
+            let user: User = users::table
+                .find(user_id)
+                .select(User::as_select())
+                .first(transaction)
                 .await
                 .map_err(log_internal)?;
-        }
-    }
 
-    let user: User = users::table
-        .find(user_id)
-        .select(User::as_select())
-        .first(&mut connection)
-        .await
-        .map_err(log_internal)?;
+            // A passkey is possession plus verification: strong auth, no TOTP
+            // step. Signing in is the last step, so a store failure rolls the
+            // rest back.
+            let jar = signed_in_jar(
+                &state,
+                &sessions,
+                transaction,
+                &context,
+                &user,
+                SignInMethod::Passkey,
+            )
+            .await?;
+            Ok(Some((user, jar)))
+        })
+        .await?;
+    let (user, jar) = signed_in.ok_or_else(invalid_passkey)?;
 
-    // A passkey is possession plus verification: strong auth, no TOTP step.
-    let jar = signed_in_jar(
-        &state,
-        &sessions,
-        &mut connection,
-        &context,
-        &user,
-        SignInMethod::Passkey,
-    )
-    .await?;
     let response_body = UserBody {
         user: UserResponse::load(&mut connection, &user)
             .await
