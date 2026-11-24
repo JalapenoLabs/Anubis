@@ -300,10 +300,11 @@ impl Wallets {
 
     /// What a debit owes the people and the recharge behind the wallet.
     ///
-    /// The balance fell from `before` to the wallet's. Crossing the low mark
-    /// tells the billing members, unless auto-recharge is on, because then the
-    /// recharge is the answer and a failed one says so itself. Landing below
-    /// the threshold arms a recharge unless one is already in flight.
+    /// The balance fell from `before` to the wallet's. Landing below the
+    /// threshold arms a recharge unless one is already in flight. Without a
+    /// recharge that can run, crossing the low mark tells the billing members
+    /// instead; with one, the recharge is the answer, and a failed one says so
+    /// itself.
     async fn after_debit(
         &self,
         connection: &mut AsyncPgConnection,
@@ -313,11 +314,13 @@ impl Wallets {
     ) -> Result<(), Error> {
         let after = wallet.balance_micros;
         match wallet.auto_recharge() {
-            Some((threshold, _amount)) if self.billing_enabled && after < threshold => {
-                arm_recharge(connection, wallet).await?;
+            Some((threshold, _amount)) if self.billing_enabled => {
+                if after < threshold {
+                    arm_recharge(connection, wallet).await?;
+                }
             }
-            Some(_settings) => {}
-            None => {
+            // Nothing will recharge, so the people are told instead.
+            _manual => {
                 if let Some(low) = terms.low_balance_micros()
                     && before >= low
                     && after < low

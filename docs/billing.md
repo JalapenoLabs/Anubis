@@ -332,7 +332,7 @@ Notices go to the organization's **billing members**: everyone holding the `admi
 
 | Kind | When |
 |---|---|
-| `wallet.low_balance` | A spend takes the balance from at or above `low_balance_micros` to below it, once per dip. Not sent while auto-recharge is on, because the recharge is the answer, and a failed one says so itself |
+| `wallet.low_balance` | A spend takes the balance from at or above `low_balance_micros` to below it, once per dip. Not sent while auto-recharge can run, because the recharge is the answer, and a failed one says so itself |
 | `wallet.recharge_failed` | A recharge was refused and auto-recharge turned off |
 
 Credits, refunds, reversals, and auto-recharge changes and failures are audited on the organization, in the transaction that wrote them. Spends are not: the ledger is their record, and a meter charging every minute would bury every other act in the log. Every notice and audit row rides the connection of the write it describes, so it commits with the entry, or with nothing.

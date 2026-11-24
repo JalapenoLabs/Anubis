@@ -567,6 +567,14 @@ impl Reconciler {
                     // A one-off payment rather than a subscription: a top-up
                     // when the wallet's metadata names it, and otherwise a fact
                     // about Stripe rather than about this application.
+                    if !session.metadata.contains_key(stripe::WALLET_METADATA) {
+                        tracing::debug!(
+                            billing.checkout.session = session.id,
+                            "checkout session {{billing.checkout.session}} bought neither a \
+                             subscription nor credit",
+                        );
+                        return Ok(());
+                    }
                     return self
                         .converge_payment_named(
                             connection,
@@ -606,6 +614,10 @@ impl Reconciler {
                 let session = CompletedCheckout::deserialize(object).map_err(|source| {
                     Error::data(format!("the checkout session could not be read: {source}"))
                 })?;
+                if !session.metadata.contains_key(stripe::WALLET_METADATA) {
+                    // A subscription's settles through its own events.
+                    return Ok(());
+                }
                 self.converge_payment_named(
                     connection,
                     session.payment_intent.as_deref(),

@@ -1305,11 +1305,16 @@ async fn without_stripe_the_wallet_reads_and_every_write_says_so() {
 
     // Credit already held is still spent: metering does not stop because the
     // deployment cannot sell more for a while.
+    // Auto-recharge was set up while Stripe was configured; with nothing able
+    // to recharge now, crossing the low mark tells the people instead.
     let mut connection = scene.connection().await;
     diesel::insert_into(wallets::table)
         .values((
             wallets::organization_id.eq(scene.organization_id),
             wallets::balance_micros.eq(5 * DOLLAR),
+            wallets::recharge_payment_method_id.eq("pm_card_visa"),
+            wallets::auto_recharge_threshold_micros.eq(4 * DOLLAR),
+            wallets::auto_recharge_amount_micros.eq(10 * DOLLAR),
         ))
         .execute(&mut connection)
         .await
@@ -1332,6 +1337,17 @@ async fn without_stripe_the_wallet_reads_and_every_write_says_so() {
         .expect("held credit is spent");
     assert_eq!(spent.balance_micros(), 4 * DOLLAR);
     assert_eq!(spent.entry().subject_id, Some(server.id()));
+
+    scene
+        .spend(3 * DOLLAR, "metered-2")
+        .await
+        .expect("held credit is spent");
+    assert_eq!(
+        scene.recharges_queued().await,
+        0,
+        "nothing can charge the card"
+    );
+    assert_eq!(scene.notified("wallet.low_balance").await, 1);
 }
 
 #[tokio::test]
