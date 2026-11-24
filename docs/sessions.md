@@ -16,7 +16,7 @@ A browser stays signed in with a session: an opaque token in a cookie, checked o
 | `SESSION_STORE` | Sessions live in | Needs |
 |---|---|---|
 | unset, or `postgres` | the `sessions` table | nothing |
-| `redis` | the Redis `REDIS_URL` names | `REDIS_URL`, Redis 6.2 or later, and persistence (below) |
+| `redis` | the Redis `REDIS_URL` names | `REDIS_URL`, Redis 7.0 or later, and persistence (below) |
 
 Postgres is the right default: one datastore fewer to run, and sessions are backed up with everything else. Redis suits an application that already runs one and wants the session check, which every authenticated request makes, off Postgres.
 
@@ -63,7 +63,7 @@ Two kinds of key, under the framework's own `anubis:sessions:` prefix:
 | Key | Holds | Expires |
 |---|---|---|
 | `anubis:sessions:token:<sha256>` | the session as JSON: its id, the user's id, when it was created, when it ends | when the session ends |
-| `anubis:sessions:user:<user id>` | a sorted set of that user's token hashes, scored by when each ends | when the user's newest session ends |
+| `anubis:sessions:user:<user id>` | a sorted set of that user's token hashes, scored by when each ends | when the user's last session ends |
 
 The token key answers the per-request question in one read; the user's index answers the account's own questions, listing and signing out. Writes touching both keys run as one `MULTI` block. Signing everyone out removes exactly the sessions it read from the index, so a sign-in racing it survives and stays listed and revocable, which is what the Postgres store's `DELETE` does too. Ended entries are pruned from the index at the user's next sign-in and skipped by every read.
 

@@ -5,7 +5,7 @@
 //! | Key | Holds | Expires |
 //! |---|---|---|
 //! | `anubis:sessions:token:<sha256>` | the session, as JSON: its id, the user's id, when it was created and when it ends | when the session ends |
-//! | `anubis:sessions:user:<user id>` | a sorted set of that user's token hashes, each scored by when it ends | when the user's newest session ends |
+//! | `anubis:sessions:user:<user id>` | a sorted set of that user's token hashes, each scored by when it ends | when the user's last session ends |
 //!
 //! The token key answers the question every request asks, which user a cookie
 //! belongs to, in one read. The user's index answers the questions only the
@@ -25,7 +25,7 @@
 //! sessions it read from the index; a sign-in racing it survives, as it does
 //! against the Postgres store's `DELETE`, and stays listed and revocable.
 //!
-//! `SET ... EXAT` and `GETDEL` need Redis 6.2 or later.
+//! `EXPIREAT ... NX` and `GT` need Redis 7.0 or later.
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
@@ -120,9 +120,22 @@ impl RedisSessions {
             // as `expires_at <= now()` has in Postgres.
             .zrembyscore(&user_key, "-inf", now.timestamp())
             .ignore()
-            // Every session lives the same length, so the one just created
-            // ends last and the index can end with it.
-            .expire_at(&user_key, ends_at)
+            // The index ends with the user's latest session, and only ever
+            // moves later: `NX` gives a new index its end, and `GT` extends an
+            // existing one. Taking the new session's end unconditionally would
+            // be right only while every session lives the same length, and an
+            // index that ended early would hide a live session from the next
+            // sign-out-everywhere. `GT` alone never sets a first end, because
+            // Redis counts a key without one as never ending.
+            .cmd("EXPIREAT")
+            .arg(&user_key)
+            .arg(ends_at)
+            .arg("NX")
+            .ignore()
+            .cmd("EXPIREAT")
+            .arg(&user_key)
+            .arg(ends_at)
+            .arg("GT")
             .ignore()
             .exec_async(&mut redis_connection)
             .await?;

@@ -179,13 +179,26 @@ impl Store {
                     "the key must expire with the session: {seconds_left}s left",
                 );
 
+                let user_key = format!("{USER_KEY_PREFIX}{user_id}");
                 let indexed = connection
-                    .zrange(format!("{USER_KEY_PREFIX}{user_id}"), 0, -1)
+                    .zrange(&user_key, 0, -1)
                     .await
                     .expect("Redis must answer");
                 assert!(
                     indexed.contains(&token_hash),
                     "the user's index must name the session: {indexed:?}",
+                );
+
+                // The index lives as long as the user's last session.
+                let index_seconds_left = connection
+                    .ttl(&user_key)
+                    .await
+                    .expect("Redis must answer")
+                    .raw();
+                assert!(
+                    i64::try_from(index_seconds_left)
+                        .is_ok_and(|seconds| seconds > lifetime_less_an_hour),
+                    "the index must expire with the last session: {index_seconds_left}s left",
                 );
             }
         }

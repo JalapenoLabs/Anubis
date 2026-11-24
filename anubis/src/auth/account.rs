@@ -336,13 +336,11 @@ async fn list_sessions(
     sessions: Sessions,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
-    let current_token = jar
-        .get(session::SESSION_COOKIE)
-        .map(|cookie| cookie.value().to_owned());
+    let current_token = jar.get(session::SESSION_COOKIE).map(Cookie::value);
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let listed = sessions
-        .list(&mut connection, user.id, current_token.as_deref())
+        .list(&mut connection, user.id, current_token)
         .await
         .map_err(log_internal)?;
 
