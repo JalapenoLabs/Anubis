@@ -38,6 +38,10 @@ export type {
   PasskeyRegistrationChallenge,
   ProfileUpdate,
   Registration,
+  ResourceGrant,
+  ResourceGrantChange,
+  ResourceGrantsOverview,
+  ResourceKindStanding,
   ResourceRoles,
   Role,
   RoleCatalog,
@@ -69,7 +73,11 @@ export type { NotificationBellLabels } from './react/NotificationBell'
 export type { NotificationsResult } from './react/useNotifications'
 export type { OauthProvidersResult } from './react/useOauthProviders'
 export type { RetryCountdown } from './react/useRetryCountdown'
+export type { ResourceGrantsResult } from './react/useResourceGrants'
+export type { ResourceOptionsResult } from './react/useResourceOptions'
 export type { RoleCatalogScope, RolesResult } from './react/useRoles'
+export type { ResourceGrantEditorLabels } from './access/ResourceGrantEditor'
+export type { ResourceGrantDraft, ResourceGrantMode } from './access/draft'
 export type { MemberRolesPickerLabels } from './roles/MemberRolesPicker'
 export type { RoleFormLabels, RoleFormValues } from './roles/RoleForm'
 export type { RoleLadderLabels } from './roles/RoleLadder'
@@ -169,6 +177,7 @@ export { isMovable, moveRole, reorderRequest } from './roles/ladder'
 export {
   MEMBERSHIP_SUBJECT,
   PERMISSION_ACTIONS,
+  RESOURCE_GRANT_SUBJECT,
   ROLE_SUBJECT,
   SUBSCRIPTION_SUBJECT,
   allows,
@@ -178,6 +187,12 @@ export {
   outranks,
   outranksMember,
 } from './roles/permissions'
+
+// Resource grants
+export { ResourceGrantEditor } from './access/ResourceGrantEditor'
+export { changeOf, draftOf, isSameGrant } from './access/draft'
+export { useResourceGrants } from './react/useResourceGrants'
+export { useResourceOptions } from './react/useResourceOptions'
 
 /**
  * The version of the Anubis frontend package.

@@ -12,6 +12,11 @@ import type { GrantTier, Role, RoleSummary, TenantAccess } from '../api/types'
 export const MEMBERSHIP_SUBJECT = 'Tenancy::Membership'
 export const ROLE_SUBJECT = 'Tenancy::Role'
 export const SUBSCRIPTION_SUBJECT = 'Billing::Subscription'
+/**
+ * Choosing which teams reach the records an organization owns directly. The
+ * server also asks the sharer to hold every permission on the kind shared.
+ */
+export const RESOURCE_GRANT_SUBJECT = 'Tenancy::ResourceGrant'
 
 export type PermissionAction = 'read' | 'create' | 'update' | 'destroy'
 

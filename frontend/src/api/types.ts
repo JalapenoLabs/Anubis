@@ -310,6 +310,53 @@ export type TeamRosterMember = {
 }
 
 /**
+ * One kind of record organizations own directly, as the viewer stands toward it.
+ *
+ * `kind` is the model the records are, spelled as `roles.yml` spells it, which
+ * is also the subject of every permission on them.
+ */
+export type ResourceKindStanding = {
+  kind: string
+  /**
+   * Whether the viewer's organization standing reaches every record of the
+   * kind, which is what lets them see which teams reach which records.
+   */
+  reaches: boolean
+  /** Whether the viewer may change which teams reach the kind. */
+  mayManage: boolean
+}
+
+/** What one team reaches of one kind of the organization's own records. */
+export type ResourceGrant = {
+  teamId: string
+  kind: string
+  /** Every record of the kind, now and later. */
+  every: boolean
+  /** The specific records, by name, when `every` is false. */
+  resources: { value: string, label: string }[]
+}
+
+/**
+ * The access screen's whole read: the kinds the application shares, the
+ * organization's teams, and the grants of every kind the viewer reaches.
+ */
+export type ResourceGrantsOverview = {
+  kinds: ResourceKindStanding[]
+  /** Empty for a viewer who reaches no kind, since there is nothing to read. */
+  teams: { id: string, name: string }[]
+  grants: ResourceGrant[]
+}
+
+/**
+ * The end state one change asks for, for one team and one kind: every record
+ * of it, specific ones, or (both empty) none.
+ */
+export type ResourceGrantChange = {
+  every: boolean
+  resourceIds: string[]
+}
+
+/**
  * One row of an organization roster.
  *
  * An organization invitation creates no membership until it is claimed, so
