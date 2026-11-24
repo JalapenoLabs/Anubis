@@ -494,8 +494,9 @@ async fn sweep_unused_registrations(connection: &mut AsyncPgConnection) -> Resul
 /// stale one with no grant, no pending authorization request, and no live
 /// device authorization costs only a fetch to rebuild. A denied device
 /// authorization holds neither a request nor a grant, and its program reads
-/// `access_denied` from the row until it expires, so it holds the client too. Without this, every distinct document URL anybody ever
-/// presented would stay forever, and `/oauth/authorize` is open to strangers.
+/// `access_denied` from the row until it expires, so it holds the client too.
+/// Without this, every distinct document URL anybody ever presented would
+/// stay forever, and `/oauth/authorize` is open to strangers.
 /// Swept whenever a document is fetched, which is the only thing that adds a
 /// row, so an abandoned one outlives its cache lifetime (a day at most) only
 /// until the next fetch. The URL being resolved is left alone, because the

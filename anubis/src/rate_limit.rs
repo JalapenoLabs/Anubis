@@ -220,6 +220,11 @@ pub enum Budget {
     /// Code guessing measured per client: entering a device's user code.
     UserCodePerClient,
     /// Code guessing measured per signed-in account, whatever address it uses.
+    ///
+    /// Charged by the framework's code-entry handler, which knows the account.
+    /// Through [`RateLimiter::layer`] it would be keyed by client address,
+    /// which is [`Budget::UserCodePerClient`]'s job, so it is not one for a
+    /// route of an application's own.
     UserCodePerAccount,
 }
 

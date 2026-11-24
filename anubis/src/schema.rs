@@ -540,6 +540,7 @@ diesel::table! {
         created_at -> Timestamptz,
         expires_at -> Timestamptz,
         device_code_id -> Nullable<Uuid>,
+        entered_by -> Nullable<Uuid>,
     }
 }
 

@@ -184,8 +184,10 @@ pub const OAUTH_REFRESH_REUSED: &str = "oauth.refresh_reused";
 /// revoked.
 ///
 /// The device code is the program's credential for the device grant (RFC 8628)
-/// and is exchanged once. Presented a second time it is held twice, which is
-/// treated exactly as a replayed authorization code is.
+/// and is exchanged once. Presented a second time, it is either held by a
+/// second party or retried by a program whose first answer was lost, which
+/// the server cannot tell apart, so both are treated exactly as a replayed
+/// authorization code is.
 pub const OAUTH_DEVICE_CODE_REUSED: &str = "oauth.device_code_reused";
 
 /// Writes one audit event through `connection`, returning its id.

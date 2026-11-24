@@ -4,7 +4,7 @@
 import { useLocation } from 'react-router'
 
 // UI
-import { DevicePage } from './DevicePage'
+import { DeviceVerificationPage } from './DeviceVerificationPage'
 
 // Utility
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -38,7 +38,7 @@ function stubEntry(entries: unknown[], answer: Response) {
   })
 }
 
-describe('DevicePage', () => {
+describe('DeviceVerificationPage', () => {
   afterEach(() => {
     vi.useRealTimers()
   })
@@ -50,7 +50,7 @@ describe('DevicePage', () => {
     const { container } = renderWithProviders(
       <>
         <LocationProbe />
-        <DevicePage />
+        <DeviceVerificationPage />
       </>,
       '/device',
     )
@@ -72,7 +72,7 @@ describe('DevicePage', () => {
     const entries: unknown[] = []
     stubEntry(entries, Response.json({ request_id: 'request-7' }))
 
-    renderWithProviders(<DevicePage />, '/device?user_code=WDJB-MJHT')
+    renderWithProviders(<DeviceVerificationPage />, '/device?user_code=WDJB-MJHT')
 
     expect(screen.getByLabelText<HTMLInputElement>('Code').value).toBe('WDJB-MJHT')
     expect(screen.getByText('Check that this matches the code your device shows.')).toBeTruthy()
@@ -86,11 +86,31 @@ describe('DevicePage', () => {
   it('should say a refused code is not valid, whatever made it so', async () => {
     stubEntry([], Response.json({ message: 'That code is not valid.' }, { status: 400 }))
 
-    const { container } = renderWithProviders(<DevicePage />, '/device?user_code=WDJB-MJHT')
+    const { container } = renderWithProviders(<DeviceVerificationPage />, '/device?user_code=WDJB-MJHT')
     fireEvent.submit(container.querySelector('form') as HTMLFormElement)
 
     expect(await screen.findByText('That code is not valid. Check it against your device\'s screen.'))
       .toBeTruthy()
+  })
+
+  it('should send an account on a temporary password to choose its own', async () => {
+    stubFetch({
+      '/oauth/device_verification': {
+        status: 403,
+        body: {
+          message: 'Choose a new password before you continue.',
+          code: 'password_change_required',
+        },
+      },
+    })
+
+    const { container } = renderWithProviders(<DeviceVerificationPage />, '/device?user_code=WDJB-MJHT')
+    fireEvent.submit(container.querySelector('form') as HTMLFormElement)
+
+    expect(await screen.findByText(/Your account is on a temporary password/)).toBeTruthy()
+    const link = screen.getByRole('link', { name: 'Choose a new password' })
+    expect(link.getAttribute('href')).toBe('/settings/security')
+    expect(screen.queryByText('Choose a new password before you continue.')).toBeNull()
   })
 
   it('should count a rate-limited entry down rather than refuse the code', async () => {
@@ -103,7 +123,7 @@ describe('DevicePage', () => {
       },
     })
 
-    const { container } = renderWithProviders(<DevicePage />, '/device?user_code=WDJB-MJHT')
+    const { container } = renderWithProviders(<DeviceVerificationPage />, '/device?user_code=WDJB-MJHT')
     fireEvent.submit(container.querySelector('form') as HTMLFormElement)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0)
@@ -114,19 +134,19 @@ describe('DevicePage', () => {
   })
 
   it('should say how the decision went when the backend returns the browser', () => {
-    const { unmount } = renderWithProviders(<DevicePage />, '/device?result=approved')
+    const { unmount } = renderWithProviders(<DeviceVerificationPage />, '/device?result=approved')
     expect(screen.getByText('Device approved')).toBeTruthy()
     expect(screen.getByRole('link', { name: 'Connect another device' }).getAttribute('href'))
       .toBe('/device')
     unmount()
 
-    renderWithProviders(<DevicePage />, '/device?result=denied')
+    renderWithProviders(<DeviceVerificationPage />, '/device?result=denied')
     expect(screen.getByText('Device denied')).toBeTruthy()
     expect(screen.queryByLabelText('Code')).toBeNull()
   })
 
   it('should treat a result it does not know as no result', () => {
-    renderWithProviders(<DevicePage />, '/device?result=elsewhere')
+    renderWithProviders(<DeviceVerificationPage />, '/device?result=elsewhere')
 
     expect(screen.getByLabelText('Code')).toBeTruthy()
   })

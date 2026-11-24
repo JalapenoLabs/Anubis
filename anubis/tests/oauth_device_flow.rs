@@ -33,7 +33,7 @@ use support::oauth::{
     DEVICE_CODE_GRANT, MetadataDocument, RESOURCE, authorize, authorize_params, decide,
     device_codes, enter_code, mcp, param, poll, post_form, request_for_code, start_device,
 };
-use support::{Harness, TestDatabase, register, send};
+use support::{Harness, TestDatabase, register, send, sign_in};
 
 const WHOAMI: &str =
     r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#;
@@ -579,8 +579,8 @@ async fn code_entry_is_signed_in_and_says_the_same_about_every_unusable_code() {
         "every unusable code reads the same: {refusals:?}",
     );
 
-    // Two browsers entering one code see one request, decided once.
-    let second_browser = register(router, &format!("other-{}@example.com", Uuid::new_v4())).await;
+    // Two browsers signed in to one account see one request, decided once.
+    let second_browser = sign_in(router, &email).await;
     let first = request_for_code(router, &cookie, &codes.user_code).await;
     let second = request_for_code(router, &second_browser, &codes.user_code).await;
     assert_eq!(first, second);
@@ -598,15 +598,13 @@ async fn code_entry_is_signed_in_and_says_the_same_about_every_unusable_code() {
         StatusCode::NOT_FOUND,
         "the first decision consumed it"
     );
-    // The approval bound to the account that made it.
+    // The approval is the account's.
     let (status, tokens) = poll(router, &program.client_id, &codes.device_code).await;
     assert_eq!(status, StatusCode::OK, "body: {tokens}");
     let access_token = tokens["access_token"].as_str().expect("an access token");
     let (_status, _headers, answer) = mcp(router, Some(access_token), &whoami(), &[]).await;
-    assert!(
-        answer["result"]["structuredContent"]["user"]["email"]
-            .as_str()
-            .is_some_and(|signed_in| signed_in.starts_with("other-")),
+    assert_eq!(
+        answer["result"]["structuredContent"]["user"]["email"], email,
         "body: {answer}",
     );
 
@@ -621,6 +619,56 @@ async fn code_entry_is_signed_in_and_says_the_same_about_every_unusable_code() {
     let (status, body) = enter_code(router, Some(&cookie), &fresh.user_code).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
     assert_eq!(body["code"], anubis::auth::PASSWORD_CHANGE_REQUIRED);
+}
+
+/// A request id is no way around typing the code. Whoever starts a device
+/// flow can enter its code and send the consent link on; the person it lands
+/// with must not be able to approve, or the sender's device would act as them.
+#[tokio::test]
+async fn only_the_account_that_entered_a_code_may_decide_its_request() {
+    let Some(database) = TestDatabase::create("oauth_device_entrant").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let sender = register(router, &format!("sender-{}@example.com", Uuid::new_v4())).await;
+    let recipient = register(router, &format!("recipient-{}@example.com", Uuid::new_v4())).await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(router, &program.client_id, "").await;
+    let request_id = request_for_code(router, &sender, &codes.user_code).await;
+
+    let path = format!("/oauth/requests/{request_id}");
+    let (status, _headers, _body) = send(router, "GET", &path, None, Some(&recipient)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the link shows nothing to its recipient"
+    );
+    let (status, _headers, _body) = send(
+        router,
+        "POST",
+        &path,
+        Some(&json!({ "approve": true })),
+        Some(&recipient),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nor lets the recipient approve"
+    );
+    let (_status, body) = poll(router, &program.client_id, &codes.device_code).await;
+    assert_eq!(body["error"], "authorization_pending", "body: {body}");
+
+    // The refusal consumed nothing: the account that entered the code still
+    // decides, and once the recipient enters it, the request is theirs.
+    let (status, _headers, _body) = send(router, "GET", &path, None, Some(&sender)).await;
+    assert_eq!(status, StatusCode::OK);
+    let entered = request_for_code(router, &recipient, &codes.user_code).await;
+    assert_eq!(entered, request_id);
+    let (status, _headers, _body) = send(router, "GET", &path, None, Some(&sender)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the latest entry decides");
+    decide(router, &recipient, &request_id, true).await;
 }
 
 #[tokio::test]
@@ -652,6 +700,66 @@ async fn a_denied_device_outlives_the_sweep_of_stale_documents() {
     assert_eq!(body["error"], "access_denied", "body: {body}");
 }
 
+/// A web page can make every visitor's browser post a form anywhere, so a
+/// device authorization a browser sent is refused before it stores anything:
+/// a program on a device sends neither header a browser adds.
+#[tokio::test]
+async fn a_web_page_cannot_start_device_flows_through_its_visitors() {
+    let Some(database) = TestDatabase::create("oauth_device_browsers").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let form = format!(
+        "client_id={}",
+        url::form_urlencoded::byte_serialize(program.client_id.as_bytes()).collect::<String>(),
+    );
+
+    for (header, value) in [
+        ("origin", "https://elsewhere.example"),
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-site", "same-site"),
+    ] {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post("/oauth/device_authorization")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header, value)
+                    .body(Body::from(form.clone()))
+                    .expect("the request builds"),
+            )
+            .await
+            .expect("the router answers");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{header}: {value}"
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body collects")
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("an OAuth error");
+        assert_eq!(body["error"], "invalid_request", "{header}: {value}");
+    }
+
+    let mut connection = harness.pool.get().await.expect("a connection");
+    let stored: i64 = oauth_device_codes::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("the count runs");
+    assert_eq!(stored, 0, "nothing a browser sent was stored");
+    drop(connection);
+
+    // The program itself, sending neither, is served.
+    device_codes(&harness.router, &program.client_id, "").await;
+}
+
 #[tokio::test]
 async fn waiting_device_authorizations_are_bounded() {
     let Some(database) = TestDatabase::create("oauth_device_ceiling").await else {
@@ -668,7 +776,7 @@ async fn waiting_device_authorizations_are_bounded() {
         "INSERT INTO oauth_device_codes \
          (client_id, device_code_hash, user_code_hash, interval_seconds, expires_at) \
          SELECT client_id, 'filler-device-' || n, 'filler-user-' || n, 5, now() + interval '10 minutes' \
-         FROM oauth_device_codes, generate_series(1, 4999) AS n",
+         FROM oauth_device_codes, generate_series(1, 99999) AS n",
     )
     .execute(&mut connection)
     .await

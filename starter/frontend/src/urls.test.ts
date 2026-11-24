@@ -80,8 +80,6 @@ describe('getOauthStartUrl', () => {
   })
 })
 
-// The link factory a model scaffold writes above the `url-factories` anchor.
-// Every generated page navigates through one, so the shape is worth pinning.
 describe('getConsentRequestUrl', () => {
   it('should name the request the consent screen reads', () => {
     expect(getConsentRequestUrl('5f0c2a1e-0000-4000-8000-000000000001'))
@@ -89,6 +87,8 @@ describe('getConsentRequestUrl', () => {
   })
 })
 
+// The link factory a model scaffold writes above the `url-factories` anchor.
+// Every generated page navigates through one, so the shape is worth pinning.
 describe('getCreativeConceptUrl', () => {
   it('should fill the record id into the show route', () => {
     expect(getCreativeConceptUrl('9f8b7c6d')).toBe('/creative-concepts/9f8b7c6d')

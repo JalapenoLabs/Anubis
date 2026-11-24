@@ -374,9 +374,12 @@ impl StoredRequest {
 }
 
 /// `GET /oauth/requests/{id}`: the request a person is about to decide.
+///
+/// A device request is shown only to the account that entered its code; to
+/// anyone else it is as absent as an id that never existed.
 pub(crate) async fn show(
     State(server): State<Server>,
-    CurrentUser(_user): CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(request_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = server.pool().get().await.map_err(|error| {
@@ -391,6 +394,11 @@ pub(crate) async fn show(
         .inner_join(oauth_clients::table)
         .filter(oauth_authorization_requests::id.eq(request_id))
         .filter(oauth_authorization_requests::expires_at.gt(Utc::now()))
+        .filter(
+            oauth_authorization_requests::device_code_id
+                .is_null()
+                .or(oauth_authorization_requests::entered_by.eq(user.id)),
+        )
         .select((StoredRequest::as_select(), ClientRow::as_select()))
         .first(&mut connection)
         .await
@@ -443,7 +451,9 @@ struct DecisionResponse {
 /// The request is consumed by the first decision, deleted with `RETURNING`, so
 /// two decisions arriving together produce one code at most. Approving
 /// creates the grant and its code, or lands it on the device authorization,
-/// in the same transaction as the audit event that records it.
+/// in the same transaction as the audit event that records it. A device
+/// request is decided only by the account that entered its code, and an
+/// attempt by any other leaves it in place, answering `404`.
 pub(crate) async fn decide(
     State(server): State<Server>,
     CurrentUser(user): CurrentUser,
@@ -464,7 +474,12 @@ pub(crate) async fn decide(
             let consumed: Option<(Uuid, StoredRequest)> = diesel::delete(
                 oauth_authorization_requests::table
                     .filter(oauth_authorization_requests::id.eq(request_id))
-                    .filter(oauth_authorization_requests::expires_at.gt(Utc::now())),
+                    .filter(oauth_authorization_requests::expires_at.gt(Utc::now()))
+                    .filter(
+                        oauth_authorization_requests::device_code_id
+                            .is_null()
+                            .or(oauth_authorization_requests::entered_by.eq(user.id)),
+                    ),
             )
             .returning((
                 oauth_authorization_requests::client_id,

@@ -29,5 +29,7 @@ mod passkey;
 pub mod socket;
 
 pub use database::TestDatabase;
-pub use harness::{Harness, PASSWORD, invitation_token, register, send, serve, session_token};
+pub use harness::{
+    Harness, PASSWORD, invitation_token, register, send, serve, session_token, sign_in,
+};
 pub use passkey::SoftAuthenticator;

@@ -19,6 +19,11 @@ ALTER TABLE oauth_clients
             ]
         );
 
+-- A cached metadata document's grants are read only when it is fetched, so
+-- every cached document is fetched again on its next use rather than keeping
+-- the default above until its cache entry is due.
+UPDATE oauth_clients SET refresh_after = now() WHERE kind = 'metadata_document';
+
 -- One device authorization: the codes a program was handed, how it polls, and
 -- what the person decided.
 --
@@ -55,13 +60,22 @@ CREATE INDEX oauth_device_codes_grant_id ON oauth_device_codes (grant_id);
 -- An authorization request is delivered one of two ways: back to a redirect
 -- URI with a code (the authorization code flow), or to a device that polls
 -- (this grant). A device request has no redirect URI, no `state`, and no PKCE
--- challenge, because the device code is what proves the program.
+-- challenge, because the device code is what proves the program. It belongs
+-- to the account that last entered its user code (`entered_by`), and no other
+-- account may read or decide it, so passing the request's id to somebody is
+-- no way around typing the code.
 ALTER TABLE oauth_authorization_requests
     ALTER COLUMN redirect_uri DROP NOT NULL,
     ALTER COLUMN code_challenge DROP NOT NULL,
     ADD COLUMN device_code_id UUID UNIQUE REFERENCES oauth_device_codes(id) ON DELETE CASCADE,
+    ADD COLUMN entered_by UUID REFERENCES users(id) ON DELETE CASCADE,
     ADD CONSTRAINT oauth_authorization_requests_delivery CHECK (
-        (device_code_id IS NULL AND redirect_uri IS NOT NULL AND code_challenge IS NOT NULL)
+        (
+            device_code_id IS NULL
+            AND redirect_uri IS NOT NULL
+            AND code_challenge IS NOT NULL
+            AND entered_by IS NULL
+        )
         OR (
             device_code_id IS NOT NULL
             AND redirect_uri IS NULL

@@ -11,28 +11,36 @@
 //! |---|---|---|
 //! | `POST /oauth/device_authorization` | the program | Issue a device code and a user code |
 //! | `POST /oauth/device_verification` | the code-entry page | Find the request a user code names (session) |
-//! | `POST /oauth/token`, `grant_type=urn:ietf:params:oauth:grant-type:device_code` | the program | Poll, and exchange once approved |
+//! | `POST /oauth/token` with the device code grant | the program | Poll, and exchange once approved |
 //!
 //! # One request, decided once
 //!
 //! Issuing the codes also stores an authorization request, the same row the
 //! consent screen reads for a redirecting client, linked to the device code.
-//! Entering the user code answers that request's id, and the consent
-//! screen's decision consumes it, exactly as it does for any request: two
-//! browsers entering one code see one request, and the second decision finds
-//! it gone. The decision lands on the device code as a grant or a refusal,
-//! and the program's next poll reads it.
+//! Entering the user code makes that request the entering account's and
+//! answers its id; no other account may read or decide it, so the id passed
+//! on is no way around typing the code. The consent screen's decision
+//! consumes it, exactly as it does for any request: two browsers signed in to
+//! one account see one request, and the second decision finds it gone. The
+//! decision lands on the device code as a grant or a refusal, and the
+//! program's next poll reads it.
 //!
 //! # Polling
 //!
 //! Every poll writes: its time, the grown interval when it came too soon,
 //! the spend when it exchanges. So a poll locks the device code's row and
 //! decides from what it reads there ([`DeviceCode::poll`]), and polls of one
-//! code take turns. A device code is exchanged once. Presented again it is
-//! held twice, which revokes the grant ([`audit::OAUTH_DEVICE_CODE_REUSED`])
-//! just as a replayed authorization code does, so two polls racing after an
-//! approval mint one token set and the loser's arrival ends it. A program
-//! that polls one request at a time, as RFC 8628 has it do, never meets that.
+//! code take turns.
+//!
+//! A device code is exchanged once. Presented again, it may be held by a
+//! second party, or the program may be retrying an exchange whose answer was
+//! lost on its way back; the server cannot tell the two apart, and treats
+//! both as a replayed authorization code: the grant is revoked
+//! ([`audit::OAUTH_DEVICE_CODE_REUSED`]). The first answer's tokens are out of
+//! the program's reach either way, so revoking them takes nothing it still
+//! had, and it starts again. Two polls racing after an approval therefore
+//! mint one token set and the second one's arrival ends it, and a reuse in
+//! the audit log means a repeated exchange, a copied code or a lost answer.
 //!
 //! # What makes a user code safe to type
 //!
@@ -41,16 +49,19 @@
 //! database, and worth nothing there: a code lives ten minutes and only lets
 //! its finder approve somebody else's device into their own account. Online,
 //! entry needs a session and is charged per client address and per account
-//! ([`Budget::UserCodePerClient`] and [`Budget::UserCodePerAccount`]), and at
-//! most [`MAX_LIVE_DEVICE_CODES`] codes wait at once, which bounds both what
-//! strangers can store and the odds of a guess naming any of them.
+//! ([`Budget::UserCodePerClient`] and [`Budget::UserCodePerAccount`]).
+//!
+//! Starting a device flow is open to strangers, so a browser's request is
+//! refused (a web page could otherwise recruit its visitors), and at most
+//! [`MAX_LIVE_DEVICE_CODES`] wait at once, which bounds storage.
 //!
 //! [`Budget::UserCodePerClient`]: crate::rate_limit::Budget::UserCodePerClient
 //! [`Budget::UserCodePerAccount`]: crate::rate_limit::Budget::UserCodePerAccount
 
 use axum::extract::rejection::FormRejection;
 use axum::extract::{Form, State};
-use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderMap;
+use axum::http::header::{CACHE_CONTROL, ORIGIN};
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
@@ -73,9 +84,9 @@ use crate::schema::{oauth_authorization_requests, oauth_clients, oauth_device_co
 /// Where the SPA renders the code-entry page, RFC 8628's verification URI.
 ///
 /// A contract with the application's frontend, the way [`super::CONSENT_PATH`]
-/// is: the starter's `UrlTree.device` names the same path. The page reads a
-/// prefilled code from [`USER_CODE_PARAM`] and the outcome of a decision from
-/// [`DEVICE_RESULT_PARAM`].
+/// is: the starter's `UrlTree.deviceVerification` names the same path. The
+/// page reads a prefilled code from [`USER_CODE_PARAM`] and the outcome of a
+/// decision from [`DEVICE_RESULT_PARAM`].
 pub const DEVICE_PATH: &str = "/device";
 
 /// The query parameter `verification_uri_complete` carries the user code in.
@@ -102,6 +113,15 @@ const POLL_INTERVAL_SECONDS: i32 = 5;
 /// section 3.5 fixes for `slow_down`.
 const SLOW_DOWN_SECONDS: i32 = 5;
 
+/// How much sooner than the interval a poll may arrive and still be on time.
+///
+/// RFC 8628 has the program wait the interval between the requests it sends,
+/// and this server can only measure when they arrive: a program on a timer
+/// sees one poll land a little after the last whenever that one was held up
+/// on the network, in the pool, or behind the row lock. A second absorbs that
+/// jitter, while a program ignoring the interval still meets `slow_down`.
+const POLL_SLACK: Duration = Duration::seconds(1);
+
 /// The letters a user code is drawn from: RFC 8628 section 6.1's twenty
 /// consonants, with no vowel to spell a word and no digit to mistake for a
 /// letter.
@@ -114,17 +134,20 @@ const USER_CODE_GROUP_LENGTH: usize = 4;
 /// How many device authorizations may wait at once before the endpoint
 /// refuses with `503`.
 ///
-/// The endpoint is open to strangers and every call stores two rows, so this
-/// bounds what a flood from rotating addresses can store for the ten minutes
-/// they live. It also bounds the odds of a guessed user code naming any live
-/// one: five thousand of 20^8 codes is one in five million per guess. Real
-/// use is a person connecting a device, finished within minutes.
-pub(crate) const MAX_LIVE_DEVICE_CODES: i64 = 5_000;
+/// A storage bound and nothing more. The endpoint is open to strangers and
+/// every call stores two rows, so this caps what a flood from rotating
+/// addresses can hold for the ten minutes they live: a hundred thousand
+/// authorizations take about 65 MB with their indexes, and counting them takes
+/// milliseconds. It sits far above real use, a person connecting a device and
+/// done within minutes, because reaching it refuses every client; the address
+/// budget, not this, is what holds a stranger back.
+pub(crate) const MAX_LIVE_DEVICE_CODES: i64 = 100_000;
 
 /// How many user codes are drawn before giving up on finding an unused one.
 ///
 /// A collision needs one of at most [`MAX_LIVE_DEVICE_CODES`] live codes out
-/// of 20^8, so a second draw is already a one-in-five-million event.
+/// of 20^8, so a second draw is already a one-in-250,000 event and a third
+/// failing is not one to plan for.
 const USER_CODE_DRAWS: usize = 3;
 
 /// A device authorization request, RFC 8628 section 3.1.
@@ -162,8 +185,23 @@ struct NewDeviceCode<'a> {
 /// `POST /oauth/device_authorization`.
 pub(crate) async fn authorize(
     State(server): State<Server>,
+    headers: HeaderMap,
     form: Result<Form<DeviceAuthorizationForm>, FormRejection>,
 ) -> Result<impl IntoResponse, OauthError> {
+    // A web page can have every visitor's browser post this form, each from
+    // its own address and so on its own budget, and fill the table of waiting
+    // codes. A browser marks such a write with `Origin`, and a current one
+    // with `Sec-Fetch-Site`; a program on a device sends neither.
+    let sent_by_a_page = headers.contains_key(ORIGIN)
+        || headers
+            .get("sec-fetch-site")
+            .is_some_and(|site| site == "cross-site" || site == "same-site");
+    if sent_by_a_page {
+        return Err(OauthError::invalid_request(
+            "Device authorization is for programs, not web pages.",
+        ));
+    }
+
     let Form(form) = form.map_err(|rejection| {
         OauthError::invalid_request(format!(
             "The device authorization request must be a form-encoded body: {rejection}"
@@ -281,7 +319,8 @@ async fn issue(
         );
 
         // A user code already waiting is a collision, drawn again rather than
-        // failing the transaction on the unique index.
+        // failing the transaction on its unique index. Only that index: a
+        // device code colliding is a broken random source, and fails.
         let stored: Option<Uuid> = diesel::insert_into(oauth_device_codes::table)
             .values(NewDeviceCode {
                 client_id: client.id,
@@ -290,7 +329,8 @@ async fn issue(
                 interval_seconds: POLL_INTERVAL_SECONDS,
                 expires_at,
             })
-            .on_conflict_do_nothing()
+            .on_conflict(oauth_device_codes::user_code_hash)
+            .do_nothing()
             .returning(oauth_device_codes::id)
             .get_result(connection)
             .await
@@ -354,11 +394,13 @@ struct VerificationResponse {
 
 /// `POST /oauth/device_verification`: the request a user code names.
 ///
-/// Signed in, so the decision that follows binds to this account. Charged per
-/// account before anything is looked up, beside the per-address budget the
-/// route's layer charges. Every code that names nothing waiting, whether
-/// malformed, unknown, expired, or already decided, answers the same `400`,
-/// so the answer says nothing about which.
+/// Signed in, and the request becomes this account's: only the account that
+/// last entered its code may read or decide it, so its id passed to somebody
+/// else is no way around typing the code. Charged per account before anything
+/// is looked up, beside the per-address budget the route's layer charges.
+/// Every code that names nothing waiting, whether malformed, unknown, expired,
+/// or already decided, answers the same `400`, so the answer says nothing
+/// about which.
 pub(crate) async fn verify(
     State(server): State<Server>,
     Extension(rate_limit): Extension<RateLimiter>,
@@ -380,14 +422,19 @@ pub(crate) async fn verify(
         );
         ApiError::internal()
     })?;
-    let request_id: Option<Uuid> = oauth_authorization_requests::table
-        .inner_join(oauth_device_codes::table)
+    let named_device = oauth_device_codes::table
         .filter(oauth_device_codes::user_code_hash.eq(token::hash(&user_code)))
-        .filter(oauth_authorization_requests::expires_at.gt(Utc::now()))
-        .select(oauth_authorization_requests::id)
-        .first(&mut connection)
-        .await
-        .optional()?;
+        .select(oauth_device_codes::id.nullable());
+    let request_id: Option<Uuid> = diesel::update(
+        oauth_authorization_requests::table
+            .filter(oauth_authorization_requests::device_code_id.eq_any(named_device))
+            .filter(oauth_authorization_requests::expires_at.gt(Utc::now())),
+    )
+    .set(oauth_authorization_requests::entered_by.eq(Some(user.id)))
+    .returning(oauth_authorization_requests::id)
+    .get_result(&mut connection)
+    .await
+    .optional()?;
 
     let request_id = request_id.ok_or_else(unusable)?;
     Ok(Json(VerificationResponse { request_id }))
@@ -506,7 +553,7 @@ impl DeviceCode {
         let interval = Duration::seconds(i64::from(self.interval_seconds));
         let too_soon = self
             .last_polled_at
-            .is_some_and(|last| now < last + interval);
+            .is_some_and(|last| now < last + interval - POLL_SLACK);
         if too_soon {
             return Poll::TooSoon;
         }
@@ -674,7 +721,7 @@ mod tests {
             "the first poll is never too soon"
         );
 
-        device.last_polled_at = Some(now - Duration::seconds(4));
+        device.last_polled_at = Some(now - Duration::seconds(3));
         assert_eq!(device.poll(now), Poll::TooSoon);
 
         device.last_polled_at = Some(now - Duration::seconds(5));
@@ -684,9 +731,15 @@ mod tests {
             "the interval itself is soon enough"
         );
 
+        // A program on a five-second timer sees one poll arrive a little after
+        // the last whenever that one was held up on its way in. That is jitter,
+        // not a program polling too soon.
+        device.last_polled_at = Some(now - Duration::milliseconds(4_500));
+        assert_eq!(device.poll(now), Poll::Pending, "jitter is forgiven");
+
         // A grown interval is the one held to.
         device.interval_seconds = 10;
-        device.last_polled_at = Some(now - Duration::seconds(9));
+        device.last_polled_at = Some(now - Duration::seconds(8));
         assert_eq!(device.poll(now), Poll::TooSoon);
     }
 

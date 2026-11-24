@@ -38,7 +38,8 @@ use uuid::Uuid;
 
 use support::oauth::{MetadataDocument, device_codes, mcp, poll, request_for_code};
 use support::{
-    Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, socket,
+    Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, sign_in,
+    socket,
 };
 
 /// How many racers a test fires at once.
@@ -886,17 +887,18 @@ async fn polls_racing_after_an_approval_mint_one_token_set() {
     assert_eq!(reused, 1, "the revocation is recorded once");
 }
 
-/// Two browsers entered one user code and decided at the same instant, one
-/// approving and one denying. The request they share is consumed once, so
-/// exactly one decision lands on the device and the program reads that one.
+/// Two browsers signed in to one account entered one user code and decided at
+/// the same instant, one approving and one denying. The request they share is
+/// consumed once, so exactly one decision lands on the device and the program
+/// reads that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_approval_and_a_refusal_of_one_device_decide_once() {
     let Some(database) = TestDatabase::create("concurrency_device_decisions").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
-    let approver = register(&harness.router, "device-approver@example.com").await;
-    let refuser = register(&harness.router, "device-refuser@example.com").await;
+    let approver = register(&harness.router, "device-decider@example.com").await;
+    let refuser = sign_in(&harness.router, "device-decider@example.com").await;
     let program = MetadataDocument::serve_device("Server agent");
     let codes = device_codes(&harness.router, &program.client_id, "").await;
     let request_id = request_for_code(&harness.router, &approver, &codes.user_code).await;

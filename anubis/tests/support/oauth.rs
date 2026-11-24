@@ -82,12 +82,21 @@ impl MetadataDocument {
         let address: SocketAddr = listener.local_addr().expect("the listener is bound");
 
         let client_id = format!("http://127.0.0.1:{}/client.json", address.port());
+        // A client of the code flow names its response type, as Claude Code's
+        // document does; one that never visits the authorization endpoint
+        // names none.
+        let response_types: &[&str] = if grant_types.contains(&"authorization_code") {
+            &["code"]
+        } else {
+            &[]
+        };
         let document = json!({
             "client_id": client_id,
             "client_name": name,
             "client_uri": "https://example.com",
             "redirect_uris": redirect_uris,
             "grant_types": grant_types,
+            "response_types": response_types,
             "token_endpoint_auth_method": "none",
         });
         let router = Router::new().route(

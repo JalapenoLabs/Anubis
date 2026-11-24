@@ -5,8 +5,10 @@ import type { FormEvent } from 'react'
 // Core
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import {
+  PASSWORD_CHANGE_REQUIRED,
+  getApiErrorCode,
   getApiErrorMessage,
   getRetryAfterSeconds,
   useAnubisApi,
@@ -21,7 +23,7 @@ import { RateLimitNotice } from '../RateLimitNotice'
 import { HTTPError } from 'ky'
 
 // Misc
-import { getConsentRequestUrl } from '../../urls'
+import { UrlTree, getConsentRequestUrl } from '../../urls'
 
 /** A user code is eight letters; people add a dash or spaces while copying it. */
 const USER_CODE_LENGTH = 8
@@ -48,6 +50,7 @@ export function UserCodeForm(props: Props) {
   const [ userCode, setUserCode ] = useState(props.initialCode.toUpperCase())
   const [ isSubmitting, setIsSubmitting ] = useState(false)
   const [ errorMessage, setErrorMessage ] = useState<string | null>(null)
+  const [ needsOwnPassword, setNeedsOwnPassword ] = useState(false)
 
   const codeRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
@@ -60,6 +63,7 @@ export function UserCodeForm(props: Props) {
     event.preventDefault()
     setIsSubmitting(true)
     setErrorMessage(null)
+    setNeedsOwnPassword(false)
     try {
       const requestId = await api.verifyUserCode(userCode)
       navigate(getConsentRequestUrl(requestId))
@@ -74,6 +78,12 @@ export function UserCodeForm(props: Props) {
       }
 
       console.debug('the user code was refused', error)
+      // An account on an operator's temporary password may do nothing else
+      // until it chooses its own, and the consent screen says so the same way.
+      if (getApiErrorCode(error) === PASSWORD_CHANGE_REQUIRED) {
+        setNeedsOwnPassword(true)
+        return
+      }
       // Every code that names nothing waiting answers one 400, whose server
       // sentence is English; the translated one says the same.
       if (error instanceof HTTPError && error.response.status === 400) {
@@ -116,6 +126,17 @@ export function UserCodeForm(props: Props) {
       ? <p role='alert' className='compact text-danger'>{
           errorMessage
         }</p>
+      : null
+    }
+    { needsOwnPassword
+      ? <div className='compact'>
+          <p role='alert' className='compact text-danger'>{
+              t('oauth.consent.passwordChangeRequired')
+            }</p>
+          <Link to={UrlTree.settingsSecurity} className='text-primary'>{
+              t('oauth.consent.choosePassword')
+            }</Link>
+        </div>
       : null
     }
     <div className='relaxed mt-6'>

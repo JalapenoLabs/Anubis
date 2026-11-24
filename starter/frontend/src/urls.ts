@@ -50,9 +50,10 @@ export const UrlTree = {
    * The backend hands this URL to the device as its verification URI and
    * returns the browser here once the person decided, so the path is a
    * contract with `anubis::oauth_server::DEVICE_PATH`, like the consent
-   * screen's.
+   * screen's. Named for RFC 8628's verification URI rather than `device`,
+   * which is the key `anubis scaffold model Device` writes here.
    */
-  device: '/device',
+  deviceVerification: '/device',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
   /**

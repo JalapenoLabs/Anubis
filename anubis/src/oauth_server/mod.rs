@@ -304,7 +304,7 @@ mod tests {
         .expect("the starter's urls are readable");
 
         for expected in [
-            format!("device: '{}'", super::DEVICE_PATH),
+            format!("deviceVerification: '{}'", super::DEVICE_PATH),
             format!("DEVICE_USER_CODE_PARAM = '{}'", super::USER_CODE_PARAM),
             format!("DEVICE_RESULT_PARAM = '{}'", super::DEVICE_RESULT_PARAM),
         ] {

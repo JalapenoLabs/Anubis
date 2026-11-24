@@ -32,7 +32,7 @@ const resultCopy = {
  * device offers carries its code, which prefills the field but is never sent
  * on the person's behalf: someone else's device can send a link too.
  */
-export function DevicePage() {
+export function DeviceVerificationPage() {
   const { t } = useTranslation()
   const [ searchParams ] = useSearchParams()
 
@@ -49,7 +49,7 @@ export function DevicePage() {
       <p className='relaxed'>{
           t(copy.body)
         }</p>
-      <Link to={UrlTree.device} className='text-primary'>{
+      <Link to={UrlTree.deviceVerification} className='text-primary'>{
           t('oauth.device.another')
         }</Link>
     </AuthLayout>
