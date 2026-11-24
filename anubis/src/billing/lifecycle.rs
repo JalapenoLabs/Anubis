@@ -18,6 +18,11 @@
 //!   subscription at Stripe and writes back the answer through the same
 //!   convergence.
 //!
+//! The wallet's payments ride the same events and the same reconciliation:
+//! a top-up, a recharge, or a refund names a payment, and
+//! [`crate::billing::wallet`] reads it back and records it in the ledger
+//! once. [`RechargeWallet`] runs through [`Reconciler::recharge_wallet`].
+//!
 //! A subscription and its line items are written together, in one
 //! transaction behind one ordering guard, so an event too old to change a
 //! subscription cannot change its items either, and the items written are
@@ -609,6 +614,17 @@ impl Reconciler {
                 .await
             }
             PAYMENT_SUCCEEDED | PAYMENT_FAILED => {
+                // Every payment the account takes raises these, an invoice's
+                // included. The body's metadata decides only whether the
+                // payment is a wallet's, which saves reading back every other
+                // one; what it says about money is read back from Stripe.
+                if object
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get(stripe::WALLET_METADATA))
+                    .is_none()
+                {
+                    return Ok(());
+                }
                 let named = object.get("id").and_then(serde_json::Value::as_str);
                 self.converge_payment_named(connection, named, Refunds::Skip)
                     .await

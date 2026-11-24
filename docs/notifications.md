@@ -58,6 +58,10 @@ Notifying several people is a loop, and two helpers name the usual audiences: `n
 | `INVITATION_CLAIMED` | `invitation.claimed` | The admins of the team or organization that was joined |
 | `MEMBERSHIP_ROLES_CHANGED` | `membership.roles_changed` | The member whose roles changed |
 | `WEBHOOK_DELIVERY_FAILED` | `webhook.delivery_failed` | The team's admins, when a delivery runs out of attempts |
+| `WALLET_LOW_BALANCE` | `wallet.low_balance` | The organization's billing members, when a spend takes its credit below the wallet's low-balance mark |
+| `WALLET_RECHARGE_FAILED` | `wallet.recharge_failed` | The organization's billing members, when a recharge was refused and auto-recharge turned off |
+
+The billing members of an organization are everyone holding its `admin` or `billing` role whose membership is not suspended. The low-balance notice is sent once per dip, when a spend crosses the mark on the way down, and not while auto-recharge is on, because the recharge is the answer; see [billing.md](billing.md#notices-and-the-audit-log).
 
 An invitation to an address with no account writes nothing: there is no inbox yet, and the email carries the invitation either way. The claim token stays in that email and never reaches a notification, because a token is a credential and the row would be holding it in the clear, so the notice says where to accept rather than linking to it.
 

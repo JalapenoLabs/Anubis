@@ -700,23 +700,16 @@ wallet:
         let plans = plans();
         let terms = plans.wallet().expect("credit is sold");
 
-        assert!(validate_auto_recharge(terms, 5_000_000, 10_000_000).is_ok());
-        assert!(
-            validate_auto_recharge(terms, 20_000_000, 10_000_000).is_err(),
-            "below threshold"
-        );
-        assert!(
-            validate_auto_recharge(terms, 0, 5_000_000).is_err(),
-            "below the minimum"
-        );
-        assert!(
-            validate_auto_recharge(terms, -1, 10_000_000).is_err(),
-            "negative threshold"
-        );
-        assert!(
-            validate_auto_recharge(terms, 0, 10_000_001).is_err(),
-            "a fraction of a cent"
-        );
+        validate_auto_recharge(terms, 5_000_000, 10_000_000).expect("a recharge clearing it");
+        for (threshold, amount, why) in [
+            (20_000_000, 10_000_000, "below its threshold"),
+            (0, 5_000_000, "below the minimum top-up"),
+            (-1, 10_000_000, "a negative threshold"),
+            (0, 10_000_001, "a fraction of a cent"),
+        ] {
+            let refused = validate_auto_recharge(terms, threshold, amount).expect_err(why);
+            assert!(refused.is_invalid(), "{why}: {refused}");
+        }
     }
 
     #[test]

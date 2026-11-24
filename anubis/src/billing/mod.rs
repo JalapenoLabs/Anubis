@@ -29,6 +29,9 @@
 //!   projection from it.
 //! - [`Limits`] is what makes a plan's limits mean something: it resolves the
 //!   plan an organization is on and answers whether one more record fits.
+//! - [`Wallets`] spends an organization's prepaid credit from the
+//!   application's own metering; the [`wallet`] module holds the balance, the
+//!   append-only ledger it is the sum of, top-ups, auto-recharge, and refunds.
 //!
 //! [`router`] serves the organization-scoped endpoints an application mounts
 //! under `/billing`; [`webhook_router`] serves the receiver Stripe posts to,
@@ -47,12 +50,13 @@
 //! 3. [`Reconciler::reconcile`] repairs an organization whose events were
 //!    missed, and is exposed as an endpoint for the day one is.
 //!
-//! Registering the two jobs is the whole of the wiring, beside the framework's
-//! webhook deliverer:
+//! Registering the three jobs is the whole of the wiring, beside the
+//! framework's webhook deliverer:
 //!
 //! ```ignore
 //! let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans.clone(), &config);
 //! let seats = reconciler.clone();
+//! let recharger = reconciler.clone();
 //! let worker = anubis::jobs::Worker::builder(pool)
 //!     .register(move |job: anubis::billing::ProcessStripeEvent| {
 //!         let reconciler = reconciler.clone();
@@ -61,6 +65,10 @@
 //!     .register(move |job: anubis::billing::SyncSeats| {
 //!         let seats = seats.clone();
 //!         async move { seats.sync_seats(job).await }
+//!     })
+//!     .register(move |job: anubis::billing::RechargeWallet| {
+//!         let recharger = recharger.clone();
+//!         async move { recharger.recharge_wallet(job).await }
 //!     })
 //!     .build();
 //! ```
@@ -84,13 +92,15 @@
 //!
 //! # The free plan is the absence of a row
 //!
-//! Exactly one plan in `billing.yml` sells no prices, and that is the free
-//! plan. An organization with no live plan subscription is on it. Nothing is
-//! written at signup, nothing is backfilled when a plan is renamed, and a
-//! cancellation lands back where a new organization starts. Plan resolution is
-//! therefore total: every organization is always on a plan. Subject
-//! subscriptions never move it, because each buys its own record rather than
-//! the organization's limits.
+//! Exactly one plan in `billing.yml` sells no prices, leaving aside the paid
+//! plan, and that is the free plan. An organization paying for nothing is on
+//! it. Nothing is written at signup, nothing is backfilled when a plan is
+//! renamed, and a cancellation lands back where a new organization starts.
+//! Plan resolution is therefore total: every organization is always on a plan.
+//! A live plan subscription decides it; without one, an organization paying
+//! for anything else, a subscription for one of its records or credit in its
+//! wallet, is on the plan `paid_plan` names, when the file names one. See
+//! [`limits`].
 //!
 //! # Stripe is the system of record for money
 //!
@@ -99,8 +109,9 @@
 //! purchase, the Stripe Billing customer portal takes every change to a plan
 //! subscription, and [`Subscriptions`] makes the changes an application makes
 //! to the records it sells. What this framework keeps is the projection it has
-//! to authorize from, and the projection is only ever written from what Stripe
-//! reports.
+//! to authorize from, written only from what Stripe reports, and the wallet's
+//! ledger, whose credits are only ever the amounts Stripe says it received and
+//! whose debits are the application's own spends and Stripe's refunds.
 //!
 //! # Billing disabled
 //!

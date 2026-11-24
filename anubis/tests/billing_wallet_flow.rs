@@ -685,6 +685,10 @@ async fn deliver(router: &Router, event: &Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one narrative: the checkout opened, then every event that could credit it twice"
+)]
 async fn a_top_up_is_opened_at_checkout_and_credits_once_however_its_events_arrive() {
     let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
         return;
@@ -1328,4 +1332,28 @@ async fn without_stripe_the_wallet_reads_and_every_write_says_so() {
         .expect("held credit is spent");
     assert_eq!(spent.balance_micros(), 4 * DOLLAR);
     assert_eq!(spent.entry().subject_id, Some(server.id()));
+}
+
+#[tokio::test]
+async fn a_top_up_while_stripe_is_unreachable_answers_unavailable() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    // A port nothing listens on: every call to Stripe fails to connect.
+    let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a loopback port");
+    let base = format!("http://{unreachable}");
+    let scene = Scene::with_stripe(&database, Some(&base), Mock::default()).await;
+
+    let (status, body) = scene
+        .request(
+            "POST",
+            "/wallet/top-up",
+            Some(json!({ "amount_micros": 10 * DOLLAR })),
+            &scene.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert!(scene.entries().await.is_empty(), "nothing is credited");
 }

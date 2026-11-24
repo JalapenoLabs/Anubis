@@ -1132,7 +1132,7 @@ pub struct NewRecharge<'a> {
     pub attempt_id: Uuid,
 }
 
-/// A Stripe PaymentIntent, as much of one as the wallet reads.
+/// A Stripe `PaymentIntent`, as much of one as the wallet reads.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaymentIntent {
     /// Stripe's id for the payment, e.g. `pi_1Q...`.

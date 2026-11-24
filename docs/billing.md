@@ -244,6 +244,107 @@ If the local write fails after Stripe answered, the change still happened at Str
 | `is_transport()` | `503` | Stripe could not be reached; retrying may work |
 | none of these | `500`, detail in the log | Stripe refused, or the database did |
 
+## The prepaid credit wallet
+
+A usage-priced application sells credit up front and spends it as usage accrues: customers top up, the application charges each hour a server ran, and Stripe stays the record of every payment and refund. The wallet is on when `billing.yml` has a `wallet` section, and an application that sells no credit pays nothing for it.
+
+### Amounts
+
+Every amount is an integer number of **micro-units** of the wallet's currency: 1,000,000 is $1.00, so an hour at $0.0875 is 87,500 and a minute never rounds to zero. The unit is in every name that carries one (`balance_micros`, `amount_micros`), in the tables, the Rust API, the JSON, and `billing.yml` alike, so no two amounts that meet are ever in different units. Stripe charges in the currency's smallest unit instead, and `anubis::billing::currency` is the one place the two meet, following Stripe's own list of zero-decimal and three-decimal currencies: a top-up or a recharge is a whole cent (a whole yen, ten fils), at most Stripe's eight digits.
+
+### The ledger, and the balance it caches
+
+`wallet_entries` is append-only. Credits are positive, spends and refunds negative, and every entry carries the balance it left, so each line of the ledger reads on its own. Nothing updates or deletes a row: a refund that fails after it was debited is a second, compensating entry.
+
+| Kind | Sign | Written by |
+|---|---|---|
+| `top_up` | + | A payment through Stripe Checkout, keyed by its PaymentIntent |
+| `recharge` | + | Auto-recharge's off-session charge, keyed by its PaymentIntent |
+| `spend` | - | The application's metering, keyed by the application |
+| `refund` | - | A Stripe refund of a wallet payment, keyed by the refund |
+| `refund_reversal` | + | That refund failing or being cancelled after it was debited |
+
+`wallets.balance_micros` is the sum of the ledger, moved in the same transaction as each entry under the wallet's row lock. Every write takes that lock first, reads, then writes, and none calls Stripe while holding it, so two writers to one wallet are ordered rather than one overwriting the other's balance, and an idempotency key checked under the lock cannot be written twice. Unique indexes back both keys: one per kind and key per organization, and one credit per PaymentIntent across every path that could credit it.
+
+### Spending
+
+The application calls `anubis::billing::Wallets` from its own metering, on its own connection, so a spend commits with the application's record of the usage it charges for and a rolled-back meter spends nothing:
+
+```rust
+let wallets = anubis::billing::Wallets::new(plans.clone(), &config);
+
+let spent = wallets
+    .spend(&mut connection, organization_id, Spend {
+        amount_micros: 87_500,
+        key: &format!("server:{server_id}:hour:{hour}"),
+        description: Some("Server alpha, one hour awake"),
+        subject: Some(&Subject::new("Server", server_id)),
+    })
+    .await?;
+if spent.uncovered_micros() > 0 {
+    // The credit ran out during this hour: stop the server.
+}
+```
+
+**A spend drains to zero, and never below.** A spend the balance covers takes its amount. One larger than the balance takes what is left, leaving exactly zero, and reports how much it could not cover; one made at zero or below is refused (`402`, `Error::is_insufficient`) with nothing written. Metering charges for usage that already happened, so refusing it whole would leave a remainder that no later charge fits, and an organization holding a fraction of a cent would count as paying forever. An overdraft would be credit extended, which needs a limit, a policy, and collections. **The application learns the wallet ran dry from the spend itself**, in the same call: that is the earliest anything could tell it, and it is exactly where usage is stopped. A balance the application wants to read ahead of time is `Wallets::balance`, and every spend answers with the balance it left.
+
+**Only a refund takes the balance below zero.** The money has already left at Stripe, so the debit cannot be refused; the organization pays for nothing while it owes, and its next credit pays the debt first.
+
+**The key makes a retry one charge.** It is unique per organization and names the charge, so it is best derived from what is being charged for. The same key and amount answers with the entry already written (`Spent::is_replay`); the same key for a different amount or record is refused as a conflict, because a meter reusing keys is a bug worth hearing about. A refusal for lack of credit writes nothing, so the same key charges once credit arrives.
+
+Keep the transaction short: a spend holds the wallet's row lock until the caller commits.
+
+### Top-ups
+
+`POST /billing/organizations/{id}/wallet/top-up` takes `{"amount_micros": 25000000, "save_card": true}` and answers with a Stripe Checkout URL. The session is `mode=payment`, one line priced inline in the wallet's currency and named by `wallet.name`, on the organization's Stripe customer, with `organization_id` and `wallet=top_up` on the payment's metadata. `save_card` adds `payment_intent_data[setup_future_usage]=off_session`, which is how a card auto-recharge can charge gets saved. Below `minimum_top_up_micros`, or not a whole cent, answers `400`; the minimum exists because a card charge carries a fixed fee. Stripe returns the browser to the billing page with `?top_up=success` or `?top_up=canceled`, trusted for nothing but a sentence.
+
+Nothing is credited by the request. The payment arrives as events, `checkout.session.completed`, `checkout.session.async_payment_succeeded` for a method that settles later, and `payment_intent.succeeded`; each reads the payment back from Stripe and credits **the amount Stripe says it received**, never an amount an event body or a browser carried, once, keyed by the PaymentIntent, whichever of them lands first. The payment's customer is the binding: credit only lands in the wallet of the organization whose Stripe customer paid, and a payment whose metadata names another organization fails its job for a person to look at. A payment in a currency the wallet does not hold fails the same way. A top-up that saved its card makes that card the wallet's recharge card, unless a newer top-up already saved one, so a late event never brings back an older card.
+
+### Auto-recharge
+
+`PUT .../wallet/auto-recharge` takes `{"threshold_micros": 5000000, "amount_micros": 10000000}`: when a spend leaves the balance below the threshold, the saved card is charged the amount. It needs a saved card (`409` until a top-up saves one), an amount at least the minimum top-up and at least the threshold, which is what guarantees one recharge lifts a spent-down wallet back over it, and is audited as `wallet.auto_recharge_changed`. `DELETE` turns it off. Turning it on below the threshold recharges at once.
+
+**One dip, one charge.** The spend that lands below the threshold arms an attempt on the wallet row, inside its own transaction under the wallet's lock, and queues `RechargeWallet`. Every spend landing there while the attempt is armed finds it armed and arms nothing, so ten spends crossing at once queue one job. The attempt's id travels in the payment's metadata and, with a revision, keys the request at Stripe. The job reads Stripe back before it charges: it lists the customer's payments since the attempt was armed and looks for one carrying its id, so a run whose answer was lost, or two workers running one attempt, find the charge rather than make another. Then it charges the card off-session (`off_session=true`, `confirm=true`, redirects refused), and the payment is credited exactly as a top-up is.
+
+| Stripe's answer | What happens |
+|---|---|
+| Succeeded | Credited once, and the attempt is cleared |
+| Processing | The attempt stays armed; `payment_intent.succeeded` or `payment_intent.payment_failed` settles it |
+| Declined (`402`, a `card_error`), or another definite refusal | The attempt ends, **auto-recharge turns off**, `wallet.auto_recharge_failed` is audited, and the billing members are told. A declining card is never charged in a loop: a person turns it back on, after a top-up saves a card that works |
+| No answer, a key still in use | Read back; a charge found is credited, and otherwise the job fails and the queue retries under the same key |
+| A server error | Read back; Stripe saves that answer under the key and would replay it, so with nothing found the attempt's revision moves and the retry is a new request |
+
+An attempt left armed for an hour, because its job was dead-lettered or its payment is still processing, is queued again by the next spend below the threshold, under the same attempt, which reads Stripe back first. A refund never arms a recharge: charging a customer again for the credit they were just refunded is not what they asked for.
+
+### Refunds
+
+A refund is made at Stripe (the dashboard, or support), and arrives as `charge.refunded`, `refund.created`, and as it changes, `refund.updated`, `charge.refund.updated`, or `refund.failed`. Every one of them names the payment, and processing reads the payment and **every refund of it** back from Stripe, so which event this is, and the order they come in, never matters:
+
+- a refund that is `pending`, `requires_action`, or `succeeded` is debited once, keyed by its id: the money is leaving or has left;
+- a refund that later `failed` or was `canceled`, after its debit, is credited back once by a `refund_reversal`;
+- the payment itself is converged first, so a refund processed before its own payment's credit still finds the credit it returns money from.
+
+Refunds and reversals are audited as `wallet.refunded` and `wallet.refund_reversed`.
+
+### Notices and the audit log
+
+Notices go to the organization's **billing members**: everyone holding the `admin` or `billing` organization role whose membership is not suspended, linking to the billing page.
+
+| Kind | When |
+|---|---|
+| `wallet.low_balance` | A spend takes the balance from at or above `low_balance_micros` to below it, once per dip. Not sent while auto-recharge is on, because the recharge is the answer, and a failed one says so itself |
+| `wallet.recharge_failed` | A recharge was refused and auto-recharge turned off |
+
+Credits, refunds, reversals, and auto-recharge changes and failures are audited on the organization, in the transaction that wrote them. Spends are not: the ledger is their record, and a meter charging every minute would bury every other act in the log. Every notice and audit row rides the connection of the write it describes, so it commits with the entry, or with nothing.
+
+### Reading the wallet
+
+The billing `GET` answers the wallet to `admin` and `billing` (see [the endpoints](#endpoints)), and `GET .../wallet/entries?page=&limit=` pages the ledger, newest first, by `position`, the order the balances chain in. Both are the billing roles' only: the balance says what the organization spends, and a spend names the record it paid for, which a member may not reach. Reconciliation converges the wallet's payments too: a top-up whose events never arrived is credited, and a refund whose events were missed is debited, reading each payment's refunds only when its charge says it was refunded.
+
+### Without Stripe
+
+With `STRIPE_SECRET_KEY` unset, the wallet still reads and the ledger still pages; a top-up and auto-recharge answer `503` naming the variable; and credit already held is still spent, because metering does not stop when a deployment cannot sell more for a while. Nothing is armed, since there is no card to charge.
+
 ## Configuration
 
 | Variable | Default | Meaning |
