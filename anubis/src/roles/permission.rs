@@ -9,7 +9,7 @@
 //!
 //! # The framework's subjects
 //!
-//! Three things the framework itself guards are permissions rather than fixed
+//! Four things the framework itself guards are permissions rather than fixed
 //! role keys, so an organization can hand them to a role of its own:
 //!
 //! | Subject | Actions | Guards |
@@ -17,6 +17,7 @@
 //! | [`MEMBERSHIP`] | `create`, `update`, `destroy` | Inviting, granting and revoking roles, removing members and revoking invitations |
 //! | [`ROLE`] | `create`, `update`, `destroy` | Defining, editing, reordering, and deleting roles |
 //! | [`SUBSCRIPTION`] | `update` | Spending the organization's money |
+//! | [`RESOURCE_GRANT`] | `update` | Choosing which teams reach the records the organization owns |
 //!
 //! Their names are namespaced (`Tenancy::Membership`), which no scaffolded
 //! model can be, so an application's own `Subscription` model never collides
@@ -43,18 +44,27 @@ pub const ROLE: &str = "Tenancy::Role";
 /// Changing what the organization pays for: checkout, the portal, reconciling.
 pub const SUBSCRIPTION: &str = "Billing::Subscription";
 
+/// Choosing which teams reach the records the organization owns directly.
+///
+/// Holding it is not enough on its own: sharing a kind of record also takes
+/// every permission on that kind a tenant may hold, organization-wide, because
+/// the team it is shared with acts on those records with its own roles and its
+/// administrator's token. See `docs/tenancy.md`.
+pub const RESOURCE_GRANT: &str = "Tenancy::ResourceGrant";
+
 /// The framework's subjects and the actions each one means anything for.
 ///
 /// `manage` on one of these expands to exactly its actions, and an action not
 /// listed is refused when `roles.yml` names it, because a toggle that guards
 /// nothing would mislead whoever reads the role editor.
-pub(crate) const FRAMEWORK_SUBJECTS: [(&str, &[Action]); 3] = [
+pub(crate) const FRAMEWORK_SUBJECTS: [(&str, &[Action]); 4] = [
     (
         MEMBERSHIP,
         &[Action::Create, Action::Update, Action::Destroy],
     ),
     (ROLE, &[Action::Create, Action::Update, Action::Destroy]),
     (SUBSCRIPTION, &[Action::Update]),
+    (RESOURCE_GRANT, &[Action::Update]),
 ];
 
 /// Grants the framework attaches to the role keys it gives meaning.

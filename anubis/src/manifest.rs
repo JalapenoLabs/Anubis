@@ -380,6 +380,21 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/tenancy/organizations/{organization_id}/resource-grants",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/tenancy/organizations/{organization_id}/resource-grants/{kind}/options",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PUT",
+        path: "/tenancy/organizations/{organization_id}/teams/{team_id}/resource-grants/{kind}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/tenancy/teams/{team_id}/roles",
         area: "tenancy",
     },

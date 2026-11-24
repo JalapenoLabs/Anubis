@@ -123,7 +123,7 @@ async fn a_2025_client_initializes_lists_and_calls() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(names, ["whoami", "write_note"]);
+    assert_eq!(names, ["whoami", "write_note", "read_machine"]);
     assert_eq!(
         answer["result"]["tools"][1]["inputSchema"]["required"],
         json!(["text"]),

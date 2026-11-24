@@ -3,8 +3,8 @@
 //! The model follows Bullet Train's, extended two levels: users join teams
 //! through team memberships, teams belong to organizations, and users also
 //! hold organization-level memberships for org-wide roles. Domain resources
-//! chain ownership back to a team and are assigned to team memberships, never
-//! directly to users. The full design lives in the repository's
+//! chain ownership back to a team, or to the organization itself, and are
+//! assigned to team memberships, never directly to users. The full design lives in the repository's
 //! `docs/tenancy.md`.
 //!
 //! Between the two sits the **sub-tenant**, the tier that owns the work: what
@@ -22,6 +22,14 @@
 //! that decides who reaches what and with which permissions; nothing
 //! re-derives them.
 //!
+//! **Some records belong to the organization itself** rather than to one of
+//! its teams, and are shared with teams by choice: a **resource grant** gives a
+//! team every record of a kind in the organization, or specific ones.
+//! [`resolve_resource_access`] and [`resolve_resource_scope`] are the fourth
+//! resolver, beside the three above, for those records; an application
+//! describes each kind it shares with a [`ResourceKind`] and hands it to
+//! [`router_with`], which serves the access screen's endpoints.
+//!
 //! Every user gets a personal organization with a default sub-tenant and team
 //! at signup, so an application that never surfaces the tier still has a
 //! complete ownership chain. Applications mount [`router`] (conventionally
@@ -36,6 +44,9 @@ mod hierarchy;
 mod invitation;
 mod management;
 mod model;
+mod resource_access;
+mod resource_grant_routes;
+mod resource_kind;
 mod role;
 mod role_routes;
 mod routes;
@@ -60,6 +71,13 @@ pub use model::{
     TeamMembership,
 };
 #[doc(inline)]
+pub use resource_access::{
+    OrganizationResource, ResourceScope, forget_resource, resolve_resource_access,
+    resolve_resource_scope, team_reaches_resource, team_resource_scope,
+};
+#[doc(inline)]
+pub use resource_kind::{ResourceKind, ResourceKindFuture};
+#[doc(inline)]
 pub use role::{Role, RoleSummary, RoleView};
 #[doc(inline)]
-pub use routes::router;
+pub use routes::{Options, router, router_with};
