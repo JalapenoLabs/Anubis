@@ -1448,8 +1448,8 @@ mod tests {
             validate_name("  Ops  ", "team").as_deref().ok(),
             Some("Ops")
         );
-        assert!(validate_name("   ", "team").is_err());
-        assert!(validate_name(&"x".repeat(101), "team").is_err());
-        assert!(validate_name("line\nbreak", "team").is_err());
+        validate_name("   ", "team").expect_err("a blank name is refused");
+        validate_name(&"x".repeat(101), "team").expect_err("a name is bounded");
+        validate_name("line\nbreak", "team").expect_err("a name is one line");
     }
 }

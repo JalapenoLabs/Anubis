@@ -33,7 +33,7 @@ use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::{ApiError, absent_or_null};
 use crate::roles::{Action, MAX_ROLE_NAME_CHARS, Permission, ROLE, RoleSet, is_hex_color};
 use crate::schema::{role_grants, roles as role_rows, team_memberships};
-use crate::tenancy::access::AccessView;
+use crate::tenancy::access::{Access, AccessView};
 use crate::tenancy::hierarchy;
 use crate::tenancy::management::{lock_organization, organization_standing};
 use crate::tenancy::role::{self, NewRole, Role, RoleView};
@@ -94,8 +94,22 @@ struct UpdateRoleBody {
     color: Option<String>,
     /// A list replaces the role's permissions; `null` returns a role seeded
     /// from `roles.yml` to following it; absent leaves them alone.
+    #[expect(
+        clippy::option_option,
+        reason = "absent permissions and null ones are different requests"
+    )]
     #[serde(default, deserialize_with = "absent_or_null")]
     permissions: Option<Option<Vec<String>>>,
+}
+
+/// What an update asks of a role's permissions.
+enum PermissionsChange {
+    /// Leave them as they are.
+    Keep,
+    /// Go back to following `roles.yml`.
+    Follow,
+    /// Replace them with this set.
+    Replace(BTreeSet<Permission>),
 }
 
 #[derive(Deserialize)]
@@ -265,10 +279,10 @@ async fn update_role(
 ) -> Result<impl IntoResponse, ApiError> {
     let name = body.name.as_deref().map(validate_role_name).transpose()?;
     let color = body.color.as_deref().map(validate_color).transpose()?;
-    let requested = match &body.permissions {
-        Some(Some(keys)) => Some(Some(parse_permissions(&state.roles, keys)?)),
-        Some(None) => Some(None),
-        None => None,
+    let change = match &body.permissions {
+        None => PermissionsChange::Keep,
+        Some(None) => PermissionsChange::Follow,
+        Some(Some(keys)) => PermissionsChange::Replace(parse_permissions(&state.roles, keys)?),
     };
     let organization_id = member.organization.id;
 
@@ -283,76 +297,36 @@ async fn update_role(
 
             let current = find_role(transaction, organization_id, role_id).await?;
             hierarchy::require_outranks_role(&actor, &current)?;
-
-            let before_permissions = current.permissions(&state.roles);
-            let stored_permissions: Option<Option<Vec<String>>> = match requested {
-                None => None,
-                Some(_change) if current.is_administrator() => {
-                    return Err(ApiError::validation(
-                        "The administrator role holds every permission, so its permissions \
-                         are not edited.",
-                    ));
-                }
-                Some(None) => {
-                    let Some(key) = current.key.as_deref() else {
-                        return Err(ApiError::validation(
-                            "Only a role seeded from the application's recommended roles can \
-                             go back to following them.",
-                        ));
-                    };
-                    let after = state.roles.permissions_of(key);
-                    hierarchy::require_holds(
-                        &actor,
-                        hierarchy::toggled(&before_permissions, &after),
-                    )?;
-                    Some(None)
-                }
-                Some(Some(after)) => {
-                    hierarchy::require_holds(
-                        &actor,
-                        hierarchy::toggled(&before_permissions, &after),
-                    )?;
-                    Some(Some(after.iter().map(ToString::to_string).collect()))
-                }
-            };
-
-            let changes = RoleChanges {
+            require_permissions_change(&state.roles, &actor, &current, &change)?;
+            let renamed = RoleChanges {
                 name: name.as_deref(),
                 color: color.as_deref(),
-                permissions: stored_permissions.as_ref().map(Option::as_deref),
             };
-            if changes.is_empty() {
+            if matches!(change, PermissionsChange::Keep) && renamed.is_empty() {
                 return Ok(current);
             }
-            let updated: Role = diesel::update(role_rows::table.find(current.id))
-                .set(&changes)
-                .returning(Role::as_returning())
-                .get_result(transaction)
-                .await?;
 
-            let after_permissions = updated.permissions(&state.roles);
-            let mut recorded = Changes::new();
-            if updated.display_name(&state.roles) != current.display_name(&state.roles) {
-                recorded = recorded.field(
-                    "name",
-                    current.display_name(&state.roles),
-                    updated.display_name(&state.roles),
-                );
+            let stored: Option<Vec<String>> = match &change {
+                PermissionsChange::Keep => current.permissions.clone(),
+                PermissionsChange::Follow => None,
+                PermissionsChange::Replace(after) => {
+                    Some(after.iter().map(ToString::to_string).collect())
+                }
+            };
+            if !matches!(change, PermissionsChange::Keep) {
+                diesel::update(role_rows::table.find(current.id))
+                    .set(role_rows::permissions.eq(stored))
+                    .execute(transaction)
+                    .await?;
             }
-            if updated.display_color(&state.roles) != current.display_color(&state.roles) {
-                recorded = recorded.field(
-                    "color",
-                    current.display_color(&state.roles),
-                    updated.display_color(&state.roles),
-                );
+            if !renamed.is_empty() {
+                diesel::update(role_rows::table.find(current.id))
+                    .set(&renamed)
+                    .execute(transaction)
+                    .await?;
             }
-            if after_permissions != before_permissions {
-                recorded = recorded.field(
-                    "permissions",
-                    spelled(&before_permissions),
-                    spelled(&after_permissions),
-                );
-            }
+            let updated = find_role(transaction, organization_id, current.id).await?;
+
             audit::record(
                 transaction,
                 &context.by(&member.user),
@@ -360,7 +334,7 @@ async fn update_role(
                     .organization(organization_id)
                     .subject(updated.id)
                     .label(&updated.display_name(&state.roles))
-                    .changes(recorded),
+                    .changes(role_changes(&state.roles, &current, &updated)),
             )
             .await?;
 
@@ -371,6 +345,70 @@ async fn update_role(
     Ok(Json(RoleBody {
         role: updated.view(&state.roles),
     }))
+}
+
+/// Refuses a change to a role's permissions the actor may not make.
+///
+/// Every permission the change switches on or off is held to what the actor
+/// holds, measured against the role as it stands under the lock, so an edit
+/// made from a stale screen cannot undo somebody else's.
+///
+/// # Errors
+/// Returns `400` for the administrator role, whose permissions are not edited,
+/// and for returning a role the organization made to `roles.yml`, which it
+/// never followed; `403` from [`hierarchy::require_holds`].
+fn require_permissions_change(
+    roles: &RoleSet,
+    actor: &Access,
+    current: &Role,
+    change: &PermissionsChange,
+) -> Result<(), ApiError> {
+    let after = match change {
+        PermissionsChange::Keep => return Ok(()),
+        _change if current.is_administrator() => {
+            return Err(ApiError::validation(
+                "The administrator role holds every permission, so its permissions are not \
+                 edited.",
+            ));
+        }
+        PermissionsChange::Follow => {
+            let Some(key) = current.key.as_deref() else {
+                return Err(ApiError::validation(
+                    "Only a role seeded from the application's recommended roles can go back \
+                     to following them.",
+                ));
+            };
+            roles.permissions_of(key)
+        }
+        PermissionsChange::Replace(after) => after.clone(),
+    };
+
+    let before = current.permissions(roles);
+    hierarchy::require_holds(actor, hierarchy::toggled(&before, &after))
+}
+
+/// What an update moved, as the audit log records it.
+fn role_changes(roles: &RoleSet, before: &Role, after: &Role) -> Changes {
+    let mut recorded = Changes::new();
+    if after.display_name(roles) != before.display_name(roles) {
+        recorded = recorded.field(
+            "name",
+            before.display_name(roles),
+            after.display_name(roles),
+        );
+    }
+    if after.display_color(roles) != before.display_color(roles) {
+        recorded = recorded.field(
+            "color",
+            before.display_color(roles),
+            after.display_color(roles),
+        );
+    }
+    let (held_before, held_after) = (before.permissions(roles), after.permissions(roles));
+    if held_after != held_before {
+        recorded = recorded.field("permissions", spelled(&held_before), spelled(&held_after));
+    }
+    recorded
 }
 
 /// Deletes a role, revoking it from everybody holding it anywhere.
@@ -530,20 +568,18 @@ async fn reorder_roles(
     }))
 }
 
-/// The columns an update writes; `None` leaves a column alone.
+/// The name and colour an update writes; `None` leaves a column alone.
 #[derive(AsChangeset)]
 #[diesel(table_name = role_rows)]
 struct RoleChanges<'a> {
     name: Option<&'a str>,
     color: Option<&'a str>,
-    /// `Some(None)` writes null, returning the role to following `roles.yml`.
-    permissions: Option<Option<&'a [String]>>,
 }
 
 impl RoleChanges<'_> {
-    /// Returns `true` when the request named nothing to change.
+    /// Returns `true` when the request named neither.
     fn is_empty(&self) -> bool {
-        self.name.is_none() && self.color.is_none() && self.permissions.is_none()
+        self.name.is_none() && self.color.is_none()
     }
 }
 
@@ -668,8 +704,8 @@ mod tests {
     #[test]
     fn colors_are_stored_lowercase_and_validated() {
         assert_eq!(validate_color(" #ABCDEF ").ok().as_deref(), Some("#abcdef"));
-        assert!(validate_color("red").is_err());
-        assert!(validate_color("#abcd").is_err());
+        validate_color("red").expect_err("a word is not a colour");
+        validate_color("#abcd").expect_err("four digits are not a colour");
     }
 
     #[test]
@@ -678,9 +714,9 @@ mod tests {
             validate_role_name("  Moderator ").ok().as_deref(),
             Some("Moderator")
         );
-        assert!(validate_role_name("").is_err());
-        assert!(validate_role_name(&"m".repeat(51)).is_err());
-        assert!(validate_role_name("Mod\nerator").is_err());
+        validate_role_name("").expect_err("a name is never empty");
+        validate_role_name(&"m".repeat(51)).expect_err("a name is bounded");
+        validate_role_name("Mod\nerator").expect_err("a name is one line");
     }
 
     #[test]

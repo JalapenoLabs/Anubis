@@ -496,6 +496,10 @@ fn token_hash(token: &str) -> String {
 ///
 /// Raw SQL, because the `roles` columns these rows carry no longer exist in
 /// the framework's schema module.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture, every row of which is a member somebody depends on"
+)]
 async fn seed_legacy_rows(connection: &mut AsyncPgConnection) -> Legacy {
     let legacy = Legacy {
         acme: Uuid::new_v4(),

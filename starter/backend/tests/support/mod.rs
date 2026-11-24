@@ -238,7 +238,32 @@ pub async fn bootstrapped_team(router: &Router, cookie: &str) -> String {
         .to_owned()
 }
 
-/// Invites `email` to `team_id` with `roles` and claims the invitation.
+/// The ids of the team organization's roles seeded from `keys`.
+///
+/// The default role is everybody's and is never granted, so asking for it
+/// asks for nothing.
+pub async fn role_ids(router: &Router, cookie: &str, team_id: &str, keys: &[&str]) -> Vec<String> {
+    let path = format!("/tenancy/teams/{team_id}/roles");
+    let (status, body) = send(router, "GET", &path, None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    keys.iter()
+        .filter(|key| **key != "default")
+        .map(|key| {
+            body["roles"]
+                .as_array()
+                .expect("the listing carries roles")
+                .iter()
+                .find(|role| role["key"] == *key)
+                .and_then(|role| role["id"].as_str())
+                .unwrap_or_else(|| panic!("no role seeded from {key:?} in {body}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Invites `email` to `team_id` with the roles seeded from `roles`, and
+/// claims the invitation.
 pub async fn invite_and_claim(
     router: &Router,
     outbox: &TestOutbox,
@@ -248,7 +273,8 @@ pub async fn invite_and_claim(
     email: &str,
     roles: &[&str],
 ) {
-    let invite = json!({ "email": email, "team_id": team_id, "roles": roles });
+    let role_ids = role_ids(router, admin_cookie, team_id, roles).await;
+    let invite = json!({ "email": email, "team_id": team_id, "role_ids": role_ids });
     let (status, body) = send(
         router,
         "POST",

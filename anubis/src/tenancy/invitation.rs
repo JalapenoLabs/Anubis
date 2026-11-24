@@ -60,6 +60,10 @@ struct NewInvitation<'a> {
 
 #[derive(Insertable)]
 #[diesel(table_name = invitation_roles)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "a join row is nothing but the ids it joins, named as their columns"
+)]
 struct NewInvitationRole {
     invitation_id: Uuid,
     role_id: Uuid,

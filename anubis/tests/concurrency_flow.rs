@@ -614,6 +614,288 @@ fn demote_member(
 }
 
 // ---------------------------------------------------------------------------
+// Runtime roles
+// ---------------------------------------------------------------------------
+
+/// Two administrators of one organization, and the organization's role ids.
+struct TwoAdministrators {
+    harness: Harness,
+    first: String,
+    second: String,
+    organization: Uuid,
+    team: Uuid,
+}
+
+impl TwoAdministrators {
+    async fn open(database: &TestDatabase) -> Self {
+        let harness = Harness::boot(database).await;
+        let first = register(&harness.router, "first-role-admin@example.com").await;
+        let team = harness.bootstrapped_team(&first).await;
+        let organization: Uuid = {
+            let mut connection = harness.pool.get().await.expect("connection");
+            teams::table
+                .find(team)
+                .select(teams::organization_id)
+                .first(&mut connection)
+                .await
+                .expect("the team has an organization")
+        };
+        let second = register(&harness.router, "second-role-admin@example.com").await;
+        let administrator = role_id(&harness.router, &first, team, "admin").await;
+        let invite = json!({
+            "email": "second-role-admin@example.com",
+            "organization_id": organization,
+            "role_ids": [administrator],
+        });
+        let (status, _headers, body) = send(
+            &harness.router,
+            "POST",
+            "/tenancy/invitations",
+            Some(&invite),
+            Some(&first),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let token = invitation_token(&harness.outbox, "second-role-admin@example.com");
+        let claimed = claim_invitation(&harness, &json!({ "token": token }), second.clone()).await;
+        assert_eq!(claimed, StatusCode::OK);
+
+        Self {
+            harness,
+            first,
+            second,
+            organization,
+            team,
+        }
+    }
+
+    /// Runs two requests that both reach the organization lock before either
+    /// holds it, so neither wins by being scheduled first.
+    async fn race(
+        &self,
+        one: (&str, String, Value, &str),
+        other: (&str, String, Value, &str),
+    ) -> (StatusCode, StatusCode) {
+        let mut blocker = self.harness.pool.get().await.expect("connection");
+        let racing = blocker
+            .transaction::<_, diesel::result::Error, _>(async |transaction| {
+                organizations::table
+                    .find(self.organization)
+                    .select(organizations::id)
+                    .for_update()
+                    .first::<Uuid>(transaction)
+                    .await?;
+                let one = self.spawn(one);
+                let other = self.spawn(other);
+                tokio::time::sleep(QUEUING_WINDOW).await;
+                Ok((one, other))
+            })
+            .await
+            .expect("holding the organization lock must succeed");
+        drop(blocker);
+
+        let (one, other) = racing;
+        (
+            one.await.expect("the request task must not panic"),
+            other.await.expect("the request task must not panic"),
+        )
+    }
+
+    fn spawn(
+        &self,
+        (method, path, body, cookie): (&str, String, Value, &str),
+    ) -> JoinHandle<StatusCode> {
+        let router = self.harness.router.clone();
+        let method = method.to_owned();
+        let cookie = cookie.to_owned();
+        tokio::spawn(async move {
+            let (status, _headers, _body) =
+                send(&router, &method, &path, Some(&body), Some(&cookie)).await;
+            status
+        })
+    }
+
+    /// The organization's roles as `(id, position, permissions)`, highest first.
+    async fn ladder(&self) -> Vec<(Uuid, i64, Value)> {
+        let path = format!("/tenancy/organizations/{}/roles", self.organization);
+        let (status, _headers, body) =
+            send(&self.harness.router, "GET", &path, None, Some(&self.first)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        body["roles"]
+            .as_array()
+            .expect("the listing carries roles")
+            .iter()
+            .map(|role| {
+                (
+                    role["id"]
+                        .as_str()
+                        .expect("a role id is a string")
+                        .parse()
+                        .expect("a role id is a UUID"),
+                    role["position"].as_i64().expect("a position is a number"),
+                    role["permissions"].clone(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Two reorders at the same instant are ordered by the organization lock, so
+/// the ladder ends as one of them asked, whole and dense, never a mix that
+/// ties two roles on one rung.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_reorders_leave_one_whole_ladder() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let court = TwoAdministrators::open(&database).await;
+    let editor = role_id(&court.harness.router, &court.first, court.team, "editor").await;
+    let billing = role_id(&court.harness.router, &court.first, court.team, "billing").await;
+
+    let path = format!("/tenancy/organizations/{}/role-order", court.organization);
+    let (one, other) = court
+        .race(
+            (
+                "PUT",
+                path.clone(),
+                json!({ "role_ids": [editor, billing] }),
+                &court.first,
+            ),
+            (
+                "PUT",
+                path,
+                json!({ "role_ids": [billing, editor] }),
+                &court.second,
+            ),
+        )
+        .await;
+    assert_eq!((one, other), (StatusCode::OK, StatusCode::OK));
+
+    let positions: Vec<i64> = court
+        .ladder()
+        .await
+        .into_iter()
+        .map(|(_id, position, _permissions)| position)
+        .collect();
+    assert_eq!(
+        positions,
+        [3, 2, 1, 0],
+        "one dense ladder, whichever landed last"
+    );
+}
+
+/// Two edits of one role at the same instant each replace the whole set, so
+/// the role ends exactly as one of them asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_edits_of_one_role_land_whole() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let court = TwoAdministrators::open(&database).await;
+    let editor = role_id(&court.harness.router, &court.first, court.team, "editor").await;
+
+    let path = format!(
+        "/tenancy/organizations/{}/roles/{editor}",
+        court.organization
+    );
+    let reading = json!({ "permissions": ["Team.read"] });
+    let writing = json!({ "permissions": ["Team.create", "Team.update"] });
+    let (one, other) = court
+        .race(
+            ("PATCH", path.clone(), reading, &court.first),
+            ("PATCH", path, writing, &court.second),
+        )
+        .await;
+    assert_eq!((one, other), (StatusCode::OK, StatusCode::OK));
+
+    let landed = court
+        .ladder()
+        .await
+        .into_iter()
+        .find(|(id, _position, _permissions)| *id == editor)
+        .map(|(_id, _position, permissions)| permissions)
+        .expect("the role still exists");
+    assert!(
+        landed == json!(["Team.read"]) || landed == json!(["Team.create", "Team.update"]),
+        "one edit or the other, never a merge: {landed}",
+    );
+}
+
+/// A role deleted while somebody is being granted it leaves no grant behind,
+/// whichever request the organization lock lets through first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_deleted_while_granted_leaves_no_grant() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let court = TwoAdministrators::open(&database).await;
+    let editor = role_id(&court.harness.router, &court.first, court.team, "editor").await;
+
+    let invite = json!({ "email": "role-target@example.com", "team_id": court.team });
+    let (status, _headers, body) = send(
+        &court.harness.router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&invite),
+        Some(&court.first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let roster = format!("/tenancy/teams/{}/members", court.team);
+    let (status, _headers, body) = send(
+        &court.harness.router,
+        "GET",
+        &roster,
+        None,
+        Some(&court.first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let target = body["members"]
+        .as_array()
+        .expect("the roster is an array")
+        .iter()
+        .find(|member| member["pending"] == json!(true))
+        .and_then(|member| member["membership_id"].as_str())
+        .expect("the invitation holds a place")
+        .to_owned();
+
+    let (deleted, granted) = court
+        .race(
+            (
+                "DELETE",
+                format!(
+                    "/tenancy/organizations/{}/roles/{editor}",
+                    court.organization
+                ),
+                json!({}),
+                &court.first,
+            ),
+            (
+                "PATCH",
+                format!("/tenancy/teams/{}/members/{target}", court.team),
+                json!({ "role_ids": [editor] }),
+                &court.first,
+            ),
+        )
+        .await;
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+    assert!(
+        matches!(granted, StatusCode::OK | StatusCode::NOT_FOUND),
+        "the grant lands before the delete or finds the role gone: {granted}",
+    );
+
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    let left: i64 = role_grants::table
+        .filter(role_grants::role_id.eq(editor))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(left, 0, "a deleted role is held by nobody");
+}
+
+// ---------------------------------------------------------------------------
 // Realtime channels
 // ---------------------------------------------------------------------------
 

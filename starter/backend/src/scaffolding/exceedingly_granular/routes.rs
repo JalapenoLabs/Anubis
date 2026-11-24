@@ -29,7 +29,7 @@ use anubis::auth::CurrentUser;
 use anubis::db::DbPool;
 use anubis::http::{ApiError, ListParams, Pagination};
 use anubis::roles::{Action, RoleSet};
-use anubis::tenancy::TeamMembership;
+use anubis::tenancy::Access;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -491,9 +491,9 @@ async fn list(
     Query(filters): Query<GranularDetailFilters>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, _creative_concept, membership) =
-        load_parent(&mut connection, user.id, tangible_thing_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (tangible_thing, _creative_concept, access) =
+        load_parent(&mut connection, &state.roles, user.id, tangible_thing_id).await?;
+    access.require(Action::Read, MODEL)?;
 
     Ok(Json(
         list_page(&mut connection, &tangible_thing, &params, &filters).await?,
@@ -508,9 +508,9 @@ async fn create(
     Json(body): Json<CreateGranularDetailBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, creative_concept, membership) =
-        load_parent(&mut connection, user.id, tangible_thing_id).await?;
-    require(&state.roles, &membership, Action::Create)?;
+    let (tangible_thing, creative_concept, access) =
+        load_parent(&mut connection, &state.roles, user.id, tangible_thing_id).await?;
+    access.require(Action::Create, MODEL)?;
 
     let granular_detail = insert_record(
         &mut connection,
@@ -532,9 +532,9 @@ async fn show(
     Path(granular_detail_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, _tangible_thing, _creative_concept, membership) =
-        load(&mut connection, user.id, granular_detail_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (record, _tangible_thing, _creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, granular_detail_id).await?;
+    access.require(Action::Read, MODEL)?;
 
     let granular_detail = GranularDetailView::one(&mut connection, record)
         .await
@@ -550,9 +550,9 @@ async fn update(
     Json(body): Json<UpdateGranularDetailBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, tangible_thing, creative_concept, membership) =
-        load(&mut connection, user.id, granular_detail_id).await?;
-    require(&state.roles, &membership, Action::Update)?;
+    let (record, tangible_thing, creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, granular_detail_id).await?;
+    access.require(Action::Update, MODEL)?;
 
     let granular_detail = apply_changes(
         &mut connection,
@@ -573,9 +573,9 @@ async fn destroy(
     Path(granular_detail_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (granular_detail, _tangible_thing, creative_concept, membership) =
-        load(&mut connection, user.id, granular_detail_id).await?;
-    require(&state.roles, &membership, Action::Destroy)?;
+    let (granular_detail, _tangible_thing, creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, granular_detail_id).await?;
+    access.require(Action::Destroy, MODEL)?;
 
     delete_record(
         &mut connection,
@@ -794,10 +794,11 @@ async fn api_destroy(
 /// one, exactly as it does for an id that names nothing.
 async fn load_parent(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     tangible_thing_id: Uuid,
-) -> Result<(TangibleThing, CreativeConcept, TeamMembership), ApiError> {
-    TangibleThing::load_for_member(connection, user_id, tangible_thing_id)
+) -> Result<(TangibleThing, CreativeConcept, Access), ApiError> {
+    TangibleThing::load_for_member(connection, roles, user_id, tangible_thing_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
@@ -818,18 +819,11 @@ async fn load_parent_for_token(
 /// Loads the granular detail, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     granular_detail_id: Uuid,
-) -> Result<
-    (
-        GranularDetail,
-        TangibleThing,
-        CreativeConcept,
-        TeamMembership,
-    ),
-    ApiError,
-> {
-    GranularDetail::load_for_member(connection, user_id, granular_detail_id)
+) -> Result<(GranularDetail, TangibleThing, CreativeConcept, Access), ApiError> {
+    GranularDetail::load_for_member(connection, roles, user_id, granular_detail_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
@@ -845,17 +839,6 @@ async fn load_for_token(
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
-}
-
-/// Rejects with `403` unless a held role grants the action on this model.
-fn require(roles: &RoleSet, membership: &TeamMembership, action: Action) -> Result<(), ApiError> {
-    if roles.can(&membership.roles, action, MODEL) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You do not have permission to do that.",
-        ))
-    }
 }
 
 /// Normalizes a submitted text value into a changeset column.

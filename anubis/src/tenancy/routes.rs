@@ -247,52 +247,15 @@ async fn list_memberships(
     let team_membership_ids: Vec<Uuid> = team_rows.iter().map(|row| row.2).collect();
     let mut organization_ids: Vec<Uuid> = org_rows.iter().map(|row| row.0.id).collect();
     organization_ids.extend(team_rows.iter().map(|row| row.0.id));
-
-    let granted: Vec<(Option<Uuid>, Option<Uuid>, Role)> = role_grants::table
-        .inner_join(role_rows::table)
-        .filter(
-            role_grants::organization_membership_id
-                .eq_any(&organization_membership_ids)
-                .or(role_grants::team_membership_id
-                    .eq_any(&team_membership_ids)
-                    .and(role_grants::resource_id.is_null())),
-        )
-        .select((
-            role_grants::organization_membership_id,
-            role_grants::team_membership_id,
-            Role::as_select(),
-        ))
-        .load(&mut connection)
-        .await
-        .map_err(log_internal)?;
-
-    let defaults: HashMap<Uuid, Role> = role_rows::table
-        .filter(role_rows::organization_id.eq_any(&organization_ids))
-        .filter(role_rows::key.eq(DEFAULT_ROLE))
-        .select(Role::as_select())
-        .load(&mut connection)
-        .await
-        .map_err(log_internal)?
-        .into_iter()
-        .map(|role| (role.organization_id, role))
-        .collect();
-
-    let mut held_by_membership: HashMap<Uuid, Vec<Role>> = HashMap::new();
-    for (organization_membership_id, team_membership_id, role) in granted {
-        if let Some(membership_id) = organization_membership_id.or(team_membership_id) {
-            held_by_membership
-                .entry(membership_id)
-                .or_default()
-                .push(role);
-        }
-    }
+    let held = HeldByMembership::load(
+        &mut connection,
+        &organization_membership_ids,
+        &team_membership_ids,
+        &organization_ids,
+    )
+    .await?;
     let access_of = |organization_id: Uuid, membership_id: Uuid| {
-        let mut held = held_by_membership
-            .get(&membership_id)
-            .cloned()
-            .unwrap_or_default();
-        held.extend(defaults.get(&organization_id).cloned());
-        Access::from_roles(held, &state.roles).view()
+        held.access(&state.roles, organization_id, membership_id)
     };
 
     let mut grouped: BTreeMap<Uuid, MembershipOrganization> = BTreeMap::new();
@@ -331,6 +294,71 @@ async fn list_memberships(
     Ok(Json(MembershipsBody {
         organizations: organizations_list,
     }))
+}
+
+/// The roles a page of memberships hold, read in two queries.
+struct HeldByMembership {
+    /// Organization-wide and team-wide grants, keyed by the membership.
+    granted: HashMap<Uuid, Vec<Role>>,
+    /// Each organization's default role, keyed by organization.
+    defaults: HashMap<Uuid, Role>,
+}
+
+impl HeldByMembership {
+    async fn load(
+        connection: &mut AsyncPgConnection,
+        organization_membership_ids: &[Uuid],
+        team_membership_ids: &[Uuid],
+        organization_ids: &[Uuid],
+    ) -> Result<Self, ApiError> {
+        let rows: Vec<(Option<Uuid>, Option<Uuid>, Role)> = role_grants::table
+            .inner_join(role_rows::table)
+            .filter(
+                role_grants::organization_membership_id
+                    .eq_any(organization_membership_ids)
+                    .or(role_grants::team_membership_id
+                        .eq_any(team_membership_ids)
+                        .and(role_grants::resource_id.is_null())),
+            )
+            .select((
+                role_grants::organization_membership_id,
+                role_grants::team_membership_id,
+                Role::as_select(),
+            ))
+            .load(connection)
+            .await
+            .map_err(log_internal)?;
+
+        let defaults = role_rows::table
+            .filter(role_rows::organization_id.eq_any(organization_ids))
+            .filter(role_rows::key.eq(DEFAULT_ROLE))
+            .select(Role::as_select())
+            .load(connection)
+            .await
+            .map_err(log_internal)?
+            .into_iter()
+            .map(|role| (role.organization_id, role))
+            .collect();
+
+        let mut granted: HashMap<Uuid, Vec<Role>> = HashMap::new();
+        for (organization_membership_id, team_membership_id, role) in rows {
+            if let Some(membership_id) = organization_membership_id.or(team_membership_id) {
+                granted.entry(membership_id).or_default().push(role);
+            }
+        }
+        Ok(Self { granted, defaults })
+    }
+
+    /// What one membership allows, with the organization's default role.
+    fn access(&self, roles: &RoleSet, organization_id: Uuid, membership_id: Uuid) -> AccessView {
+        let mut held = self
+            .granted
+            .get(&membership_id)
+            .cloned()
+            .unwrap_or_default();
+        held.extend(self.defaults.get(&organization_id).cloned());
+        Access::from_roles(held, roles).view()
+    }
 }
 
 /// The roles one record of a team was granted to a member.
@@ -568,7 +596,7 @@ async fn offered_summaries(
     Ok(offered
         .into_iter()
         .map(|(invitation_id, mut held)| {
-            held.sort_by(|left, right| right.position.cmp(&left.position));
+            held.sort_by_key(|role| std::cmp::Reverse(role.position));
             let summaries = held.iter().map(|role| role.summary(roles)).collect();
             (invitation_id, summaries)
         })

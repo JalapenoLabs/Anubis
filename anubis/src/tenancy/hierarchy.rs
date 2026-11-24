@@ -151,13 +151,23 @@ pub(crate) fn toggled<'a>(
 /// that change.
 ///
 /// # Errors
-/// Returns `400` for a list that is not exactly those roles, and `403` when
-/// the order would move a role at or above the actor's rank.
+/// Returns `404` for an id that is not one of the organization's roles, `400`
+/// for a list that is not exactly the movable ones, and `403` when the order
+/// would move a role at or above the actor's rank.
 pub(crate) fn plan_reorder(
     current: &[Role],
     requested: &[Uuid],
     actor: &Access,
 ) -> Result<Vec<(Uuid, i32)>, ApiError> {
+    // An id that is not one of this organization's roles is answered as one
+    // that does not exist, whoever's it is.
+    if requested
+        .iter()
+        .any(|id| !current.iter().any(|role| role.id == *id))
+    {
+        return Err(ApiError::not_found());
+    }
+
     let movable: Vec<&Role> = current
         .iter()
         .filter(|role| !role.is_structural())
@@ -269,8 +279,8 @@ roles:
         let ladder = ladder();
         let moderator = holding(&[&ladder[0], &ladder[3]]);
 
-        assert!(require_outranks_role(&moderator, &ladder[1]).is_ok());
-        assert!(require_outranks_role(&moderator, &ladder[2]).is_ok());
+        require_outranks_role(&moderator, &ladder[1]).expect("a seeded role below is theirs");
+        require_outranks_role(&moderator, &ladder[2]).expect("a custom role below is theirs");
         assert_eq!(
             status(require_outranks_role(&moderator, &ladder[3])),
             StatusCode::FORBIDDEN,
@@ -287,10 +297,8 @@ roles:
         let ladder = ladder();
         let administrator = holding(&[&ladder[0], &ladder[4]]);
 
-        assert!(
-            require_outranks_role(&administrator, &ladder[4]).is_ok(),
-            "an administrator appoints the next one",
-        );
+        require_outranks_role(&administrator, &ladder[4])
+            .expect("an administrator appoints the next one");
 
         // Even a reordered ladder that put a role above the administrator
         // could not make it grantable by anybody else.
@@ -310,14 +318,14 @@ roles:
 
         let held = Permission::new(MEMBERSHIP, Action::Update);
         let not_held = Permission::new("Project", Action::Destroy);
-        assert!(require_holds(&moderator, [&held]).is_ok());
+        require_holds(&moderator, [&held]).expect("a held permission may be given");
         assert_eq!(
             status(require_holds(&moderator, [&held, &not_held])),
             StatusCode::FORBIDDEN,
         );
 
         let administrator = holding(&[&ladder[4]]);
-        assert!(require_holds(&administrator, [&not_held]).is_ok());
+        require_holds(&administrator, [&not_held]).expect("an administrator holds everything");
     }
 
     #[test]
@@ -328,7 +336,7 @@ roles:
         let junior = holding(&[&ladder[0], &ladder[1]]);
         let administrator = holding(&[&ladder[0], &ladder[4]]);
 
-        assert!(require_outranks_member(&moderator, &junior, false).is_ok());
+        require_outranks_member(&moderator, &junior, false).expect("a junior ranks below");
         assert_eq!(
             status(require_outranks_member(&moderator, &peer, false)),
             StatusCode::FORBIDDEN,
@@ -337,11 +345,10 @@ roles:
             status(require_outranks_member(&moderator, &administrator, false)),
             StatusCode::FORBIDDEN,
         );
-        assert!(
-            require_outranks_member(&moderator, &peer, true).is_ok(),
-            "your own roles are held to the role rules alone",
-        );
-        assert!(require_outranks_member(&administrator, &administrator, false).is_ok());
+        require_outranks_member(&moderator, &peer, true)
+            .expect("your own roles are held to the role rules alone");
+        require_outranks_member(&administrator, &administrator, false)
+            .expect("an administrator manages anybody");
     }
 
     #[test]
@@ -378,7 +385,6 @@ roles:
             vec![moderator, custom],
             vec![moderator, custom, custom],
             vec![moderator, custom, helper, ladder[4].id],
-            vec![moderator, custom, helper, Uuid::new_v4()],
         ] {
             assert_eq!(
                 status(plan_reorder(&ladder, &partial, &administrator)),
@@ -386,6 +392,15 @@ roles:
                 "{partial:?}",
             );
         }
+        assert_eq!(
+            status(plan_reorder(
+                &ladder,
+                &[moderator, custom, helper, Uuid::new_v4()],
+                &administrator
+            )),
+            StatusCode::NOT_FOUND,
+            "a role of no organization, or of another, reads as missing",
+        );
 
         let planned = plan_reorder(&ladder, &[moderator, helper, custom], &administrator)
             .expect("a full permutation is accepted");

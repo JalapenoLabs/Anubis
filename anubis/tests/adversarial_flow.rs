@@ -581,3 +581,1021 @@ async fn an_email_address_cannot_carry_a_line_break() {
         "an address with a line break reached the mailer: {sent:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime roles: every way of managing roles that could be a way to gain them
+// ---------------------------------------------------------------------------
+
+/// The permissions the court's Moderator role carries: it manages members and
+/// roles, and reads the team's one model, and nothing else.
+const MODERATOR_PERMISSIONS: [&str; 7] = [
+    "Tenancy::Membership.create",
+    "Tenancy::Membership.update",
+    "Tenancy::Membership.destroy",
+    "Tenancy::Role.create",
+    "Tenancy::Role.update",
+    "Tenancy::Role.destroy",
+    "Team.read",
+];
+
+/// One organization, set up the way an escalation story needs it.
+///
+/// The owner made a Moderator role able to manage members and roles and put
+/// it above `billing` and `editor`, so the ladder reads default 0, editor 1,
+/// billing 2, Moderator 3, admin 4. The moderator holds it organization-wide
+/// and in the team; the member holds `editor` in the team and only the
+/// default role organization-wide.
+struct Court {
+    harness: Harness,
+    owner: String,
+    moderator: String,
+    member: String,
+    organization: Uuid,
+    team: Uuid,
+    roles: CourtRoles,
+}
+
+struct CourtRoles {
+    default: Uuid,
+    editor: Uuid,
+    billing: Uuid,
+    moderator: Uuid,
+    administrator: Uuid,
+}
+
+impl Court {
+    async fn open(database: &TestDatabase) -> Self {
+        let harness = Harness::boot(database).await;
+        let run = Uuid::new_v4();
+        let moderator_email = format!("moderator-{run}@example.com");
+        let member_email = format!("member-{run}@example.com");
+
+        let owner = register(&harness.router, &format!("owner-{run}@example.com")).await;
+        let team = harness.bootstrapped_team(&owner).await;
+        let (status, _headers, body) = send(
+            &harness.router,
+            "GET",
+            "/tenancy/memberships",
+            None,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let organization = id_of(&body["organizations"][0]["id"]);
+
+        let (status, _headers, body) = send(
+            &harness.router,
+            "POST",
+            &format!("/tenancy/organizations/{organization}/roles"),
+            Some(&json!({
+                "name": "Moderator",
+                "color": "#dc2626",
+                "permissions": MODERATOR_PERMISSIONS,
+            })),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let moderator_role = id_of(&body["role"]["id"]);
+
+        let listed = role_listing(&harness, &owner, organization).await;
+        let roles = CourtRoles {
+            default: keyed(&listed, "default"),
+            editor: keyed(&listed, "editor"),
+            billing: keyed(&listed, "billing"),
+            moderator: moderator_role,
+            administrator: keyed(&listed, "admin"),
+        };
+
+        let (status, _headers, body) = send(
+            &harness.router,
+            "PUT",
+            &format!("/tenancy/organizations/{organization}/role-order"),
+            Some(&json!({ "role_ids": [roles.moderator, roles.billing, roles.editor] })),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let moderator = register(&harness.router, &moderator_email).await;
+        let member = register(&harness.router, &member_email).await;
+        let court = Self {
+            harness,
+            owner,
+            moderator,
+            member,
+            organization,
+            team,
+            roles,
+        };
+
+        for invitation in [
+            json!({
+                "email": moderator_email,
+                "organization_id": organization,
+                "role_ids": [court.roles.moderator],
+            }),
+            json!({
+                "email": moderator_email,
+                "team_id": team,
+                "role_ids": [court.roles.moderator],
+            }),
+            json!({ "email": member_email, "organization_id": organization }),
+            json!({ "email": member_email, "team_id": team, "role_ids": [court.roles.editor] }),
+        ] {
+            let joining = if invitation["email"] == moderator_email.as_str() {
+                &court.moderator
+            } else {
+                &court.member
+            };
+            court.invite_and_claim(&invitation, joining).await;
+        }
+
+        court
+    }
+
+    async fn invite_and_claim(&self, invitation: &Value, joining: &str) {
+        let (status, _headers, body) = self
+            .send(
+                "POST",
+                "/tenancy/invitations",
+                Some(invitation),
+                &self.owner,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let email = invitation["email"]
+            .as_str()
+            .expect("an invitation names an email");
+        let token = latest_invitation_token(&self.harness, email);
+        let (status, _headers, body) = self
+            .send(
+                "POST",
+                "/tenancy/invitations/claim",
+                Some(&json!({ "token": token })),
+                joining,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        cookie: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        send(&self.harness.router, method, path, body, Some(cookie)).await
+    }
+
+    /// Edits a role's permissions as `cookie`, answering the status.
+    async fn set_permissions(&self, cookie: &str, role: Uuid, permissions: &[&str]) -> StatusCode {
+        let path = format!("/tenancy/organizations/{}/roles/{role}", self.organization);
+        let (status, _headers, _body) = self
+            .send(
+                "PATCH",
+                &path,
+                Some(&json!({ "permissions": permissions })),
+                cookie,
+            )
+            .await;
+        status
+    }
+
+    /// The team membership of the account behind an email.
+    async fn team_membership(&self, email_prefix: &str) -> Uuid {
+        let path = format!("/tenancy/teams/{}/members", self.team);
+        let (status, _headers, body) = self.send("GET", &path, None, &self.owner).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        roster_entry(&body, email_prefix)
+    }
+
+    /// The organization membership of the account behind an email.
+    async fn organization_membership(&self, email_prefix: &str) -> Uuid {
+        let path = format!("/tenancy/organizations/{}/members", self.organization);
+        let (status, _headers, body) = self.send("GET", &path, None, &self.owner).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        roster_entry(&body, email_prefix)
+    }
+
+    /// Replaces a team member's team-wide roles as `cookie`.
+    async fn grant_in_team(&self, cookie: &str, membership: Uuid, roles: &[Uuid]) -> StatusCode {
+        let path = format!("/tenancy/teams/{}/members/{membership}", self.team);
+        let (status, _headers, _body) = self
+            .send("PATCH", &path, Some(&json!({ "role_ids": roles })), cookie)
+            .await;
+        status
+    }
+
+    /// Invites a fresh address as `cookie`, answering the status.
+    async fn offer(&self, cookie: &str, target: (&str, Uuid), roles: &[Uuid]) -> StatusCode {
+        let invitation = json!({
+            "email": format!("offered-{}@example.com", Uuid::new_v4()),
+            target.0: target.1,
+            "role_ids": roles,
+        });
+        let (status, _headers, _body) = self
+            .send("POST", "/tenancy/invitations", Some(&invitation), cookie)
+            .await;
+        status
+    }
+}
+
+fn id_of(value: &Value) -> Uuid {
+    value
+        .as_str()
+        .expect("an id is a string")
+        .parse()
+        .expect("an id is a UUID")
+}
+
+async fn role_listing(harness: &Harness, cookie: &str, organization: Uuid) -> Value {
+    let (status, _headers, body) = send(
+        &harness.router,
+        "GET",
+        &format!("/tenancy/organizations/{organization}/roles"),
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body
+}
+
+fn keyed(listing: &Value, key: &str) -> Uuid {
+    id_of(
+        &listing["roles"]
+            .as_array()
+            .expect("the listing carries roles")
+            .iter()
+            .find(|role| role["key"] == key)
+            .unwrap_or_else(|| panic!("no role seeded from {key:?}"))["id"],
+    )
+}
+
+fn roster_entry(roster: &Value, email_prefix: &str) -> Uuid {
+    let entry = roster["members"]
+        .as_array()
+        .expect("a roster lists members")
+        .iter()
+        .find(|member| {
+            member["email"]
+                .as_str()
+                .is_some_and(|email| email.starts_with(email_prefix))
+        })
+        .unwrap_or_else(|| panic!("nobody named {email_prefix} in {roster}"));
+    id_of(&entry["membership_id"])
+}
+
+/// The newest invitation token mailed to an address.
+fn latest_invitation_token(harness: &Harness, email: &str) -> String {
+    let invitation = harness
+        .outbox
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|sent| sent.to == email && sent.subject.contains("invited"))
+        .expect("the invitation email must be in the outbox");
+    let (_before, rest) = invitation
+        .text_body
+        .split_once("token=")
+        .expect("the invitation email must carry a link");
+    rest.split_whitespace()
+        .next()
+        .expect("the token ends at whitespace")
+        .to_owned()
+}
+
+/// Editing a role is changing what its holders may do, so every permission
+/// switched on, and every one switched off, must be one the editor holds.
+#[tokio::test]
+async fn a_role_editor_switches_only_what_they_hold() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let (owner, moderator) = (&court.owner, &court.moderator);
+
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.editor, &["Team.update"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "a role below yours still cannot carry what you lack",
+    );
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.editor, &["Team.read"])
+            .await,
+        StatusCode::OK,
+    );
+
+    // A stale screen cannot undo somebody else's edit either.
+    assert_eq!(
+        court
+            .set_permissions(owner, court.roles.editor, &["Team.read", "Team.destroy"])
+            .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.editor, &["Team.read"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "switching off a permission you do not hold is refused too",
+    );
+
+    // `billing` carries the organization's money, which the moderator does not.
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.billing, &[])
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.moderator, &MODERATOR_PERMISSIONS)
+            .await,
+        StatusCode::FORBIDDEN,
+        "nobody edits a role at their own rank, their own role included",
+    );
+
+    let path = format!("/tenancy/organizations/{}/roles", court.organization);
+    for (permissions, expected) in [
+        (vec!["Team.update"], StatusCode::FORBIDDEN),
+        (vec!["Team.read"], StatusCode::CREATED),
+    ] {
+        let (status, _headers, body) = court
+            .send(
+                "POST",
+                &path,
+                Some(&json!({ "name": "Helper", "color": "#0ea5e9", "permissions": permissions })),
+                moderator,
+            )
+            .await;
+        assert_eq!(status, expected, "body: {body}");
+    }
+}
+
+/// Holding a role-management permission is not a way to hand out a role that
+/// carries more than you do, to somebody else, to an invitee, or to yourself.
+#[tokio::test]
+async fn nobody_hands_out_a_role_carrying_what_they_lack() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let (owner, moderator) = (&court.owner, &court.moderator);
+
+    assert_eq!(
+        court
+            .set_permissions(owner, court.roles.editor, &["Team.update"])
+            .await,
+        StatusCode::OK,
+    );
+    let member = court.team_membership("member-").await;
+    let moderator_membership = court.team_membership("moderator-").await;
+
+    // Taking a lower role away hands nothing out, so the hierarchy alone
+    // decides it; giving it back is a grant of what the moderator lacks.
+    assert_eq!(
+        court.grant_in_team(moderator, member, &[]).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court
+            .grant_in_team(moderator, member, &[court.roles.editor])
+            .await,
+        StatusCode::FORBIDDEN,
+        "editor now carries Team.update, which the moderator lacks",
+    );
+    assert_eq!(
+        court
+            .grant_in_team(
+                moderator,
+                moderator_membership,
+                &[court.roles.moderator, court.roles.editor],
+            )
+            .await,
+        StatusCode::FORBIDDEN,
+        "nor may they take it themselves",
+    );
+    assert_eq!(
+        court
+            .offer(moderator, ("team_id", court.team), &[court.roles.editor])
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        court
+            .offer(
+                moderator,
+                ("organization_id", court.organization),
+                &[court.roles.billing],
+            )
+            .await,
+        StatusCode::FORBIDDEN,
+        "billing carries the organization's money",
+    );
+    assert_eq!(
+        court
+            .offer(moderator, ("team_id", court.team), &[court.roles.default])
+            .await,
+        StatusCode::BAD_REQUEST,
+        "the default role is everybody's and never granted",
+    );
+
+    // The administrator role: nobody but an administrator touches it, and an
+    // administrator appoints the next one, so the top is never frozen.
+    assert_eq!(
+        court
+            .grant_in_team(moderator, member, &[court.roles.administrator])
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        court
+            .offer(
+                moderator,
+                ("team_id", court.team),
+                &[court.roles.administrator]
+            )
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        court
+            .grant_in_team(owner, member, &[court.roles.administrator])
+            .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court.grant_in_team(moderator, member, &[]).await,
+        StatusCode::FORBIDDEN,
+        "and once appointed, they outrank the moderator",
+    );
+}
+
+/// A reorder states the whole ladder or nothing, and never moves a role at or
+/// above the person reordering.
+#[tokio::test]
+async fn a_reorder_states_the_whole_ladder_and_lifts_nothing() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let roles = &court.roles;
+    let path = format!("/tenancy/organizations/{}/role-order", court.organization);
+    let reorder = async |order: Value| {
+        let (status, _headers, _body) = court
+            .send(
+                "PUT",
+                &path,
+                Some(&json!({ "role_ids": order })),
+                &court.moderator,
+            )
+            .await;
+        status
+    };
+
+    assert_eq!(
+        reorder(json!([roles.billing, roles.moderator, roles.editor])).await,
+        StatusCode::FORBIDDEN,
+        "putting billing above the moderator's own role",
+    );
+    assert_eq!(
+        reorder(json!([roles.moderator, roles.editor, roles.billing])).await,
+        StatusCode::OK,
+        "roles below the mover may change places",
+    );
+    for incomplete in [
+        json!([roles.moderator, roles.billing]),
+        json!([roles.moderator, roles.billing, roles.billing]),
+        json!([
+            roles.moderator,
+            roles.billing,
+            roles.editor,
+            roles.administrator
+        ]),
+        json!([roles.moderator, roles.billing, roles.editor, roles.default]),
+    ] {
+        assert_eq!(
+            reorder(incomplete.clone()).await,
+            StatusCode::BAD_REQUEST,
+            "{incomplete}",
+        );
+    }
+    assert_eq!(
+        reorder(json!([
+            roles.moderator,
+            roles.billing,
+            roles.editor,
+            Uuid::new_v4()
+        ]))
+        .await,
+        StatusCode::NOT_FOUND,
+    );
+
+    let listing = role_listing(&court.harness, &court.owner, court.organization).await;
+    let positions: Vec<i64> = listing["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .map(|role| role["position"].as_i64().expect("a position is a number"))
+        .collect();
+    assert_eq!(
+        positions,
+        [4, 3, 2, 1, 0],
+        "the ladder stays dense and whole"
+    );
+}
+
+/// The default role is everybody's, including whoever edits it, so it is the
+/// obvious lever for raising everybody at once. It lifts nobody.
+#[tokio::test]
+async fn the_default_role_lifts_nobody() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let (owner, moderator, member) = (&court.owner, &court.moderator, &court.member);
+
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.default, &["Team.update"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "the moderator cannot give everybody what they lack",
+    );
+    assert_eq!(
+        court
+            .set_permissions(moderator, court.roles.default, &["Team.read"])
+            .await,
+        StatusCode::OK,
+    );
+
+    // Even every management permission on the default role is inert in the
+    // hands of somebody whose highest role it is: they rank 0, and nothing
+    // ranks below 0.
+    assert_eq!(
+        court
+            .set_permissions(owner, court.roles.default, &MODERATOR_PERMISSIONS)
+            .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court
+            .set_permissions(member, court.roles.default, &[])
+            .await,
+        StatusCode::FORBIDDEN,
+        "the default role is at the member's own rank",
+    );
+    let (status, _headers, _body) = court
+        .send(
+            "POST",
+            &format!("/tenancy/organizations/{}/roles", court.organization),
+            Some(&json!({ "name": "Mine", "color": "#000000", "permissions": [] })),
+            member,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a new role would sit at their rank"
+    );
+    assert_eq!(
+        court
+            .offer(
+                member,
+                ("organization_id", court.organization),
+                &[court.roles.editor]
+            )
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+    let moderator_membership = court.organization_membership("moderator-").await;
+    let (status, _headers, _body) = court
+        .send(
+            "DELETE",
+            &format!(
+                "/tenancy/organizations/{}/members/{moderator_membership}",
+                court.organization
+            ),
+            None,
+            member,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "everybody else outranks them"
+    );
+}
+
+/// The administrator role is the top of every organization: it cannot be
+/// edited away, deleted, or left without a holder.
+#[tokio::test]
+async fn the_administrator_role_stays_whole_and_held() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let (owner, moderator) = (&court.owner, &court.moderator);
+    let roles_path = format!("/tenancy/organizations/{}/roles", court.organization);
+
+    assert_eq!(
+        court
+            .set_permissions(owner, court.roles.administrator, &[])
+            .await,
+        StatusCode::BAD_REQUEST,
+        "the administrator holds every permission; there is nothing to edit",
+    );
+    for structural in [court.roles.administrator, court.roles.default] {
+        let (status, _headers, _body) = court
+            .send("DELETE", &format!("{roles_path}/{structural}"), None, owner)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let owner_membership = court.organization_membership("owner-").await;
+    let owner_path = format!(
+        "/tenancy/organizations/{}/members/{owner_membership}",
+        court.organization
+    );
+    let (status, _headers, _body) = court
+        .send(
+            "PATCH",
+            &owner_path,
+            Some(&json!({ "role_ids": [] })),
+            moderator,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the moderator cannot unseat the owner"
+    );
+    let (status, _headers, _body) = court
+        .send(
+            "PATCH",
+            &owner_path,
+            Some(&json!({ "role_ids": [] })),
+            owner,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the last administrator cannot step down, so management is never locked out",
+    );
+
+    // Appointing a second administrator is what lets the first step down.
+    let moderator_membership = court.organization_membership("moderator-").await;
+    let (status, _headers, body) = court
+        .send(
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/members/{moderator_membership}",
+                court.organization
+            ),
+            Some(&json!({ "role_ids": [court.roles.administrator] })),
+            owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, _headers, body) = court
+        .send(
+            "PATCH",
+            &owner_path,
+            Some(&json!({ "role_ids": [] })),
+            owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// A role granted on one team or one record is standing there and nowhere
+/// wider: it never raises organization-wide rank or team-wide permissions.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "two narrow grants, each proved against every wider place it must not reach"
+)]
+async fn a_narrow_grant_never_raises_wider_standing() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let owner = &court.owner;
+    let member = court.team_membership("member-").await;
+
+    // The member is made a moderator of the team only.
+    assert_eq!(
+        court
+            .grant_in_team(owner, member, &[court.roles.moderator])
+            .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court
+            .set_permissions(&court.member, court.roles.editor, &["Team.read"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "a team grant is no standing over the organization's roles",
+    );
+    let moderator_in_organization = court.organization_membership("moderator-").await;
+    let (status, _headers, _body) = court
+        .send(
+            "DELETE",
+            &format!(
+                "/tenancy/organizations/{}/members/{moderator_in_organization}",
+                court.organization
+            ),
+            None,
+            &court.member,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A newcomer is made a moderator of one record of the team.
+    let run = Uuid::new_v4();
+    let newcomer_email = format!("newcomer-{run}@example.com");
+    let newcomer = register(&court.harness.router, &newcomer_email).await;
+    court
+        .invite_and_claim(
+            &json!({ "email": newcomer_email, "team_id": court.team }),
+            &newcomer,
+        )
+        .await;
+    let newcomer_membership = court.team_membership("newcomer-").await;
+    let record = Uuid::new_v4();
+    let path = format!(
+        "/tenancy/teams/{}/members/{newcomer_membership}",
+        court.team
+    );
+    let (status, _headers, body) = court
+        .send(
+            "PATCH",
+            &path,
+            Some(&json!({ "role_ids": [court.roles.moderator], "resource_id": record })),
+            owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let viewer = {
+        let (status, _headers, body) = court
+            .send(
+                "POST",
+                &format!("/tenancy/organizations/{}/roles", court.organization),
+                Some(
+                    &json!({ "name": "Viewer", "color": "#22c55e", "permissions": ["Team.read"] }),
+                ),
+                owner,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        id_of(&body["role"]["id"])
+    };
+    // Somebody fresh to the team, whom the newcomer outranks only on the
+    // record they moderate.
+    let fresh_email = format!("fresh-{run}@example.com");
+    let fresh = register(&court.harness.router, &fresh_email).await;
+    court
+        .invite_and_claim(
+            &json!({ "email": fresh_email, "team_id": court.team }),
+            &fresh,
+        )
+        .await;
+    let fresh_membership = court.team_membership("fresh-").await;
+    let fresh_path = format!("/tenancy/teams/{}/members/{fresh_membership}", court.team);
+    for (body, expected, why) in [
+        (
+            json!({ "role_ids": [viewer] }),
+            StatusCode::FORBIDDEN,
+            "team-wide, the newcomer holds only the default role",
+        ),
+        (
+            json!({ "role_ids": [viewer], "resource_id": record }),
+            StatusCode::OK,
+            "on the record they moderate, they manage",
+        ),
+        (
+            json!({ "role_ids": [viewer], "resource_id": Uuid::new_v4() }),
+            StatusCode::FORBIDDEN,
+            "on any other record they hold nothing",
+        ),
+    ] {
+        let (status, _headers, answer) = court
+            .send("PATCH", &fresh_path, Some(&body), &newcomer)
+            .await;
+        assert_eq!(status, expected, "{why}: {answer}");
+    }
+    let (status, _headers, _body) = court
+        .send(
+            "PATCH",
+            &format!("/tenancy/teams/{}/members/{member}", court.team),
+            Some(&json!({ "role_ids": [], "resource_id": record })),
+            &newcomer,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the team's moderator ranks as high as the record's, even on the record",
+    );
+}
+
+/// Ids from another organization, of a role, a team, or a membership, read
+/// exactly as ids that do not exist.
+#[tokio::test]
+async fn ids_from_another_organization_read_as_missing() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let owner = &court.owner;
+
+    let stranger = register(
+        &court.harness.router,
+        &format!("stranger-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let stranger_team = court.harness.bootstrapped_team(&stranger).await;
+    let (status, _headers, body) = send(
+        &court.harness.router,
+        "GET",
+        &format!("/tenancy/teams/{stranger_team}/roles"),
+        None,
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let foreign_role = keyed(&body, "editor");
+    let member = court.team_membership("member-").await;
+
+    assert_eq!(
+        court.grant_in_team(owner, member, &[foreign_role]).await,
+        StatusCode::NOT_FOUND,
+    );
+    assert_eq!(
+        court
+            .offer(owner, ("team_id", court.team), &[foreign_role])
+            .await,
+        StatusCode::NOT_FOUND,
+    );
+    for method in ["PATCH", "DELETE"] {
+        let path = format!(
+            "/tenancy/organizations/{}/roles/{foreign_role}",
+            court.organization
+        );
+        let (status, _headers, _body) = court
+            .send(method, &path, Some(&json!({ "name": "Mine" })), owner)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // A team of another organization and a team that does not exist answer
+    // the same, so inviting cannot probe for teams.
+    let (foreign, _headers, foreign_body) = court
+        .send(
+            "POST",
+            "/tenancy/invitations",
+            Some(&json!({ "email": "probe@example.com", "team_id": stranger_team })),
+            owner,
+        )
+        .await;
+    let (absent, _headers, absent_body) = court
+        .send(
+            "POST",
+            "/tenancy/invitations",
+            Some(&json!({ "email": "probe@example.com", "team_id": Uuid::new_v4() })),
+            owner,
+        )
+        .await;
+    assert_eq!(foreign, StatusCode::NOT_FOUND);
+    assert_eq!(absent, foreign);
+    assert_eq!(absent_body, foreign_body);
+
+    // The stranger reads nothing of the court's roles.
+    let (status, _headers, _body) = send(
+        &court.harness.router,
+        "GET",
+        &format!("/tenancy/organizations/{}/roles", court.organization),
+        None,
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A grant belongs to the membership it hangs off, so somebody removed and
+/// invited back holds what the new invitation offers and nothing they held
+/// before.
+#[tokio::test]
+async fn a_member_invited_back_finds_no_old_roles_waiting() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let owner = &court.owner;
+    let member = court.team_membership("member-").await;
+
+    assert_eq!(
+        court
+            .grant_in_team(owner, member, &[court.roles.administrator])
+            .await,
+        StatusCode::OK,
+    );
+    let (status, _headers, _body) = court
+        .send(
+            "DELETE",
+            &format!("/tenancy/teams/{}/members/{member}", court.team),
+            None,
+            owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let email = court
+        .harness
+        .outbox
+        .emails()
+        .into_iter()
+        .find(|sent| sent.subject.contains("invited") && sent.to.starts_with("member-"))
+        .map(|sent| sent.to)
+        .expect("the member was invited once already");
+    court
+        .invite_and_claim(
+            &json!({ "email": email, "team_id": court.team }),
+            &court.member,
+        )
+        .await;
+
+    let (status, _headers, _body) = court
+        .send(
+            "PATCH",
+            &format!("/tenancy/teams/{}", court.team),
+            Some(&json!({ "name": "Taken back" })),
+            &court.member,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the administrator grant went with the old membership",
+    );
+}
+
+/// Deleting a role takes it from everybody holding it, at once, and they fall
+/// back to whatever else they hold and the default role.
+#[tokio::test]
+async fn a_deleted_role_leaves_its_holders_with_the_rest() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+
+    let (status, _headers, body) = court
+        .send(
+            "DELETE",
+            &format!(
+                "/tenancy/organizations/{}/roles/{}",
+                court.organization, court.roles.moderator
+            ),
+            None,
+            &court.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
+
+    assert_eq!(
+        court
+            .set_permissions(&court.moderator, court.roles.editor, &["Team.read"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "the moderator's management went with the role",
+    );
+    let (status, _headers, body) = court
+        .send("GET", "/account/notifications", None, &court.moderator)
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["notifications"]
+            .as_array()
+            .expect("the inbox lists notices")
+            .iter()
+            .any(|notice| notice["kind"] == "membership.roles_changed"),
+        "holders are told: {body}",
+    );
+
+    let listing = role_listing(&court.harness, &court.owner, court.organization).await;
+    let positions: Vec<i64> = listing["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .map(|role| role["position"].as_i64().expect("a position is a number"))
+        .collect();
+    assert_eq!(positions, [3, 2, 1, 0], "the roles above close the gap");
+}

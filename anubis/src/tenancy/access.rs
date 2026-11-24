@@ -102,7 +102,7 @@ impl Access {
     /// The same role reached along two paths counts once.
     pub(crate) fn from_roles(held: Vec<Role>, roles: &RoleSet) -> Self {
         let mut held = held;
-        held.sort_by(|left, right| right.position.cmp(&left.position));
+        held.sort_by_key(|role| std::cmp::Reverse(role.position));
         held.dedup_by_key(|role| role.id);
 
         let mut permissions = BTreeSet::new();
