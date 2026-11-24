@@ -79,6 +79,7 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `ROLE_UPDATED` | `role.updated` | A role's name, colour, or permissions change |
 | `ROLE_DESTROYED` | `role.destroyed` | A role is deleted, and everybody holding it loses it |
 | `ROLE_REORDERED` | `role.reordered` | An organization's roles are put in a new order |
+| `TEAM_ACCESS_CHANGED` | `team.access_changed` | What a team reaches of one kind of the organization's own records changes, recorded on the organization with the team as its subject; the change set is keyed by the kind, naming the records before and after. See [tenancy.md](tenancy.md#resource-grants) |
 | `MEMBER_REMOVED` | `member.removed` | An administrator removes somebody else |
 | `MEMBER_LEFT` | `member.left` | Somebody leaves of their own accord |
 | `PASSWORD_CHANGED` | `password.changed` | An account rotates its password |

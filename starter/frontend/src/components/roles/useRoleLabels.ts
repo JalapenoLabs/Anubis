@@ -10,13 +10,19 @@ import type {
 import { useTranslation } from 'react-i18next'
 
 // Misc
-import { MEMBERSHIP_SUBJECT, ROLE_SUBJECT, SUBSCRIPTION_SUBJECT } from '@jalapenolabs/anubis'
+import {
+  MEMBERSHIP_SUBJECT,
+  RESOURCE_GRANT_SUBJECT,
+  ROLE_SUBJECT,
+  SUBSCRIPTION_SUBJECT,
+} from '@jalapenolabs/anubis'
 
 /** The framework's own subjects, by the key their name is translated under. */
 const frameworkSubjectKeys: Record<string, string> = {
   [MEMBERSHIP_SUBJECT]: 'roles.subjects.membership',
   [ROLE_SUBJECT]: 'roles.subjects.role',
   [SUBSCRIPTION_SUBJECT]: 'roles.subjects.subscription',
+  [RESOURCE_GRANT_SUBJECT]: 'roles.subjects.resourceGrant',
 }
 
 /**

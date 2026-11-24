@@ -18,7 +18,11 @@ import { OrganizationTeamsCard } from '../../components/tenancy/OrganizationTeam
 import { RenameTenantCard } from '../../components/tenancy/RenameTenantCard'
 
 // Misc
-import { getOrganizationBillingUrl, getOrganizationRolesUrl } from '../../urls'
+import {
+  getOrganizationAccessUrl,
+  getOrganizationBillingUrl,
+  getOrganizationRolesUrl,
+} from '../../urls'
 
 /**
  * Administering one organization: its name, its people, and its teams.
@@ -140,6 +144,34 @@ export function OrganizationSettingsPage() {
               >
                 <span>{
                     t('roles.cardAction')
+                  }</span>
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+      : null
+    }
+    { isOrganizationMember
+      ? <Card className='relaxed p-2'>
+          <CardBody>
+            <div className='level items-start'>
+              <div>
+                <h3 className='compact text-xl font-semibold'>{
+                    t('access.cardTitle')
+                  }</h3>
+                <p className='opacity-70'>{
+                    t('access.cardSubtitle')
+                  }</p>
+              </div>
+              <Button
+                as={Link}
+                to={getOrganizationAccessUrl(organization.id)}
+                color='primary'
+                variant='flat'
+                className='shrink-0'
+              >
+                <span>{
+                    t('access.cardAction')
                   }</span>
               </Button>
             </div>

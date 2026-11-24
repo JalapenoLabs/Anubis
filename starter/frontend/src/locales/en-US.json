@@ -535,7 +535,25 @@
     "subjects": {
       "membership": "Members and invitations",
       "role": "Roles",
-      "subscription": "Billing"
+      "subscription": "Billing",
+      "resourceGrant": "Team access"
     }
+  },
+  "access": {
+    "title": "Team access",
+    "cardTitle": "Team access",
+    "cardSubtitle": "Which teams reach the records this organization shares.",
+    "cardAction": "Manage team access",
+    "group": "{{team}}: {{kind}}",
+    "nothing": "Nothing",
+    "every": "Every record",
+    "only": "Only these",
+    "add": "Add a record",
+    "remove": "Remove",
+    "nothingShared": "Nothing in this application is shared between teams.",
+    "outOfReach": "Sharing these takes roles that reach every one of them.",
+    "notManaged": "Sharing these takes the team access permission and every permission on them.",
+    "nothingChanged": "Nothing has changed yet.",
+    "saved": "Team access saved."
   }
 }

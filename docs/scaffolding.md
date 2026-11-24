@@ -265,7 +265,7 @@ The command runs inside an application, which is a directory holding `backend/`,
 anubis scaffold model Task Goal,Project,Team name:text_field
 ```
 
-The ownership chain ends in `Team`, because every application record reaches a team. Its length selects the living template: `Team` the team-owned one, `<Parent>,Team` the nested one, `<Parent>,<GrandParent>,Team` the deepest. A fourth level is refused by name, because [a depth is a template](#three-levels-of-ownership) rather than a flag. Every link must already exist, and no link may repeat.
+The ownership chain ends in `Team`. A record the organization owns directly and shares with its teams chains to `Organization` instead, and that root is written by hand today rather than scaffolded ([resource grants](tenancy.md#resource-grants), [#147](https://github.com/JalapenoLabs/Anubis/issues/147)). Its length selects the living template: `Team` the team-owned one, `<Parent>,Team` the nested one, `<Parent>,<GrandParent>,Team` the deepest. A fourth level is refused by name, because [a depth is a template](#three-levels-of-ownership) rather than a flag. Every link must already exist, and no link may repeat.
 
 One run produces, on the backend:
 

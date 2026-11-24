@@ -19,6 +19,11 @@
 //! cannot reach, deliberately: a caller who can tell those apart can probe for
 //! ids, so callers answer `404` for both.
 //!
+//! Records an organization owns directly, rather than through a team, are
+//! reached through resource grants, and their resolver sits beside these three
+//! in `resource_access` ([`crate::tenancy::resolve_resource_access`]), reading
+//! the team side through the same [`admitted_teams`] statement.
+//!
 //! # Reach
 //!
 //! **A suspension is a deny.** It is checked before any grant and it outranks

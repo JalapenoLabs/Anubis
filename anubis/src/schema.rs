@@ -116,7 +116,9 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Working tenants. All domain resources chain ownership back to a team.
+    /// Working tenants. Domain resources chain ownership back to a team, apart
+    /// from the records an organization owns directly and shares through
+    /// `resource_grants`.
     ///
     /// `sub_tenant_id` is null for an organization-level team, which every
     /// sub-tenant inherits; a set value scopes the team to one sub-tenant.
