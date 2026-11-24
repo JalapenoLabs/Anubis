@@ -719,3 +719,63 @@ async fn a_seat_update_whose_answer_was_lost_is_not_sent_again() {
         "the projection holds what Stripe holds"
     );
 }
+
+/// A seat update answered with a replay that shows other seats is retried afresh.
+///
+/// The first attempt sets two seats and its answer is lost; then the quantity
+/// is put back to one at Stripe directly. The retry sends the same request
+/// under the same key, and Stripe replays the first answer. Read back, the
+/// subscription bills one seat, not two, so the job fails to be retried under a
+/// fresh key rather than reporting seats it never synchronized.
+#[tokio::test]
+async fn a_seat_update_answered_by_a_stale_replay_is_retried_afresh() {
+    let Some(database) = TestDatabase::create("billing_limits_sync").await else {
+        return;
+    };
+    let harness = Harness::boot_with_plans(&database, plans(PER_SEAT_YML)).await;
+    let (stripe_base, stripe) = start_mock_stripe_refusing(0).await;
+    let reconciler = Reconciler::new(
+        harness.pool.clone(),
+        plans(PER_SEAT_YML),
+        &config(&stripe_base),
+    );
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    insert_subscription(&harness.pool, organization_id, 1).await;
+    let (status, body) = invite(
+        &harness.router,
+        organization_id,
+        &owner,
+        &format!("guest-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    *unlock(&stripe.lose_next_answer) = true;
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("the answer never arrived");
+    *unlock(&stripe.quantity) = 1;
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("the replay shows one seat, so the seats are not synchronized");
+    assert_eq!(*unlock(&stripe.quantity), 1);
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect("keyed afresh, the next attempt is a new request");
+    assert_eq!(
+        *unlock(&stripe.quantity),
+        2,
+        "Stripe bills the seats in use"
+    );
+}

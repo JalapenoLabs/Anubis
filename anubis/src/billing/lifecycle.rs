@@ -262,6 +262,12 @@ impl Reconciler {
             return Ok(());
         }
 
+        // Every write below is Stripe's own answer, stamped when the read
+        // began, exactly as reconciliation is.
+        let origin = Origin {
+            organization_id: Some(job.organization_id),
+            metadata: None,
+        };
         let read_at = unlocked_read_began();
         let current = stripe
             .retrieve_subscription(&held.stripe_subscription_id)
@@ -277,10 +283,6 @@ impl Reconciler {
             // cancellation did. Sending the update again would only fetch that
             // attempt's saved answer, stale by now, so what Stripe holds is
             // written instead.
-            let origin = Origin {
-                organization_id: Some(job.organization_id),
-                metadata: None,
-            };
             self.converge(&mut connection, &current, &origin, read_at)
                 .await?;
             return Ok(());
@@ -322,6 +324,28 @@ impl Reconciler {
             Err(unanswered) => return Err(unanswered.into()),
         };
 
+        self.converge(&mut connection, &updated, &origin, read_at)
+            .await?;
+
+        let billed = updated
+            .item_for_price(per_seat_price)
+            .and_then(stripe::SubscriptionItem::quantity);
+        if billed != Some(seats) {
+            // A replayed answer to an earlier attempt, read back, and the
+            // subscription moved since: these seats were never set. A fresh
+            // revision lets the queue's retry send them as a new request.
+            move_revision(&mut connection, held.id).await?;
+            return Err(Error::new(
+                ErrorKind::Data,
+                format!(
+                    "Stripe answered an earlier seat update for {}, which no longer holds; the \
+                     retry sends {seats} seats afresh",
+                    held.stripe_subscription_id,
+                ),
+            )
+            .into());
+        }
+
         tracing::info!(
             organization.id = %job.organization_id,
             billing.subscription.id = updated.id,
@@ -330,15 +354,6 @@ impl Reconciler {
             "seats on {{billing.subscription.id}} moved from {{billing.seats.previous}} to \
              {{billing.seats.current}}",
         );
-
-        // Written from Stripe's answer, stamped when the read began, exactly
-        // as reconciliation is.
-        let origin = Origin {
-            organization_id: Some(job.organization_id),
-            metadata: None,
-        };
-        self.converge(&mut connection, &updated, &origin, read_at)
-            .await?;
 
         Ok(())
     }

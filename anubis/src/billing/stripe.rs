@@ -830,13 +830,19 @@ impl SubscriptionItem {
         self.quantity
     }
 
-    /// The price's recurrence as Stripe spells it, `month` or `year`.
+    /// The price's recurrence unit as Stripe spells it, `month` or `year`.
     ///
-    /// `None` for a price that recurs every several intervals; see
-    /// [`Price::recurring_interval`].
+    /// The unit alone, however many of it pass between bills: the projection
+    /// records whatever Stripe reports, because a subscription it refused to
+    /// record would be one whose cancellation it could not record either. It
+    /// is checkout that refuses a price billing every several intervals, before
+    /// anything is bought; see [`Price::recurring_interval`].
     #[must_use]
     pub fn recurring_interval(&self) -> Option<&str> {
-        self.price.as_ref().and_then(Price::recurring_interval)
+        self.price
+            .as_ref()
+            .and_then(|price| price.recurring.as_ref())
+            .map(|recurring| recurring.interval.as_str())
     }
 }
 
@@ -853,8 +859,8 @@ impl Price {
     /// How often the price bills, as Stripe spells it: `month` or `year`.
     ///
     /// `None` for a one-time price, and for one that recurs every several
-    /// intervals (quarterly is every three months), neither of which the
-    /// framework records a subscription on.
+    /// intervals (quarterly is every three months), neither of which
+    /// [`crate::billing::Subscriptions::checkout`] will sell.
     #[must_use]
     pub fn recurring_interval(&self) -> Option<&str> {
         self.recurring.as_ref().and_then(Recurring::single_interval)

@@ -2645,7 +2645,10 @@ async fn a_replayed_answer_is_read_back_rather_than_trusted() {
         )
         .await
         .expect_err("Stripe only replayed an attempt that no longer holds");
-    assert!(retried.is_transport(), "worth retrying: {retried}");
+    assert!(
+        retried.is_conflict(),
+        "the subscription moved; worth retrying: {retried}"
+    );
     let writes = scene.mock.subscription_writes();
     assert_eq!(
         writes[0].idempotency_key, writes[1].idempotency_key,
@@ -2777,5 +2780,57 @@ async fn a_subscription_that_is_over_is_never_revived() {
     assert!(
         scene.live(&record).await.is_none(),
         "a later read still showing it active does not bring it back",
+    );
+}
+
+/// A subscription on a price billing every several months is recorded, and so is its end.
+///
+/// The framework's own checkout refuses such a price, but one can still arrive
+/// from the Stripe dashboard or the customer portal. The projection records
+/// whatever Stripe reports, because a subscription it cannot record is one whose
+/// cancellation it cannot record either, and a deletion is the last event
+/// Stripe sends.
+#[tokio::test]
+async fn a_subscription_billing_every_several_months_is_recorded_and_so_is_its_end() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    scene.mock.hold(
+        "sub_quarterly",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .mock
+        .ledger()
+        .subscriptions
+        .get_mut("sub_quarterly")
+        .expect("held")["items"]["data"][0]["price"]["recurring"]["interval_count"] = json!(3);
+    let now = Utc::now().timestamp();
+
+    scene.announce("sub_quarterly", now - 600).await;
+    assert!(
+        scene.live(&record).await.is_some(),
+        "the subscription Stripe reports is recorded",
+    );
+
+    let mut ended = scene.mock.snapshot("sub_quarterly");
+    ended["status"] = json!("canceled");
+    scene
+        .deliver(
+            "evt_quarterly_deleted",
+            "customer.subscription.deleted",
+            now,
+            &ended,
+        )
+        .await;
+    scene.process().await;
+    assert!(
+        scene.live(&record).await.is_none(),
+        "and its cancellation is recorded too",
     );
 }

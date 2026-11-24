@@ -81,6 +81,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::deadpool::Object;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use futures_util::future::try_join_all;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -294,8 +295,15 @@ impl Subscriptions {
 
         // Before Stripe takes payment, not after: a subscription on a price
         // recurring any other way would be charged and then never recorded.
-        for item in purchase.line_items {
-            let price = stripe.retrieve_price(item.price_id()).await?;
+        // Read together: each is a round trip, and a person is waiting.
+        let prices = try_join_all(
+            purchase
+                .line_items
+                .iter()
+                .map(|item| stripe.retrieve_price(item.price_id())),
+        )
+        .await?;
+        for price in prices {
             if price
                 .recurring_interval()
                 .and_then(Interval::parse)
@@ -304,9 +312,9 @@ impl Subscriptions {
                 return Err(Error::new(
                     ErrorKind::Invalid,
                     format!(
-                        "{} does not bill monthly or yearly, and subscriptions are recorded \
-                         monthly or yearly",
-                        item.price_id(),
+                        "{} does not bill every month or every year, which is how subscriptions \
+                         are sold",
+                        price.id,
                     ),
                 ));
             }
@@ -534,7 +542,7 @@ impl Subscriptions {
                     // the next attempt afresh.
                     move_revision(connection, held.id).await?;
                     return Ok(Outcome::Refused(Error::new(
-                        ErrorKind::Unavailable,
+                        ErrorKind::Conflict,
                         format!(
                             "Stripe answered an earlier attempt of the change to {subject}, which \
                              no longer holds; try again"
@@ -641,7 +649,7 @@ async fn lock_live(
     if busy > 0 {
         return Err(Error::new(
             ErrorKind::Conflict,
-            format!("another change to the subscription for {subject} is in progress; try again"),
+            format!("the subscription for {subject} is being written; try again"),
         ));
     }
     Err(Error::new(
@@ -1035,8 +1043,10 @@ impl Error {
         matches!(self.kind, ErrorKind::Invalid)
     }
 
-    /// Returns `true` when the subject already has a live subscription, or its
-    /// subscription has ended.
+    /// Returns `true` when the subject already has a live subscription, its
+    /// subscription has ended, another write to it is in progress, or Stripe
+    /// answered an earlier attempt of the change rather than this one: retrying
+    /// may work for the last two.
     #[must_use]
     pub fn is_conflict(&self) -> bool {
         matches!(self.kind, ErrorKind::Conflict)
