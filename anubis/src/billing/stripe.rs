@@ -905,6 +905,9 @@ struct ApiErrorEnvelope {
 struct ApiErrorBody {
     message: Option<String>,
     code: Option<String>,
+    /// The error's family, e.g. `idempotency_error`.
+    #[serde(default, rename = "type")]
+    family: Option<String>,
 }
 
 /// Percent-encodes one path segment.
@@ -963,6 +966,8 @@ enum ErrorKind {
         status: u16,
         /// Stripe's own error code, when it named one, e.g. `resource_missing`.
         code: Option<String>,
+        /// Whether Stripe refused the idempotency key rather than the request.
+        idempotency: bool,
     },
     /// Stripe answered with something this client could not read.
     Decode,
@@ -1005,6 +1010,33 @@ impl Error {
         }
     }
 
+    /// Returns `true` when Stripe answered with a server error.
+    ///
+    /// Stripe documents such an outcome as unknown: the request may have been
+    /// carried out. It also saves the answer under the request's idempotency
+    /// key, so a retry under that key is handed the same error back.
+    #[must_use]
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self.kind, ErrorKind::Api { status, .. } if status >= 500)
+    }
+
+    /// Returns `true` when Stripe refused the idempotency key, not the request.
+    ///
+    /// Either another request under the same key is still being carried out
+    /// (`idempotency_key_in_use`), or the key was first used with other
+    /// parameters (`idempotency_error`). Both mean another attempt holds the
+    /// key, which a retry later resolves.
+    #[must_use]
+    pub fn is_idempotency_conflict(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::Api {
+                idempotency: true,
+                ..
+            }
+        )
+    }
+
     /// Stripe's own error code, when it named one, e.g. `resource_missing`.
     #[must_use]
     pub fn code(&self) -> Option<&str> {
@@ -1024,14 +1056,24 @@ impl Error {
     /// Reads Stripe's error envelope, falling back to the raw body.
     fn api(status: u16, body: &str, path: &str) -> Self {
         let parsed: Option<ApiErrorEnvelope> = serde_json::from_str(body).ok();
-        let (message, code) = match parsed {
-            Some(envelope) => (envelope.error.message, envelope.error.code),
-            None => (Some(body.to_owned()), None),
+        let (message, code, family) = match parsed {
+            Some(envelope) => (
+                envelope.error.message,
+                envelope.error.code,
+                envelope.error.family,
+            ),
+            None => (Some(body.to_owned()), None, None),
         };
         let message = message.unwrap_or_else(|| "Stripe gave no reason".to_owned());
+        let idempotency = family.as_deref() == Some("idempotency_error")
+            || code.as_deref() == Some("idempotency_key_in_use");
 
         Self::new(
-            ErrorKind::Api { status, code },
+            ErrorKind::Api {
+                status,
+                code,
+                idempotency,
+            },
             &format!("Stripe answered {status} for {path}: {message}"),
         )
     }
@@ -1245,6 +1287,37 @@ mod tests {
             "an id out of an event body cannot climb the path",
         );
         assert_eq!(encode_path_segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn a_refused_key_and_a_server_error_say_so() {
+        let mismatch = Error::api(
+            400,
+            r#"{"error":{"type":"idempotency_error","message":"Keys for idempotent requests"}}"#,
+            "/v1/customers",
+        );
+        let in_use = Error::api(
+            409,
+            r#"{"error":{"type":"invalid_request_error","code":"idempotency_key_in_use"}}"#,
+            "/v1/subscriptions/sub_1",
+        );
+        let server = Error::api(
+            500,
+            r#"{"error":{"type":"api_error"}}"#,
+            "/v1/subscriptions/sub_1",
+        );
+        let refused = Error::api(
+            400,
+            r#"{"error":{"type":"invalid_request_error"}}"#,
+            "/v1/x",
+        );
+
+        assert!(mismatch.is_idempotency_conflict());
+        assert!(in_use.is_idempotency_conflict());
+        assert!(server.is_indeterminate());
+        assert!(!server.is_idempotency_conflict());
+        assert!(!refused.is_indeterminate());
+        assert!(!refused.is_idempotency_conflict());
     }
 
     #[test]

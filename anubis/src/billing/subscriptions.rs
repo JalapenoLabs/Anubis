@@ -59,9 +59,12 @@
 //! what was asked for ([`ItemChange::set`] of a price already at that quantity
 //! sends nothing), and sends it with an idempotency key naming the row's last
 //! write. Stripe's answer is written into the projection, with the change's
-//! audit event, before the lock is released. An answer lost on the way back is
-//! not taken for a failed change: the subscription is read back, and a change
-//! Stripe shows in place is written and recorded like any other. Stripe
+//! audit event, before the lock is released. An outcome Stripe leaves unknown
+//! (an answer lost on the way back, a server error, an earlier attempt still
+//! being carried out under the key) is not taken for a failed change: the
+//! subscription is read back, and a change Stripe shows in place is written
+//! and recorded like any other. A change Stripe completes only after that read
+//! reaches the projection through its event, with no audit row. Stripe
 //! replays the first answer to a key for a day, refusals included, so a change
 //! Stripe refuses moves the row's revision and the next attempt is keyed
 //! afresh, which is safe because it reads Stripe back first; a replayed answer
@@ -293,32 +296,8 @@ impl Subscriptions {
         }
         drop(connection);
 
-        // Before Stripe takes payment, not after: a subscription on a price
-        // recurring any other way would be charged and then never recorded.
-        // Read together: each is a round trip, and a person is waiting.
-        let prices = try_join_all(
-            purchase
-                .line_items
-                .iter()
-                .map(|item| stripe.retrieve_price(item.price_id())),
-        )
-        .await?;
-        for price in prices {
-            if price
-                .recurring_interval()
-                .and_then(Interval::parse)
-                .is_none()
-            {
-                return Err(Error::new(
-                    ErrorKind::Invalid,
-                    format!(
-                        "{} does not bill every month or every year, which is how subscriptions \
-                         are sold",
-                        price.id,
-                    ),
-                ));
-            }
-        }
+        let price_ids: Vec<&str> = purchase.line_items.iter().map(LineItem::price_id).collect();
+        require_monthly_or_yearly(stripe, &price_ids).await?;
 
         let landing = format!("{}{}", self.app_url, purchase.return_path);
         self.open_checkout(
@@ -358,6 +337,15 @@ impl Subscriptions {
         changes: &[ItemChange],
     ) -> Result<SubscriptionWithItems, Error> {
         validate_changes(changes)?;
+        let stripe = self.configured()?;
+        let price_ids: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Set { price_id, .. } => Some(price_id.as_str()),
+                ItemChange::Remove { .. } => None,
+            })
+            .collect();
+        require_monthly_or_yearly(stripe, &price_ids).await?;
         self.detached_change(
             context,
             organization_id,
@@ -506,20 +494,35 @@ impl Subscriptions {
 
                 let answered = match send_request(stripe, &held, &request, &current).await {
                     Ok(answered) => answered,
-                    Err(refused) if refused.is_api() => {
+                    Err(refused)
+                        if refused.is_api()
+                            && !refused.is_indeterminate()
+                            && !refused.is_idempotency_conflict() =>
+                    {
                         move_revision(connection, held.id).await?;
                         return Ok(Outcome::Refused(refused.into()));
                     }
-                    // The answer was lost, not necessarily the change: Stripe
-                    // may have applied it. Reading back says which, and a change
-                    // Stripe shows in place is written and recorded as made.
-                    Err(unanswered) => {
+                    // The outcome is unknown, not necessarily a failure: the
+                    // answer was lost, Stripe answered with a server error, or an
+                    // earlier attempt under this key is still being carried out.
+                    // Reading back says which, and a change Stripe shows in place
+                    // is written and recorded as made.
+                    Err(unknown) => {
                         match stripe
                             .retrieve_subscription(&held.stripe_subscription_id)
                             .await
                         {
                             Ok(after) if reached(intent, &after) => after,
-                            _unknown => return Err(unanswered.into()),
+                            _not_in_place => {
+                                if unknown.is_indeterminate() {
+                                    // Stripe saved this answer under the key;
+                                    // a fresh revision lets the next attempt be
+                                    // a new request.
+                                    move_revision(connection, held.id).await?;
+                                    return Ok(Outcome::Refused(unknown.into()));
+                                }
+                                return Err(unknown.into());
+                            }
                         }
                     }
                 };
@@ -755,6 +758,41 @@ async fn send_request(
     }
 }
 
+/// Refuses any of `price_ids` that does not bill every month or every year.
+///
+/// Before Stripe takes payment, not after: a subscription on a price recurring
+/// any other way would be charged and then could not be recorded, nor could
+/// its end. The prices are read together, because each is a round trip and a
+/// person is waiting.
+async fn require_monthly_or_yearly(
+    stripe: &stripe::Client,
+    price_ids: &[&str],
+) -> Result<(), Error> {
+    let prices = try_join_all(
+        price_ids
+            .iter()
+            .map(|price_id| stripe.retrieve_price(price_id)),
+    )
+    .await?;
+    for price in prices {
+        if price
+            .recurring_interval()
+            .and_then(Interval::parse)
+            .is_none()
+        {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                format!(
+                    "{} does not bill every month or every year, which is how subscriptions are \
+                     sold",
+                    price.id,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `subscription` is where `intent` asked it to be.
 fn reached(intent: &Intent, subscription: &stripe::Subscription) -> bool {
     let ended = SubscriptionStatus::parse(&subscription.status)
@@ -946,10 +984,21 @@ async fn ensure_customer(
         Ok(customer) => customer,
         Err(refused) => {
             // Two first purchases at once share the organization's key, and
-            // Stripe refuses the second when its email differs. By the time it
-            // does, the first has usually stored the customer both are for.
+            // Stripe refuses the second when its email differs, or while the
+            // first is still being carried out. By the time it does, the first
+            // has usually stored the customer both are for; when it has not
+            // yet, a retry finds it.
             if let Some(existing) = stored_customer_id(connection, organization_id).await? {
                 return Ok(existing);
+            }
+            if refused.is_idempotency_conflict() {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "another purchase is creating organization {organization_id}'s Stripe \
+                         customer; try again"
+                    ),
+                ));
             }
             return Err(refused.into());
         }
@@ -1086,6 +1135,9 @@ impl From<stripe::Error> for Error {
     fn from(source: stripe::Error) -> Self {
         let kind = if source.is_transport() {
             ErrorKind::Unavailable
+        } else if source.is_idempotency_conflict() {
+            // Another attempt holds the key; a retry later resolves it.
+            ErrorKind::Conflict
         } else {
             ErrorKind::Internal
         };
