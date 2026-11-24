@@ -254,7 +254,7 @@
       "you": "You",
       "editRolesAction": "Edit roles",
       "rolesModalTitle": "Roles for {{email}}",
-      "rolesModalBody": "Roles are replaced by what you choose here. A team always keeps at least one admin.",
+      "rolesModalBody": "Roles are replaced by what you choose here. A team always keeps at least one administrator.",
       "removeAction": "Remove",
       "removeModalTitle": "Remove this member?",
       "removeModalBody": "{{email}} loses access to this team right away. You can invite them back.",
@@ -547,6 +547,60 @@
       "invalid_request": "The app's request was incomplete.",
       "server_error": "Something went wrong on our side. Try connecting again.",
       "unknown": "The app's request could not be completed. Try connecting again from the app."
+    }
+  },
+  "roles": {
+    "title": "Roles",
+    "cardTitle": "Roles",
+    "cardSubtitle": "What each role may do, and which outranks which.",
+    "cardAction": "Manage roles",
+    "onlyDefault": "Member",
+    "newAction": "New role",
+    "newTitle": "New role",
+    "createAction": "Create role",
+    "back": "Back to roles",
+    "saved": "Role saved.",
+    "nothingChanged": "Nothing has changed yet.",
+    "followRecommended": "Use the recommended permissions",
+    "dangerTitle": "Danger zone",
+    "deleteAction": "Delete role",
+    "deleteModalTitle": "Delete {{role}}?",
+    "deleteModalBody": "Everybody holding {{role}} loses it right away and keeps their other roles. This cannot be undone.",
+    "ladder": {
+      "ariaLabel": "Roles, highest first",
+      "administrator": "Administrator",
+      "everybody": "Everybody",
+      "drag": "Drag to reorder",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "pinned": "Only roles below your highest role can be moved"
+    },
+    "form": {
+      "name": "Name",
+      "color": "Color",
+      "permissions": "Permissions",
+      "subject": "Area",
+      "administratorNote": "The administrator role holds every permission.",
+      "defaultNote": "Everybody holds this role, so every permission here is everybody's.",
+      "notHeld": "You can only switch permissions you hold.",
+      "notGrantable": "No role in this application grants this permission."
+    },
+    "actions": {
+      "read": "Read",
+      "create": "Create",
+      "update": "Update",
+      "destroy": "Delete"
+    },
+    "picker": {
+      "label": "Roles",
+      "wrongTier": "Granted at another level",
+      "outranked": "Ranks at or above your highest role",
+      "lacksPermissions": "Carries permissions you do not hold"
+    },
+    "subjects": {
+      "membership": "Members and invitations",
+      "role": "Roles",
+      "subscription": "Billing"
     }
   }
 }

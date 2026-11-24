@@ -237,9 +237,9 @@ async fn guards_enforce_membership_and_permissions() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Invite the outsider as `default`: membership without Probe grants
-    // turns the 404 into a 403.
-    let invite = json!({ "email": outsider_email, "team_id": team_id, "roles": ["default"] });
+    // Invite the outsider with nothing beyond the default role: membership
+    // without Probe grants turns the 404 into a 403.
+    let invite = json!({ "email": outsider_email, "team_id": team_id });
     let (status, _headers, body) = send(
         &router,
         "POST",

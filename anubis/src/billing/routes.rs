@@ -4,19 +4,20 @@
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
-//! | `GET /organizations/{organization_id}` | org member | The plan in force and why, the plan subscription, the seats in use, and, for admin or billing, every live subscription with its items and the wallet |
-//! | `POST /organizations/{organization_id}/checkout` | org admin or billing | Opens a Stripe Checkout session and answers with its URL |
-//! | `POST /organizations/{organization_id}/portal` | org admin or billing | Opens the Stripe customer portal and answers with its URL |
-//! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscriptions and wallet payments this application shows |
-//! | `POST /organizations/{organization_id}/wallet/top-up` | org admin or billing | Opens a Stripe Checkout session that buys credit, and answers with its URL |
-//! | `PUT /organizations/{organization_id}/wallet/auto-recharge` | org admin or billing | Turns auto-recharge on, or changes it |
-//! | `DELETE /organizations/{organization_id}/wallet/auto-recharge` | org admin or billing | Turns auto-recharge off |
-//! | `GET /organizations/{organization_id}/wallet/entries` | org admin or billing | One page of the wallet's ledger, newest first |
+//! | `GET /organizations/{organization_id}` | org member | The plan in force and why, the plan subscription, the seats in use, and, for a member who may spend, every live subscription with its items and the wallet |
+//! | `POST /organizations/{organization_id}/checkout` | `Billing::Subscription.update` | Opens a Stripe Checkout session and answers with its URL |
+//! | `POST /organizations/{organization_id}/portal` | `Billing::Subscription.update` | Opens the Stripe customer portal and answers with its URL |
+//! | `POST /organizations/{organization_id}/reconcile` | `Billing::Subscription.update` | Reads Stripe and corrects the subscriptions and wallet payments this application shows |
+//! | `POST /organizations/{organization_id}/wallet/top-up` | `Billing::Subscription.update` | Opens a Stripe Checkout session that buys credit, and answers with its URL |
+//! | `PUT /organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge on, or changes it |
+//! | `DELETE /organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge off |
+//! | `GET /organizations/{organization_id}/wallet/entries` | `Billing::Subscription.update` | One page of the wallet's ledger, newest first |
 //!
 //! Reading is open to every member because the plan and its limits explain
-//! what the whole organization can do. Spending money is not: it takes the
-//! `admin` role, or the `billing` role, which the starter's `roles.yml`
-//! defines for exactly this.
+//! what the whole organization can do. Spending money is not: it takes
+//! `Billing::Subscription.update`, which the administrator role always holds,
+//! the framework grants the `billing` key, and an organization may hand to a
+//! role of its own.
 //!
 //! The write routes answer `503` when `STRIPE_SECRET_KEY` is unset, and the
 //! read route keeps working: an application with no Stripe account is on the
@@ -51,14 +52,8 @@ use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::OrganizationMember;
 use crate::http::{ApiError, ListParams, Pagination};
-use crate::roles::RoleSet;
-use crate::tenancy::ADMIN_ROLE;
-
-/// Role key that may spend the organization's money without administering it.
-///
-/// The starter's `config/roles.yml` ships it, described as "can manage billing
-/// and subscriptions", and this is the surface that sentence refers to.
-pub const BILLING_ROLE: &str = "billing";
+use crate::roles::{Action, RoleSet, SUBSCRIPTION};
+use crate::tenancy::OrganizationAccess;
 
 /// Where Stripe returns the browser, under `APP_URL`.
 ///
@@ -166,7 +161,7 @@ struct BillingBody {
     ///
     /// `None` for a member who may not manage billing, for the same reason
     /// `subscriptions` is: the balance says what the organization spends, and
-    /// spending is the billing roles' business.
+    /// spending is the business of a member who may spend.
     wallet: Option<WalletBody>,
 }
 
@@ -184,7 +179,7 @@ struct WalletBody {
     /// Sent rather than worked out in the browser, whose currency tables are
     /// display rules that disagree with Stripe's for some currencies.
     charge_step_micros: i64,
-    /// The balance below which a spend tells the billing members.
+    /// The balance below which a spend tells the administrators.
     low_balance_micros: Option<i64>,
     /// The auto-recharge settings, when auto-recharge is on.
     auto_recharge: Option<AutoRechargeBody>,
@@ -266,8 +261,8 @@ async fn show(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     // Only what the caller may see is loaded: an organization paying per
-    // record can hold hundreds of subscriptions, which a member without billing
-    // authority is never shown.
+    // record can hold hundreds of subscriptions, which a member who may not
+    // spend on them is never shown.
     let list_all = holds_billing_authority(&member);
     let live = if list_all {
         Subscription::live_for_organization(&mut connection, member.organization.id).await
@@ -590,7 +585,7 @@ async fn change_auto_recharge(
 
 /// One page of the wallet's ledger, newest first.
 ///
-/// Open to the billing roles only: a spend names what it paid for, and a
+/// Open only to a member who may spend: a spend names what it paid for, and a
 /// member may not reach every record the organization pays for.
 async fn list_entries(
     State(state): State<BillingState>,
@@ -629,12 +624,17 @@ fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
 }
 
 /// Whether a member may spend the organization's money and see what it buys.
+///
+/// Spending is `Billing::Subscription.update`, which the administrator role
+/// always holds and the `billing` key carries, and which an organization may
+/// hand to a role of its own. It counts only for a full member or an
+/// administrator: a guest reaches only what was granted by name, and the
+/// organization's subscriptions pay for records across every sub-tenant, so a
+/// guest's organization-wide roles spend nothing, as they manage nothing.
 fn holds_billing_authority(member: &OrganizationMember) -> bool {
-    member
-        .membership
-        .roles
-        .iter()
-        .any(|role| role == ADMIN_ROLE || role == BILLING_ROLE)
+    let standing_counts =
+        member.membership.access == OrganizationAccess::Full || member.access.is_administrator();
+    standing_counts && member.can(Action::Update, SUBSCRIPTION)
 }
 
 /// Refuses a member who may see the plan but not buy one.
@@ -643,7 +643,7 @@ fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError
         Ok(())
     } else {
         Err(ApiError::forbidden(
-            "You need the admin or billing role to manage this organization's billing.",
+            "You need permission to manage this organization's billing.",
         ))
     }
 }

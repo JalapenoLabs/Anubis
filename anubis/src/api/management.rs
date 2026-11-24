@@ -2,8 +2,8 @@
 //!
 //! [`router`] returns the routes an application mounts (conventionally under
 //! `/developers`). All routes are team-scoped through the [`TeamMember`]
-//! guard and additionally require the admin role key, since a platform token
-//! acts as the whole team.
+//! guard and additionally require the administrator role, since a platform
+//! token acts as the team's administrator.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -21,7 +21,6 @@ use crate::guard::TeamMember;
 use crate::http::ApiError;
 use crate::roles::RoleSet;
 use crate::schema::platform_applications;
-use crate::tenancy::ADMIN_ROLE;
 
 /// Returns the platform application management routes.
 pub fn router(pool: DbPool, roles: RoleSet) -> Router {
@@ -168,20 +167,13 @@ async fn rotate_token(
     Ok(Json(RotatedTokenBody { token: raw_token }))
 }
 
-/// Platform tokens act as the whole team, so management needs the admin key.
+/// Platform tokens act as the team's administrator, so minting one stays with
+/// the administrator role: a role that could mint one could exercise through
+/// the token every permission it does not hold itself.
 fn require_team_admin(member: &TeamMember) -> Result<(), ApiError> {
-    if member
-        .membership
-        .roles
-        .iter()
-        .any(|role| role == ADMIN_ROLE)
-    {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You need the admin role to manage platform applications.",
-        ))
-    }
+    member
+        .access
+        .require_administrator("manage platform applications")
 }
 
 fn log_internal(error: impl std::fmt::Display) -> ApiError {

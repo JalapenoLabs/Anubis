@@ -334,7 +334,7 @@ impl Wallets {
     /// The balance fell from `before` to the wallet's. Landing at or below the
     /// threshold arms a recharge unless one is already in flight, so a
     /// threshold of zero recharges the moment the credit runs out. Without a
-    /// recharge that can run, crossing the low mark tells the billing members
+    /// recharge that can run, crossing the low mark tells the administrators
     /// instead; with one, the recharge is the answer, and a failed one says so
     /// itself.
     async fn after_debit(

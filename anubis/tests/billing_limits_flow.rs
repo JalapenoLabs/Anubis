@@ -276,7 +276,7 @@ async fn invite(
     cookie: &str,
     email: &str,
 ) -> (StatusCode, Value) {
-    let body = json!({ "email": email, "organization_id": organization_id, "roles": [] });
+    let body = json!({ "email": email, "organization_id": organization_id });
     let (status, _headers, answer) = send(
         router,
         "POST",

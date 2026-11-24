@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { MembershipOrganization } from '@jalapenolabs/anubis'
+import type { MembershipOrganization, TenantAccess } from '@jalapenolabs/anubis'
 
 // Core
 import { describe, expect, it } from 'vitest'
@@ -8,33 +8,43 @@ import { describe, expect, it } from 'vitest'
 // Misc
 import { findTeam, resolveCurrentTeam } from './TeamProvider'
 
+/** Nothing to say about access here: these tests are about which team. */
+const access: TenantAccess = {
+  roles: [],
+  permissions: [],
+  rank: 0,
+  isAdministrator: false,
+}
+
 const organizations: MembershipOrganization[] = [
   {
     id: 'organization-acme',
     name: 'Acme',
-    roles: [ 'admin' ],
+    isMember: true,
+    access,
     teams: [
       {
         id: 'team-general',
         name: 'General',
-        roles: [ 'admin' ],
+        access,
       },
       {
         id: 'team-platform',
         name: 'Platform',
-        roles: [ 'editor' ],
+        access,
       },
     ],
   },
   {
     id: 'organization-side',
     name: 'Side Project',
-    roles: [],
+    isMember: false,
+    access,
     teams: [
       {
         id: 'team-side',
         name: 'General',
-        roles: [ 'default' ],
+        access,
       },
     ],
   },

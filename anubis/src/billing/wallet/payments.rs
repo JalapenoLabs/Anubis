@@ -25,7 +25,7 @@
 //! before it charges anything it looks for a payment the attempt already
 //! made, and an answer Stripe never delivered is found again rather than
 //! charged twice. A definite refusal, a declined card above all, ends the
-//! attempt and turns auto-recharge off with a notice to the billing members,
+//! attempt and turns auto-recharge off with a notice to the administrators,
 //! so a card that keeps declining is never charged in a loop.
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -631,7 +631,7 @@ async fn fail_attempt(
     fail_armed(connection, terms, organization_id, attempt, reason).await
 }
 
-/// Ends the armed attempt as failed and turns auto-recharge off, telling the billing members.
+/// Ends the armed attempt as failed and turns auto-recharge off, telling the administrators.
 ///
 /// Conditional on `attempt` still being the armed one, so a late event about
 /// an attempt already settled changes nothing. Turning auto-recharge off is

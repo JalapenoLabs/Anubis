@@ -1,6 +1,7 @@
 //! The `GranularDetail` model: a record owned two parents away from its team.
 
-use anubis::tenancy::TeamMembership;
+use anubis::roles::RoleSet;
+use anubis::tenancy::{Access, resolve_team_access};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -137,14 +138,15 @@ impl GranularDetail {
     /// Loads one granular detail the user may see, walking the chain to its team.
     ///
     /// Returns the granular detail, its parent tangible thing, the creative
-    /// concept at the chain's root, and the caller's membership in the owning
-    /// team, or `None` when the record does not exist *or* the caller is not a
-    /// member of that team. Handlers answer both with `404`.
+    /// concept at the chain's root, and what the caller may do to it, or
+    /// `None` when the record does not exist *or* the caller does not reach
+    /// the owning team. Handlers answer both with `404`. A role granted on any
+    /// record of the chain applies.
     ///
     /// The chain's root is selected alongside the parent rather than
     /// denormalized onto the row, which is the whole reason a third ownership
     /// level costs one join and no trigger. The application's three tables
-    /// join in one query; the membership is a second lookup, because
+    /// join in one query; the caller's standing is a second lookup, because
     /// application and framework tables cannot share a Diesel query (see the
     /// note in `crate::schema`).
     ///
@@ -152,9 +154,10 @@ impl GranularDetail {
     /// Returns the underlying Diesel error when either query fails.
     pub async fn load_for_member(
         connection: &mut AsyncPgConnection,
+        roles: &RoleSet,
         user_id: Uuid,
         granular_detail_id: Uuid,
-    ) -> QueryResult<Option<(Self, TangibleThing, CreativeConcept, TeamMembership)>> {
+    ) -> QueryResult<Option<(Self, TangibleThing, CreativeConcept, Access)>> {
         let found: Option<(Self, TangibleThing, CreativeConcept)> = granular_details::table
             .inner_join(tangible_things::table.inner_join(creative_concepts::table))
             .filter(granular_details::id.eq(granular_detail_id))
@@ -170,15 +173,16 @@ impl GranularDetail {
             return Ok(None);
         };
 
-        let membership =
-            TeamMembership::for_user(connection, user_id, creative_concept.team_id).await?;
-        Ok(membership.map(|membership| {
-            (
-                granular_detail,
-                tangible_thing,
-                creative_concept,
-                membership,
-            )
+        let found = resolve_team_access(
+            connection,
+            roles,
+            user_id,
+            creative_concept.team_id,
+            &[granular_detail.id, tangible_thing.id, creative_concept.id],
+        )
+        .await?;
+        Ok(found.map(|(_team, _membership, access)| {
+            (granular_detail, tangible_thing, creative_concept, access)
         }))
     }
 

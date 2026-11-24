@@ -1,12 +1,12 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { OrganizationRosterMember } from '@jalapenolabs/anubis'
+import type { OrganizationRosterMember, RoleCatalog } from '@jalapenolabs/anubis'
 import type { ReactNode } from 'react'
 
 // Core
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useAnubisApi } from '@jalapenolabs/anubis'
+import { MEMBERSHIP_SUBJECT, allows, outranksMember, useAnubisApi } from '@jalapenolabs/anubis'
 
 // UI
 import {
@@ -21,14 +21,16 @@ import {
   TableHeader,
   TableRow,
 } from '@heroui/react'
+import { RoleChips } from '../roles/RoleChips'
 import { ConfirmActionModal } from './ConfirmActionModal'
+import { EditMemberRolesModal } from './EditMemberRolesModal'
 
 type Props = {
   organizationId: string
   members: OrganizationRosterMember[]
   isLoading: boolean
-  /** True for an organization admin: removals and revocations appear. */
-  canManage: boolean
+  /** The organization's roles, with the viewer's organization-wide standing. */
+  catalog: RoleCatalog | undefined
   /** The signed-in user's address, so their own row offers no removal. */
   currentUserEmail: string
   /** Revalidates the roster after a change lands. */
@@ -38,9 +40,9 @@ type Props = {
 /**
  * The organization roster: its members, and the invitations still outstanding.
  *
- * Organization roles are granted by the invitation and are not edited here,
- * because the framework has no endpoint that would change them; what an admin
- * can do is take back an invitation or remove a member. Invitations into the
+ * A row offers what the viewer may do to that member: change their
+ * organization-wide roles, remove them, or take back the invitation, each
+ * only for somebody ranking below the viewer. Invitations into the
  * organization's teams belong to those teams' rosters, so each place appears
  * exactly once across the two screens.
  */
@@ -48,6 +50,21 @@ export function OrganizationRosterCard(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
   const [ confirming, setConfirming ] = useState<OrganizationRosterMember | null>(null)
+  const [ editing, setEditing ] = useState<OrganizationRosterMember | null>(null)
+
+  const viewer = props.catalog?.viewer
+  const mayEditRoles = allows(viewer, 'update', MEMBERSHIP_SUBJECT)
+  const mayRemove = allows(viewer, 'destroy', MEMBERSHIP_SUBJECT)
+
+  async function onSaveRoles(roleIds: string[]) {
+    if (!editing?.membershipId) {
+      console.debug('organization roles saved with no claimed member being edited', editing)
+      return
+    }
+
+    await api.changeOrganizationMemberRoles(props.organizationId, editing.membershipId, roleIds)
+    props.onChanged()
+  }
 
   async function onConfirmed() {
     if (!confirming) {
@@ -75,8 +92,7 @@ export function OrganizationRosterCard(props: Props) {
     }
 
     if (columnKey === 'roles') {
-      // Role keys are the application's own vocabulary, from roles.yml.
-      return member.roles.join(', ')
+      return <RoleChips roles={member.roles} />
     }
 
     if (columnKey === 'status') {
@@ -91,24 +107,43 @@ export function OrganizationRosterCard(props: Props) {
         }</Chip>
     }
 
-    if (member.email === props.currentUserEmail) {
-      return <span className='opacity-60'>{
-          t('team.members.you')
-        }</span>
-    }
-
-    return <Button
-      size='sm'
-      variant='light'
-      color='danger'
-      onPress={() => setConfirming(member)}
-    >
-      <span>{
-          member.pending
-            ? t('team.members.revokeAction')
-            : t('team.members.removeAction')
-        }</span>
-    </Button>
+    const isSelf = member.email === props.currentUserEmail
+    const reachable = Boolean(viewer && outranksMember(viewer, member.roles, isSelf))
+    return <div className='level-left gap-2'>
+      { mayEditRoles && reachable && !member.pending
+        ? <Button
+            size='sm'
+            variant='flat'
+            onPress={() => setEditing(member)}
+          >
+            <span>{
+                t('team.members.editRolesAction')
+              }</span>
+          </Button>
+        : null
+      }
+      { isSelf
+        ? <span className='opacity-60'>{
+            t('team.members.you')
+          }</span>
+        : null
+      }
+      { !isSelf && mayRemove && reachable
+        ? <Button
+            size='sm'
+            variant='light'
+            color='danger'
+            onPress={() => setConfirming(member)}
+          >
+            <span>{
+                member.pending
+                  ? t('team.members.revokeAction')
+                  : t('team.members.removeAction')
+              }</span>
+          </Button>
+        : null
+      }
+    </div>
   }
 
   const columns = [
@@ -116,7 +151,7 @@ export function OrganizationRosterCard(props: Props) {
     { key: 'roles', label: t('team.members.rolesHeader') },
     { key: 'status', label: t('team.members.status') },
   ]
-  if (props.canManage) {
+  if (mayEditRoles || mayRemove) {
     columns.push({ key: 'actions', label: t('common.actions') })
   }
 
@@ -161,6 +196,15 @@ export function OrganizationRosterCard(props: Props) {
           }
         </TableBody>
       </Table>
+      <EditMemberRolesModal
+        key={editing?.membershipId ?? 'nobody'}
+        email={editing ? editing.email : null}
+        heldRoleIds={editing?.roles.map((role) => role.id) ?? []}
+        catalog={props.catalog}
+        tier='organization'
+        onSave={onSaveRoles}
+        onClose={() => setEditing(null)}
+      />
       <ConfirmActionModal
         isOpen={Boolean(confirming)}
         title={

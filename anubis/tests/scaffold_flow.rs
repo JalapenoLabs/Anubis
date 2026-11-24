@@ -378,7 +378,7 @@ fn a_grandchild_scaffolds_through_two_parents() {
         routes.contains("path = \"/api/v1/goals/{goal_id}/tasks\","),
         "{routes}",
     );
-    assert!(routes.contains("Goal::load_for_member(connection, user_id, goal_id)"));
+    assert!(routes.contains("Goal::load_for_member(connection, roles, user_id, goal_id)"));
     assert!(routes.contains("Goal::load_for_team(connection, caller.team.id, goal_id)"));
     assert!(routes.contains("let team_id = project.team_id;"));
 

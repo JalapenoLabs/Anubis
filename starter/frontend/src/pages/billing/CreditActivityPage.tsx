@@ -13,13 +13,13 @@ import { AppShell } from '../../components/AppShell'
 import { CreditActivityCard } from '../../components/billing/CreditActivityCard'
 
 // Misc
-import { ADMIN_ROLE, BILLING_ROLE } from '../../permissions'
+import { SUBSCRIPTION_SUBJECT, allows } from '@jalapenolabs/anubis'
 import { getOrganizationBillingUrl, getOrganizationSettingsUrl } from '../../urls'
 
 /**
  * The organization's credit ledger, a level below the billing screen.
  *
- * Gated on the `admin` or `billing` role, which is what the ledger endpoint
+ * Gated on `Billing::Subscription.update`, which is what the ledger endpoint
  * enforces: a spend names the record it paid for, and a member may not reach
  * every record the organization pays for. Anyone else reads a sentence rather
  * than a request that would come back `403`.
@@ -38,9 +38,9 @@ export function CreditActivityPage() {
   const organization = memberships.organizations.find(
     (candidate) => candidate.id === organizationId,
   )
-  const canManage = Boolean(organization?.roles.some(
-    (role) => role === ADMIN_ROLE || role === BILLING_ROLE,
-  ))
+  const canManage = Boolean(
+    organization?.isMember && allows(organization.access, 'update', SUBSCRIPTION_SUBJECT),
+  )
 
   const billing = useSWR(
     canManage ? `billing/${organizationId}` : null,

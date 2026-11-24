@@ -74,7 +74,11 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `INVITATION_CLAIMED` | `invitation.claimed` | An invitation is accepted |
 | `INVITATION_REVOKED` | `invitation.revoked` | A pending invitation is taken back |
 | `MEMBER_ADDED` | `member.added` | Somebody joins by claiming an invitation |
-| `MEMBER_ROLE_CHANGED` | `member.role_changed` | A member's roles are replaced |
+| `MEMBER_ROLE_CHANGED` | `member.role_changed` | A member's roles are replaced, at one scope |
+| `ROLE_CREATED` | `role.created` | An organization makes a role of its own |
+| `ROLE_UPDATED` | `role.updated` | A role's name, colour, or permissions change |
+| `ROLE_DESTROYED` | `role.destroyed` | A role is deleted, and everybody holding it loses it |
+| `ROLE_REORDERED` | `role.reordered` | An organization's roles are put in a new order |
 | `MEMBER_REMOVED` | `member.removed` | An administrator removes somebody else |
 | `MEMBER_LEFT` | `member.left` | Somebody leaves of their own accord |
 | `PASSWORD_CHANGED` | `password.changed` | An account rotates its password |
@@ -157,7 +161,7 @@ Two routes, both read-only, mounted under `/account`:
 | `GET /account/teams/{team_id}/audit-events` | team admin | Everything recorded in that team |
 | `GET /account/audit-events` | signed in | The caller's own account events |
 
-The team listing takes the admin role for the same reason the Developers section does: it shows every member's activity, which is an administrative view of the team rather than an editorial one. A member without it gets `403`, a non-member gets `404` (the guard refuses before the role is read, so the team's existence is not revealed), and nobody at all gets `401`.
+The team listing takes the administrator role for the same reason the Developers section does: it shows every member's activity, which is an administrative view of the team rather than an editorial one. A member without it gets `403`, a non-member gets `404` (the guard refuses before the role is read, so the team's existence is not revealed), and nobody at all gets `401`.
 
 It pages on the standard `page`, `limit`, and `sort` parameters, newest first, and narrows on two filters:
 
@@ -176,7 +180,7 @@ Neither route is on `/api/v1`. The log is an operator's view of one team, not pa
 
 `/teams/:teamId/audit-log`, reachable from the team switcher's Manage section. One table: who, what, to what, when, and the change set. Time reads as "3 hours ago" with the exact moment in its tooltip, because a log is read by scanning; the change set is a count that unfolds into the fields that moved, rendered as JSON, because the honest rendering of a value the screen knows nothing about is the value.
 
-The screen is gated on the compiled affordances the same way the endpoint is gated on the role, and it mirrors rather than replaces the server's answer: a member without the admin role sees a sentence instead of a table that would have come back `403`.
+The screen is gated on the resolved access the same way the endpoint is gated on the role, and it mirrors rather than replaces the server's answer: a member without the administrator role sees a sentence instead of a table that would have come back `403`.
 
 ## Roadmap
 

@@ -22,9 +22,9 @@ use super::stream::{EventStream, Subscriber};
 use super::{Channels, MAX_CHANNELS_PER_STREAM, Refusal};
 use crate::auth::User;
 use crate::db::DbPool;
-use crate::guard::admitted_teams;
 use crate::http::ApiError;
 use crate::schema::teams;
+use crate::tenancy::admitted_teams;
 
 /// Where the endpoint is mounted, and what `crate::spa` reserves for it.
 ///

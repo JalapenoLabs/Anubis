@@ -26,24 +26,39 @@ const USER = {
   created_at: '2026-01-01T00:00:00Z',
 }
 
-function memberships(organizationRoles: string[]) {
+/** A full member's standing, carrying exactly `permissions`. */
+function standing(permissions: string[]) {
+  return {
+    roles: [],
+    permissions,
+    rank: 1,
+    is_administrator: false,
+  }
+}
+
+/** The account's one organization, where it holds `permissions`. */
+function memberships(permissions: string[]) {
   return {
     organizations: [
       {
         id: ORGANIZATION_ID,
         name: 'Acme',
-        roles: organizationRoles,
+        is_member: true,
+        ...standing(permissions),
         teams: [
           {
             id: '3f1a2b3c-0000-4000-8000-0000000000aa',
             name: 'Acme HQ',
-            roles: [ 'admin' ],
+            ...standing(permissions),
           },
         ],
       },
     ],
   }
 }
+
+/** The permission that spends the organization's money, and reads its wallet. */
+const MAY_SPEND = [ 'Billing::Subscription.update' ]
 
 const WALLET = {
   currency: 'usd',
@@ -137,7 +152,7 @@ const PAGES: Record<string, unknown[]> = {
  * list that changes. Every ledger request is recorded, so a case can prove one
  * was never sent.
  */
-function stubLedger(organizationRoles: string[], wallet: unknown = WALLET) {
+function stubLedger(permissions: string[], wallet: unknown = WALLET) {
   const ledgerRequests: string[] = []
   vi.stubGlobal('fetch', async (input: Request | string | URL) => {
     const requested = input instanceof Request
@@ -149,7 +164,7 @@ function stubLedger(organizationRoles: string[], wallet: unknown = WALLET) {
       return Response.json({ user: USER })
     }
     if (url.pathname === '/tenancy/memberships') {
-      return Response.json(memberships(organizationRoles))
+      return Response.json(memberships(permissions))
     }
     if (url.pathname === `/billing/organizations/${ORGANIZATION_ID}`) {
       return Response.json(billing(wallet))
@@ -178,7 +193,7 @@ function rowTexts() {
 
 describe('CreditActivityPage', () => {
   it('should page through the ledger with every amount to the micro-unit', async () => {
-    const ledgerRequests = stubLedger([ 'billing' ])
+    const ledgerRequests = stubLedger(MAY_SPEND)
 
     renderWithProviders(<App />, ACTIVITY_PATH)
 
@@ -215,7 +230,7 @@ describe('CreditActivityPage', () => {
   })
 
   it('should trail back to the billing screen it belongs under', async () => {
-    stubLedger([ 'admin' ])
+    stubLedger(MAY_SPEND)
 
     renderWithProviders(<App />, ACTIVITY_PATH)
 
@@ -226,7 +241,7 @@ describe('CreditActivityPage', () => {
   })
 
   it('should refuse a member without a billing role, as the endpoint does', async () => {
-    const ledgerRequests = stubLedger([ 'editor' ])
+    const ledgerRequests = stubLedger([])
 
     renderWithProviders(<App />, ACTIVITY_PATH)
 
@@ -236,7 +251,7 @@ describe('CreditActivityPage', () => {
   })
 
   it('should go back to the billing screen for an application that sells no credit', async () => {
-    const ledgerRequests = stubLedger([ 'admin' ], null)
+    const ledgerRequests = stubLedger(MAY_SPEND, null)
 
     renderWithProviders(<App />, ACTIVITY_PATH)
 

@@ -99,7 +99,7 @@ wallet:
   name: Account credit            # what Stripe Checkout calls a top-up
   currency: usd
   minimum_top_up_micros: 10000000 # $10.00, the smallest top-up and the smallest recharge
-  low_balance_micros: 2000000     # optional: tell the billing members below $2.00
+  low_balance_micros: 2000000     # optional: tell the administrators below $2.00
 ```
 
 The paid plan may sell no prices of its own, which is the shape of an application that sells per-record subscriptions or credit and no plan at all: a free plan of one seat, and a paid plan of a hundred that paying for anything reaches. The paid plan is never the free plan, so the free plan is the one price-less plan `paid_plan` does not name.
@@ -204,7 +204,7 @@ subscriptions.cancel(&audit_context, organization_id, &server, Cancellation::AtP
 
 ### Why the application owns the routes
 
-The framework serves no endpoint that starts or changes a subject subscription, and that is deliberate. Three questions decide whether one is allowed, and only the application can answer them: whether the record belongs to the organization, who may spend money on it, and which Stripe prices it is sold at. The last is the sharpest: an endpoint taking price ids from a browser would let a customer buy any price in the Stripe account. So the application's own route authorizes the caller against its own record and its own permission model, computes the prices, and calls `Subscriptions`, which owns doing it correctly at Stripe. The framework's `/billing` endpoints list every subscription the organization holds, with its items, and reconcile them. A route that spends money on a record should require what the framework's own billing writes require, the `admin` or `billing` organization role, unless the application has a reason to grant it more narrowly.
+The framework serves no endpoint that starts or changes a subject subscription, and that is deliberate. Three questions decide whether one is allowed, and only the application can answer them: whether the record belongs to the organization, who may spend money on it, and which Stripe prices it is sold at. The last is the sharpest: an endpoint taking price ids from a browser would let a customer buy any price in the Stripe account. So the application's own route authorizes the caller against its own record and its own permission model, computes the prices, and calls `Subscriptions`, which owns doing it correctly at Stripe. The framework's `/billing` endpoints list every subscription the organization holds, with its items, and reconcile them. A route that spends money on a record should require what the framework's own billing writes require, `Billing::Subscription.update` organization-wide (`member.can(Action::Update, SUBSCRIPTION)`), unless the application has a reason to grant it more narrowly.
 
 Every method names the organization, and a record that organization holds no live subscription for answers as not found, so a record another tenant pays for cannot be changed through this one.
 
@@ -317,7 +317,7 @@ Nothing is credited by the request. The payment arrives as events, `checkout.ses
 |---|---|
 | Succeeded | Credited once, and the attempt is cleared |
 | Processing | The attempt stays armed; `payment_intent.succeeded` or `payment_intent.payment_failed` settles it |
-| Declined (`402`, a `card_error`), or another definite refusal | The attempt ends, **auto-recharge turns off**, `wallet.auto_recharge_failed` is audited, and the billing members are told. A declining card is never charged in a loop: a person turns it back on, after a top-up saves a card that works |
+| Declined (`402`, a `card_error`), or another definite refusal | The attempt ends, **auto-recharge turns off**, `wallet.auto_recharge_failed` is audited, and the organization's administrators are told. A declining card is never charged in a loop: a person turns it back on, after a top-up saves a card that works |
 | No answer, a key still in use | Read back; a charge found is credited, and otherwise the job fails and the queue retries under the same key |
 | A server error | Read back; Stripe saves that answer under the key and would replay it, so with nothing found the attempt's revision moves and the retry is a new request |
 
@@ -337,7 +337,7 @@ Refunds and reversals are audited as `wallet.refunded` and `wallet.refund_revers
 
 ### Notices and the audit log
 
-Notices go to the organization's **billing members**: everyone holding the `admin` or `billing` organization role whose membership is not suspended, linking to the billing page.
+Notices go to the organization's **administrators**, whose role always holds the billing permission, linking to the billing page. Anyone else an organization lets spend reads the same state on the billing screen.
 
 | Kind | When |
 |---|---|
@@ -348,7 +348,7 @@ Credits, refunds, reversals, and auto-recharge changes and failures are audited 
 
 ### Reading the wallet
 
-The billing `GET` answers the wallet to `admin` and `billing` (see [the endpoints](#endpoints)), and `GET .../wallet/entries?page=&limit=` pages the ledger, newest first, by `position`, the order the balances chain in. Both are the billing roles' only: the balance says what the organization spends, and a spend names the record it paid for, which a member may not reach. Reconciliation converges the wallet's payments too: a top-up whose events never arrived is credited, and a refund whose events were missed is debited, reading each payment's refunds when its charge says it was refunded or the ledger holds a refund of it, which is how a refund that failed while its events were missed is credited back.
+The billing `GET` answers the wallet only to a member who may spend, a full member or administrator allowed `Billing::Subscription.update` (see [the endpoints](#endpoints)), and `GET .../wallet/entries?page=&limit=` pages the ledger, newest first, by `position`, the order the balances chain in. Both are that member's alone, a guest's included roles never counting: the balance says what the organization spends, and a spend names the record it paid for, which a member may not reach. Reconciliation converges the wallet's payments too: a top-up whose events never arrived is credited, and a refund whose events were missed is debited, reading each payment's refunds when its charge says it was refunded or the ledger holds a refund of it, which is how a refund that failed while its events were missed is credited back.
 
 ### Without Stripe
 
@@ -384,17 +384,17 @@ Two mounts, both in the application's `main.rs` and both listed by `anubis route
 
 | Route | Guard | Effect |
 |---|---|---|
-| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the plan subscription behind it, the seats in use, whether billing is configured, and, for `admin` or `billing`, every live subscription with its line items |
-| `POST /billing/organizations/{organization_id}/checkout` | org `admin` or `billing` | Opens a Stripe Checkout session, answers with its URL |
-| `POST /billing/organizations/{organization_id}/portal` | org `admin` or `billing` | Opens the Stripe customer portal, answers with its URL |
-| `POST /billing/organizations/{organization_id}/reconcile` | org `admin` or `billing` | Reads Stripe and corrects every subscription and wallet payment this application shows |
-| `POST /billing/organizations/{organization_id}/wallet/top-up` | org `admin` or `billing` | Opens a Stripe Checkout session that buys credit, answers with its URL |
-| `PUT /billing/organizations/{organization_id}/wallet/auto-recharge` | org `admin` or `billing` | Turns auto-recharge on, or changes it |
-| `DELETE /billing/organizations/{organization_id}/wallet/auto-recharge` | org `admin` or `billing` | Turns auto-recharge off |
-| `GET /billing/organizations/{organization_id}/wallet/entries` | org `admin` or `billing` | One page of the wallet's ledger, newest first |
+| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the plan subscription behind it, the seats in use, whether billing is configured, and, for a member allowed `Billing::Subscription.update`, every live subscription with its line items, and the wallet |
+| `POST /billing/organizations/{organization_id}/checkout` | `Billing::Subscription.update` | Opens a Stripe Checkout session, answers with its URL |
+| `POST /billing/organizations/{organization_id}/portal` | `Billing::Subscription.update` | Opens the Stripe customer portal, answers with its URL |
+| `POST /billing/organizations/{organization_id}/reconcile` | `Billing::Subscription.update` | Reads Stripe and corrects every subscription and wallet payment this application shows |
+| `POST /billing/organizations/{organization_id}/wallet/top-up` | `Billing::Subscription.update` | Opens a Stripe Checkout session that buys credit, answers with its URL |
+| `PUT /billing/organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge on, or changes it |
+| `DELETE /billing/organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge off |
+| `GET /billing/organizations/{organization_id}/wallet/entries` | `Billing::Subscription.update` | One page of the wallet's ledger, newest first |
 | `POST /webhooks/stripe-billing` | a Stripe signature | Stores one Stripe event and queues the job that acts on it |
 
-Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. The list of every subscription is the exception, served to `admin` and `billing` alone: a record's subscription names the record, its prices, and its status, and a member, a guest above all, may not reach every record the organization pays for. Spending money takes the `admin` role or the `billing` role, which the starter's `roles.yml` ships described as "can manage billing and subscriptions"; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on every one, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
+Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. The list of every subscription is the exception, served only to a member whose access allows `Billing::Subscription.update`: a record's subscription names the record, its prices, and its status, and a member, a guest above all, may not reach every record the organization pays for. Spending money takes `Billing::Subscription.update`, which the administrator role always holds and the framework grants the `billing` key itself (the starter's `roles.yml` ships it described as "can manage billing and subscriptions"), and which an organization may hand to a role of its own. The framework's grant goes to that key alone, never through `includes`: a key including `billing` inherits what the file gives `billing`, and spends only if the file says so. The permission counts only for a full member or an administrator: a guest reaches only what was granted by name, so a guest's organization-wide roles spend nothing and do not show them the list of every subscription, the wallet, or its ledger; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on every one, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
 
 The receiver is the exception to all of that: it is mounted under `/webhooks` rather than `/billing`, carries no guard, and authenticates its caller with a signature. See [the lifecycle](#the-subscription-lifecycle).
 
@@ -442,9 +442,9 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
 }
 ```
 
-`subscription` is the plan subscription, the one behind `plan`; `subscriptions` is everything the organization pays for, the plan subscription first and then its records, grouped by model and oldest first, and is `null` for a member without the `admin` or `billing` role. A screen that shows a record's subscription usually shows it where the record lives, and reads it from here or from `Subscription::live_for_subject`.
+`subscription` is the plan subscription, the one behind `plan`; `subscriptions` is everything the organization pays for, the plan subscription first and then its records, grouped by model and oldest first, and is `null` for a member whose access does not allow `Billing::Subscription.update`. A screen that shows a record's subscription usually shows it where the record lives, and reads it from here or from `Subscription::live_for_subject`.
 
-`plan_source` says which step of [plan resolution](#which-plan-is-in-force) decided the plan, and every member reads it. `wallet` is `null` when the application sells no credit, and for a member without the `admin` or `billing` role, for the same reason `subscriptions` is: the balance says what the organization spends, and the ledger names the records it spent on.
+`plan_source` says which step of [plan resolution](#which-plan-is-in-force) decided the plan, and every member reads it. `wallet` is `null` when the application sells no credit, and for a member who may not spend, for the same reason `subscriptions` is: the balance says what the organization spends, and the ledger names the records it spent on.
 
 `seats_used` is the one usage figure the framework can count for every application, because memberships are its own table. A screen reads it against the plan's `seats` limit to show how full the organization is; an application's own limits are counted by the application.
 
@@ -452,7 +452,7 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
 
 | Answer | When |
 |---|---|
-| `403` | The caller holds neither `admin` nor `billing` |
+| `403` | The caller's organization-wide roles do not carry `Billing::Subscription.update` |
 | `503` | `STRIPE_SECRET_KEY` is unset |
 | `400` | Unknown plan, the free plan, an unknown interval, or an interval that plan does not sell |
 | `409` | The organization already has a live plan subscription; changing plans is the portal's job. Subscriptions for its records are no obstacle |
@@ -617,7 +617,7 @@ Five narratives, all against a **mock Stripe**: a small axum server serving the 
 
 - `anubis/tests/billing_subscriptions_flow.rs` covers several live subscriptions and their items, against a stateful mock that applies updates, keeps Stripe's idempotency cache, pages its lists, and embeds only the first page of a long item list: a plan subscription and two records held at once with the plan deciding the limits, a second live subscription for one plan or one record refused with a message naming it, a record bought through Checkout and arriving as an event, add-ons bought, resized, swapped, and removed mid-period with keyed requests and audit rows, a repeated change sending nothing, a late event leaving items alone and a newer one winning, a redelivery changing nothing twice, a record another organization pays for answering not found, the list of records withheld from a member without billing authority, both cancellations, changes refused with `503` and nothing written when Stripe is unset or unreachable, a change Stripe refused sent afresh rather than replayed, a change whose answer was lost, or answered with a server error, read back and recorded, a replayed answer read back rather than trusted, a change onto a weekly price refused before Stripe hears of it, a first purchase refused before the other stored the customer told to retry, a price billing weekly or quarterly refused before Checkout while a subscription created at Stripe on a quarterly price, and its cancellation, are still recorded, two first purchases with different emails sharing one customer, a cancelled subscription never revived by a later read, and reconciliation following pages and long item lists, deleting drifted items, and repairing the rest past one it cannot record. The races run for real: a second change refused while the first is held open at Stripe, a change refusing while the test holds its row, five retries on a held subscription each answered at once rather than queued, a change whose caller is aborted mid-flight still finishing and freeing the row, a webhook arriving while a change holds the row, two purchases of one record converging at once, a reconciliation whose older read lands after a newer event or a cancellation created in the same second, and a cancellation in the same second as a write.
 
-- `anubis/tests/billing_wallet_flow.rs` covers the wallet, against a stateful mock that holds payments and refunds, charges saved cards off-session with Stripe's idempotency cache, and can decline, lose an answer, or save a server error under a key: a top-up opened at Checkout with its card saved, credited once from Stripe's received amount however its four events arrive and repeat; spends that replay by key, refuse a reused key, drain to exactly zero, and move the organization from the free plan to the paid plan and back; a refund processed before its own payment's credit, a failed refund credited back once, and a refund past what was left taking the balance below zero; reconciliation crediting a top-up whose events never arrived; the billing roles alone reading and spending, another organization answering not found; and Stripe unset leaving reads answering, writes `503`, and held credit still spendable. The races run for real: forty spends and five credits on one wallet leaving the balance equal to the ledger's sum and every entry chaining from the one before; ten spends landing below the threshold arming one recharge, and two workers running it charging the card once; a declined card turning auto-recharge off and never being charged again; and a recharge whose answer was lost found by its attempt rather than charged twice, one answered with a saved server error retried under a fresh key.
+- `anubis/tests/billing_wallet_flow.rs` covers the wallet, against a stateful mock that holds payments and refunds, charges saved cards off-session with Stripe's idempotency cache, and can decline, lose an answer, or save a server error under a key: a top-up opened at Checkout with its card saved, credited once from Stripe's received amount however its four events arrive and repeat; spends that replay by key, refuse a reused key, drain to exactly zero, and move the organization from the free plan to the paid plan and back; a refund processed before its own payment's credit, a failed refund credited back once, and a refund past what was left taking the balance below zero; reconciliation crediting a top-up whose events never arrived; only a member allowed `Billing::Subscription.update` reading and spending, a guest holding it spending nothing, another organization answering not found; and Stripe unset leaving reads answering, writes `503`, and held credit still spendable. The races run for real: forty spends and five credits on one wallet leaving the balance equal to the ledger's sum and every entry chaining from the one before; ten spends landing below the threshold arming one recharge, and two workers running it charging the card once; a declined card turning auto-recharge off and never being charged again; and a recharge whose answer was lost found by its attempt rather than charged twice, one answered with a saved server error retried under a fresh key.
 
 - `anubis/tests/billing_limits_flow.rs` covers the limits: an invitation past the free plan's seats refused with the plan named, a re-invitation of somebody who already holds a seat costing nothing, a soft limit letting a record through where a hard one refuses (both against a real subscription row, so plan resolution is exercised rather than assumed), a membership change queueing `SyncSeats` only when a price is per-seat, the job telling a stateful mock Stripe the new quantity exactly once, a seat update Stripe refused sent under a fresh key on the job's next attempt rather than replayed, a retry after a lost answer sending nothing once the subscription is over, and a seat update answered by a stale replay retried under a fresh key.
 
@@ -650,12 +650,12 @@ It renders in one shape with a few states:
 | Cancelling | "Access ends" rather than "Renews", plus a line saying the subscription stops at the end of the period |
 | Over the seat limit | A warning line under the seat count, which is where a soft limit shows itself |
 | Back from Stripe | `?checkout=success` or `?checkout=canceled` opens the page with the matching sentence, and `?top_up=success` or `?top_up=canceled` after a top-up. None is trusted: the subscription or the credit appears when Stripe's event arrives |
-| Selling credit | A credit card with the balance, a low-balance or below-zero warning, the auto-recharge settings, a warning when a declined recharge turned it off, the "Add credit" and "Auto-recharge" dialogs for `admin` or `billing` while billing is configured, and a link to the ledger at `/organizations/:organizationId/billing/activity`, paginated, newest first |
+| Selling credit | A credit card with the balance, a low-balance or below-zero warning, the auto-recharge settings, a warning when a declined recharge turned it off, the "Add credit" and "Auto-recharge" dialogs for a member allowed `Billing::Subscription.update` while billing is configured, and a link to the ledger at `/organizations/:organizationId/billing/activity`, paginated, newest first |
 | Paid status | The plan the paid plan resolution put in force, with a line saying it is in force because the organization pays for something |
 
 The screen renders the plan subscription. The subscriptions an application sells per record arrive in the same response, for the application to render where each record lives rather than on a page that cannot name them.
 
-Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for `admin` or `billing`, read from the compiled `roles.generated.ts` through `permissions.ts`, which is the same authority the endpoints enforce.
+Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for a member whose resolved access allows `Billing::Subscription.update`, read from the membership overview, which is the same authority the endpoints enforce.
 
 The refresh action is `POST .../reconcile`. It exists on the screen because the one thing a customer does after paying is come back and look, and an event that has not landed yet is the one moment the page can be wrong.
 

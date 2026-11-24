@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use anubis::schema::{invitations, organization_memberships, team_memberships, teams, users};
+use anubis::schema::{
+    invitations, organization_memberships, role_grants, roles, team_memberships, teams, users,
+};
 
 const ROLES_YML: &str = "
 roles:
@@ -93,6 +95,47 @@ async fn register(router: &Router, email: &str) -> String {
         send(router, "POST", "/auth/register", Some(&credentials), None).await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
     session_token(&headers)
+}
+
+/// The id of the role seeded from `key` in the team's organization.
+async fn role_id(router: &Router, cookie: &str, team_id: Uuid, key: &str) -> String {
+    let (status, _headers, body) = send(
+        router,
+        "GET",
+        &format!("/tenancy/teams/{team_id}/roles"),
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .find(|role| role["key"] == key)
+        .and_then(|role| role["id"].as_str())
+        .unwrap_or_else(|| panic!("no role seeded from {key:?} in {body}"))
+        .to_owned()
+}
+
+/// The keys of the roles granted through one membership, sorted.
+async fn granted_keys(
+    connection: &mut diesel_async::AsyncPgConnection,
+    granted_through: Uuid,
+) -> Vec<String> {
+    let mut keys: Vec<Option<String>> = role_grants::table
+        .inner_join(roles::table)
+        .filter(
+            role_grants::team_membership_id
+                .eq(granted_through)
+                .or(role_grants::organization_membership_id.eq(granted_through)),
+        )
+        .select(roles::key)
+        .load(connection)
+        .await
+        .expect("grants must load");
+    keys.sort();
+    keys.into_iter().flatten().collect()
 }
 
 fn invitation_token(email_body: &str) -> String {
@@ -182,7 +225,9 @@ async fn invitations_are_sent_claimed_and_guarded() {
     // ------------------------------------------------------------------
     // Team invitation: membership exists before the claim and survives it.
     // ------------------------------------------------------------------
-    let invite = json!({ "email": teammate_email, "team_id": team_id, "roles": ["editor"] });
+    let editor = role_id(&router, &admin_cookie, team_id, "editor").await;
+    let billing = role_id(&router, &admin_cookie, team_id, "billing").await;
+    let invite = json!({ "email": teammate_email, "team_id": team_id, "role_ids": [editor] });
     let (status, _headers, body) = send(
         &router,
         "POST",
@@ -226,14 +271,18 @@ async fn invitations_are_sent_claimed_and_guarded() {
         .first(&mut connection)
         .await
         .expect("the teammate must exist");
-    let (claimed_user, claimed_roles): (Option<Uuid>, Vec<String>) = team_memberships::table
+    let claimed_user: Option<Uuid> = team_memberships::table
         .filter(team_memberships::id.eq(unclaimed_id))
-        .select((team_memberships::user_id, team_memberships::roles))
+        .select(team_memberships::user_id)
         .first(&mut connection)
         .await
         .expect("the membership must survive the claim under the same id");
     assert_eq!(claimed_user, Some(teammate_id));
-    assert_eq!(claimed_roles, vec!["editor".to_owned()]);
+    assert_eq!(
+        granted_keys(&mut connection, unclaimed_id).await,
+        ["editor"],
+        "the grants waited on the membership and came with it",
+    );
 
     // The invitation is single-use.
     let (status, _headers, _body) = send(
@@ -261,7 +310,7 @@ async fn invitations_are_sent_claimed_and_guarded() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let unknown_role =
-        json!({ "email": "x@example.com", "team_id": team_id, "roles": ["emperor"] });
+        json!({ "email": "x@example.com", "team_id": team_id, "role_ids": [Uuid::new_v4()] });
     let (status, _headers, _body) = send(
         &router,
         "POST",
@@ -270,7 +319,11 @@ async fn invitations_are_sent_claimed_and_guarded() {
         Some(&admin_cookie),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a role of no organization is nobody's"
+    );
 
     let both_targets =
         json!({ "email": "x@example.com", "team_id": team_id, "organization_id": organization_id });
@@ -287,8 +340,11 @@ async fn invitations_are_sent_claimed_and_guarded() {
     // ------------------------------------------------------------------
     // Organization invitation: claimed into an org membership.
     // ------------------------------------------------------------------
-    let org_invite =
-        json!({ "email": biller_email, "organization_id": organization_id, "roles": ["billing"] });
+    let org_invite = json!({
+        "email": biller_email,
+        "organization_id": organization_id,
+        "role_ids": [billing],
+    });
     let (status, _headers, body) = send(
         &router,
         "POST",
@@ -325,14 +381,17 @@ async fn invitations_are_sent_claimed_and_guarded() {
         .first(&mut connection)
         .await
         .expect("the biller must exist");
-    let biller_roles: Vec<String> = organization_memberships::table
+    let biller_membership: Uuid = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(organization_id))
         .filter(organization_memberships::user_id.eq(biller_id))
-        .select(organization_memberships::roles)
+        .select(organization_memberships::id)
         .first(&mut connection)
         .await
         .expect("the org membership must exist");
-    assert_eq!(biller_roles, vec!["billing".to_owned()]);
+    assert_eq!(
+        granted_keys(&mut connection, biller_membership).await,
+        ["billing"]
+    );
 
     // No invitations linger for this run's emails.
     let pending: i64 = invitations::table
@@ -373,9 +432,20 @@ async fn invitations_are_sent_claimed_and_guarded() {
         .iter()
         .find(|org| org["id"] == json!(organization_id.to_string()))
         .expect("the admin's org must be listed");
+    assert_eq!(admin_org["is_member"], json!(false), "no org membership");
     assert_eq!(admin_org["roles"], json!([]), "no org-level roles");
     assert_eq!(admin_org["teams"][0]["name"], json!("General"));
-    assert_eq!(admin_org["teams"][0]["roles"], json!(["editor"]));
+    let team_roles: Vec<&str> = admin_org["teams"][0]["roles"]
+        .as_array()
+        .expect("a team lists the roles that apply")
+        .iter()
+        .filter_map(|role| role["name"].as_str())
+        .collect();
+    assert_eq!(
+        team_roles,
+        ["Editor", "Default"],
+        "the granted role, then the one everybody holds",
+    );
 
     // ------------------------------------------------------------------
     // Roster: members and pending invitations; non-members get 404.
@@ -405,7 +475,11 @@ async fn invitations_are_sent_claimed_and_guarded() {
         .find(|entry| entry["pending"] == json!(true))
         .expect("the pending invitation must be listed");
     assert_eq!(pending_member["email"], json!(lurker_email));
-    assert_eq!(pending_member["roles"], json!(["default"]));
+    assert_eq!(
+        pending_member["roles"],
+        json!([]),
+        "an invitation offering nothing leaves the default role, which is never listed",
+    );
 
     // The biller holds an org membership but no team membership: 404.
     let biller_cookie = {

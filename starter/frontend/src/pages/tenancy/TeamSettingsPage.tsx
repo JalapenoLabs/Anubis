@@ -4,7 +4,7 @@
 import { useTranslation } from 'react-i18next'
 import { useParams } from 'react-router'
 import useSWR from 'swr'
-import { useAnubisApi, useCurrentUser } from '@jalapenolabs/anubis'
+import { MEMBERSHIP_SUBJECT, allows, useAnubisApi, useCurrentUser, useRoles } from '@jalapenolabs/anubis'
 import { findTeam, useTeamContext } from '../../context/TeamProvider'
 
 // UI
@@ -16,7 +16,6 @@ import { TeamDangerZoneCard } from '../../components/tenancy/TeamDangerZoneCard'
 import { TeamRosterCard } from '../../components/tenancy/TeamRosterCard'
 
 // Misc
-import { ADMIN_ROLE } from '../../permissions'
 import { getOrganizationSettingsUrl } from '../../urls'
 
 /**
@@ -24,7 +23,9 @@ import { getOrganizationSettingsUrl } from '../../urls'
  *
  * The organization the team belongs to comes from the membership overview
  * rather than from a second request, which is also what tells the page whether
- * the viewer may dissolve the team: that is an organization admin's call.
+ * the viewer may dissolve the team: that is an organization administrator's
+ * call. The roles offered on the roster and in an invitation are read through
+ * the team, with the viewer's standing there.
  */
 export function TeamSettingsPage() {
   const { t } = useTranslation()
@@ -37,6 +38,7 @@ export function TeamSettingsPage() {
     teamId ? `team-members/${teamId}` : null,
     () => api.listTeamMembers(teamId),
   )
+  const roles = useRoles(teamId ? { teamId } : null)
 
   // RequireAuth guarantees a user before this page renders.
   if (!user) {
@@ -57,8 +59,11 @@ export function TeamSettingsPage() {
   }
 
   const { organization, team } = found
-  const isTeamAdmin = team.roles.includes(ADMIN_ROLE)
-  const isOrganizationAdmin = organization.roles.includes(ADMIN_ROLE)
+  const isTeamAdmin = team.access.isAdministrator
+  const isOrganizationAdmin = organization.access.isAdministrator
+  // The organization's managers have always been able to staff its teams.
+  const mayInvite = allows(team.access, 'create', MEMBERSHIP_SUBJECT)
+    || allows(organization.access, 'create', MEMBERSHIP_SUBJECT)
 
   return <AppShell
     user={user}
@@ -90,16 +95,19 @@ export function TeamSettingsPage() {
       teamId={team.id}
       members={roster.data ?? []}
       isLoading={roster.isLoading}
-      canManage={isTeamAdmin}
+      catalog={roles.catalog}
       currentUserEmail={user.email}
       onChanged={() => {
         void roster.mutate()
+        void memberships.refresh()
       }}
     />
-    { isTeamAdmin || isOrganizationAdmin
+    { mayInvite
       ? <InviteMemberCard
           title={t('team.members.inviteTitle')}
           teamId={team.id}
+          catalog={roles.catalog}
+          organizationViewer={organization.access}
           onInvited={() => {
             void roster.mutate()
           }}

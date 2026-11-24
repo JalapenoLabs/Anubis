@@ -220,8 +220,8 @@ function toOverview(wire: WireBilling): BillingOverview {
  * Money lives at Stripe: buying a plan, managing one, and buying credit all
  * answer with a URL to send the browser to, and nothing here renders a card
  * form. Reading the plan is open to every member; every write, the wallet,
- * and its ledger need the `admin` or `billing` role. A subscription paying for
- * one of the application's records is bought and changed through the
+ * and its ledger need `Billing::Subscription.update`. A subscription paying
+ * for one of the application's records is bought and changed through the
  * application's own routes.
  */
 export function createBillingRoutes(client: KyInstance) {
@@ -316,7 +316,7 @@ export function createBillingRoutes(client: KyInstance) {
    * One page of the wallet's ledger, newest first.
    *
    * A read like the overview, so it answers while Stripe is unset; it is gated
-   * on the billing roles because a spend names the record it paid for.
+   * on the billing permission because a spend names the record it paid for.
    */
   async function listWalletEntries(
     organizationId: string,

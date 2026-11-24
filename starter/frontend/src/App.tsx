@@ -19,6 +19,9 @@ import { CreditActivityPage } from './pages/billing/CreditActivityPage'
 import { DevelopersPage } from './pages/developers/DevelopersPage'
 import { AuditLogPage } from './pages/auditLog/AuditLogPage'
 import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
+import { NewRolePage } from './pages/roles/NewRolePage'
+import { RolePage } from './pages/roles/RolePage'
+import { RolesPage } from './pages/roles/RolesPage'
 import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
 import { SecuritySettingsPage } from './pages/settings/SecuritySettingsPage'
@@ -183,6 +186,31 @@ export function App() {
       element={
         <Workspace>
           <CreditActivityPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationRoles}
+      element={
+        <Workspace>
+          <RolesPage />
+        </Workspace>
+      }
+    />
+    {/* Declared before the role's own page so `new` is never read as an id. */}
+    <Route
+      path={UrlTree.organizationRoleNew}
+      element={
+        <Workspace>
+          <NewRolePage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationRole}
+      element={
+        <Workspace>
+          <RolePage />
         </Workspace>
       }
     />

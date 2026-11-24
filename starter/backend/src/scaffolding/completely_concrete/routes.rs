@@ -22,7 +22,7 @@ use anubis::auth::CurrentUser;
 use anubis::db::DbPool;
 use anubis::http::{ApiError, ListParams, Pagination};
 use anubis::roles::{Action, RoleSet};
-use anubis::tenancy::TeamMembership;
+use anubis::tenancy::Access;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -479,9 +479,9 @@ async fn list(
     Query(filters): Query<TangibleThingFilters>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load_parent(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (creative_concept, access) =
+        load_parent(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Read, MODEL)?;
 
     Ok(Json(
         list_page(&mut connection, &creative_concept, &params, &filters).await?,
@@ -496,9 +496,9 @@ async fn create(
     Json(body): Json<CreateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load_parent(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Create)?;
+    let (creative_concept, access) =
+        load_parent(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Create, MODEL)?;
 
     let tangible_thing =
         insert_record(&mut connection, &creative_concept, body, &context.by(&user)).await?;
@@ -514,9 +514,9 @@ async fn show(
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, _creative_concept, membership) =
-        load(&mut connection, user.id, tangible_thing_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (record, _creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, tangible_thing_id).await?;
+    access.require(Action::Read, MODEL)?;
 
     let tangible_thing = TangibleThingView::one(&mut connection, record)
         .await
@@ -532,9 +532,23 @@ async fn update(
     Json(body): Json<UpdateTangibleThingBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, creative_concept, membership) =
-        load(&mut connection, user.id, tangible_thing_id).await?;
-    require(&state.roles, &membership, Action::Update)?;
+    let (record, creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, tangible_thing_id).await?;
+    access.require(Action::Update, MODEL)?;
+    // Moving the record is creating it under another parent, so the move is
+    // held to what the caller may create there: a role granted on one parent
+    // reaches that parent alone. A parent outside the team reaches nothing,
+    // and `apply_changes` refuses it as one this team cannot use.
+    if let Some(requested) = body
+        .creative_concept_id
+        .filter(|requested| *requested != creative_concept.id)
+        && let Some((_destination, destination_access)) =
+            CreativeConcept::load_for_member(&mut connection, &state.roles, user.id, requested)
+                .await
+                .map_err(log_internal)?
+    {
+        destination_access.require(Action::Create, MODEL)?;
+    }
 
     let tangible_thing = apply_changes(
         &mut connection,
@@ -554,9 +568,9 @@ async fn destroy(
     Path(tangible_thing_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (tangible_thing, creative_concept, membership) =
-        load(&mut connection, user.id, tangible_thing_id).await?;
-    require(&state.roles, &membership, Action::Destroy)?;
+    let (tangible_thing, creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, tangible_thing_id).await?;
+    access.require(Action::Destroy, MODEL)?;
 
     delete_record(
         &mut connection,
@@ -769,10 +783,11 @@ async fn api_destroy(
 /// Loads the parent creative concept, answering `404` when it is unreachable.
 async fn load_parent(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     creative_concept_id: Uuid,
-) -> Result<(CreativeConcept, TeamMembership), ApiError> {
-    CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
+) -> Result<(CreativeConcept, Access), ApiError> {
+    CreativeConcept::load_for_member(connection, roles, user_id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
@@ -793,10 +808,11 @@ async fn load_parent_for_token(
 /// Loads the tangible thing, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     tangible_thing_id: Uuid,
-) -> Result<(TangibleThing, CreativeConcept, TeamMembership), ApiError> {
-    TangibleThing::load_for_member(connection, user_id, tangible_thing_id)
+) -> Result<(TangibleThing, CreativeConcept, Access), ApiError> {
+    TangibleThing::load_for_member(connection, roles, user_id, tangible_thing_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
@@ -812,17 +828,6 @@ async fn load_for_token(
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
-}
-
-/// Rejects with `403` unless a held role grants the action on this model.
-fn require(roles: &RoleSet, membership: &TeamMembership, action: Action) -> Result<(), ApiError> {
-    if roles.can(&membership.roles, action, MODEL) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You do not have permission to do that.",
-        ))
-    }
 }
 
 /// Normalizes a submitted text value into a changeset column.

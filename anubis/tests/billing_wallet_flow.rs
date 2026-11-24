@@ -695,11 +695,70 @@ impl Scene {
             .values((
                 organization_memberships::organization_id.eq(self.organization_id),
                 organization_memberships::user_id.eq(user_id),
-                organization_memberships::roles.eq(vec!["default".to_owned()]),
             ))
             .execute(&mut connection)
             .await
             .expect("the membership must insert");
+        cookie
+    }
+
+    /// A guest of the organization holding the role that carries the billing permission.
+    async fn guest_with_billing_role(&self) -> String {
+        let cookie = register(
+            &self.harness.router,
+            &format!("guest-{}@example.com", Uuid::new_v4()),
+        )
+        .await;
+        let (status, _headers, me) =
+            send(&self.harness.router, "GET", "/auth/me", None, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        let user_id: Uuid = me["user"]["id"]
+            .as_str()
+            .expect("an id")
+            .parse()
+            .expect("a uuid");
+        let mut connection = self.connection().await;
+        let membership_id: Uuid = diesel::insert_into(organization_memberships::table)
+            .values((
+                organization_memberships::organization_id.eq(self.organization_id),
+                organization_memberships::user_id.eq(user_id),
+                organization_memberships::access.eq("guest"),
+            ))
+            .returning(organization_memberships::id)
+            .get_result(&mut connection)
+            .await
+            .expect("the membership must insert");
+
+        let roles_path = format!("/tenancy/organizations/{}/roles", self.organization_id);
+        let (status, _headers, listing) = send(
+            &self.harness.router,
+            "GET",
+            &roles_path,
+            None,
+            Some(&self.owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {listing}");
+        let billing_role = listing["roles"]
+            .as_array()
+            .expect("the listing carries roles")
+            .iter()
+            .find(|role| role["key"] == "billing")
+            .and_then(|role| role["id"].as_str())
+            .expect("every organization is offered the billing role")
+            .to_owned();
+        let (status, _headers, body) = send(
+            &self.harness.router,
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/members/{membership_id}",
+                self.organization_id
+            ),
+            Some(&json!({ "role_ids": [billing_role] })),
+            Some(&self.owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
         cookie
     }
 }
@@ -1997,4 +2056,45 @@ async fn turning_auto_recharge_off_and_on_while_a_sent_recharge_is_unrecorded_ch
     assert_eq!(scene.mock.ledger().charges, 1, "one dip, one charge");
     assert_eq!(scene.recharge_amounts(), [1_000]);
     assert_eq!(scene.balance().await, 14 * DOLLAR);
+}
+
+#[tokio::test]
+async fn a_guest_holding_the_billing_role_cannot_top_up_or_read_the_wallet() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_seed", 1_000, true).await;
+
+    // A guest reaches only what was granted by name, so an organization-wide
+    // role carrying the billing permission spends nothing for one.
+    let guest = scene.guest_with_billing_role().await;
+    let (status, body) = scene.billing_body(&guest).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["wallet"],
+        Value::Null,
+        "a guest is not shown the balance"
+    );
+    for (method, path, payload) in [
+        ("GET", "/wallet/entries", None),
+        (
+            "POST",
+            "/wallet/top-up",
+            Some(json!({ "amount_micros": 10 * DOLLAR })),
+        ),
+        (
+            "PUT",
+            "/wallet/auto-recharge",
+            Some(json!({ "threshold_micros": 0, "amount_micros": 10 * DOLLAR })),
+        ),
+        ("DELETE", "/wallet/auto-recharge", None),
+    ] {
+        let (status, body) = scene.request(method, path, payload, &guest).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+    }
+    assert!(
+        scene.mock.ledger().sessions.is_empty(),
+        "no Checkout was opened"
+    );
 }

@@ -2549,11 +2549,11 @@ async fn a_member_without_billing_authority_reads_the_plan_but_not_each_record()
         .first(&mut connection)
         .await
         .expect("the account exists");
+    // No grant at all, so the member holds the default role and nothing else.
     diesel::insert_into(anubis::schema::organization_memberships::table)
         .values((
             anubis::schema::organization_memberships::organization_id.eq(scene.organization_id),
             anubis::schema::organization_memberships::user_id.eq(member_id),
-            anubis::schema::organization_memberships::roles.eq(vec!["default".to_owned()]),
         ))
         .execute(&mut connection)
         .await

@@ -1,4 +1,4 @@
-//! What a wallet tells people: notifications to its billing members, and audit rows.
+//! What a wallet tells people: notifications to its administrators, and audit rows.
 //!
 //! Both ride the connection of the write they describe, so a notice or a
 //! record commits with the entry that caused it, or with nothing.
@@ -10,11 +10,9 @@ use uuid::Uuid;
 use super::Error;
 use super::model::{EntryKind, WalletEntry};
 use crate::audit::{self, Changes};
-use crate::billing::BILLING_ROLE;
 use crate::billing::currency;
 use crate::notifications::{self, NewNotification};
-use crate::schema::{organization_memberships, organizations};
-use crate::tenancy::ADMIN_ROLE;
+use crate::schema::organizations;
 
 /// How the audit log names a ledger entry as the thing an act happened to.
 const ENTRY_SUBJECT: &str = "WalletEntry";
@@ -22,29 +20,12 @@ const ENTRY_SUBJECT: &str = "WalletEntry";
 /// How the audit log names a wallet's settings as the thing changed.
 const WALLET_SUBJECT: &str = "Wallet";
 
-/// The people a wallet notice goes to: whoever may spend the organization's money.
+/// Tells the organization's administrators one thing about the wallet.
 ///
-/// Organization members holding the `admin` or the `billing` role, the same
-/// authority the billing endpoints ask for; a suspended membership hears
-/// nothing, because a suspension is a deny everywhere.
-async fn billing_members(
-    connection: &mut AsyncPgConnection,
-    organization_id: Uuid,
-) -> QueryResult<Vec<Uuid>> {
-    organization_memberships::table
-        .filter(organization_memberships::organization_id.eq(organization_id))
-        .filter(
-            organization_memberships::roles
-                .overlaps_with(vec![ADMIN_ROLE.to_owned(), BILLING_ROLE.to_owned()]),
-        )
-        .filter(organization_memberships::suspended_at.is_null())
-        .select(organization_memberships::user_id)
-        .order(organization_memberships::user_id.asc())
-        .load(connection)
-        .await
-}
-
-/// Tells the billing members one thing about the wallet.
+/// The administrators, because the administrator role always holds the
+/// billing permission and is resolved without the organization's role set;
+/// anyone else an organization lets spend reads the same state on the billing
+/// screen.
 async fn tell(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
@@ -53,7 +34,7 @@ async fn tell(
     body: &str,
 ) -> Result<(), Error> {
     let href = format!("/organizations/{organization_id}/billing");
-    for user_id in billing_members(connection, organization_id).await? {
+    for user_id in notifications::organization_admins(connection, organization_id).await? {
         notifications::notify(
             connection,
             NewNotification {
@@ -82,7 +63,7 @@ async fn organization_name(
         .await
 }
 
-/// Tells the billing members a spend took the balance below the low mark.
+/// Tells the administrators a spend took the balance below the low mark.
 pub(super) async fn low_balance(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
@@ -105,7 +86,7 @@ pub(super) async fn low_balance(
     .await
 }
 
-/// Tells the billing members a recharge was refused and auto-recharge is off.
+/// Tells the administrators a recharge was refused and auto-recharge is off.
 pub(super) async fn recharge_failed(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,

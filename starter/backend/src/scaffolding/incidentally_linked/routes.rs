@@ -18,7 +18,7 @@ use anubis::db::DbPool;
 use anubis::guard::TeamMember;
 use anubis::http::{ApiError, FieldOption, FieldOptions};
 use anubis::roles::{Action, RoleSet};
-use anubis::tenancy::TeamMembership;
+use anubis::tenancy::Access;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -99,9 +99,9 @@ async fn list(
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load_owner(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (creative_concept, access) =
+        load_owner(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Read, CREATIVE_CONCEPT_MODEL)?;
 
     let peripheral_notions =
         IncidentalLinkage::attached_peripheral_notions(&mut connection, creative_concept.id)
@@ -119,9 +119,9 @@ async fn attach(
     Json(body): Json<AttachPeripheralNotionBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load_owner(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Update)?;
+    let (creative_concept, access) =
+        load_owner(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Update, CREATIVE_CONCEPT_MODEL)?;
 
     IncidentalLinkage::attach(
         &mut connection,
@@ -141,9 +141,9 @@ async fn detach(
     Path((creative_concept_id, peripheral_notion_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load_owner(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Update)?;
+    let (creative_concept, access) =
+        load_owner(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Update, CREATIVE_CONCEPT_MODEL)?;
 
     IncidentalLinkage::detach(&mut connection, creative_concept.id, peripheral_notion_id)
         .await
@@ -155,24 +155,14 @@ async fn detach(
 /// Loads the owning creative concept, answering `404` when it is unreachable.
 async fn load_owner(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     creative_concept_id: Uuid,
-) -> Result<(CreativeConcept, TeamMembership), ApiError> {
-    CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
+) -> Result<(CreativeConcept, Access), ApiError> {
+    CreativeConcept::load_for_member(connection, roles, user_id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
-}
-
-/// Rejects with `403` unless a held role grants the action on the owning model.
-fn require(roles: &RoleSet, membership: &TeamMembership, action: Action) -> Result<(), ApiError> {
-    if roles.can(&membership.roles, action, CREATIVE_CONCEPT_MODEL) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You do not have permission to do that.",
-        ))
-    }
 }
 
 fn log_internal(error: impl std::fmt::Display) -> ApiError {

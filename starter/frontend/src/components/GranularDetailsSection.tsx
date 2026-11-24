@@ -66,9 +66,9 @@ export function GranularDetailsSection(props: Props) {
     }),
   )
 
-  const heldRoles = current?.team.roles ?? []
-  const mayWrite = can(heldRoles, 'create', GRANULAR_DETAIL_MODEL)
-  const mayDestroy = can(heldRoles, 'destroy', GRANULAR_DETAIL_MODEL)
+  const permissions = current?.team.access.permissions ?? []
+  const mayWrite = can(permissions, 'create', GRANULAR_DETAIL_MODEL)
+  const mayDestroy = can(permissions, 'destroy', GRANULAR_DETAIL_MODEL)
   const pagination = granularDetails.data?.pagination
 
   return <section>

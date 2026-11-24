@@ -11,7 +11,9 @@ use diesel_async::RunQueryDsl;
 use serde_json::json;
 use tower::ServiceExt;
 
-use anubis::schema::{organization_memberships, organizations, team_memberships, teams, users};
+use anubis::schema::{
+    organization_memberships, organizations, role_grants, roles, team_memberships, teams, users,
+};
 use anubis::tenancy::{ADMIN_ROLE, Organization, OrganizationMembership, Team, TeamMembership};
 
 #[tokio::test]
@@ -75,7 +77,14 @@ async fn registration_bootstraps_a_personal_organization() {
         .first(&mut connection)
         .await
         .expect("an organization membership must exist");
-    assert_eq!(org_membership.roles, vec![ADMIN_ROLE.to_owned()]);
+    let org_roles: Vec<Option<String>> = role_grants::table
+        .inner_join(roles::table)
+        .filter(role_grants::organization_membership_id.eq(org_membership.id))
+        .select(roles::key)
+        .load(&mut connection)
+        .await
+        .expect("the creator's grants must load");
+    assert_eq!(org_roles, vec![Some(ADMIN_ROLE.to_owned())]);
 
     let organization: Organization = organizations::table
         .find(org_membership.organization_id)
@@ -100,5 +109,12 @@ async fn registration_bootstraps_a_personal_organization() {
         .await
         .expect("a team membership must exist");
     assert_eq!(team_membership.user_id, Some(user_id));
-    assert_eq!(team_membership.roles, vec![ADMIN_ROLE.to_owned()]);
+    let team_roles: Vec<Option<String>> = role_grants::table
+        .inner_join(roles::table)
+        .filter(role_grants::team_membership_id.eq(team_membership.id))
+        .select(roles::key)
+        .load(&mut connection)
+        .await
+        .expect("the creator's grants must load");
+    assert_eq!(team_roles, vec![Some(ADMIN_ROLE.to_owned())]);
 }

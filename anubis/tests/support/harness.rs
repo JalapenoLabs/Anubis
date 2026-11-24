@@ -27,6 +27,10 @@ use uuid::Uuid;
 use super::TestDatabase;
 
 /// The starter's role vocabulary, which is what tenancy bootstrapping needs.
+///
+/// Two entries exist for the suites that probe what an organization's roles
+/// may carry: `Invoice` is named with less than every action, and `Ledger` is
+/// named only by a platform role, so neither is wholly a tenant's to grant.
 const ROLES_YML: &str = "
 roles:
   default:
@@ -41,6 +45,11 @@ roles:
     includes: [editor, billing]
     models:
       Team: [manage]
+      Invoice: [read]
+  operator:
+    scopes: [platform]
+    models:
+      Ledger: [manage]
 ";
 
 /// The password every account in these suites registers with.
@@ -317,6 +326,32 @@ pub async fn send(
         .to_bytes();
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, headers, value)
+}
+
+/// The id of the role seeded from `key` in the organization `team_id` is in.
+///
+/// Read through the team's own listing, so a member of the team alone can ask
+/// too, which is how a team administrator who joined by a team invitation
+/// finds the roles they grant.
+///
+/// # Panics
+/// Panics when the caller cannot read the team's roles, or the organization
+/// has no role seeded from `key`.
+pub async fn role_id(router: &Router, cookie: &str, team_id: Uuid, key: &str) -> Uuid {
+    let path = format!("/tenancy/teams/{team_id}/roles");
+    let (status, _headers, body) = send(router, "GET", &path, None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    body["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .find(|role| role["key"] == key)
+        .unwrap_or_else(|| panic!("no role seeded from {key:?} in {body}"))["id"]
+        .as_str()
+        .expect("a role id is a string")
+        .parse()
+        .expect("a role id is a UUID")
 }
 
 /// Registers an account and returns its session token.

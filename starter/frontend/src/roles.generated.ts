@@ -5,6 +5,35 @@
 
 export type PermissionAction = 'read' | 'create' | 'update' | 'destroy'
 
+// Every permission a role may carry: each model's actions, and the framework's own subjects.
+export const PermissionKeys = [
+  'Billing::Subscription.update',
+  'CreativeConcept.read',
+  'CreativeConcept.create',
+  'CreativeConcept.update',
+  'CreativeConcept.destroy',
+  'GranularDetail.read',
+  'GranularDetail.create',
+  'GranularDetail.update',
+  'GranularDetail.destroy',
+  'PeripheralNotion.read',
+  'PeripheralNotion.create',
+  'PeripheralNotion.update',
+  'PeripheralNotion.destroy',
+  'TangibleThing.read',
+  'TangibleThing.create',
+  'TangibleThing.update',
+  'TangibleThing.destroy',
+  'Tenancy::Membership.create',
+  'Tenancy::Membership.update',
+  'Tenancy::Membership.destroy',
+  'Tenancy::Role.create',
+  'Tenancy::Role.update',
+  'Tenancy::Role.destroy',
+] as const
+
+export type PermissionKey = typeof PermissionKeys[number]
+
 export type RoleKey =
   | 'admin'
   | 'billing'
@@ -12,18 +41,22 @@ export type RoleKey =
   | 'editor'
   | 'operator'
 
+// What each role in roles.yml grants: the definition an organization's
+// recommended role follows until it is edited, and what a platform role means.
 export const RoleGrants = {
   admin: {
-    CreativeConcept: [ 'read', 'create', 'update', 'destroy' ],
-    GranularDetail: [ 'read', 'create', 'update', 'destroy' ],
-    PeripheralNotion: [ 'read', 'create', 'update', 'destroy' ],
-    TangibleThing: [ 'read', 'create', 'update', 'destroy' ],
+    'Billing::Subscription': [ 'update' ],
+    'CreativeConcept': [ 'read', 'create', 'update', 'destroy' ],
+    'GranularDetail': [ 'read', 'create', 'update', 'destroy' ],
+    'PeripheralNotion': [ 'read', 'create', 'update', 'destroy' ],
+    'TangibleThing': [ 'read', 'create', 'update', 'destroy' ],
   },
   billing: {
-    CreativeConcept: [ 'read' ],
-    GranularDetail: [ 'read' ],
-    PeripheralNotion: [ 'read' ],
-    TangibleThing: [ 'read' ],
+    'Billing::Subscription': [ 'update' ],
+    'CreativeConcept': [ 'read' ],
+    'GranularDetail': [ 'read' ],
+    'PeripheralNotion': [ 'read' ],
+    'TangibleThing': [ 'read' ],
   },
   default: {
     CreativeConcept: [ 'read' ],
@@ -40,19 +73,13 @@ export const RoleGrants = {
   operator: {},
 } as const satisfies Record<RoleKey, Partial<Record<string, readonly PermissionAction[]>>>
 
-// Widened view so arbitrary runtime role keys index safely.
-const grantsByRole: Record<string, Partial<Record<string, readonly PermissionAction[]>> | undefined>
-  = RoleGrants
-
+// Whether the permission keys the server resolved for a tenant allow the action.
 export function can(
-  heldRoles: readonly string[],
+  permissions: readonly string[],
   action: PermissionAction,
   model: string,
 ): boolean {
-  return heldRoles.some((role) => {
-    const grants = grantsByRole[role]
-    return Boolean(grants?.[model]?.includes(action))
-  })
+  return permissions.includes(`${model}.${action}`)
 }
 
 // The tiers each role may be granted at.

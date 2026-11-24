@@ -436,7 +436,7 @@ struct BillingFile {
 ///   name: Account credit
 ///   currency: usd
 ///   minimum_top_up_micros: 10000000   # $10.00
-///   low_balance_micros: 2000000       # tell the billing members below $2.00
+///   low_balance_micros: 2000000       # tell the administrators below $2.00
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -470,7 +470,7 @@ impl WalletTerms {
         self.minimum_top_up_micros
     }
 
-    /// The balance below which a spend tells the billing members, if any.
+    /// The balance below which a spend tells the administrators, if any.
     #[must_use]
     pub fn low_balance_micros(&self) -> Option<i64> {
         self.low_balance_micros

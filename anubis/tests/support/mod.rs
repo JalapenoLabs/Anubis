@@ -30,6 +30,6 @@ pub mod stream;
 
 pub use database::TestDatabase;
 pub use harness::{
-    Harness, PASSWORD, invitation_token, register, send, serve, session_token, sign_in,
+    Harness, PASSWORD, invitation_token, register, role_id, send, serve, session_token, sign_in,
 };
 pub use passkey::SoftAuthenticator;

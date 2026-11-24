@@ -83,6 +83,9 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         stripe_customer_id -> Nullable<Text>,
+        /// The `roles.yml` keys this organization has been offered, so a
+        /// recommended role it deleted never comes back.
+        offered_role_keys -> Array<Text>,
     }
 }
 
@@ -99,14 +102,13 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Joins users to sub-tenants, carrying sub-tenant-level role keys. A row
-    /// is the explicit grant a guest organization member reaches a sub-tenant
-    /// through; `suspended_at` makes the row a deny instead.
+    /// Joins users to sub-tenants. A row is the explicit grant a guest
+    /// organization member reaches a sub-tenant through, and what sub-tenant
+    /// role grants hang off; `suspended_at` makes the row a deny instead.
     sub_tenant_memberships (id) {
         id -> Uuid,
         sub_tenant_id -> Uuid,
         user_id -> Uuid,
-        roles -> Array<Text>,
         suspended_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
@@ -129,7 +131,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Joins users to organizations, carrying org-level role keys.
+    /// Joins users to organizations; organization-wide role grants hang off it.
     ///
     /// `access` says whether the membership cascades into every sub-tenant
     /// (`full`) or reaches only the ones granted explicitly (`guest`), and
@@ -138,7 +140,6 @@ diesel::table! {
         id -> Uuid,
         organization_id -> Uuid,
         user_id -> Uuid,
-        roles -> Array<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         access -> Text,
@@ -147,13 +148,12 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Joins users to teams, carrying team-level role keys. `user_id` is
-    /// null for invited people who have not claimed the membership yet.
+    /// Joins users to teams; team and record role grants hang off it.
+    /// `user_id` is null for invited people who have not claimed it yet.
     team_memberships (id) {
         id -> Uuid,
         team_id -> Uuid,
         user_id -> Nullable<Uuid>,
-        roles -> Array<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -168,7 +168,6 @@ diesel::table! {
         organization_id -> Uuid,
         team_id -> Nullable<Uuid>,
         team_membership_id -> Nullable<Uuid>,
-        roles -> Array<Text>,
         invited_by -> Nullable<Uuid>,
         token_hash -> Text,
         created_at -> Timestamptz,
@@ -552,6 +551,54 @@ diesel::joinable!(organization_memberships -> organizations (organization_id));
 diesel::joinable!(organization_memberships -> users (user_id));
 diesel::joinable!(team_memberships -> teams (team_id));
 diesel::joinable!(team_memberships -> users (user_id));
+diesel::table! {
+    /// An organization's roles: named, coloured, ordered bundles of
+    /// permission keys. A row seeded from `roles.yml` carries its `key`, and
+    /// each of `name`, `color`, and `permissions` follows that key's
+    /// definition while null.
+    roles (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        key -> Nullable<Text>,
+        name -> Nullable<Text>,
+        color -> Nullable<Text>,
+        position -> Int4,
+        permissions -> Nullable<Array<Text>>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// One role granted through one membership, which is the grant's scope:
+    /// the organization, a sub-tenant, a team, or one record of a team.
+    /// `scope_type` and `scope_id` are generated from the holder.
+    role_grants (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        role_id -> Uuid,
+        organization_membership_id -> Nullable<Uuid>,
+        sub_tenant_id -> Nullable<Uuid>,
+        sub_tenant_membership_id -> Nullable<Uuid>,
+        team_id -> Nullable<Uuid>,
+        team_membership_id -> Nullable<Uuid>,
+        resource_id -> Nullable<Uuid>,
+        granted_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        scope_type -> Text,
+        scope_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    /// The roles an organization invitation offers, granted when it is claimed.
+    invitation_roles (invitation_id, role_id) {
+        invitation_id -> Uuid,
+        role_id -> Uuid,
+        organization_id -> Uuid,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
 diesel::allow_tables_to_appear_in_same_query!(oauth_identities, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
@@ -564,7 +611,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     team_memberships,
     invitations,
     users,
+    roles,
+    role_grants,
+    invitation_roles,
 );
+diesel::joinable!(roles -> organizations (organization_id));
+diesel::joinable!(role_grants -> roles (role_id));
+diesel::joinable!(invitation_roles -> roles (role_id));
+diesel::joinable!(invitation_roles -> invitations (invitation_id));
 diesel::joinable!(subscriptions -> organizations (organization_id));
 diesel::allow_tables_to_appear_in_same_query!(subscriptions, organizations);
 diesel::joinable!(subscription_items -> subscriptions (subscription_id));
