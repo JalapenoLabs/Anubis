@@ -38,10 +38,10 @@ const EMPTY_PAGE: NotificationsPage = {
  * The signed-in user's inbox, kept current by the realtime bell channel.
  *
  * Nothing is fetched while signed out. Under a `RealtimeProvider` the hook
- * subscribes to `user:{id}:notifications` and refetches on every ping, which
- * is all the socket carries: the REST answer stays the only source of what a
- * notification says. Without a provider the inbox is still correct, it just
- * waits for the next fetch.
+ * subscribes to `user:{id}:notifications` and refetches on every ping and on
+ * every reset, which is all the stream carries: the REST answer stays the only
+ * source of what a notification says. Without a provider the inbox is still
+ * correct, it just waits for the next fetch.
  */
 export function useNotifications() {
   const api = useAnubisApi()
@@ -59,6 +59,7 @@ export function useNotifications() {
       return () => {}
     }
 
+    // An event and a reset both mean "read the inbox again".
     return realtime.subscribe(
       `user:${user.id}:${NOTIFICATIONS_TOPIC}`,
       () => {

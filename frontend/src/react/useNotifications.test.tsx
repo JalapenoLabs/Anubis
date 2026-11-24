@@ -81,7 +81,16 @@ function fakeRealtime() {
     },
     channels: () => [ ...listeners.keys() ],
     publish(channel: string) {
-      listeners.get(channel)?.({ channel, event: 'created', payload: {}})
+      listeners.get(channel)?.({
+        type: 'event',
+        id: '00000000000000ab-1',
+        channel,
+        event: 'created',
+        payload: {},
+      })
+    },
+    reset(channel: string) {
+      listeners.get(channel)?.({ type: 'reset', channel })
     },
   }
 }
@@ -139,6 +148,25 @@ describe('useNotifications', () => {
 
     await waitFor(() => {
       expect(result.current.unread).toBe(2)
+    })
+  })
+
+  it('should refetch on a reset, since the inbox may have changed while it was not heard', async () => {
+    const listNotifications = vi.fn()
+      .mockResolvedValueOnce(page(1))
+      .mockResolvedValue(page(3))
+    const realtime = fakeRealtime()
+
+    const { result } = renderNotifications(fakeApi({ listNotifications }), realtime)
+
+    await waitFor(() => {
+      expect(result.current.unread).toBe(1)
+    })
+
+    realtime.reset(`user:${USER.id}:notifications`)
+
+    await waitFor(() => {
+      expect(result.current.unread).toBe(3)
     })
   })
 

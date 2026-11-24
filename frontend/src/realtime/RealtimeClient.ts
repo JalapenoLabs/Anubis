@@ -1,97 +1,77 @@
 // Copyright © 2026 Jalapeno Labs
 
+import type { ConnectionState, EventStreamOptions } from './EventStream'
 import type { ListenerRegistry, RealtimeListener } from './listeners'
-import type { ClientFrame } from './protocol'
+import type { StreamFrame } from './protocol'
 
 // Core
+import { EventStream } from './EventStream'
 import { createListenerRegistry } from './listeners'
 
-// Misc
-import { parseServerFrame } from './protocol'
-
-/** Where the framework mounts the realtime socket. */
+/** Where the framework serves the realtime stream. */
 export const REALTIME_PATH = '/realtime'
-
-/** How long the first reconnection waits, in milliseconds. */
-const RECONNECT_BASE = 500
-
-/** The longest a reconnection ever waits, in milliseconds. */
-const RECONNECT_CEILING = 10_000
-
-/** What the client is doing about its connection. */
-export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed'
-
-/**
- * The part of the browser's WebSocket this client uses.
- *
- * Narrow on purpose: a real `WebSocket` satisfies it, and so does a fake in a
- * test, which is what makes the reconnect and resubscribe behavior testable
- * without a server.
- */
-export type WebSocketLike = {
-  send: (data: string) => void
-  close: () => void
-  onopen: ((event: Event) => void) | null
-  onclose: ((event: CloseEvent) => void) | null
-  onerror: ((event: Event) => void) | null
-  onmessage: ((event: MessageEvent) => void) | null
-}
 
 export type RealtimeClientOptions = {
   /**
-   * Where to connect.
-   *
-   * A `ws://` or `wss://` URL is used as given. Anything else is treated as a
-   * path on the current origin, which is the deployment the framework ships:
-   * one binary serving both the API and the socket. Defaults to `/realtime`.
+   * Where the stream is served. A path resolves against the page, which is
+   * the deployment the framework ships. Defaults to `/realtime`.
    */
   url?: string
-  /** Builds the socket. Defaults to the browser's `WebSocket`. */
-  createSocket?: (url: string) => WebSocketLike
+  /** The fetch to make requests with. Defaults to the browser's. */
+  fetch?: EventStreamOptions['fetch']
   /** Called whenever the connection state changes. */
   onStateChange?: (state: ConnectionState) => void
 }
 
 /**
- * How long to wait before the reconnection attempt numbered `attempt`.
+ * One event stream to the Anubis realtime endpoint, shared by every listener.
  *
- * Doubling from half a second and capped at ten seconds: a server that
- * restarts is picked up almost at once, while a server that is genuinely down
- * is not hammered by every open tab. The schedule is deliberately free of
- * jitter, because a browser tab is one client, not a fleet, and a predictable
- * schedule is one a person can recognize in a network panel.
- */
-export function reconnectDelay(attempt: number): number {
-  const delay = RECONNECT_BASE * 2 ** Math.max(attempt, 0)
-  return Math.min(delay, RECONNECT_CEILING)
-}
-
-/**
- * One websocket to the Anubis realtime endpoint, shared by every subscriber.
+ * The stream carries every channel that has a listener. It opens with the
+ * first one, follows the set as listeners come and go, and closes when the
+ * last one leaves. Changes that happen together, such as a page swapping its
+ * views, are gathered into one new stream rather than one per change, and the
+ * new stream resumes where the old one stopped, so nothing published in
+ * between is lost. Callers see none of that: they hold a disposer and hear
+ * their channel until they call it.
  *
- * Connects on the first subscription and stays connected: dropped connections
- * are retried on a capped exponential backoff, and every channel that still
- * has a listener is resubscribed as soon as the new connection opens. Callers
- * see none of that; they hold a disposer and get events until they call it.
- *
- * Realtime is a notification bus, not a log. Events published while the socket
- * was down are not replayed, so a listener that must not miss state should
- * refetch when it reconnects.
+ * A listener hears every event on its channel, and a `reset` whenever what it
+ * holds may be stale: once when its channel goes live, since anything it
+ * fetched before then may already be behind, and again whenever a reconnect
+ * spanned more than the server keeps. Refetching on a reset is always right.
  *
  * ```ts
  * const client = new RealtimeClient()
- * const stop = client.subscribe(`team:${teamId}:projects`, (event) => {
- *   console.log(event.event, event.payload)
+ * const stop = client.subscribe(`team:${teamId}:projects`, (message) => {
+ *   if (message.type === 'reset') {
+ *     void refetchProjects()
+ *     return
+ *   }
+ *   applyToCache(message.event, message.payload)
  * })
  * ```
  */
 export class RealtimeClient {
   private readonly options: RealtimeClientOptions
   private readonly listeners: ListenerRegistry = createListenerRegistry()
-  private socket: WebSocketLike | null = null
+  private stream: EventStream | null = null
+  /** The channels the open stream carries, sorted. */
+  private carried: string[] = []
+  /**
+   * The channels the server has confirmed live on this client's cursor.
+   *
+   * Only these may resume from it. A channel that joins later was not on the
+   * connection the cursor came from, so it opens at the head instead.
+   */
+  private readonly live = new Set<string>()
+  /** The cursor a replacement stream resumes from. */
+  private cursor: string | null = null
+  /**
+   * Which stream is current. A retired stream can still report a state or a
+   * frame on its way out, and neither may land on its replacement.
+   */
+  private generation = 0
+  private rebuildTimer: ReturnType<typeof setTimeout> | null = null
   private connectionState: ConnectionState = 'idle'
-  private attempt = 0
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(options: RealtimeClientOptions = {}) {
     this.options = options
@@ -105,17 +85,12 @@ export class RealtimeClient {
   /**
    * Listens to `channel` until the returned disposer is called.
    *
-   * Subscribing connects if the client is not connected yet. Several
-   * listeners may share a channel; the server is told only when the first
-   * arrives and when the last leaves.
+   * Several listeners may share a channel; the stream carries it while any of
+   * them is listening.
    */
   subscribe(channel: string, listener: RealtimeListener): () => void {
-    const isFirstListener = this.listeners.add(channel, listener)
-    this.connect()
-
-    if (isFirstListener) {
-      this.send({ type: 'subscribe', channel })
-    }
+    this.listeners.add(channel, listener)
+    this.scheduleRebuild()
 
     let released = false
     return () => {
@@ -125,108 +100,133 @@ export class RealtimeClient {
       }
       released = true
 
-      if (this.listeners.remove(channel, listener)) {
-        this.send({ type: 'unsubscribe', channel })
-      }
+      this.listeners.remove(channel, listener)
+      this.scheduleRebuild()
     }
   }
 
   /**
-   * Closes the connection and stops reconnecting.
+   * Closes the stream.
    *
-   * Listeners are kept, so a later `subscribe` reopens the connection with
-   * everything that is still being listened to.
+   * Listeners are kept, so the next `subscribe` or disposer opens a stream
+   * again for everything that is still being listened to, resuming where
+   * this one stopped.
    */
   close(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
+    if (this.rebuildTimer) {
+      clearTimeout(this.rebuildTimer)
+      this.rebuildTimer = null
     }
-
+    this.retire()
     this.setState('closed')
-    this.socket?.close()
-    this.socket = null
   }
 
-  /** Opens a connection unless one is already open or on its way. */
-  private connect(): void {
-    if (this.socket || this.reconnectTimer) {
+  /**
+   * Rebuilds the stream once the current task is done.
+   *
+   * One React commit unmounts and mounts many listeners in a row, and they
+   * should cost one connection, not one each.
+   */
+  private scheduleRebuild(): void {
+    if (this.rebuildTimer) {
       return
     }
 
-    const url = this.options.url
-    const createSocket = this.options.createSocket ?? ((target: string) => new WebSocket(target))
-
-    this.setState('connecting')
-    const socket = createSocket(resolveUrl(url))
-    this.socket = socket
-
-    socket.onopen = () => {
-      this.attempt = 0
-      this.setState('open')
-      // A new connection knows nothing about the old one's subscriptions.
-      for (const channel of this.listeners.channels()) {
-        this.send({ type: 'subscribe', channel })
-      }
-    }
-
-    socket.onmessage = (event: MessageEvent) => {
-      const frame = parseServerFrame(event.data)
-      if (!frame) {
-        return
-      }
-
-      if (frame.type === 'event') {
-        this.listeners.emit({
-          channel: frame.channel,
-          event: frame.event,
-          payload: frame.payload,
-        })
-        return
-      }
-
-      if (frame.type === 'error') {
-        console.warn('The realtime server refused a request', frame)
-      }
-    }
-
-    socket.onerror = (event: Event) => {
-      // The close that follows is what actually drives the reconnect; this is
-      // only worth saying out loud so a failure is visible in the console.
-      console.debug('The realtime socket reported an error', event)
-    }
-
-    socket.onclose = () => {
-      this.socket = null
-      if (this.connectionState === 'closed') {
-        return
-      }
-      this.scheduleReconnect()
-    }
+    this.rebuildTimer = setTimeout(() => {
+      this.rebuildTimer = null
+      this.rebuild()
+    }, 0)
   }
 
-  /** Waits out the backoff, then connects again. */
-  private scheduleReconnect(): void {
-    const delay = reconnectDelay(this.attempt)
-    this.attempt += 1
-    this.setState('connecting')
-
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.connect()
-    }, delay)
-  }
-
-  /** Sends one frame, if there is an open connection to send it on. */
-  private send(frame: ClientFrame): void {
-    if (!this.socket || this.connectionState !== 'open') {
-      // Not a failure: everything still listened to is resubscribed the
-      // moment the connection opens.
-      console.debug('RealtimeClient deferred a frame until the socket opens', frame)
+  /** Opens a stream for the channels listened to now, unless one already carries them. */
+  private rebuild(): void {
+    const channels = this.listeners.channels().sort()
+    const running = this.stream && this.stream.state !== 'closed'
+    const unchanged = channels.length === this.carried.length
+      && channels.every((channel, index) => channel === this.carried[index])
+    if (running && unchanged) {
       return
     }
 
-    this.socket.send(JSON.stringify(frame))
+    this.retire()
+    // A channel nobody listens to any more stops being live, so one that
+    // comes back later joins at the head rather than on an old cursor.
+    for (const channel of [ ...this.live ]) {
+      if (!channels.includes(channel)) {
+        this.live.delete(channel)
+      }
+    }
+    this.carried = channels
+
+    if (!channels.length) {
+      this.setState('idle')
+      return
+    }
+
+    const generation = this.generation
+    this.stream = new EventStream({
+      url: () => this.streamUrl(),
+      lastEventId: this.cursor,
+      onFrame: (frame) => {
+        if (generation === this.generation) {
+          this.receive(frame)
+        }
+      },
+      onStateChange: (state) => {
+        if (generation === this.generation) {
+          this.setState(state)
+        }
+      },
+      fetch: this.options.fetch,
+    })
+  }
+
+  /** Closes the current stream, keeping its cursor for the next one. */
+  private retire(): void {
+    this.generation += 1
+    if (!this.stream) {
+      return
+    }
+    this.cursor = this.stream.lastEventId ?? this.cursor
+    this.stream.close()
+    this.stream = null
+  }
+
+  /**
+   * The URL for the next connection: every carried channel, and which of
+   * them are fresh, because they have not gone live on the cursor yet.
+   *
+   * Read before every attempt, so a reconnection after a drop resumes every
+   * channel the stream confirmed live before it dropped. With no cursor at
+   * all, every channel is fresh and the server needs telling of none.
+   */
+  private streamUrl(): string {
+    const parameters = new URLSearchParams({ channels: this.carried.join(',') })
+    const cursor = this.stream?.lastEventId ?? this.cursor
+    const fresh = this.carried.filter((channel) => !this.live.has(channel))
+    if (cursor && fresh.length) {
+      parameters.set('fresh', fresh.join(','))
+    }
+
+    return `${this.options.url ?? REALTIME_PATH}?${parameters.toString()}`
+  }
+
+  /** Routes one frame: messages to their listeners, the rest to the client. */
+  private receive(frame: StreamFrame): void {
+    if (frame.type === 'event' || frame.type === 'reset') {
+      this.listeners.emit(frame)
+      return
+    }
+
+    if (frame.type === 'live') {
+      // Everything the stream was opened for is now on this cursor.
+      for (const channel of this.carried) {
+        this.live.add(channel)
+      }
+      return
+    }
+
+    console.warn('The realtime server refused a channel', frame)
   }
 
   private setState(state: ConnectionState): void {
@@ -237,28 +237,4 @@ export class RealtimeClient {
     this.connectionState = state
     this.options.onStateChange?.(state)
   }
-}
-
-/**
- * Turns the configured URL into the absolute one the socket connects to.
- *
- * A path is resolved against the page, upgrading `https` to `wss`, which is
- * what the one-binary deployment wants and what a Vite dev server proxies.
- */
-function resolveUrl(url: string | undefined): string {
-  if (url?.startsWith('ws://') || url?.startsWith('wss://')) {
-    return url
-  }
-
-  const path = url || REALTIME_PATH
-  if (typeof window === 'undefined') {
-    throw new Error(
-      'RealtimeClient needs an absolute ws:// or wss:// url when there is no page to resolve against',
-    )
-  }
-
-  const scheme = window.location.protocol === 'https:'
-    ? 'wss:'
-    : 'ws:'
-  return `${scheme}//${window.location.host}${path}`
 }
