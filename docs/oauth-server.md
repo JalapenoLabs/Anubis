@@ -76,7 +76,7 @@ A device code is exchanged once. Presented again, it is held twice, and the serv
 
 The device code is the framework's usual 256 random bits. The user code is eight letters from RFC 8628's twenty consonants, `BCDFGHJKLMNPQRSTVWXZ`, shown as two groups of four and compared without regard to case, dashes, or spaces. Both are stored as SHA-256 and live ten minutes. The user code's 34 bits are what make it typeable, and they are guarded online rather than by size:
 
-- **Entry needs a session.** The approval binds to the account that made it, and the account is a key a guesser cannot rotate.
+- **Entry needs a session, and JSON.** The approval binds to the account that made it, and the account is a key a guesser cannot rotate. A form post, which is all another site can send without a preflight, is refused; the session cookie is `SameSite=Lax` and no origin gets credentialed CORS, so a page elsewhere cannot enter a code in a visitor's name.
 - **Entry is charged twice**: thirty an hour per client address (`Budget::UserCodePerClient`) and thirty an hour per account (`Budget::UserCodePerAccount`), before anything is looked up, so a refusal says nothing about the code.
 - **Every unusable code reads the same**: malformed, never issued, expired, and already decided all answer one `400` with one sentence.
 - **At most 5,000 device codes wait at once.** `POST /oauth/device_authorization` is open to strangers, takes the same thirty an hour per address as `/oauth/authorize` (`Budget::Authorization`, one balance across both), and answers `503` at the ceiling, so a flood fills a bounded table, and the odds of a guess naming any live code stay below one in five million.

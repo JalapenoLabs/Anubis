@@ -548,6 +548,22 @@ async fn code_entry_is_signed_in_and_says_the_same_about_every_unusable_code() {
     let (status, _body) = enter_code(router, None, &codes.user_code).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // A form post is all another site can send without a preflight, so code
+    // entry takes JSON alone, and a page elsewhere cannot enter a code in a
+    // signed-in visitor's name.
+    let forged = router
+        .clone()
+        .oneshot(
+            Request::post("/oauth/device_verification")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(COOKIE, format!("anubis_session={cookie}"))
+                .body(Body::from(format!("user_code={}", codes.user_code)))
+                .expect("the request builds"),
+        )
+        .await
+        .expect("the router answers");
+    assert_eq!(forged.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
     // Malformed, never issued, and already decided read identically.
     let decided = device_codes(router, &program.client_id, "").await;
     let request_id = request_for_code(router, &cookie, &decided.user_code).await;
