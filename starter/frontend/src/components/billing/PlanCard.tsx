@@ -44,6 +44,19 @@ export function PlanCard(props: Props) {
   const { t } = useTranslation()
   const { plan } = props
 
+  // Two plans may have nothing to buy here. The free plan costs nothing, and a
+  // paid plan selling no price of its own is what paying for anything else (a
+  // record's subscription, or credit) puts an organization on, so it reads as
+  // coming with the rest. A paid plan that does sell prices is bought here
+  // like any other.
+  let includedLabel: string | null = null
+  if (plan.free) {
+    includedLabel = t('billing.freePrice')
+  }
+  else if (plan.paid && !Object.keys(plan.prices).length) {
+    includedLabel = t('billing.paidPlanIncluded')
+  }
+
   // Full height with the price pushed to the bottom, so the buttons of every
   // card in the grid sit on one line however much a plan has to say for itself.
   return <Card
@@ -94,9 +107,9 @@ export function PlanCard(props: Props) {
         }
       </ul>
 
-      { plan.free
+      { includedLabel
         ? <p className='mt-auto pt-4 text-lg font-semibold'>{
-            t('billing.freePrice')
+            includedLabel
           }</p>
         : <div className='mt-auto pt-4'>
             {

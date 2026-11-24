@@ -39,8 +39,10 @@ export type Plan = {
   description: string | null
   /** True for the plan a pricing grid should make stand out. */
   highlighted: boolean
-  /** True for the plan an organization with no subscription is on. */
+  /** True for the plan an organization paying for nothing is on. */
   free: boolean
+  /** True for the plan an organization paying for anything but a plan is on. */
+  paid: boolean
   prices: Partial<Record<BillingInterval, PlanPrice>>
   limits: Partial<Record<string, PlanLimit>>
 }
@@ -53,6 +55,7 @@ export const Plans = [
     description: 'Everything a small group needs to try the product.',
     highlighted: false,
     free: true,
+    paid: false,
     prices: {},
     limits: {
       creative_concepts: { count: 3, enforcement: 'hard' },
@@ -65,6 +68,7 @@ export const Plans = [
     description: 'For a team working together.',
     highlighted: true,
     free: false,
+    paid: false,
     prices: {
       monthly: {
         stripePriceId: 'price_replace_me_pro_monthly',

@@ -247,6 +247,8 @@ mod tests {
             pro.price(anubis::billing::Interval::Monthly).is_some(),
             "a paid plan sells at least one interval",
         );
+        let wallet = plans.wallet().expect("the starter sells credit");
+        assert_eq!(wallet.currency(), "usd");
     }
 
     #[test]

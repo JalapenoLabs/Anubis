@@ -495,9 +495,107 @@ export type BillingSubscription = {
   updatedAt: string
 }
 
+/**
+ * Why the plan in force is the one in force.
+ *
+ * `plan_subscription`: a live plan subscription names it. `paid_status`: no
+ * plan subscription does, but the organization pays for something else (a
+ * subscription for one of its records, or credit), which puts it on the
+ * application's paid plan. `free`: it pays for nothing.
+ */
+export type BillingPlanSource = 'plan_subscription' | 'paid_status' | 'free'
+
+/** The balance a recharge fires below, and what it buys. */
+export type BillingAutoRecharge = {
+  /** A spend that leaves the balance below this charges the saved card. */
+  thresholdMicros: number
+  amountMicros: number
+}
+
+/**
+ * The organization's prepaid credit, as the billing screen renders it.
+ *
+ * Every amount is in micro-units of `currency`, a millionth of its major unit
+ * (1 USD is 1,000,000), so a charge for one minute of usage never rounds to
+ * zero. Convert at the display layer only.
+ */
+export type BillingWallet = {
+  /** Lowercase ISO 4217, as Stripe writes it. */
+  currency: string
+  /** Can sit below zero after Stripe refunds credit that was already spent. */
+  balanceMicros: number
+  /** The smallest top-up, and the smallest recharge. */
+  minimumTopUpMicros: number
+  /** The smallest step a charge moves in, as Stripe charges this currency: a cent, or a whole yen. */
+  chargeStepMicros: number
+  /** The balance below which a spend warns the administrators; null for never. */
+  lowBalanceMicros: number | null
+  /** Null while auto-recharge is off. */
+  autoRecharge: BillingAutoRecharge | null
+  /** True once a top-up saved a card, which is the only card a recharge charges. */
+  cardSaved: boolean
+  /** True while a recharge is in flight. */
+  recharging: boolean
+  /** When the last recharge was refused, which turned auto-recharge off. */
+  rechargeFailedAt: string | null
+}
+
+/** What one ledger entry records. Credits are positive, debits negative. */
+export type WalletEntryKind = 'top_up' | 'recharge' | 'spend' | 'refund' | 'refund_reversal'
+
+/** One line of the wallet's ledger, in micro-units like the wallet itself. */
+export type WalletEntry = {
+  id: string
+  organizationId: string
+  /** Where the entry sits in the ledger, oldest first. */
+  position: number
+  kind: WalletEntryKind
+  /** Positive for a credit, negative for a debit. */
+  amountMicros: number
+  balanceAfterMicros: number
+  /**
+   * What a spend asked for. Larger than what it took when the wallet ran dry,
+   * because a spend takes what is there rather than failing.
+   */
+  requestedMicros: number | null
+  idempotencyKey: string
+  stripePaymentIntentId: string | null
+  /** What a spend was for, in the application's words. */
+  description: string | null
+  /** The model of the record a spend paid for, the audit log's pair. */
+  subjectType: string | null
+  subjectId: string | null
+  createdAt: string
+}
+
+/** One page of the ledger, newest first. */
+export type WalletEntriesPage = {
+  entries: WalletEntry[]
+  page: number
+  limit: number
+  totalItems: number
+  totalPages: number
+}
+
+export type TopUpRequest = {
+  /** A whole cent, at least the wallet's minimum top-up. */
+  amountMicros: number
+  /** Saves the card for auto-recharge, which can charge no other. */
+  saveCard: boolean
+}
+
+/**
+ * Turns auto-recharge on, or changes it.
+ *
+ * The same shape the wallet reports its settings in, named for the request so
+ * a caller reads which side of the wire it is on.
+ */
+export type AutoRechargeSettings = BillingAutoRecharge
+
 /** What a billing screen renders: the plan, the subscriptions, and the seats. */
 export type BillingOverview = {
   plan: BillingPlan
+  planSource: BillingPlanSource
   /** The plan subscription; absent on the free plan, which is its absence. */
   subscription: BillingSubscription | null
   /**
@@ -510,6 +608,12 @@ export type BillingOverview = {
   billingEnabled: boolean
   /** People who can reach the organization, claimed and invited alike. */
   seatsUsed: number
+  /**
+   * Prepaid credit. Null when the application sells none, and for a member
+   * who may not spend, since the balance says what the
+   * organization spends.
+   */
+  wallet: BillingWallet | null
 }
 
 export type BillingCheckoutRequest = {

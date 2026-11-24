@@ -8,8 +8,8 @@
 #
 # Rules the validator enforces:
 #
-#   - Exactly one plan sells no prices. That is the free plan, and it is what an
-#     organization with no subscription is on.
+#   - Exactly one plan sells no prices, leaving aside the `paid_plan` below. That
+#     is the free plan, and it is what an organization paying for nothing is on.
 #   - Plan keys and limit names are lowercase letters, digits, and underscores:
 #     they are stored on subscriptions and read by the frontend.
 #   - A Stripe price belongs to one plan, because a price is what identifies the
@@ -39,6 +39,18 @@
 #
 # The limit vocabulary below is this application's own: name whatever the
 # product meters.
+#
+# `wallet` sells prepaid credit: customers top up through Stripe Checkout, or
+# let auto-recharge charge a saved card below a threshold they choose, and the
+# application spends it as usage accrues with `anubis::billing::Wallets::spend`.
+# Its amounts are micro-units of the currency, 1000000 to the dollar, so a
+# charge for one minute of usage never rounds to zero. Delete the section to
+# sell no credit.
+#
+# `paid_plan`, when set, names the plan an organization without a plan
+# subscription is on while it pays for anything else: a subscription for one of
+# its records, or credit in its wallet. It may sell no prices of its own. Unset,
+# only a plan subscription moves an organization off the free plan.
 
 plans:
   - key: free
@@ -68,3 +80,9 @@ plans:
       creative_concepts:
         count: 100
         enforcement: soft
+
+wallet:
+  name: Account credit
+  currency: usd
+  minimum_top_up_micros: 10000000
+  low_balance_micros: 2000000

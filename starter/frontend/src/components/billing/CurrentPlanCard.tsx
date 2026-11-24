@@ -52,10 +52,14 @@ export function CurrentPlanCard(props: Props) {
   const [ isBusy, setIsBusy ] = useState(false)
   const [ errorMessage, setErrorMessage ] = useState<string | null>(null)
 
-  const { plan, subscription, seatsUsed } = props.overview
+  const { plan, planSource, subscription, seatsUsed } = props.overview
   const status = subscription?.status ?? ''
   const seatsLimit = plan.limits.seats
   const isOverSeats = Boolean(seatsLimit && seatsUsed > seatsLimit.count)
+  // No plan subscription, yet not on the free plan: paying for something else
+  // (a record's subscription, or credit) puts the organization on the
+  // application's paid plan, and the card says so instead of "No subscription".
+  const isPaidStatus = planSource === 'paid_status'
 
   // The generated catalog carries the copy a pricing page shows; the API
   // carries the plan actually in force. They are the same file, so a plan the
@@ -104,8 +108,17 @@ export function CurrentPlanCard(props: Props) {
           ? <Chip color={colorByStatus[status] ?? 'default'} variant='flat'>{
               t(`billing.statuses.${status}`, { defaultValue: status })
             }</Chip>
-          : <Chip variant='flat'>{
-              t('billing.noSubscription')
+          : <Chip
+              color={
+                isPaidStatus
+                  ? 'success'
+                  : 'default'
+              }
+              variant='flat'
+            >{
+              isPaidStatus
+                ? t('billing.paidStatusChip')
+                : t('billing.noSubscription')
             }</Chip>
         }
       </div>
@@ -136,6 +149,12 @@ export function CurrentPlanCard(props: Props) {
         }
       </dl>
 
+      { isPaidStatus
+        ? <p className='mt-2 opacity-80'>{
+            t('billing.paidStatusLine')
+          }</p>
+        : null
+      }
       { isOverSeats
         ? <p className='mt-2 text-warning'>{
             t('billing.overSeats')

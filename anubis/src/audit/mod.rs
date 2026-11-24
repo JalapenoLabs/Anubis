@@ -200,6 +200,24 @@ pub const SUBSCRIPTION_ITEMS_CHANGED: &str = "subscription.items_changed";
 /// The change set says which way: `cancel_at_period_end` moving to `true`, or
 /// `status` moving to `canceled` for a cancellation that took effect at once.
 pub const SUBSCRIPTION_CANCELED: &str = "subscription.canceled";
+/// A payment through Stripe Checkout credited an organization's wallet.
+///
+/// Recorded on the organization, attributed to the system (a Stripe event did
+/// it); the subject is the ledger entry, and the change set is `balance`
+/// before and after. See `docs/billing.md`.
+pub const WALLET_TOPPED_UP: &str = "wallet.topped_up";
+/// An auto-recharge charged the saved card and credited the wallet.
+pub const WALLET_RECHARGED: &str = "wallet.recharged";
+/// Stripe refunded a payment that bought credit, and the wallet was debited.
+pub const WALLET_REFUNDED: &str = "wallet.refunded";
+/// A refund failed or was cancelled after it was debited, so the credit came back.
+pub const WALLET_REFUND_REVERSED: &str = "wallet.refund_reversed";
+/// A person turned auto-recharge on, changed it, or turned it off.
+///
+/// The change set is `threshold_micros` and `amount_micros`, null when off.
+pub const WALLET_AUTO_RECHARGE_CHANGED: &str = "wallet.auto_recharge_changed";
+/// A recharge was refused at Stripe, so auto-recharge was turned off.
+pub const WALLET_AUTO_RECHARGE_FAILED: &str = "wallet.auto_recharge_failed";
 /// A device code was presented again after it was exchanged, so its grant was
 /// revoked.
 ///
@@ -284,6 +302,8 @@ mod tests {
         MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED, OAUTH_REFRESH_REUSED, OAUTH_REVOKED,
         ORGANIZATION_RENAMED, PASSWORD_CHANGED, PASSWORD_TEMPORARY_SET, SESSION_CREATED,
         SUBSCRIPTION_CANCELED, SUBSCRIPTION_ITEMS_CHANGED, TEAM_RENAMED,
+        WALLET_AUTO_RECHARGE_CHANGED, WALLET_AUTO_RECHARGE_FAILED, WALLET_RECHARGED,
+        WALLET_REFUND_REVERSED, WALLET_REFUNDED, WALLET_TOPPED_UP,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -308,6 +328,12 @@ mod tests {
             AVATAR_REFUSED,
             SUBSCRIPTION_ITEMS_CHANGED,
             SUBSCRIPTION_CANCELED,
+            WALLET_TOPPED_UP,
+            WALLET_RECHARGED,
+            WALLET_REFUNDED,
+            WALLET_REFUND_REVERSED,
+            WALLET_AUTO_RECHARGE_CHANGED,
+            WALLET_AUTO_RECHARGE_FAILED,
         ] {
             let (noun, verb) = action
                 .split_once('.')
