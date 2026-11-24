@@ -1,22 +1,21 @@
 //! Role and permission definitions compiled from `config/roles.yml`.
 //!
-//! One YAML file defines the application's whole permission vocabulary: role
-//! keys, role inheritance, and per-model action grants. [`RoleSet::from_yaml`]
-//! parses and fully resolves it, rejecting unknown includes, inheritance
-//! cycles, and unknown actions, so applications that embed the file with
-//! `include_str!` fail at boot (and their tests fail in CI) on any bad edit.
-//!
-//! The same resolved set drives both sides of the stack: the backend
-//! authorizes with [`RoleSet::can`], and `anubis roles generate-ts` emits the
-//! TypeScript module the SPA uses to hide controls a member cannot use.
+//! One YAML file defines the application's whole permission vocabulary and the
+//! roles it recommends: role keys, role inheritance, per-model action grants,
+//! and a display name and colour for each. [`RoleSet::from_yaml`] parses and
+//! fully resolves it, rejecting unknown includes, inheritance cycles, and
+//! unknown actions, so applications that embed the file with `include_str!`
+//! fail at boot (and their tests fail in CI) on any bad edit.
 //!
 //! ```yaml
 //! roles:
 //!   default:
+//!     name: Member
 //!     models:
 //!       Project: [read]
 //!   editor:
 //!     includes: [default]
+//!     color: '#3b82f6'
 //!     models:
 //!       Project: [create, update]
 //!   billing:
@@ -26,6 +25,23 @@
 //!     models:
 //!       Project: [manage]
 //! ```
+//!
+//! # Two things the file is
+//!
+//! **The permission vocabulary.** Every model the file names contributes its
+//! four actions, and the framework adds its own subjects (see
+//! [`permission`]). An organization's roles are bundles drawn from this
+//! vocabulary and nothing else, so every check stays typed in Rust and in the
+//! TypeScript `anubis roles generate-ts` writes.
+//!
+//! **The recommended roles.** An organization's roles are rows it can rename,
+//! recolour, reorder, edit, and delete (see [`crate::tenancy`]). The roles
+//! declared here are what each organization is offered, in the order declared,
+//! least senior first. A seeded role follows its definition here until the
+//! organization edits it, which is what lets a model scaffolded next month
+//! reach every organization's unedited roles. Two keys are structural:
+//! [`DEFAULT_ROLE`] seeds the role everybody holds and [`ADMIN_ROLE`] the
+//! administrator role at the top.
 //!
 //! `scopes` names the tiers a role may be granted at, out of `platform`,
 //! `organization`, `sub_tenant`, and `team`. Omitting it means every tenancy
@@ -38,14 +54,23 @@
 //! is the deployment itself, so a role granted there operates every tenant in
 //! it, and a role that never asked for that reach must not acquire it by
 //! sitting in a file written before the tier existed. See [`Scope::TENANCY`].
+//! Platform roles stay keys held on the account (`users.platform_roles`), and
+//! [`RoleSet::can`] is how they are asked about.
 
+pub mod permission;
 mod typescript;
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 
-use serde::Deserialize;
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+#[doc(inline)]
+pub use permission::{MEMBERSHIP, ParsePermissionError, Permission, ROLE, SUBSCRIPTION};
+
+use permission::{FRAMEWORK_GRANTS, FRAMEWORK_SUBJECTS, framework_actions};
 
 /// A concrete permission on a model.
 ///
@@ -128,23 +153,6 @@ impl Scope {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RolesFile {
-    roles: BTreeMap<String, RoleDefinition>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-struct RoleDefinition {
-    includes: Vec<String>,
-    models: BTreeMap<String, Vec<String>>,
-    scopes: Vec<String>,
-}
-
-/// Per-model action grants for one resolved role.
-pub type ModelGrants = BTreeMap<String, BTreeSet<Action>>;
-
 /// Role key that operates the deployment, the platform tier's `admin`.
 ///
 /// The tenancy tiers each have a roster an administrator is appointed through,
@@ -155,23 +163,121 @@ pub type ModelGrants = BTreeMap<String, BTreeSet<Action>>;
 /// one that wants none leaves it out, and the platform tier stays empty.
 pub const OPERATOR_ROLE: &str = "operator";
 
+/// Role key seeding every organization's administrator role.
+///
+/// The administrator role sits at the top of every organization, cannot be
+/// deleted, and holds every permission the framework guards on top of what
+/// `roles.yml` grants this key. Its holders are exempt from the role
+/// hierarchy, which is what lets an administrator appoint another. Every
+/// organization and every team keeps at least one holder.
+pub const ADMIN_ROLE: &str = "admin";
+
+/// Role key seeding every organization's default role.
+///
+/// Everybody who reaches a tenant holds the default role there, without a
+/// grant: it sits at the bottom, cannot be deleted, and is what a member with
+/// no other role can do.
+pub const DEFAULT_ROLE: &str = "default";
+
+/// Role key that may spend the organization's money without administering it.
+///
+/// Before roles were data, holding this key was the permission. The framework
+/// keeps granting `Billing::Subscription.update` to it, so a `roles.yml`
+/// declaring `billing` with no grants of its own means what it always meant.
+pub const BILLING_ROLE: &str = "billing";
+
+/// The colour a role declares none of.
+///
+/// A neutral grey that reads on light and dark themes alike, so an
+/// undecorated role never looks like it means something.
+pub const DEFAULT_ROLE_COLOR: &str = "#94a3b8";
+
+/// Longest accepted role name, in characters.
+pub const MAX_ROLE_NAME_CHARS: usize = 50;
+
+/// The `roles.yml` document, with its roles in the order they are declared.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesFile {
+    #[serde(deserialize_with = "declared_in_order")]
+    roles: Vec<(String, RoleDefinition)>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RoleDefinition {
+    includes: Vec<String>,
+    models: BTreeMap<String, Vec<String>>,
+    scopes: Vec<String>,
+    name: Option<String>,
+    color: Option<String>,
+}
+
+/// Reads the `roles` map keeping its declaration order.
+///
+/// The order is meaningful: it is the rank an organization's recommended roles
+/// are seeded in, least senior first, so a map that sorted its keys would
+/// quietly reorder every new organization.
+fn declared_in_order<'de, D>(deserializer: D) -> Result<Vec<(String, RoleDefinition)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DeclaredInOrder;
+
+    impl<'de> Visitor<'de> for DeclaredInOrder {
+        type Value = Vec<(String, RoleDefinition)>;
+
+        fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of role keys to role definitions")
+        }
+
+        fn visit_map<Access>(self, mut map: Access) -> Result<Self::Value, Access::Error>
+        where
+            Access: MapAccess<'de>,
+        {
+            let mut roles: Vec<(String, RoleDefinition)> = Vec::new();
+            while let Some((key, definition)) = map.next_entry::<String, RoleDefinition>()? {
+                if roles.iter().any(|(declared, _definition)| *declared == key) {
+                    return Err(Access::Error::custom(format!(
+                        "role {key:?} is defined twice"
+                    )));
+                }
+                roles.push((key, definition));
+            }
+            Ok(roles)
+        }
+    }
+
+    deserializer.deserialize_map(DeclaredInOrder)
+}
+
+/// Per-model action grants for one resolved role.
+pub type ModelGrants = BTreeMap<String, BTreeSet<Action>>;
+
 /// The fully resolved role and permission definitions of an application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleSet {
     resolved: BTreeMap<String, ModelGrants>,
     scopes: BTreeMap<String, BTreeSet<Scope>>,
+    names: BTreeMap<String, String>,
+    colors: BTreeMap<String, String>,
+    /// Role keys in declaration order, least senior first.
+    order: Vec<String>,
+    vocabulary: BTreeSet<Permission>,
 }
 
 impl RoleSet {
     /// Parses and resolves a `roles.yml` document.
     ///
-    /// Resolution flattens `includes` transitively and expands `manage` into
-    /// every concrete action.
+    /// Resolution flattens `includes` transitively, expands `manage` into
+    /// every action a subject takes, and adds the grants the framework gives
+    /// the keys it has always given meaning (see [`permission`]).
     ///
     /// # Errors
     /// Returns an [`Error`] on malformed YAML, a role including an undefined
-    /// role, an inheritance cycle, an unknown action word, or an unknown
-    /// scope word.
+    /// role, an inheritance cycle, an unknown action word, an action a
+    /// framework subject does not take, an unknown scope word, a structural
+    /// role narrowed with `scopes`, or a name or colour that is not one.
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
         let file: RolesFile = serde_norway::from_str(yaml)
             .map_err(|source| Error::new(format!("roles.yml does not parse: {source}")))?;
@@ -180,10 +286,16 @@ impl RoleSet {
             return Err(Error::new("roles.yml defines no roles".to_owned()));
         }
 
+        let definitions: BTreeMap<&str, &RoleDefinition> = file
+            .roles
+            .iter()
+            .map(|(key, definition)| (key.as_str(), definition))
+            .collect();
+
         // Validate includes before resolving so error messages name the edge.
         for (key, definition) in &file.roles {
             for included in &definition.includes {
-                if !file.roles.contains_key(included) {
+                if !definitions.contains_key(included.as_str()) {
                     return Err(Error::new(format!(
                         "role {key:?} includes undefined role {included:?}"
                     )));
@@ -193,18 +305,57 @@ impl RoleSet {
 
         let mut resolved = BTreeMap::new();
         let mut scopes = BTreeMap::new();
+        let mut names = BTreeMap::new();
+        let mut colors = BTreeMap::new();
+        let mut vocabulary: BTreeSet<Permission> = FRAMEWORK_SUBJECTS
+            .iter()
+            .flat_map(|(subject, actions)| {
+                actions
+                    .iter()
+                    .map(|action| Permission::new(*subject, *action))
+            })
+            .collect();
+
         for (key, definition) in &file.roles {
             let mut grants = ModelGrants::new();
             let mut in_progress = Vec::new();
-            collect_grants(&file, key, &mut grants, &mut in_progress)?;
-            resolved.insert(key.clone(), grants);
+            collect_grants(&definitions, key, &mut grants, &mut in_progress)?;
+
+            // A model declared with an empty action list still names a
+            // subject an organization may want to grant.
+            for model in definition.models.keys() {
+                vocabulary.extend(
+                    vocabulary_actions(model)
+                        .iter()
+                        .map(|action| Permission::new(model.clone(), *action)),
+                );
+            }
+
             scopes.insert(key.clone(), collect_scopes(key, definition)?);
+            names.insert(key.clone(), collect_name(key, definition)?);
+            colors.insert(key.clone(), collect_color(key, definition)?);
+            resolved.insert(key.clone(), grants);
         }
 
-        Ok(Self { resolved, scopes })
+        Ok(Self {
+            resolved,
+            scopes,
+            names,
+            colors,
+            order: file
+                .roles
+                .into_iter()
+                .map(|(key, _definition)| key)
+                .collect(),
+            vocabulary,
+        })
     }
 
-    /// Returns `true` when any of the held roles grants the action.
+    /// Returns `true` when any of the held role keys grants the action.
+    ///
+    /// This asks about compiled keys, which is how the platform tier and a
+    /// platform application's token are authorized. A tenant's runtime roles
+    /// are asked about through [`crate::tenancy::Access`].
     pub fn can<Role: AsRef<str>>(&self, held_roles: &[Role], action: Action, model: &str) -> bool {
         held_roles.iter().any(|role| {
             self.resolved
@@ -225,10 +376,70 @@ impl RoleSet {
         self.resolved.keys().map(String::as_str)
     }
 
+    /// The role keys an organization is offered, least senior first.
+    ///
+    /// Every role grantable at some tenancy tier, in the order `roles.yml`
+    /// declares them. Platform-only roles are held on accounts and never
+    /// become an organization's.
+    pub fn recommended(&self) -> impl Iterator<Item = &str> {
+        self.order.iter().map(String::as_str).filter(|key| {
+            Scope::TENANCY
+                .into_iter()
+                .any(|scope| self.is_grantable_at(key, scope))
+        })
+    }
+
     /// The resolved per-model grants of a role, if defined.
     #[must_use]
     pub fn grants(&self, role: &str) -> Option<&ModelGrants> {
         self.resolved.get(role)
+    }
+
+    /// The permissions a role key carries, empty when the key is undefined.
+    ///
+    /// An undefined key granting nothing is what makes a role seeded from a
+    /// key the application later removed fail closed.
+    #[must_use]
+    pub fn permissions_of(&self, role: &str) -> BTreeSet<Permission> {
+        self.resolved
+            .get(role)
+            .into_iter()
+            .flatten()
+            .flat_map(|(model, actions)| {
+                actions
+                    .iter()
+                    .map(|action| Permission::new(model.clone(), *action))
+            })
+            .collect()
+    }
+
+    /// Every permission a role may carry, sorted by subject and action.
+    #[must_use]
+    pub fn vocabulary(&self) -> &BTreeSet<Permission> {
+        &self.vocabulary
+    }
+
+    /// Returns `true` when the permission is in this application's vocabulary.
+    #[must_use]
+    pub fn is_permission(&self, permission: &Permission) -> bool {
+        self.vocabulary.contains(permission)
+    }
+
+    /// The display name `roles.yml` gives a key, or the key made readable.
+    #[must_use]
+    pub fn name_of(&self, role: &str) -> String {
+        self.names
+            .get(role)
+            .cloned()
+            .unwrap_or_else(|| readable(role))
+    }
+
+    /// The colour `roles.yml` gives a key, or [`DEFAULT_ROLE_COLOR`].
+    #[must_use]
+    pub fn color_of(&self, role: &str) -> &str {
+        self.colors
+            .get(role)
+            .map_or(DEFAULT_ROLE_COLOR, String::as_str)
     }
 
     /// The tiers a role may be granted at, if the role is defined.
@@ -248,9 +459,8 @@ impl RoleSet {
 
     /// Returns `true` when the role is defined and may be granted at the tier.
     ///
-    /// This is what a roster endpoint asks before writing a role key onto a
-    /// membership, so a role the application scoped to the organization cannot
-    /// be attached to a team.
+    /// This is what a grant asks before attaching a seeded role, so a role the
+    /// application scoped to the organization cannot be granted on a team.
     #[must_use]
     pub fn is_grantable_at(&self, role: &str, scope: Scope) -> bool {
         self.scopes
@@ -261,7 +471,22 @@ impl RoleSet {
     /// Renders the resolved set as the generated TypeScript module.
     #[must_use]
     pub fn to_typescript(&self) -> String {
-        typescript::render(&self.resolved, &self.scopes)
+        typescript::render(self)
+    }
+}
+
+/// The actions a subject takes: a framework subject's own, or all four.
+fn vocabulary_actions(subject: &str) -> &'static [Action] {
+    framework_actions(subject).unwrap_or(&Action::ALL)
+}
+
+/// A key as a person would read it: `billing_admin` reads "Billing admin".
+fn readable(key: &str) -> String {
+    let spaced = key.replace('_', " ");
+    let mut characters = spaced.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => spaced,
     }
 }
 
@@ -269,6 +494,17 @@ impl RoleSet {
 fn collect_scopes(key: &str, definition: &RoleDefinition) -> Result<BTreeSet<Scope>, Error> {
     if definition.scopes.is_empty() {
         return Ok(Scope::TENANCY.into_iter().collect());
+    }
+
+    // The two structural roles exist in every organization and every team:
+    // the default role is everybody's wherever they reach, and a team is
+    // created with its creator holding the administrator role. A file that
+    // narrowed either would describe tenants the framework cannot build.
+    if key == DEFAULT_ROLE || key == ADMIN_ROLE {
+        return Err(Error::new(format!(
+            "role {key:?} is structural: every organization and team holds it, \
+             so it cannot be narrowed with scopes"
+        )));
     }
 
     definition
@@ -287,9 +523,54 @@ fn collect_scopes(key: &str, definition: &RoleDefinition) -> Result<BTreeSet<Sco
         .collect()
 }
 
+/// Reads a role's display name, defaulting to its key made readable.
+fn collect_name(key: &str, definition: &RoleDefinition) -> Result<String, Error> {
+    let Some(name) = definition.name.as_deref() else {
+        return Ok(readable(key));
+    };
+
+    let trimmed = name.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.chars().count() <= MAX_ROLE_NAME_CHARS
+        && !trimmed.chars().any(char::is_control);
+    if !valid {
+        return Err(Error::new(format!(
+            "role {key:?} has name {name:?}; a name is 1 to {MAX_ROLE_NAME_CHARS} \
+             characters without control characters"
+        )));
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+/// Reads a role's colour, defaulting to [`DEFAULT_ROLE_COLOR`].
+fn collect_color(key: &str, definition: &RoleDefinition) -> Result<String, Error> {
+    let Some(color) = definition.color.as_deref() else {
+        return Ok(DEFAULT_ROLE_COLOR.to_owned());
+    };
+
+    if !is_hex_color(color) {
+        return Err(Error::new(format!(
+            "role {key:?} has color {color:?}; a color is #rrggbb in lowercase hex"
+        )));
+    }
+
+    Ok(color.to_owned())
+}
+
+/// Returns `true` for `#rrggbb` in lowercase hex, the one spelling stored.
+#[must_use]
+pub fn is_hex_color(candidate: &str) -> bool {
+    candidate.len() == 7
+        && candidate.starts_with('#')
+        && candidate[1..]
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+}
+
 /// Depth-first grant collection with cycle detection.
 fn collect_grants(
-    file: &RolesFile,
+    definitions: &BTreeMap<&str, &RoleDefinition>,
     key: &str,
     grants: &mut ModelGrants,
     in_progress: &mut Vec<String>,
@@ -303,38 +584,52 @@ fn collect_grants(
     in_progress.push(key.to_owned());
 
     // Validated above, so the definition exists.
-    let definition = &file.roles[key];
+    let definition = definitions[key];
 
     for included in &definition.includes {
-        collect_grants(file, included, grants, in_progress)?;
+        collect_grants(definitions, included, grants, in_progress)?;
     }
 
     for (model, action_words) in &definition.models {
+        let takes = vocabulary_actions(model);
         let actions = grants.entry(model.clone()).or_default();
         for word in action_words {
-            match word.as_str() {
-                "read" => {
-                    actions.insert(Action::Read);
-                }
-                "create" => {
-                    actions.insert(Action::Create);
-                }
-                "update" => {
-                    actions.insert(Action::Update);
-                }
-                "destroy" => {
-                    actions.insert(Action::Destroy);
-                }
-                "manage" => {
-                    actions.extend(Action::ALL);
-                }
+            let named: &[Action] = match word.as_str() {
+                "read" => &[Action::Read],
+                "create" => &[Action::Create],
+                "update" => &[Action::Update],
+                "destroy" => &[Action::Destroy],
+                "manage" => takes,
                 unknown => {
                     return Err(Error::new(format!(
                         "role {key:?} grants unknown action {unknown:?} on model {model:?} \
                          (expected read, create, update, destroy, or manage)"
                     )));
                 }
+            };
+            if let Some(refused) = named.iter().find(|action| !takes.contains(action)) {
+                let accepted = takes
+                    .iter()
+                    .map(|action| action.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::new(format!(
+                    "role {key:?} grants {:?} on {model:?}, which takes only {accepted}",
+                    refused.as_str(),
+                )));
             }
+            actions.extend(named.iter().copied());
+        }
+    }
+
+    // Applied while walking, so a role including `billing` inherits what the
+    // framework gives `billing` exactly as it inherits the file's grants.
+    for (role, subject, actions) in FRAMEWORK_GRANTS {
+        if role == key {
+            grants
+                .entry(subject.to_owned())
+                .or_default()
+                .extend(actions.iter().copied());
         }
     }
 
@@ -372,7 +667,7 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, RoleSet, Scope};
+    use super::{Action, DEFAULT_ROLE_COLOR, MEMBERSHIP, Permission, RoleSet, SUBSCRIPTION, Scope};
 
     const BASELINE: &str = "
 roles:
@@ -512,6 +807,11 @@ roles:
             "naming one tier narrows the role to it",
         );
         assert_eq!(set.platform_role_keys().collect::<Vec<_>>(), ["operator"]);
+        assert_eq!(
+            set.recommended().collect::<Vec<_>>(),
+            ["default"],
+            "a platform-only role is never an organization's",
+        );
     }
 
     #[test]
@@ -540,7 +840,7 @@ roles:
     fn unknown_scopes_are_rejected() {
         let yaml = "
 roles:
-  admin:
+  editor:
     scopes: [galaxy]
 ";
         let error = RoleSet::from_yaml(yaml).expect_err("must reject");
@@ -549,9 +849,142 @@ roles:
     }
 
     #[test]
+    fn the_structural_roles_cannot_be_narrowed() {
+        for key in ["admin", "default"] {
+            let yaml = format!("roles:\n  {key}:\n    scopes: [organization]\n");
+            let error = RoleSet::from_yaml(&yaml).expect_err("must reject");
+            let rendered = error.to_string();
+            assert!(rendered.contains("structural"), "got: {rendered}");
+        }
+    }
+
+    #[test]
     fn empty_and_malformed_documents_are_rejected() {
         RoleSet::from_yaml("roles: {}").expect_err("empty roles must be rejected");
         RoleSet::from_yaml("not yaml: [").expect_err("malformed yaml must be rejected");
         RoleSet::from_yaml("roles:\n  admin:\n    typo_field: 1").expect_err("unknown fields");
+    }
+
+    #[test]
+    fn recommended_roles_keep_their_declared_order() {
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+
+        assert_eq!(
+            set.recommended().collect::<Vec<_>>(),
+            ["default", "editor", "billing", "admin"],
+            "declaration order is seniority, least senior first",
+        );
+    }
+
+    #[test]
+    fn names_and_colors_default_to_something_readable() {
+        let yaml = "
+roles:
+  default:
+    name: Member
+    color: '#22c55e'
+  billing_admin:
+    models: {}
+";
+        let set = RoleSet::from_yaml(yaml).expect("must parse");
+
+        assert_eq!(set.name_of("default"), "Member");
+        assert_eq!(set.color_of("default"), "#22c55e");
+        assert_eq!(set.name_of("billing_admin"), "Billing admin");
+        assert_eq!(set.color_of("billing_admin"), DEFAULT_ROLE_COLOR);
+        assert_eq!(
+            set.name_of("ghost"),
+            "Ghost",
+            "an undefined key still reads"
+        );
+    }
+
+    #[test]
+    fn names_and_colors_are_validated() {
+        for yaml in [
+            "roles:\n  editor:\n    name: ''\n",
+            "roles:\n  editor:\n    name: \"line\\nbreak\"\n",
+            "roles:\n  editor:\n    color: red\n",
+            "roles:\n  editor:\n    color: '#ABCDEF'\n",
+        ] {
+            RoleSet::from_yaml(yaml).expect_err(yaml);
+        }
+    }
+
+    #[test]
+    fn the_vocabulary_is_every_named_model_and_the_frameworks_subjects() {
+        let yaml = "
+roles:
+  default:
+    models:
+      Project: [read]
+      Archive: []
+";
+        let set = RoleSet::from_yaml(yaml).expect("must parse");
+
+        for action in Action::ALL {
+            assert!(set.is_permission(&Permission::new("Project", action)));
+            assert!(
+                set.is_permission(&Permission::new("Archive", action)),
+                "a model named with no actions is still in the vocabulary",
+            );
+        }
+        assert!(set.is_permission(&Permission::new(MEMBERSHIP, Action::Update)));
+        assert!(set.is_permission(&Permission::new(SUBSCRIPTION, Action::Update)));
+        assert!(
+            !set.is_permission(&Permission::new(SUBSCRIPTION, Action::Read)),
+            "a framework subject takes only the actions it guards",
+        );
+        assert!(!set.is_permission(&Permission::new("Ghost", Action::Read)));
+    }
+
+    #[test]
+    fn framework_subjects_take_only_their_own_actions() {
+        let yaml = "
+roles:
+  treasurer:
+    models:
+      Billing::Subscription: [read]
+";
+        let error = RoleSet::from_yaml(yaml).expect_err("must reject");
+        assert!(error.to_string().contains("takes only update"), "{error}");
+
+        let yaml = "
+roles:
+  moderator:
+    models:
+      Tenancy::Membership: [manage]
+";
+        let set = RoleSet::from_yaml(yaml).expect("manage expands to what the subject takes");
+        let held = ["moderator"];
+        assert!(set.can(&held, Action::Update, MEMBERSHIP));
+        assert!(!set.can(&held, Action::Read, MEMBERSHIP));
+    }
+
+    #[test]
+    fn the_billing_key_keeps_paying_for_the_organization() {
+        // A roles.yml written before roles were data declares `billing` with
+        // no grants of its own: holding the key was the whole permission.
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+
+        assert!(
+            set.permissions_of("billing")
+                .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
+        );
+        assert!(
+            set.permissions_of("admin")
+                .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
+            "a role including billing inherits it",
+        );
+        assert!(
+            !set.permissions_of("editor")
+                .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
+        );
+    }
+
+    #[test]
+    fn an_undefined_key_carries_no_permissions() {
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+        assert!(set.permissions_of("removed_last_month").is_empty());
     }
 }

@@ -38,15 +38,8 @@ use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::OrganizationMember;
 use crate::http::ApiError;
-use crate::roles::RoleSet;
+use crate::roles::{Action, RoleSet, SUBSCRIPTION};
 use crate::schema::organizations;
-use crate::tenancy::ADMIN_ROLE;
-
-/// Role key that may spend the organization's money without administering it.
-///
-/// The starter's `config/roles.yml` ships it, described as "can manage billing
-/// and subscriptions", and this is the surface that sentence refers to.
-pub const BILLING_ROLE: &str = "billing";
 
 /// Where Stripe returns the browser, under `APP_URL`.
 ///
@@ -422,18 +415,16 @@ fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
 }
 
 /// Refuses a member who may see the plan but not buy one.
+///
+/// Spending is `Billing::Subscription.update`, which the administrator role
+/// always holds and the `billing` key has always carried, and which an
+/// organization may hand to a role of its own.
 fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError> {
-    let permitted = member
-        .membership
-        .roles
-        .iter()
-        .any(|role| role == ADMIN_ROLE || role == BILLING_ROLE);
-
-    if permitted {
+    if member.can(Action::Update, SUBSCRIPTION) {
         Ok(())
     } else {
         Err(ApiError::forbidden(
-            "You need the admin or billing role to manage this organization's subscription.",
+            "You need permission to manage this organization's subscription.",
         ))
     }
 }

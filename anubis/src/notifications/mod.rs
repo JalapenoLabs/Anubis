@@ -57,12 +57,10 @@ mod ping;
 mod routes;
 
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
 use uuid::Uuid;
 
 use crate::jobs;
-use crate::schema::{organization_memberships, team_memberships};
-use crate::tenancy::ADMIN_ROLE;
 
 #[doc(inline)]
 pub use model::{NewNotification, Notification};
@@ -135,9 +133,10 @@ pub async fn notify(
 
 /// The users who administer `team_id`, the audience for a team-wide notice.
 ///
-/// Claimed memberships only: an invited seat has nobody behind it to read an
-/// inbox. Ordered by id so a caller notifying several people writes their rows
-/// in a stable order.
+/// The holders of the administrator role team-wide, through claimed
+/// memberships only: an invited seat has nobody behind it to read an inbox.
+/// Ordered by id so a caller notifying several people writes their rows in a
+/// stable order.
 ///
 /// # Errors
 /// Returns the underlying query error, for the same reason [`notify`] does.
@@ -145,22 +144,13 @@ pub async fn team_admins(
     connection: &mut AsyncPgConnection,
     team_id: Uuid,
 ) -> QueryResult<Vec<Uuid>> {
-    let holders: Vec<Option<Uuid>> = team_memberships::table
-        .filter(team_memberships::team_id.eq(team_id))
-        .filter(team_memberships::roles.contains(vec![ADMIN_ROLE.to_owned()]))
-        .filter(team_memberships::user_id.is_not_null())
-        .select(team_memberships::user_id)
-        .order(team_memberships::user_id.asc())
-        .load(connection)
-        .await?;
-
-    Ok(holders.into_iter().flatten().collect())
+    crate::tenancy::team_administrators(connection, team_id).await
 }
 
 /// The users who administer `organization_id`.
 ///
-/// The organization-level counterpart of [`team_admins`]. An organization
-/// membership always names a user, so nothing is filtered out here.
+/// The organization-level counterpart of [`team_admins`]: the holders of the
+/// administrator role organization-wide.
 ///
 /// # Errors
 /// Returns the underlying query error, for the same reason [`notify`] does.
@@ -168,13 +158,7 @@ pub async fn organization_admins(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
 ) -> QueryResult<Vec<Uuid>> {
-    organization_memberships::table
-        .filter(organization_memberships::organization_id.eq(organization_id))
-        .filter(organization_memberships::roles.contains(vec![ADMIN_ROLE.to_owned()]))
-        .select(organization_memberships::user_id)
-        .order(organization_memberships::user_id.asc())
-        .load(connection)
-        .await
+    crate::tenancy::organization_administrators(connection, organization_id).await
 }
 
 /// The path a team's settings screen is served at.

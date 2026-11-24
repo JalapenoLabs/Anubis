@@ -1,20 +1,23 @@
 //! Invitation model and database operations.
 //!
 //! Team invitations pre-create an unclaimed [`TeamMembership`], so resources
-//! can be assigned to the invitee before they join, and the membership (with
-//! its assignments) survives the claim. Organization invitations create the
-//! organization membership at claim time. The emailed token follows the
-//! framework's token discipline: random 256 bits to the recipient, SHA-256 at
-//! rest, single use.
+//! can be assigned to the invitee before they join, and the roles the
+//! invitation offers are granted on that membership straight away: the claim
+//! hands over the membership with its id, its grants, and any resource
+//! assignments intact. Organization invitations create the organization
+//! membership at claim time, so the roles they offer wait in
+//! `invitation_roles` until then. The emailed token follows the framework's
+//! token discipline: random 256 bits to the recipient, SHA-256 at rest, single
+//! use.
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
-use diesel::result::DatabaseErrorKind;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use crate::auth::token;
-use crate::schema::{invitations, organization_memberships, team_memberships};
+use crate::schema::{invitation_roles, invitations, organization_memberships, team_memberships};
+use crate::tenancy::grants::{self, Holder};
 use crate::tenancy::model::{NewOrganizationMembership, NewTeamMembership, TeamMembership};
 
 /// How long an invitation stays claimable.
@@ -35,8 +38,6 @@ pub struct Invitation {
     pub team_id: Option<Uuid>,
     /// The unclaimed membership created alongside a team invitation.
     pub team_membership_id: Option<Uuid>,
-    /// Role keys granted on claim.
-    pub roles: Vec<String>,
     /// Who sent the invitation, if they still exist.
     pub invited_by: Option<Uuid>,
     /// When the invitation was created.
@@ -52,10 +53,17 @@ struct NewInvitation<'a> {
     organization_id: Uuid,
     team_id: Option<Uuid>,
     team_membership_id: Option<Uuid>,
-    roles: &'a [String],
     invited_by: Uuid,
     token_hash: &'a str,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = invitation_roles)]
+struct NewInvitationRole {
+    invitation_id: Uuid,
+    role_id: Uuid,
+    organization_id: Uuid,
 }
 
 /// What an invitation targets.
@@ -68,25 +76,33 @@ pub(crate) enum InvitationTarget {
     },
 }
 
+/// A claimed invitation, and the roles the claim granted.
+#[derive(Debug, Clone)]
+pub(crate) struct Claimed {
+    /// The invitation, which no longer exists.
+    pub invitation: Invitation,
+    /// The roles the claimant now holds through it: empty when they already
+    /// belonged, because a claim by a member is absorbed and changes nothing.
+    pub role_ids: Vec<Uuid>,
+}
+
 /// Creates an invitation, returning it and the raw token for the email link.
 ///
 /// The row comes back rather than being read again afterwards, so the caller's
 /// response, its audit record, and what was stored are the same three facts
-/// from one write.
+/// from one write. `role_ids` are roles of the target's organization the
+/// caller has already been allowed to offer.
 ///
 /// Replaces any pending invitation for the same email and target (including
-/// its unclaimed membership), so re-inviting is always safe. Team invitations
-/// pre-create the unclaimed team membership.
+/// its unclaimed membership and that membership's grants), so re-inviting is
+/// always safe.
 pub(crate) async fn create(
     connection: &mut AsyncPgConnection,
     target: InvitationTarget,
     email: &str,
-    roles: &[String],
+    role_ids: &[Uuid],
     invited_by: Uuid,
 ) -> Result<(Invitation, String), diesel::result::Error> {
-    // Replace any pending invitation for this email and target. Deleting the
-    // invitation cascades nothing; the linked unclaimed membership is removed
-    // explicitly.
     let (organization_id, team_id) = match target {
         InvitationTarget::Organization(organization_id) => (organization_id, None),
         InvitationTarget::Team {
@@ -95,6 +111,9 @@ pub(crate) async fn create(
         } => (organization_id, Some(team_id)),
     };
 
+    // Replace any pending invitation for this email and target. Its offered
+    // roles cascade with it; the linked unclaimed membership is removed
+    // explicitly, and its grants cascade with that.
     let stale_membership_ids: Vec<Option<Uuid>> = diesel::delete(
         invitations::table
             .filter(invitations::email.eq(email))
@@ -123,11 +142,24 @@ pub(crate) async fn create(
                 .values(NewTeamMembership {
                     team_id,
                     user_id: None,
-                    roles,
                 })
                 .returning(TeamMembership::as_returning())
                 .get_result(connection)
                 .await?;
+            for role_id in role_ids {
+                grants::grant(
+                    connection,
+                    organization_id,
+                    *role_id,
+                    Holder::Team {
+                        team_id,
+                        membership_id: membership.id,
+                        resource_id: None,
+                    },
+                    Some(invited_by),
+                )
+                .await?;
+            }
             Some(membership.id)
         }
     };
@@ -141,7 +173,6 @@ pub(crate) async fn create(
             organization_id,
             team_id,
             team_membership_id,
-            roles,
             invited_by,
             token_hash: &token_hash,
             expires_at: Utc::now() + Duration::days(INVITATION_TTL_DAYS),
@@ -150,78 +181,178 @@ pub(crate) async fn create(
         .get_result(connection)
         .await?;
 
+    if team_id.is_none() && !role_ids.is_empty() {
+        let offered: Vec<NewInvitationRole> = role_ids
+            .iter()
+            .map(|role_id| NewInvitationRole {
+                invitation_id: invitation.id,
+                role_id: *role_id,
+                organization_id,
+            })
+            .collect();
+        diesel::insert_into(invitation_roles::table)
+            .values(&offered)
+            .on_conflict_do_nothing()
+            .execute(connection)
+            .await?;
+    }
+
     Ok((invitation, raw_token))
+}
+
+/// The roles an organization invitation offers, keyed by invitation.
+///
+/// # Errors
+/// Returns the underlying Diesel error when the query fails.
+pub(crate) async fn offered_role_ids(
+    connection: &mut AsyncPgConnection,
+    invitation_ids: &[Uuid],
+) -> QueryResult<Vec<(Uuid, Uuid)>> {
+    invitation_roles::table
+        .filter(invitation_roles::invitation_id.eq_any(invitation_ids))
+        .select((invitation_roles::invitation_id, invitation_roles::role_id))
+        .load(connection)
+        .await
 }
 
 /// Consumes an invitation token, joining the claimant to its target.
 ///
-/// Returns the claimed invitation, or `None` for unknown or expired tokens.
-/// Team claims adopt the pre-created membership (keeping its id, roles, and
-/// any resource assignments); organization claims insert the membership. A
-/// claimant who is already a member simply absorbs the invitation.
+/// Returns `None` for unknown or expired tokens. Team claims adopt the
+/// pre-created membership (keeping its id, grants, and any resource
+/// assignments); organization claims insert the membership and grant the roles
+/// the invitation still offers, so a role deleted while it was in flight is
+/// simply not granted. A claimant who is already a member absorbs the
+/// invitation and keeps exactly what they held.
+///
+/// The invitation row is locked first, so two claims of one token are ordered
+/// and the second finds nothing.
 pub(crate) async fn claim(
     connection: &mut AsyncPgConnection,
     raw_token: &str,
     claimant: Uuid,
-) -> Result<Option<Invitation>, diesel::result::Error> {
+) -> Result<Option<Claimed>, diesel::result::Error> {
     let token_hash = token::hash(raw_token);
 
-    let invitation: Option<Invitation> = diesel::delete(
-        invitations::table
-            .filter(invitations::token_hash.eq(&token_hash))
-            .filter(invitations::expires_at.gt(Utc::now())),
-    )
-    .returning(Invitation::as_returning())
-    .get_result(connection)
-    .await
-    .optional()?;
-
+    let invitation: Option<Invitation> = invitations::table
+        .filter(invitations::token_hash.eq(&token_hash))
+        .filter(invitations::expires_at.gt(Utc::now()))
+        .for_update()
+        .select(Invitation::as_select())
+        .first(connection)
+        .await
+        .optional()?;
     let Some(invitation) = invitation else {
         return Ok(None);
     };
 
-    match invitation.team_membership_id {
-        Some(membership_id) => {
-            let adopted = diesel::update(
-                team_memberships::table
-                    .filter(team_memberships::id.eq(membership_id))
-                    .filter(team_memberships::user_id.is_null()),
-            )
-            .set((team_memberships::user_id.eq(claimant),))
-            .execute(connection)
-            .await;
+    let offered: Vec<Uuid> = offered_role_ids(connection, &[invitation.id])
+        .await?
+        .into_iter()
+        .map(|(_invitation_id, role_id)| role_id)
+        .collect();
 
-            match adopted {
-                Ok(_count) => {}
-                // The claimant already belongs to the team; drop the
-                // now-redundant unclaimed membership.
-                Err(diesel::result::Error::DatabaseError(
-                    DatabaseErrorKind::UniqueViolation,
-                    _details,
-                )) => {
-                    diesel::delete(
-                        team_memberships::table
-                            .filter(team_memberships::id.eq(membership_id))
-                            .filter(team_memberships::user_id.is_null()),
-                    )
-                    .execute(connection)
-                    .await?;
-                }
-                Err(other) => return Err(other),
-            }
+    // Deleting the invitation takes its offered roles with it, which is why
+    // they were read first.
+    diesel::delete(invitations::table.find(invitation.id))
+        .execute(connection)
+        .await?;
+
+    let role_ids = match invitation.team_id {
+        Some(team_id) => {
+            // A team invitation's membership cascades it away when deleted, so
+            // one without the other is a broken row, and the claim rolls back.
+            let Some(membership_id) = invitation.team_membership_id else {
+                tracing::error!(
+                    invitation.id = %invitation.id,
+                    "team invitation {{invitation.id}} has no membership to hand over",
+                );
+                return Err(diesel::result::Error::NotFound);
+            };
+            claim_team(connection, team_id, membership_id, claimant).await?
         }
         None => {
-            diesel::insert_into(organization_memberships::table)
-                .values(NewOrganizationMembership {
-                    organization_id: invitation.organization_id,
-                    user_id: claimant,
-                    roles: &invitation.roles,
-                })
-                .on_conflict_do_nothing()
-                .execute(connection)
-                .await?;
+            claim_organization(connection, invitation.organization_id, &offered, claimant).await?
         }
+    };
+
+    Ok(Some(Claimed {
+        invitation,
+        role_ids,
+    }))
+}
+
+/// Hands the pre-created membership to the claimant, unless they belong already.
+async fn claim_team(
+    connection: &mut AsyncPgConnection,
+    team_id: Uuid,
+    membership_id: Uuid,
+    claimant: Uuid,
+) -> Result<Vec<Uuid>, diesel::result::Error> {
+    let already_member = TeamMembership::for_user(connection, claimant, team_id)
+        .await?
+        .is_some();
+    if already_member {
+        // The now-redundant unclaimed membership goes, and its grants with it.
+        diesel::delete(
+            team_memberships::table
+                .filter(team_memberships::id.eq(membership_id))
+                .filter(team_memberships::user_id.is_null()),
+        )
+        .execute(connection)
+        .await?;
+        return Ok(Vec::new());
     }
 
-    Ok(Some(invitation))
+    diesel::update(
+        team_memberships::table
+            .filter(team_memberships::id.eq(membership_id))
+            .filter(team_memberships::user_id.is_null()),
+    )
+    .set(team_memberships::user_id.eq(claimant))
+    .execute(connection)
+    .await?;
+
+    grants::held_role_ids(
+        connection,
+        Holder::Team {
+            team_id,
+            membership_id,
+            resource_id: None,
+        },
+    )
+    .await
+}
+
+/// Creates the claimant's organization membership with the offered roles.
+async fn claim_organization(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    offered: &[Uuid],
+    claimant: Uuid,
+) -> Result<Vec<Uuid>, diesel::result::Error> {
+    let joined: Option<Uuid> = diesel::insert_into(organization_memberships::table)
+        .values(NewOrganizationMembership {
+            organization_id,
+            user_id: claimant,
+        })
+        .on_conflict_do_nothing()
+        .returning(organization_memberships::id)
+        .get_result(connection)
+        .await
+        .optional()?;
+    let Some(membership_id) = joined else {
+        return Ok(Vec::new());
+    };
+
+    for role_id in offered {
+        grants::grant(
+            connection,
+            organization_id,
+            *role_id,
+            Holder::Organization { membership_id },
+            None,
+        )
+        .await?;
+    }
+    Ok(offered.to_vec())
 }

@@ -4,18 +4,19 @@
 //! exports, `as const` lookup tables, no semicolons) and is deterministic:
 //! the same roles.yml always renders byte-identical TypeScript, so CI can
 //! fail on drift with a plain diff.
+//!
+//! The module carries the vocabulary rather than anybody's standing: which
+//! permissions exist, and what each recommended role grants. What the signed-in
+//! person may do in a tenant is resolved by the server from that tenant's own
+//! roles, and `can` asks about the permission keys it answered with.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use chrono::Datelike;
 
-use crate::roles::{ModelGrants, Scope};
+use crate::roles::RoleSet;
 
-pub(crate) fn render(
-    resolved: &BTreeMap<String, ModelGrants>,
-    scopes: &BTreeMap<String, BTreeSet<Scope>>,
-) -> String {
+pub(crate) fn render(set: &RoleSet) -> String {
     let year = chrono::Utc::now().year();
     let mut out = String::new();
 
@@ -30,14 +31,33 @@ pub(crate) fn render(
          \n",
     );
 
+    out.push_str(
+        "// Every permission a role may carry: each model's actions, and the framework's own subjects.\n\
+         export const PermissionKeys = [\n",
+    );
+    for permission in set.vocabulary() {
+        let _ = writeln!(out, "  '{}',", escape(&permission.to_string()));
+    }
+    out.push_str(
+        "] as const\n\
+         \n\
+         export type PermissionKey = typeof PermissionKeys[number]\n\
+         \n",
+    );
+
     out.push_str("export type RoleKey =\n");
-    for role in resolved.keys() {
+    for role in set.role_keys() {
         let _ = writeln!(out, "  | '{}'", escape(role));
     }
     out.push('\n');
 
-    out.push_str("export const RoleGrants = {\n");
-    for (role, grants) in resolved {
+    out.push_str(
+        "// What each role in roles.yml grants: the definition an organization's\n\
+         // recommended role follows until it is edited, and what a platform role means.\n\
+         export const RoleGrants = {\n",
+    );
+    for role in set.role_keys() {
+        let grants = set.grants(role).into_iter().flatten().collect::<Vec<_>>();
         if grants.is_empty() {
             let _ = writeln!(out, "  {}: {{}},", key(role));
             continue;
@@ -60,19 +80,13 @@ pub(crate) fn render(
     );
 
     out.push_str(
-        "// Widened view so arbitrary runtime role keys index safely.\n\
-         const grantsByRole: Record<string, Partial<Record<string, readonly PermissionAction[]>> | undefined>\n\
-         \x20\x20= RoleGrants\n\
-         \n\
+        "// Whether the permission keys the server resolved for a tenant allow the action.\n\
          export function can(\n\
-         \x20\x20heldRoles: readonly string[],\n\
+         \x20\x20permissions: readonly string[],\n\
          \x20\x20action: PermissionAction,\n\
          \x20\x20model: string,\n\
          ): boolean {\n\
-         \x20\x20return heldRoles.some((role) => {\n\
-         \x20\x20\x20\x20const grants = grantsByRole[role]\n\
-         \x20\x20\x20\x20return Boolean(grants?.[model]?.includes(action))\n\
-         \x20\x20})\n\
+         \x20\x20return permissions.includes(`${model}.${action}`)\n\
          }\n\
          \n",
     );
@@ -80,9 +94,11 @@ pub(crate) fn render(
     out.push_str("// The tiers each role may be granted at.\n");
     out.push_str("export type RoleScope = 'platform' | 'organization' | 'sub_tenant' | 'team'\n\n");
     out.push_str("export const RoleScopes = {\n");
-    for (role, tiers) in scopes {
-        let rendered_tiers = tiers
-            .iter()
+    for role in set.role_keys() {
+        let rendered_tiers = set
+            .scopes(role)
+            .into_iter()
+            .flatten()
             .map(|scope| format!("'{}'", scope.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
@@ -155,12 +171,36 @@ roles:
             rendered.contains("Project: [ 'read', 'create', 'update', 'destroy' ],"),
             "got:\n{rendered}"
         );
-        assert!(rendered.contains("billing: {},"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("'Billing::Subscription': [ 'update' ],"),
+            "the framework's grant to the billing key is visible, got:\n{rendered}"
+        );
+        assert!(rendered.contains("operator: {},"), "got:\n{rendered}");
         assert!(
             rendered.contains("export function can("),
             "got:\n{rendered}"
         );
         assert!(!rendered.contains(';'), "no semicolons, got:\n{rendered}");
+    }
+
+    #[test]
+    fn renders_the_permission_vocabulary() {
+        let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
+        let rendered = set.to_typescript();
+
+        for key in [
+            "'Project.read',",
+            "'Project.destroy',",
+            "'Tenancy::Membership.update',",
+            "'Tenancy::Role.create',",
+            "'Billing::Subscription.update',",
+        ] {
+            assert!(rendered.contains(key), "missing {key}, got:\n{rendered}");
+        }
+        assert!(
+            rendered.contains("export type PermissionKey = typeof PermissionKeys[number]"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]

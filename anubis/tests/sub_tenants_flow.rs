@@ -19,7 +19,8 @@ use anubis::guard::{SubTenantMember, TeamMember};
 use anubis::http::ApiError;
 use anubis::roles::Action;
 use anubis::schema::{
-    organization_memberships, sub_tenant_memberships, sub_tenants, team_memberships, teams, users,
+    organization_memberships, role_grants, roles, sub_tenant_memberships, sub_tenants,
+    team_memberships, teams, users,
 };
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -56,9 +57,17 @@ roles:
 /// Reports the caller's resolved standing, which is what every step asserts on.
 async fn sub_tenant_probe(member: SubTenantMember) -> Result<impl IntoResponse, ApiError> {
     member.require(Action::Read, "Probe")?;
+    let mut roles: Vec<String> = member
+        .access
+        .access
+        .roles()
+        .iter()
+        .map(|role| role.name.clone())
+        .collect();
+    roles.sort();
     Ok(Json(json!({
         "sub_tenant": member.sub_tenant.name,
-        "roles": member.access.roles,
+        "roles": roles,
         "reach": format!("{:?}", member.access.reach),
         "can_update": member.can(Action::Update, "Probe"),
     })))
@@ -142,63 +151,149 @@ async fn create_team(
         .expect("the team must be creatable")
 }
 
-async fn join_team(connection: &mut AsyncPgConnection, team: Uuid, user: Uuid, roles: &[&str]) {
-    diesel::insert_into(team_memberships::table)
+/// The organization's role seeded from `key`.
+///
+/// Registration seeds only the two structural roles, and the tenancy surface,
+/// which offers the rest on first read, is not mounted here. A role this makes
+/// goes on top, because this story asserts on reach and permissions, never on
+/// rank.
+async fn role_for(connection: &mut AsyncPgConnection, organization: Uuid, key: &str) -> Uuid {
+    let found: Option<Uuid> = roles::table
+        .filter(roles::organization_id.eq(organization))
+        .filter(roles::key.eq(key))
+        .select(roles::id)
+        .first(connection)
+        .await
+        .optional()
+        .expect("the role lookup must run");
+    if let Some(found) = found {
+        return found;
+    }
+
+    let top: Option<i32> = roles::table
+        .filter(roles::organization_id.eq(organization))
+        .select(diesel::dsl::max(roles::position))
+        .first(connection)
+        .await
+        .expect("the ladder must be readable");
+    diesel::insert_into(roles::table)
+        .values((
+            roles::organization_id.eq(organization),
+            roles::key.eq(key),
+            roles::position.eq(top.unwrap_or(0) + 1),
+        ))
+        .returning(roles::id)
+        .get_result(connection)
+        .await
+        .expect("the role must be creatable")
+}
+
+/// The grants `keys` names, minus the default role everybody holds already.
+async fn granted_roles(
+    connection: &mut AsyncPgConnection,
+    organization: Uuid,
+    keys: &[&str],
+) -> Vec<Uuid> {
+    let mut granted = Vec::new();
+    for key in keys.iter().filter(|key| **key != "default") {
+        granted.push(role_for(connection, organization, key).await);
+    }
+    granted
+}
+
+async fn join_team(
+    connection: &mut AsyncPgConnection,
+    organization: Uuid,
+    team: Uuid,
+    user: Uuid,
+    keys: &[&str],
+) {
+    let membership: Uuid = diesel::insert_into(team_memberships::table)
         .values((
             team_memberships::team_id.eq(team),
             team_memberships::user_id.eq(Some(user)),
-            team_memberships::roles.eq(roles
-                .iter()
-                .map(|role| (*role).to_owned())
-                .collect::<Vec<_>>()),
         ))
-        .execute(connection)
+        .returning(team_memberships::id)
+        .get_result(connection)
         .await
         .expect("the team membership must be creatable");
+
+    for role in granted_roles(connection, organization, keys).await {
+        diesel::insert_into(role_grants::table)
+            .values((
+                role_grants::organization_id.eq(organization),
+                role_grants::role_id.eq(role),
+                role_grants::team_id.eq(Some(team)),
+                role_grants::team_membership_id.eq(Some(membership)),
+            ))
+            .execute(connection)
+            .await
+            .expect("the team grant must be creatable");
+    }
 }
 
 async fn join_organization(
     connection: &mut AsyncPgConnection,
     organization: Uuid,
     user: Uuid,
-    roles: &[&str],
+    keys: &[&str],
     access: &str,
 ) {
-    diesel::insert_into(organization_memberships::table)
+    let membership: Uuid = diesel::insert_into(organization_memberships::table)
         .values((
             organization_memberships::organization_id.eq(organization),
             organization_memberships::user_id.eq(user),
-            organization_memberships::roles.eq(roles
-                .iter()
-                .map(|role| (*role).to_owned())
-                .collect::<Vec<_>>()),
             organization_memberships::access.eq(access),
         ))
-        .execute(connection)
+        .returning(organization_memberships::id)
+        .get_result(connection)
         .await
         .expect("the organization membership must be creatable");
+
+    for role in granted_roles(connection, organization, keys).await {
+        diesel::insert_into(role_grants::table)
+            .values((
+                role_grants::organization_id.eq(organization),
+                role_grants::role_id.eq(role),
+                role_grants::organization_membership_id.eq(Some(membership)),
+            ))
+            .execute(connection)
+            .await
+            .expect("the organization grant must be creatable");
+    }
 }
 
 async fn join_sub_tenant(
     connection: &mut AsyncPgConnection,
+    organization: Uuid,
     sub_tenant: Uuid,
     user: Uuid,
-    roles: &[&str],
+    keys: &[&str],
     suspended: bool,
 ) {
-    diesel::insert_into(sub_tenant_memberships::table)
+    let membership: Uuid = diesel::insert_into(sub_tenant_memberships::table)
         .values((
             sub_tenant_memberships::sub_tenant_id.eq(sub_tenant),
             sub_tenant_memberships::user_id.eq(user),
-            sub_tenant_memberships::roles.eq(roles
-                .iter()
-                .map(|role| (*role).to_owned())
-                .collect::<Vec<_>>()),
             sub_tenant_memberships::suspended_at.eq(suspended.then(Utc::now)),
         ))
-        .execute(connection)
+        .returning(sub_tenant_memberships::id)
+        .get_result(connection)
         .await
         .expect("the sub-tenant membership must be creatable");
+
+    for role in granted_roles(connection, organization, keys).await {
+        diesel::insert_into(role_grants::table)
+            .values((
+                role_grants::organization_id.eq(organization),
+                role_grants::role_id.eq(role),
+                role_grants::sub_tenant_id.eq(Some(sub_tenant)),
+                role_grants::sub_tenant_membership_id.eq(Some(membership)),
+            ))
+            .execute(connection)
+            .await
+            .expect("the sub-tenant grant must be creatable");
+    }
 }
 
 async fn suspend_organization_member(
@@ -408,14 +503,22 @@ async fn sub_tenant_access_resolves_across_every_tier() {
         );
     }
 
-    join_sub_tenant(&mut connection, atlas, guest_id, &["default"], false).await;
+    join_sub_tenant(
+        &mut connection,
+        organization,
+        atlas,
+        guest_id,
+        &["default"],
+        false,
+    )
+    .await;
     let (status, _headers, body) =
         send(&router, "GET", &sub_tenant_path(atlas), None, Some(&guest)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["reach"], json!("Grant"));
     assert_eq!(
         body["roles"],
-        json!(["default"]),
+        json!(["Default"]),
         "the organization's editor role must not cascade to a guest",
     );
     assert_eq!(
@@ -436,7 +539,14 @@ async fn sub_tenant_access_resolves_across_every_tier() {
     // An organization-level team is inherited by every sub-tenant, and a
     // scoped team never leaves its own.
     // ---------------------------------------------------------------------
-    join_team(&mut connection, general, teammate_id, &["editor"]).await;
+    join_team(
+        &mut connection,
+        organization,
+        general,
+        teammate_id,
+        &["editor"],
+    )
+    .await;
     for (target, name) in [(main, "Main"), (atlas, "Atlas")] {
         let (status, _headers, body) = send(
             &router,
@@ -457,7 +567,14 @@ async fn sub_tenant_access_resolves_across_every_tier() {
     }
 
     let atlas_crew = create_team(&mut connection, organization, "Atlas Crew", Some(atlas)).await;
-    join_team(&mut connection, atlas_crew, crew_id, &["editor"]).await;
+    join_team(
+        &mut connection,
+        organization,
+        atlas_crew,
+        crew_id,
+        &["editor"],
+    )
+    .await;
     let (status, _headers, body) =
         send(&router, "GET", &sub_tenant_path(atlas), None, Some(&crew)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -481,8 +598,23 @@ async fn sub_tenant_access_resolves_across_every_tier() {
         "full",
     )
     .await;
-    join_sub_tenant(&mut connection, atlas, polyglot_id, &["editor"], false).await;
-    join_team(&mut connection, general, polyglot_id, &["billing"]).await;
+    join_sub_tenant(
+        &mut connection,
+        organization,
+        atlas,
+        polyglot_id,
+        &["editor"],
+        false,
+    )
+    .await;
+    join_team(
+        &mut connection,
+        organization,
+        general,
+        polyglot_id,
+        &["billing"],
+    )
+    .await;
     let (status, _headers, body) = send(
         &router,
         "GET",
@@ -494,7 +626,7 @@ async fn sub_tenant_access_resolves_across_every_tier() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["roles"],
-        json!(["billing", "default", "editor"]),
+        json!(["Billing", "Default", "Editor"]),
         "the resolved roles are the deduplicated union of every applying grant",
     );
     assert_eq!(
@@ -556,7 +688,7 @@ async fn sub_tenant_access_resolves_across_every_tier() {
 
     // A sub-tenant suspension closes the teams scoped to that sub-tenant, and
     // nothing else.
-    join_sub_tenant(&mut connection, atlas, crew_id, &[], true).await;
+    join_sub_tenant(&mut connection, organization, atlas, crew_id, &[], true).await;
     let (status, _headers, _body) =
         send(&router, "GET", &team_path(atlas_crew), None, Some(&crew)).await;
     assert_eq!(

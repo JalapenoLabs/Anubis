@@ -309,6 +309,11 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         area: "tenancy",
     },
     RouteEntry {
+        method: "PATCH",
+        path: "/tenancy/organizations/{organization_id}/members/{membership_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
         method: "DELETE",
         path: "/tenancy/organizations/{organization_id}/members/{membership_id}",
         area: "tenancy",
@@ -346,6 +351,37 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "DELETE",
         path: "/tenancy/teams/{team_id}/invitations/{invitation_id}",
+        area: "tenancy",
+    },
+    // An organization's runtime roles, behind the role editor.
+    RouteEntry {
+        method: "GET",
+        path: "/tenancy/organizations/{organization_id}/roles",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tenancy/organizations/{organization_id}/roles",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PATCH",
+        path: "/tenancy/organizations/{organization_id}/roles/{role_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "DELETE",
+        path: "/tenancy/organizations/{organization_id}/roles/{role_id}",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "PUT",
+        path: "/tenancy/organizations/{organization_id}/role-order",
+        area: "tenancy",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/tenancy/teams/{team_id}/roles",
         area: "tenancy",
     },
     // The signed-in user's own notification inbox, mounted beside the

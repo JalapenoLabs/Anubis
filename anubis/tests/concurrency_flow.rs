@@ -19,8 +19,8 @@ use std::time::Duration;
 use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
-    dead_jobs, jobs as jobs_table, sessions, team_memberships, teams, user_avatars,
-    webhook_deliveries, webhook_endpoints,
+    dead_jobs, jobs as jobs_table, organizations, role_grants, roles, sessions, team_memberships,
+    teams, user_avatars, webhook_deliveries, webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -36,7 +36,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use support::{
-    Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, socket,
+    Harness, PASSWORD, TestDatabase, invitation_token, register, role_id, send, session_token,
+    socket,
 };
 
 /// How many racers a test fires at once.
@@ -94,7 +95,9 @@ async fn one_invitation_admits_exactly_one_claimant() {
     let admin = register(&harness.router, "admin@example.com").await;
     let team_id = harness.bootstrapped_team(&admin).await;
 
-    let invite = json!({ "email": "invitee@example.com", "team_id": team_id, "roles": ["editor"] });
+    let editor = role_id(&harness.router, &admin, team_id, "editor").await;
+    let invite =
+        json!({ "email": "invitee@example.com", "team_id": team_id, "role_ids": [editor] });
     let (status, _headers, body) = send(
         &harness.router,
         "POST",
@@ -466,8 +469,12 @@ async fn simultaneous_demotions_keep_a_team_administrable() {
     let team_id = harness.bootstrapped_team(&first).await;
     let second = register(&harness.router, "second-admin@example.com").await;
 
-    let invite =
-        json!({ "email": "second-admin@example.com", "team_id": team_id, "roles": ["admin"] });
+    let administrator = role_id(&harness.router, &first, team_id, "admin").await;
+    let invite = json!({
+        "email": "second-admin@example.com",
+        "team_id": team_id,
+        "role_ids": [administrator],
+    });
     let (status, _headers, body) = send(
         &harness.router,
         "POST",
@@ -493,18 +500,28 @@ async fn simultaneous_demotions_keep_a_team_administrable() {
     let (first_membership, second_membership) = (memberships[0], memberships[1]);
 
     // Each demotes the other, and both are made to arrive together: a third
-    // connection holds the very lock the handlers take, so both get past their
-    // guards, both queue behind it, and neither can win by being scheduled
-    // first. Without that, the scheduler usually runs one request to
-    // completion, the other's guard finds it is no longer an admin, and the
-    // race the invariant exists for is never actually run.
-    let demote = json!({ "roles": ["editor"] });
+    // connection holds the very lock the handlers take first, the team's
+    // organization, so both get past their guards, both queue behind it, and
+    // neither can win by being scheduled first. Without that, the scheduler
+    // usually runs one request to completion, the other's guard finds it is no
+    // longer an admin, and the race the invariant exists for is never run.
+    let editor = role_id(&harness.router, &first, team_id, "editor").await;
+    let demote = json!({ "role_ids": [editor] });
+    let organization_id: Uuid = {
+        let mut connection = harness.pool.get().await.expect("connection");
+        teams::table
+            .find(team_id)
+            .select(teams::organization_id)
+            .first(&mut connection)
+            .await
+            .expect("the team has an organization")
+    };
     let mut blocker = harness.pool.get().await.expect("connection");
     let racing = blocker
         .transaction::<_, diesel::result::Error, _>(async |transaction| {
-            teams::table
-                .find(team_id)
-                .select(teams::id)
+            organizations::table
+                .find(organization_id)
+                .select(organizations::id)
                 .for_update()
                 .first::<Uuid>(transaction)
                 .await?;
@@ -528,11 +545,10 @@ async fn simultaneous_demotions_keep_a_team_administrable() {
     let accepted = outcomes.iter().filter(|status| status.is_success()).count();
     assert_eq!(accepted, 1, "exactly one demotion lands: {outcomes:?}");
 
-    // The loser is refused either way. `409` is what the invariant answers
-    // when both requests were already past their guards, which is what the
-    // lock above arranges; `403` is what the guard itself answers if the
-    // winner still managed to commit first, on a machine slow enough that the
-    // queuing window expired early. Either is a refusal; being served is not.
+    // The loser is refused either way. Its standing is read again once it
+    // holds the lock, so it finds itself demoted and answers `403`; `409` is
+    // what the invariant answers had it still been an administrator there.
+    // Either is a refusal; being served is not.
     let refused = outcomes
         .iter()
         .find(|status| !status.is_success())
@@ -543,10 +559,11 @@ async fn simultaneous_demotions_keep_a_team_administrable() {
     );
 
     let mut connection = harness.pool.get().await.expect("connection");
-    let admins: i64 = team_memberships::table
-        .filter(team_memberships::team_id.eq(team_id))
-        .filter(team_memberships::user_id.is_not_null())
-        .filter(team_memberships::roles.contains(vec![anubis::tenancy::ADMIN_ROLE]))
+    let admins: i64 = role_grants::table
+        .inner_join(roles::table)
+        .filter(role_grants::team_id.eq(team_id))
+        .filter(role_grants::resource_id.is_null())
+        .filter(roles::key.eq(anubis::tenancy::ADMIN_ROLE))
         .count()
         .get_result(&mut connection)
         .await

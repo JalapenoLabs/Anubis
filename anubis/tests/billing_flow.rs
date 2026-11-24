@@ -509,7 +509,6 @@ async fn only_members_who_may_spend_money_reach_the_write_endpoints() {
         .values((
             organization_memberships::organization_id.eq(organization_id),
             organization_memberships::user_id.eq(plain_id),
-            organization_memberships::roles.eq(vec!["default".to_owned()]),
         ))
         .execute(&mut harness.pool.get().await.expect("a connection"))
         .await
