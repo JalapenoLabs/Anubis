@@ -170,18 +170,40 @@ describe('EventStream', () => {
     stream.close()
   })
 
-  it<Context>('should reconnect at once after the server ends it, resuming after the last id', async (context) => {
+  it<Context>('should reconnect at once when a steady stream ends, resuming after the last id', async (context) => {
     const stream = open(context)
     await settle()
     expect(context.connections[0].lastEventId).toBeNull()
 
     context.connections[0].push(event('e-1', { type: 'live' }))
+    await settle(20_000)
     context.connections[0].push(event('e-2', { type: 'event', channel: 'c', event: 'x', payload: null }))
+    await settle(20_000)
     context.connections[0].end()
     await settle()
 
     expect(context.connections).toHaveLength(2)
     expect(context.connections[1].lastEventId).toBe('e-2')
+    stream.close()
+  })
+
+  it<Context>('should back off from a stream that keeps ending as soon as it opens', async (context) => {
+    const stream = open(context)
+    await settle()
+
+    // A proxy that forwards the opening and then truncates, every time. The
+    // backoff doubles instead of letting the tab reconnect as fast as it can.
+    let waited = 0
+    for (const delay of [ 500, 1000, 2000 ]) {
+      const latest = context.connections.at(-1)
+      latest?.push(event(`e-${waited}`, { type: 'live' }))
+      latest?.end()
+      await settle(delay - 1)
+      const before = context.connections.length
+      await settle(1)
+      expect(context.connections.length).toBe(before + 1)
+      waited += delay
+    }
     stream.close()
   })
 
@@ -335,7 +357,7 @@ describe('EventStream', () => {
     await settle()
     context.connections[0].push(event('e-1', { type: 'live' }))
     context.connections[0].end()
-    await settle()
+    await settle(500)
 
     expect(context.connections.map((connection) => connection.url)).toEqual([
       'http://localhost/stream?attempt=1',

@@ -170,7 +170,7 @@ describe('RealtimeClient', () => {
     await settle()
     current(context).push(frame({ type: 'live' }, 'e-2'))
     current(context).end()
-    await settle()
+    await settle(500)
 
     const resumed = current(context)
     expect(context.connections).toHaveLength(3)
@@ -239,7 +239,7 @@ describe('RealtimeClient', () => {
     }))
     current(context).push(frame({ type: 'live' }, 'e-1'))
     current(context).end()
-    await settle()
+    await settle(500)
 
     // The reconnect asks for it fresh: it never went live on this cursor.
     expect(current(context).lastEventId).toBe('e-1')

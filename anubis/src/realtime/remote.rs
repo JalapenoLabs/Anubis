@@ -54,6 +54,17 @@ const KEY_PREFIX: &str = "{anubis:realtime}:";
 /// How long the pump waits before its first reconnection attempt.
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 
+/// How often the pump checks that its subscriber connection still answers.
+///
+/// A connection a network black-holed never errors and never delivers, so
+/// without a check it would look idle forever while every stream on the
+/// instance heard nothing. Thirty seconds bounds that to under a minute.
+const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// How long a keepalive `PING` may go unanswered before the connection is
+/// taken for dead and rebuilt.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The most channels one `SUBSCRIBE` or `UNSUBSCRIBE` names.
 ///
 /// Large enough that the burst of every tab reconnecting after a deploy is a
@@ -318,8 +329,15 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
             .collect();
         let mut healthy = subscribe(&mut commands, &registry, &everything).await;
 
+        let mut keepalive =
+            tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         while healthy {
             tokio::select! {
+                _tick = keepalive.tick() => {
+                    healthy = still_answers(&mut commands).await;
+                }
                 announced = interest.recv() => {
                     let Some(first) = announced else { return };
                     // Every change already waiting goes in the same round
@@ -355,6 +373,27 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
 
         if !wait_before_retry(&mut interest, &mut wanted, backoff).await {
             return;
+        }
+    }
+}
+
+/// Whether the subscriber connection still answers a `PING` in time.
+async fn still_answers(commands: &mut PubSubSink) -> bool {
+    match tokio::time::timeout(KEEPALIVE_TIMEOUT, commands.ping::<redis::Value>()).await {
+        Ok(Ok(_pong)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error.message = %error,
+                "realtime fanout's Redis subscriber connection failed a keepalive: \
+                 {{error.message}}",
+            );
+            false
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "realtime fanout's Redis subscriber connection stopped answering; rebuilding it",
+            );
+            false
         }
     }
 }

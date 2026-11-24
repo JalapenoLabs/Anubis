@@ -247,9 +247,8 @@ impl Harness {
 ///
 /// Only a benchmark needs this: everything else, event streams included,
 /// drives the router directly with `oneshot`, which is faster and needs no
-/// port. The
-/// server runs with connect info, as production does, so the rate limiter can
-/// charge a caller; it stops when the test's runtime does.
+/// port. The server runs with connect info, as production does, so the rate
+/// limiter can charge a caller; it stops when the test's runtime does.
 ///
 /// Must be called from inside a runtime, which every `#[tokio::test]` is.
 ///

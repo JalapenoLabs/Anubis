@@ -95,6 +95,7 @@ use std::time::Duration;
 
 use axum::response::sse::Event;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::config::AppConfig;
 use crate::http::ApiError;
@@ -306,9 +307,6 @@ impl Channels {
             .into_iter()
             .map(|channel| (channel, start))
             .collect();
-        if requests.len() > MAX_CHANNELS_PER_STREAM {
-            return Err(Error::new(ErrorKind::TooManyChannels(requests.len())));
-        }
         self.open(subscriber, requests, Vec::new()).await
     }
 
@@ -316,6 +314,11 @@ impl Channels {
     ///
     /// `refusals` are channels the caller already refused, sent first so the
     /// client hears why a channel it asked for is silent.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when, once a channel named twice is counted once,
+    /// more than [`MAX_CHANNELS_PER_STREAM`] remain, when the account is past
+    /// its share, or when the Redis backend cannot open the stream in time.
     pub(crate) async fn open(
         &self,
         subscriber: Subscriber,
@@ -329,28 +332,58 @@ impl Channels {
             .map(|(channel, start)| (channel.to_string(), start))
             .filter(|(name, _start)| seen.insert(name.clone()))
             .collect();
+        if requests.len() > MAX_CHANNELS_PER_STREAM {
+            return Err(Error::new(ErrorKind::TooManyChannels(requests.len())));
+        }
+
+        let registered = self.register(subscriber.user().id, &requests).await?;
+        let epoch = registered.snapshot.epoch;
+        let head = registered.snapshot.head;
+        let (listener, opening) = registered.into_opening(refusals);
+
+        Ok(EventStream::new(
+            opening,
+            listener,
+            epoch,
+            head,
+            subscriber.into_drain(),
+        ))
+    }
+
+    /// Registers a stream's queue for `account` and reads its replay.
+    ///
+    /// In process both happen under the publish lock; under Redis the
+    /// subscriptions are confirmed before the replay is read. Either way every
+    /// event lands in the replay or on the queue, and never in neither.
+    async fn register(
+        &self,
+        account: Uuid,
+        requests: &[(String, Start)],
+    ) -> Result<Registered, Error> {
         let names: Vec<String> = requests.iter().map(|(name, _start)| name.clone()).collect();
-        let account = subscriber.user().id;
         let over_quota = |_over: registry::OverQuota| Error::new(ErrorKind::OverQuota);
 
-        let (listener, full, mut snapshot, granted) = match &self.inner.backend {
+        match &self.inner.backend {
             Backend::InProcess(log) => {
-                // Registering and reading under the publish lock: every event
-                // is in the snapshot or on the queue, and never in neither.
                 let log = lock(log);
                 let (listener, full) = self
                     .inner
                     .registry
                     .listen(account, &names)
                     .map_err(over_quota)?;
-                let granted = without(&requests, &full);
+                let granted = without(requests, &full);
                 let snapshot = log.snapshot(
                     granted
                         .iter()
                         .map(|(name, start)| (name.as_str(), start.since())),
                 );
                 drop(log);
-                (listener, full, snapshot, granted)
+                Ok(Registered {
+                    listener,
+                    full,
+                    snapshot,
+                    granted,
+                })
             }
             Backend::Redis(remote) => {
                 let (mut listener, full) = self
@@ -358,12 +391,12 @@ impl Channels {
                     .registry
                     .listen(account, &names)
                     .map_err(over_quota)?;
-                let granted = without(&requests, &full);
+                let granted = without(requests, &full);
                 let deadline = tokio::time::Instant::now() + OPEN_TIMEOUT;
 
-                // Redis confirms the subscriptions before the replay is read,
-                // so an event published in between lands on the queue, where
-                // the stream skips it if the replay already carried it.
+                // An event published between the confirmation and the read
+                // lands on the queue, where the stream skips it if the replay
+                // already carried it.
                 let confirmed = tokio::time::timeout_at(deadline, listener.ready()).await;
                 if !matches!(confirmed, Ok(true)) {
                     return Err(Error::new(ErrorKind::Transport(None)));
@@ -377,9 +410,40 @@ impl Channels {
                     .await
                     .map_err(|_elapsed| Error::new(ErrorKind::Transport(None)))?
                     .map_err(|source| Error::new(ErrorKind::Transport(Some(source))))?;
-                (listener, full, snapshot, granted)
+                Ok(Registered {
+                    listener,
+                    full,
+                    snapshot,
+                    granted,
+                })
             }
-        };
+        }
+    }
+}
+
+/// A stream's queue, registered and read, before its opening is built.
+struct Registered {
+    listener: registry::Listener,
+    /// The channels refused because the process holds as many as it may.
+    full: Vec<String>,
+    snapshot: replay::Snapshot,
+    /// The channels carried, each with where it begins.
+    granted: Vec<(String, Start)>,
+}
+
+impl Registered {
+    /// Builds what the stream opens with, and hands back its queue.
+    ///
+    /// Refusals first, so the client hears why a channel it asked for is
+    /// silent, then each reset, then the replay in sequence order, then the
+    /// `live` frame carrying the cursor.
+    fn into_opening(self, refusals: Vec<Refusal>) -> (registry::Listener, VecDeque<Event>) {
+        let Self {
+            listener,
+            full,
+            mut snapshot,
+            granted,
+        } = self;
 
         let mut opening = VecDeque::new();
         let full = full
@@ -416,13 +480,7 @@ impl Channels {
                 .data(Frame::Live.render()),
         );
 
-        Ok(EventStream::new(
-            opening,
-            listener,
-            snapshot.epoch,
-            snapshot.head,
-            subscriber.into_drain(),
-        ))
+        (listener, opening)
     }
 }
 
@@ -641,10 +699,11 @@ impl Error {
         matches!(self.kind, ErrorKind::Configuration(_))
     }
 
-    /// Returns `true` when Redis failed this one publish or stream, or did not
-    /// answer in time.
+    /// Returns `true` when Redis failed this one publish or stream, did not
+    /// answer in time, or lost the subscriber connection while a stream was
+    /// waiting for its subscriptions to be confirmed.
     ///
-    /// The connection reconnects underneath, so a later attempt may well
+    /// The connections reconnect underneath, so a later attempt may well
     /// succeed. Events are not queued for retry; see the module docs.
     #[must_use]
     pub fn is_transport(&self) -> bool {

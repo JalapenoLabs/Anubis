@@ -17,6 +17,18 @@ const RECONNECT_BASE = 500
 const RECONNECT_CEILING = 10_000
 
 /**
+ * How long a connection has to have stayed open, in milliseconds, before its
+ * end counts as an ordinary one.
+ *
+ * The server ends a healthy stream after five minutes, and a client should
+ * reconnect at once then. A connection that ends sooner than this, even one
+ * that delivered a frame first, is treated as a failure and backs off, so a
+ * proxy that accepts a stream and then truncates it cannot drive a tab into
+ * reconnecting as fast as the round trip allows.
+ */
+const STEADY_AFTER = 30_000
+
+/**
  * The longest a server's `Retry-After` is honored for, in milliseconds.
  *
  * A server asking for a minute is asking for patience; one asking for an hour
@@ -78,12 +90,14 @@ export type EventStreamOptions = {
 /** How one connection ended, and how long the server asked to be left. */
 type Ending = {
   kind:
-    /** The server closed it after sending something: reconnect at once and resume. */
+    /** The server closed it after sending something: resume. */
     | 'ended'
-    /** It failed, broke, or ended having said nothing: reconnect on the backoff. */
+    /** It failed, broke, or ended having said nothing: resume after a wait. */
     | 'failed'
     /** The server refused it, and will refuse it again: stop. */
     | 'refused'
+  /** Whether it delivered and stayed open past `STEADY_AFTER`. */
+  steady: boolean
   /** The least the next attempt waits, in milliseconds, from `Retry-After`. */
   waitAtLeast: number
 }
@@ -184,12 +198,21 @@ export class EventStream {
         return
       }
 
-      const backoff = ending.kind === 'ended'
-        ? 0
-        : reconnectDelay(this.attempt)
-      if (ending.kind === 'failed') {
+      // Only a connection that proved itself resets the backoff. A steady
+      // stream the server ended resumes at once; anything else waits on the
+      // doubling schedule, however it ended.
+      let backoff = 0
+      if (ending.steady) {
+        this.attempt = 0
+        if (ending.kind === 'failed') {
+          backoff = reconnectDelay(0)
+        }
+      }
+      else {
+        backoff = reconnectDelay(this.attempt)
         this.attempt += 1
       }
+
       this.setState('connecting')
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null
@@ -228,31 +251,30 @@ export class EventStream {
       if (!signal.aborted) {
         console.debug('EventStream could not connect; it will retry', error)
       }
-      return { kind: 'failed', waitAtLeast: 0 }
+      return { kind: 'failed', steady: false, waitAtLeast: 0 }
     }
 
     const waitAtLeast = retryAfter(response)
     if (response.status >= 400 && response.status < 500) {
       if (RETRYABLE_REFUSALS.has(response.status)) {
         console.debug('The event stream was asked to wait; it will retry', response.status)
-        return { kind: 'failed', waitAtLeast }
+        return { kind: 'failed', steady: false, waitAtLeast }
       }
       console.warn('The server refused the event stream, so it will not reconnect', response.status)
-      return { kind: 'refused', waitAtLeast }
+      return { kind: 'refused', steady: false, waitAtLeast }
     }
     if (!response.ok || !response.body) {
       console.debug('The event stream could not open; it will retry', response.status)
-      return { kind: 'failed', waitAtLeast }
+      return { kind: 'failed', steady: false, waitAtLeast }
     }
     if (!response.headers.get('content-type')?.startsWith('text/event-stream')) {
       console.warn('The server answered the event stream with something else, so it will not reconnect')
       await response.body.cancel().catch((error: unknown) => {
         console.debug('EventStream could not cancel an answer it will not read', error)
       })
-      return { kind: 'refused', waitAtLeast }
+      return { kind: 'refused', steady: false, waitAtLeast }
     }
 
-    this.attempt = 0
     this.setState('open')
     return this.consume(response.body, signal)
   }
@@ -266,6 +288,7 @@ export class EventStream {
   private async consume(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<Ending> {
     const reader = body.getReader()
     const decoder = new TextDecoder()
+    const openedAt = Date.now()
 
     // A server that ends a stream before sending a thing is one to back off
     // from, not one to reconnect to in a tight loop.
@@ -315,28 +338,34 @@ export class EventStream {
       },
     })
 
+    // How the connection ended, judged by what it delivered and how long it
+    // lived, which together decide whether the backoff resets.
+    const ending = (kind: Ending['kind']): Ending => ({
+      kind,
+      steady: heardAnything && Date.now() - openedAt >= STEADY_AFTER,
+      waitAtLeast: 0,
+    })
+
     restartWatchdog()
     try {
       for (;;) {
         const { done, value } = await reader.read()
         if (stalled) {
           console.debug('The event stream fell silent past its heartbeats; it will reconnect')
-          return { kind: 'failed', waitAtLeast: 0 }
+          return ending('failed')
         }
         if (done) {
           parser.feed(decoder.decode())
-          return {
-            kind: heardAnything
-              ? 'ended'
-              : 'failed',
-            waitAtLeast: 0,
+          if (!heardAnything) {
+            return ending('failed')
           }
+          return ending('ended')
         }
 
         restartWatchdog()
         parser.feed(decoder.decode(value, { stream: true }))
         if (overflowed) {
-          return { kind: 'failed', waitAtLeast: 0 }
+          return ending('failed')
         }
       }
     }
@@ -344,7 +373,7 @@ export class EventStream {
       if (!signal.aborted) {
         console.debug('The event stream broke; it will reconnect', error)
       }
-      return { kind: 'failed', waitAtLeast: 0 }
+      return ending('failed')
     }
     finally {
       if (watchdog) {

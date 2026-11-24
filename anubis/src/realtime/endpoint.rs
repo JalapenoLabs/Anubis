@@ -98,7 +98,11 @@ async fn open(
             "A stream may carry at most {MAX_CHANNELS_PER_STREAM} channels."
         )));
     }
-    let fresh: HashSet<&str> = request.fresh.split(SEPARATOR).collect();
+    let fresh: HashSet<&str> = request
+        .fresh
+        .split(SEPARATOR)
+        .filter(|name| !name.is_empty())
+        .collect();
 
     let mut refusals = Vec::new();
     let mut named = Vec::with_capacity(requested.len());
