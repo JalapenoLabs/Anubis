@@ -45,7 +45,7 @@ use crate::audit;
 use crate::auth::extract::{CurrentUser, SignedIn};
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
-use crate::auth::session::SignInMethod;
+use crate::auth::session::{Sessions, SignInMethod};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
 use crate::config::{AppConfig, AvatarConfig, Environment};
@@ -249,6 +249,7 @@ struct MessageBody {
 
 async fn register(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<RegisterBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -294,6 +295,7 @@ async fn register(
 
     let jar = signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &created,
@@ -317,6 +319,7 @@ struct MfaChallengeBody {
 
 async fn login(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<CredentialsBody>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -393,6 +396,7 @@ async fn login(
 
     let jar = signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &user,
@@ -409,11 +413,13 @@ async fn login(
 
 async fn logout(
     State(state): State<AuthState>,
+    sessions: Sessions,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
     if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
         let mut connection = state.pool.get().await.map_err(log_internal)?;
-        session::delete(&mut connection, cookie.value())
+        sessions
+            .revoke(&mut connection, cookie.value())
             .await
             .map_err(log_internal)?;
     }
@@ -606,6 +612,7 @@ async fn request_password_reset(
 
 async fn confirm_password_reset(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<ResetBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -621,8 +628,10 @@ async fn confirm_password_reset(
 
     let password_hash = state.hasher.hash(body.password).await?;
 
+    // The session store's error type, because the revocation below may be a
+    // Redis write; it converts from every Diesel error the rest raises.
     connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+        .transaction::<(), session::Error, _>(async |transaction| {
             // A password the account chose through its own inbox replaces any
             // temporary one an operator set, so the flag goes with it.
             let user: User = diesel::update(users::table.find(user_id))
@@ -637,8 +646,10 @@ async fn confirm_password_reset(
             // A reset proves the old credentials may be compromised: no
             // session created under them survives, and neither does any
             // program connected under them. The account is the actor, since
-            // it proved itself through its inbox.
-            session::delete_all_for_user(transaction, user_id).await?;
+            // it proved itself through its inbox. Revoking before the commit
+            // means a store that cannot sign everyone out leaves the old
+            // password in place rather than the old sessions.
+            sessions.revoke_all(transaction, user_id).await?;
             crate::oauth_server::revoke_every_grant(transaction, &context.by(&user), user_id)
                 .await?;
             Ok(())
@@ -712,13 +723,14 @@ async fn deliver(mailer: &Mailer, email: Email) {
 ///
 /// Every path that signs somebody in comes through here, which is what makes
 /// the [`audit::SESSION_CREATED`] record complete rather than a convention
-/// each path has to remember. The session and its record commit together, so
-/// a browser never holds a session the log does not know about. `context` is
-/// the request's, so the record carries the address and browser the sign-in
-/// came from, and the location the browser reported; see
-/// [`crate::server::origin`].
+/// each path has to remember. The record and the session are written in one
+/// transaction and the cookie is issued only after it commits, so a browser
+/// never holds a session the log does not know about. `context` is the
+/// request's, so the record carries the address and browser the sign-in came
+/// from, and the location the browser reported; see [`crate::server::origin`].
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
+    sessions: &Sessions,
     connection: &mut diesel_async::AsyncPgConnection,
     context: &audit::Context,
     user: &User,
@@ -732,8 +744,7 @@ pub(crate) async fn signed_in_jar(
     );
 
     let token = connection
-        .transaction::<_, diesel::result::Error, _>(async |transaction| {
-            let token = session::create(transaction, user.id).await?;
+        .transaction::<_, session::Error, _>(async |transaction| {
             audit::record(
                 transaction,
                 &actor,
@@ -747,7 +758,9 @@ pub(crate) async fn signed_in_jar(
                     )),
             )
             .await?;
-            Ok(token)
+            // Last, because a Redis store cannot roll back: a session written
+            // before a step that then failed would outlive its sign-in.
+            sessions.create(transaction, user.id).await
         })
         .await
         .map_err(log_internal)?;

@@ -8,18 +8,36 @@
 //! configuration uses, so a key that would fail a production boot fails here.
 //! Run from an application root, doctor also validates `config/roles.yml` and
 //! `config/billing.yml` with the same parsers the server boots with.
+//!
+//! The session store check names where sessions are kept. When `SESSION_STORE`
+//! puts them in Redis, it also asks that Redis how it persists, because a
+//! Redis that persists nothing signs every account out when it restarts: an
+//! append-only file is what a session store wants, RDB snapshots lose the
+//! sign-ins since the last one, and neither is a warning.
 
+use std::collections::HashMap;
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anubis::auth::secret_box::SecretKey;
+use anubis::config::SessionStore;
 
 /// How long the database gets to accept a connection before doctor gives up.
 /// Long enough for a cold local Postgres, short enough to not feel hung.
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long Redis gets to answer every question doctor asks it, together.
+/// The same bound as the database, for the same reason.
+const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The variable holding the key that encrypts secrets at rest.
 const SECRET_KEY_VAR: &str = "ANUBIS_SECRET_KEY";
+
+/// The variable choosing where sessions are kept.
+const SESSION_STORE_VAR: &str = "SESSION_STORE";
+
+/// The variable naming the Redis a Redis session store lives in.
+const REDIS_URL_VAR: &str = "REDIS_URL";
 
 enum Status {
     Ok,
@@ -36,6 +54,7 @@ struct Check {
 pub(crate) fn run() -> ExitCode {
     let mut checks = tool_checks();
     checks.push(database_check());
+    checks.push(session_store_check());
     checks.push(secret_key_check());
     checks.push(roles_check());
     checks.push(billing_check());
@@ -116,6 +135,172 @@ fn database_check() -> Check {
             detail: "DATABASE_URL not set; `yarn dev` provides it for the dev database".to_owned(),
         },
     }
+}
+
+/// Where sessions are kept, read with the parser the server boots with.
+///
+/// A value the server would refuse fails here, and so does a Redis store with
+/// no reachable Redis, because either one stops the boot.
+fn session_store_check() -> Check {
+    let named = std::env::var(SESSION_STORE_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let store = match named.map(|value| value.parse::<SessionStore>()) {
+        None => SessionStore::default(),
+        Some(Ok(store)) => store,
+        Some(Err(error)) => {
+            return Check {
+                status: Status::Fail,
+                detail: error.to_string(),
+            };
+        }
+    };
+
+    match store {
+        SessionStore::Postgres => Check {
+            status: Status::Ok,
+            detail: "sessions are kept in Postgres".to_owned(),
+        },
+        SessionStore::Redis => redis_sessions_check(),
+    }
+}
+
+/// How the Redis that holds the sessions keeps them across a restart.
+fn redis_sessions_check() -> Check {
+    let Some(url) = std::env::var(REDIS_URL_VAR)
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return Check {
+            status: Status::Fail,
+            detail: format!(
+                "{SESSION_STORE_VAR} is redis, and {REDIS_URL_VAR} is not set; the server refuses \
+                 to boot without the Redis to keep sessions in"
+            ),
+        };
+    };
+
+    match read_persistence(url.trim()) {
+        Err(reason) => Check {
+            status: Status::Fail,
+            detail: format!(
+                "sessions are kept in Redis, and {REDIS_URL_VAR} did not answer: {reason}"
+            ),
+        },
+        Ok(Persistence::AppendOnlyFile) => Check {
+            status: Status::Ok,
+            detail: "sessions are kept in Redis, which persists them in its append-only file"
+                .to_owned(),
+        },
+        Ok(Persistence::Snapshots) => Check {
+            status: Status::Ok,
+            detail: "sessions are kept in Redis, which persists them in RDB snapshots; a restart \
+                     loses the sign-ins since the last one, and `appendonly yes` keeps every one"
+                .to_owned(),
+        },
+        Ok(Persistence::Nothing) => Check {
+            status: Status::Warn,
+            detail: "sessions are kept in Redis, which persists nothing (appendonly is off and \
+                     save is empty): a Redis restart signs everyone out. Set `appendonly yes`"
+                .to_owned(),
+        },
+        Ok(Persistence::Unreadable) => Check {
+            status: Status::Warn,
+            detail: "sessions are kept in Redis, whose persistence could not be read (it refused \
+                     CONFIG GET, as managed Redis often does); confirm it persists, because a \
+                     restart without persistence signs everyone out"
+                .to_owned(),
+        },
+    }
+}
+
+/// What a Redis does to keep its data across a restart.
+#[derive(Debug, PartialEq, Eq)]
+enum Persistence {
+    /// It appends every write to a file it replays on start.
+    AppendOnlyFile,
+    /// It snapshots on a schedule, losing what changed since the last one.
+    Snapshots,
+    /// It keeps nothing: a restart starts empty.
+    Nothing,
+    /// It would not say.
+    Unreadable,
+}
+
+/// The verdict from `CONFIG GET appendonly` and `CONFIG GET save`.
+///
+/// `save` lists the snapshot schedule as pairs of seconds and changes, and is
+/// empty when snapshots are off. The append-only file wins when both are on,
+/// because it is the one that loses nothing.
+fn persistence(appendonly: &str, save: &str) -> Persistence {
+    if appendonly.trim().eq_ignore_ascii_case("yes") {
+        return Persistence::AppendOnlyFile;
+    }
+    if save.trim().is_empty() {
+        return Persistence::Nothing;
+    }
+    Persistence::Snapshots
+}
+
+/// The verdict from `INFO persistence`, for a Redis that refuses `CONFIG`.
+///
+/// That section says whether the append-only file is on, but not what the
+/// snapshot schedule is, so anything short of the file is unreadable rather
+/// than a guess.
+fn persistence_from_info(info: &str) -> Persistence {
+    if info.lines().any(|line| line.trim() == "aof_enabled:1") {
+        return Persistence::AppendOnlyFile;
+    }
+    Persistence::Unreadable
+}
+
+/// Asks the Redis at `url` how it persists, bounded by [`REDIS_TIMEOUT`].
+///
+/// The URL may carry a password, so no error here ever quotes it.
+fn read_persistence(url: &str) -> Result<Persistence, String> {
+    let client = redis::Client::open(url)
+        .map_err(|_error| "it is not a redis:// or rediss:// connection URL".to_owned())?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start an async runtime: {error}"))?;
+
+    runtime.block_on(async {
+        let asked = async {
+            let mut connection = client.get_multiplexed_async_connection().await?;
+            let appendonly = config_value(&mut connection, "appendonly").await;
+            let save = config_value(&mut connection, "save").await;
+            if let (Ok(appendonly), Ok(save)) = (appendonly, save) {
+                return Ok(persistence(&appendonly, &save));
+            }
+
+            let info: String = redis::cmd("INFO")
+                .arg("persistence")
+                .query_async(&mut connection)
+                .await?;
+            Ok::<_, redis::RedisError>(persistence_from_info(&info))
+        };
+
+        match tokio::time::timeout(REDIS_TIMEOUT, asked).await {
+            Err(_elapsed) => Err(format!("timed out after {}s", REDIS_TIMEOUT.as_secs())),
+            Ok(Err(error)) => Err(error.to_string()),
+            Ok(Ok(verdict)) => Ok(verdict),
+        }
+    })
+}
+
+/// One setting's value from `CONFIG GET`, empty when Redis has no such setting.
+async fn config_value(
+    connection: &mut redis::aio::MultiplexedConnection,
+    name: &str,
+) -> Result<String, redis::RedisError> {
+    let mut settings: HashMap<String, String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg(name)
+        .query_async(connection)
+        .await?;
+    Ok(settings.remove(name).unwrap_or_default())
 }
 
 /// The key that encrypts secrets at rest, parsed exactly as boot parses it.
@@ -241,4 +426,42 @@ fn connect_database(url: &str) -> Result<(), String> {
             Ok(Ok(_)) => Ok(()),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Persistence, persistence, persistence_from_info};
+
+    /// The snapshot schedule a stock `redis-server` runs with.
+    const STOCK_SAVE: &str = "3600 1 300 100 60 10000";
+
+    #[test]
+    fn an_append_only_file_persists_whatever_the_snapshots_do() {
+        assert_eq!(persistence("yes", ""), Persistence::AppendOnlyFile);
+        assert_eq!(persistence("yes", STOCK_SAVE), Persistence::AppendOnlyFile);
+        assert_eq!(persistence(" YES ", ""), Persistence::AppendOnlyFile);
+    }
+
+    #[test]
+    fn snapshot_points_alone_are_snapshots() {
+        assert_eq!(persistence("no", STOCK_SAVE), Persistence::Snapshots);
+    }
+
+    #[test]
+    fn neither_an_append_only_file_nor_snapshot_points_persists_nothing() {
+        assert_eq!(persistence("no", ""), Persistence::Nothing);
+        assert_eq!(persistence("no", "   "), Persistence::Nothing);
+    }
+
+    #[test]
+    fn info_confirms_an_append_only_file_and_nothing_less() {
+        let on = "# Persistence\r\nloading:0\r\naof_enabled:1\r\naof_rewrite_in_progress:0\r\n";
+        let off = "# Persistence\r\nloading:0\r\naof_enabled:0\r\n";
+
+        assert_eq!(persistence_from_info(on), Persistence::AppendOnlyFile);
+        // INFO never names the snapshot schedule, so an off file is not proof
+        // of nothing persisting.
+        assert_eq!(persistence_from_info(off), Persistence::Unreadable);
+        assert_eq!(persistence_from_info(""), Persistence::Unreadable);
+    }
 }

@@ -33,6 +33,7 @@ use crate::audit;
 use crate::auth::SignInMethod;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, signed_in_jar};
+use crate::auth::session::Sessions;
 use crate::auth::{CurrentUser, token};
 use crate::http::ApiError;
 use crate::schema::{user_passkeys, users, webauthn_states};
@@ -325,6 +326,7 @@ struct UserBody {
 
 async fn login_finish(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<LoginFinishBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -384,6 +386,7 @@ async fn login_finish(
     // A passkey is possession plus verification: strong auth, no TOTP step.
     let jar = signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &user,

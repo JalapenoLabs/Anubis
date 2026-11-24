@@ -23,7 +23,7 @@ use axum::http::request::Parts;
 use axum_extra::extract::CookieJar;
 
 use crate::auth::model::User;
-use crate::auth::session;
+use crate::auth::session::{self, Sessions};
 use crate::db::DbPool;
 use crate::http::ApiError;
 
@@ -47,7 +47,10 @@ pub const PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
 ///
 /// The extractor reads the connection pool from request extensions, which the
 /// auth router provides for its own routes. Application routers using
-/// `CurrentUser` add `.layer(Extension(pool.clone()))` the same way.
+/// `CurrentUser` add `.layer(Extension(pool.clone()))` the same way. The
+/// session store comes from the extension [`crate::server::harden`] puts on
+/// every request, so the configured store answers on every route; see
+/// `docs/sessions.md`.
 #[derive(Debug, Clone)]
 pub struct CurrentUser(pub User);
 
@@ -133,7 +136,8 @@ async fn signed_in_user(parts: &Parts) -> Result<User, ApiError> {
         ApiError::internal()
     })?;
 
-    let user = session::find_user(&mut connection, cookie.value())
+    let user = Sessions::for_request(parts)
+        .find_user(&mut connection, cookie.value())
         .await
         .map_err(|error| {
             tracing::error!(

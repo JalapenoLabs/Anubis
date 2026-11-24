@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::SignInMethod;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, signed_in_jar, validate_email};
+use crate::auth::session::Sessions;
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{mfa, user_token};
 use crate::http::ApiError;
@@ -125,6 +126,7 @@ struct MfaChallengeBody {
 
 async fn verify_code(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: crate::audit::Context,
     Json(body): Json<VerifyBody>,
 ) -> Result<Response, ApiError> {
@@ -189,6 +191,7 @@ async fn verify_code(
 
     let jar = signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &user,

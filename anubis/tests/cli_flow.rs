@@ -374,6 +374,87 @@ fn doctor_fails_on_a_malformed_secret_key() {
     );
 }
 
+#[test]
+fn doctor_names_postgres_as_the_session_store_by_default() {
+    let output = Command::new(ANUBIS)
+        .arg("doctor")
+        .env_remove("SESSION_STORE")
+        .output()
+        .expect("the anubis binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("[ ok ] sessions are kept in Postgres"),
+        "doctor must name the default store: {stdout}",
+    );
+}
+
+#[test]
+fn doctor_fails_a_session_store_the_server_would_refuse() {
+    for (store, redis_url, expected) in [
+        ("memcached", None, "[FAIL] invalid value for SESSION_STORE"),
+        (
+            "redis",
+            None,
+            "[FAIL] SESSION_STORE is redis, and REDIS_URL is not set",
+        ),
+        (
+            "redis",
+            // Nothing listens on the discard port, so the connection is refused
+            // at once rather than timing out.
+            Some("redis://127.0.0.1:9"),
+            "[FAIL] sessions are kept in Redis, and REDIS_URL did not answer",
+        ),
+    ] {
+        let mut command = Command::new(ANUBIS);
+        command.arg("doctor").env("SESSION_STORE", store);
+        match redis_url {
+            Some(url) => command.env("REDIS_URL", url),
+            None => command.env_remove("REDIS_URL"),
+        };
+        let output = command.output().expect("the anubis binary runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(stdout.contains(expected), "for {store}: {stdout}");
+        assert!(
+            !output.status.success(),
+            "a store the server would refuse blocks development: {stdout}",
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_how_a_redis_session_store_persists() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping the doctor's Redis persistence check: REDIS_URL is not set");
+        return;
+    };
+    let output = Command::new(ANUBIS)
+        .arg("doctor")
+        .env("SESSION_STORE", "redis")
+        .env("REDIS_URL", &redis_url)
+        .output()
+        .expect("the anubis binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The verdict depends on how that Redis was started, so any of the three
+    // readings is right; what must not happen is no reading at all.
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("sessions are kept in Redis"))
+        .unwrap_or_else(|| panic!("doctor must report the Redis store: {stdout}"));
+    assert!(
+        ["append-only file", "RDB snapshots", "persists nothing"]
+            .iter()
+            .any(|verdict| line.contains(verdict)),
+        "doctor must say how Redis persists: {line}",
+    );
+    assert!(
+        !line.contains(&redis_url),
+        "the URL, which may carry a password, is never echoed: {line}",
+    );
+}
+
 /// Removes the scratch tree a stamped app lives in.
 fn remove(app: &Path) {
     let scratch = app.parent().expect("the app sits inside its scratch tree");

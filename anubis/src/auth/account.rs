@@ -21,7 +21,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -30,11 +30,12 @@ use uuid::Uuid;
 use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
+use crate::auth::session::{ListedSession, Sessions};
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{CurrentUser, SignedIn, password, session, token, user_token};
+use crate::auth::{CurrentUser, SignedIn, password, session, user_token};
 use crate::http::ApiError;
 use crate::mail::{Email, EmailKind};
-use crate::schema::{sessions, users};
+use crate::schema::users;
 
 /// Longest accepted name, time zone, or locale value.
 ///
@@ -159,6 +160,7 @@ struct ChangePasswordBody {
 async fn change_password(
     State(state): State<AuthState>,
     SignedIn(user): SignedIn,
+    sessions: Sessions,
     context: audit::Context,
     jar: CookieJar,
     Json(body): Json<ChangePasswordBody>,
@@ -180,7 +182,7 @@ async fn change_password(
     // stays empty, because the fact is the whole of what an auditor needs and
     // neither password belongs in a table anybody can read.
     connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+        .transaction::<(), session::Error, _>(async |transaction| {
             diesel::update(users::table.find(user.id))
                 .set((
                     users::password_hash.eq(&password_hash),
@@ -195,17 +197,19 @@ async fn change_password(
                 &audit::Event::new(audit::PASSWORD_CHANGED, "User").subject(user.id),
             )
             .await?;
+
+            // Other browsers sign out; the one that made the change stays in.
+            // Inside the transaction, so a store that cannot sign them out
+            // leaves the old password in place rather than the old sessions.
+            if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
+                sessions
+                    .revoke_all_except(transaction, user.id, cookie.value())
+                    .await?;
+            }
             Ok(())
         })
         .await
         .map_err(log_internal)?;
-
-    // Other browsers sign out; the one that made the change stays in.
-    if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
-        session::delete_all_except(&mut connection, user.id, cookie.value())
-            .await
-            .map_err(log_internal)?;
-    }
 
     Ok(Json(MessageBody {
         message: "Your password has been changed. Other sessions were signed out.",
@@ -322,73 +326,43 @@ async fn confirm_email_change(
 }
 
 #[derive(Serialize)]
-struct SessionEntry {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    /// True for the session making this request.
-    current: bool,
-}
-
-#[derive(Serialize)]
 struct SessionsBody {
-    sessions: Vec<SessionEntry>,
+    sessions: Vec<ListedSession>,
 }
 
 async fn list_sessions(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
-    let current_hash = jar
+    let current_token = jar
         .get(session::SESSION_COOKIE)
-        .map(|cookie| token::hash(cookie.value()));
+        .map(|cookie| cookie.value().to_owned());
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let rows: Vec<(Uuid, DateTime<Utc>, DateTime<Utc>, String)> = sessions::table
-        .filter(sessions::user_id.eq(user.id))
-        .filter(sessions::expires_at.gt(Utc::now()))
-        .select((
-            sessions::id,
-            sessions::created_at,
-            sessions::expires_at,
-            sessions::token_hash,
-        ))
-        .order(sessions::created_at.asc())
-        .load(&mut connection)
+    let listed = sessions
+        .list(&mut connection, user.id, current_token.as_deref())
         .await
         .map_err(log_internal)?;
 
-    let entries = rows
-        .into_iter()
-        .map(|(id, created_at, expires_at, token_hash)| SessionEntry {
-            id,
-            created_at,
-            expires_at,
-            current: current_hash.as_deref() == Some(token_hash.as_str()),
-        })
-        .collect();
-
-    Ok(Json(SessionsBody { sessions: entries }))
+    Ok(Json(SessionsBody { sessions: listed }))
 }
 
 async fn revoke_session(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     context: audit::Context,
     Path(session_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let deleted = diesel::delete(
-        sessions::table
-            .filter(sessions::id.eq(session_id))
-            .filter(sessions::user_id.eq(user.id)),
-    )
-    .execute(&mut connection)
-    .await
-    .map_err(log_internal)?;
+    let revoked = sessions
+        .revoke_by_id(&mut connection, user.id, session_id)
+        .await
+        .map_err(log_internal)?;
 
-    if deleted == 0 {
+    if !revoked {
         return Err(ApiError::not_found());
     }
 
@@ -411,12 +385,13 @@ struct DeleteAccountBody {
 /// Deletes the account and settles the tenancy it leaves behind.
 ///
 /// One transaction removes the user's memberships, dissolves organizations
-/// nobody can reach any more, keeps the surviving ones administrable, and then
-/// deletes the user, so the account can never be half gone. The rules live in
-/// `docs/tenancy.md`.
+/// nobody can reach any more, keeps the surviving ones administrable, ends
+/// every session, and then deletes the user, so the account can never be half
+/// gone. The rules live in `docs/tenancy.md`.
 async fn delete_account(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     context: audit::Context,
     jar: CookieJar,
     Json(body): Json<DeleteAccountBody>,
@@ -425,7 +400,7 @@ async fn delete_account(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+        .transaction::<(), session::Error, _>(async |transaction| {
             // Recorded before the account goes, and it outlives it: the row's
             // `user_id` is set to null by the delete while `actor_name` keeps
             // who this was, which is the whole reason the name is copied.
@@ -439,6 +414,9 @@ async fn delete_account(
             .await?;
 
             crate::tenancy::settle_departure(transaction, user.id).await?;
+            // The `sessions` foreign key would cascade on its own, but a Redis
+            // store has no foreign key, so every store is told explicitly.
+            sessions.revoke_all(transaction, user.id).await?;
             diesel::delete(users::table.find(user.id))
                 .execute(transaction)
                 .await?;

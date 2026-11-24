@@ -258,6 +258,7 @@ struct UserBody {
 /// Exchanges a login challenge plus a TOTP or recovery code for a session.
 async fn verify_challenge(
     State(state): State<AuthState>,
+    sessions: crate::auth::session::Sessions,
     context: crate::audit::Context,
     Json(body): Json<ChallengeBody>,
 ) -> Result<Response, ApiError> {
@@ -300,6 +301,7 @@ async fn verify_challenge(
 
     let jar = crate::auth::routes::signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &user,

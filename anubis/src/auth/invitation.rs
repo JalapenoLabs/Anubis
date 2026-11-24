@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit;
 use crate::auth::model::UserResponse;
 use crate::auth::routes::{AuthState, registration_preference, signed_in_jar, validate_password};
-use crate::auth::session::SignInMethod;
+use crate::auth::session::{Sessions, SignInMethod};
 use crate::http::ApiError;
 use crate::platform::{Acceptance, INVITATION_UNUSABLE, accept_invitation, live_invitation};
 use crate::rate_limit::{Budget, RateLimiter};
@@ -89,6 +89,7 @@ struct UserBody {
 
 async fn accept(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<AcceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -103,7 +104,9 @@ async fn accept(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     // The account, the acceptance, and the session commit together: an
     // invitee is never left with an account the link can no longer reach and
-    // no session to show for it.
+    // no session to show for it. Signing in is the last step, which is what a
+    // Redis session store needs to roll back with the rest; see
+    // `crate::auth::session`.
     let (user, jar) = connection
         .transaction::<_, ApiError, _>(async |transaction| {
             let user = accept_invitation(
@@ -119,6 +122,7 @@ async fn accept(
             .await?;
             let jar = signed_in_jar(
                 &state,
+                &sessions,
                 transaction,
                 &context,
                 &user,

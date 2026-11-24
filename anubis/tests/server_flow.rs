@@ -744,6 +744,33 @@ async fn readiness_succeeds_against_a_live_database() {
     assert_eq!(answer.body, json!({ "status": "ready" }));
 }
 
+#[tokio::test]
+async fn a_redis_session_store_that_does_not_answer_stops_the_boot() {
+    // Nothing listens on the discard port, so every connection is refused at
+    // once; the bound below only guards against a hang this test exists to
+    // rule out.
+    let config = config(&[
+        ("SESSION_STORE", "redis"),
+        ("REDIS_URL", "redis://127.0.0.1:9"),
+        ("PORT", "0"),
+    ]);
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        server::serve(Router::new(), unreachable_pool(), &config),
+    )
+    .await
+    .expect("a Redis that refuses connections must not hang the boot")
+    .expect_err("a session store that cannot answer must stop the boot");
+
+    assert!(refused.is_session_store(), "got: {refused}");
+    let rendered = refused.to_string();
+    assert!(
+        rendered.contains("SESSION_STORE") && rendered.contains("REDIS_URL"),
+        "the refusal names the settings to fix: {rendered}",
+    );
+}
+
 /// Reads one HTTP response off a socket, to the end of the connection.
 async fn read_response(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();

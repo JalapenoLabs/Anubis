@@ -25,8 +25,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::audit;
+use crate::auth::User;
 use crate::auth::password::Hasher;
-use crate::auth::{User, session};
 use crate::config::AppConfig;
 use crate::guard::PlatformMember;
 use crate::http::ApiError;
@@ -141,8 +141,10 @@ impl Accounts {
 
                 // Whoever holds a session for this account now may be the
                 // reason it needed rescuing, and so may a program somebody
-                // connected in its name.
-                session::delete_all_for_user(transaction, user.id).await?;
+                // connected in its name. The store is the one the operator's
+                // own request was authenticated against, which is the one the
+                // configuration chose.
+                operator.sessions().revoke_all(transaction, user.id).await?;
                 crate::oauth_server::revoke_every_grant(
                     transaction,
                     &context.by(&operator.user),
