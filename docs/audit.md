@@ -100,7 +100,7 @@ The invitation verbs cover both kinds of invitation, told apart by `subject_type
 
 ## Sign-ins
 
-Every path that issues a session records `session.created` against the account, in the same transaction as the session: registering, a password, a password or emailed code completed by a second factor, an emailed code, a passkey, an OpenID Connect provider, and accepting an operator's invitation (`invitation`). They all pass through one function, so the record is complete rather than a convention each path has to remember, and a session the log does not know about cannot exist.
+Every path that issues a session records `session.created` against the account, in the same transaction as the session: registering, a password, a password or emailed code completed by a second factor, an emailed code, a passkey, an OpenID Connect provider, and accepting an operator's invitation (`invitation`). They all pass through one function, so the record is complete rather than a convention each path has to remember, and no browser ever holds a session the log does not know about. That holds in either [session store](sessions.md): in Redis, which cannot join the transaction, the session is its last write and the cookie is issued only after the commit.
 
 The change set carries one field, `method`, from nothing to one of `anubis::auth::SignInMethod`'s spellings: `registration`, `password`, `second_factor`, `email_code`, `passkey`, `oauth`. A create otherwise records an empty set; the method is the one fact the new session was created with that a reader needs. A password that meets a second-factor challenge records nothing until the code is accepted, because no session exists until then.
 

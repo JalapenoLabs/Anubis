@@ -22,18 +22,25 @@ services:
       timeout: 5s
       retries: 15
 
-  # Realtime fanout across several instances. Off unless asked for:
-  # `docker compose -f starter/compose.yaml --profile realtime up -d --wait`,
+  # Realtime fanout across several instances, and sessions when
+  # SESSION_STORE=redis. Off unless asked for:
+  # `docker compose -f starter/compose.yaml --profile redis up -d --wait`,
   # then run the server with REDIS_URL=redis://localhost:63790. Development
-  # needs none of it, since realtime channels are served in process by
-  # default. See docs/realtime.md.
+  # needs none of it, since realtime channels are served in process and
+  # sessions live in Postgres by default. See docs/realtime.md and
+  # docs/sessions.md.
   redis:
     container_name: anubis-starter-redis
     image: redis:7.4.10-alpine
-    profiles: ["realtime"]
+    profiles: ["redis"]
+    # An append-only file on a volume, because a Redis holding sessions that
+    # came back empty would sign everyone out.
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       # Off the default port so a host Redis never collides.
       - "${REDIS_PORT:-63790}:6379"
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -42,3 +49,4 @@ services:
 
 volumes:
   postgres-data:
+  redis-data:

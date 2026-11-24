@@ -140,11 +140,11 @@ Losing Redis costs live delivery until it returns, never data. The pump reconnec
 Development needs none of this, so the compose file keeps Redis behind a profile and the default `docker compose up` stays Postgres-only:
 
 ```sh
-docker compose -f starter/compose.yaml --profile realtime up -d --wait
+docker compose -f starter/compose.yaml --profile redis up -d --wait
 REDIS_URL=redis://localhost:63790 cargo run -p anubis-starter
 ```
 
-There is no volume behind it. A fanout has nothing worth persisting, and a Redis that comes back empty is a Redis that works.
+A fanout has nothing worth persisting, and a Redis that comes back empty serves it perfectly well. The compose file's Redis keeps an append-only file on a volume anyway, because the same Redis holds sessions when `SESSION_STORE=redis`; see [sessions.md](sessions.md).
 
 ## Limits
 

@@ -21,7 +21,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -30,11 +30,12 @@ use uuid::Uuid;
 use crate::audit;
 use crate::auth::model::{User, UserResponse};
 use crate::auth::routes::{AuthState, validate_email, validate_password};
+use crate::auth::session::{ListedSession, Revocation, Sessions};
 use crate::auth::user_token::TokenPurpose;
-use crate::auth::{CurrentUser, SignedIn, password, session, token, user_token};
+use crate::auth::{CurrentUser, SignedIn, password, session, user_token};
 use crate::http::ApiError;
 use crate::mail::{Email, EmailKind};
-use crate::schema::{sessions, users};
+use crate::schema::users;
 
 /// Longest accepted name, time zone, or locale value.
 ///
@@ -149,6 +150,14 @@ struct ChangePasswordBody {
     new_password: String,
 }
 
+/// What a password change led to, decided inside one transaction.
+enum PasswordChange {
+    /// A sign-out-everywhere committed after the session was validated.
+    Interrupted,
+    /// The password changed, leaving the other sessions to sweep.
+    Changed(Option<Revocation>),
+}
+
 /// Rotates the password, which is also how a temporary one is replaced.
 ///
 /// Takes [`SignedIn`] rather than [`CurrentUser`]: an account on a temporary
@@ -159,6 +168,7 @@ struct ChangePasswordBody {
 async fn change_password(
     State(state): State<AuthState>,
     SignedIn(user): SignedIn,
+    sessions: Sessions,
     context: audit::Context,
     jar: CookieJar,
     Json(body): Json<ChangePasswordBody>,
@@ -179,15 +189,26 @@ async fn change_password(
     // change is exactly the gap an audit log exists to close. The change set
     // stays empty, because the fact is the whole of what an auditor needs and
     // neither password belongs in a table anybody can read.
-    connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
-            diesel::update(users::table.find(user.id))
-                .set((
-                    users::password_hash.eq(&password_hash),
-                    users::password_change_required.eq(false),
-                ))
-                .execute(transaction)
-                .await?;
+    let outcome = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
+            // First, and only while the account is at the generation this
+            // session was validated under. A sign-out-everywhere that committed
+            // since then ended this session, and a password checked against
+            // the hash it replaced must not overwrite the one it set.
+            let changed = diesel::update(
+                users::table
+                    .find(user.id)
+                    .filter(users::session_generation.eq(user.session_generation)),
+            )
+            .set((
+                users::password_hash.eq(&password_hash),
+                users::password_change_required.eq(false),
+            ))
+            .execute(transaction)
+            .await?;
+            if changed == 0 {
+                return Ok(PasswordChange::Interrupted);
+            }
 
             audit::record(
                 transaction,
@@ -195,16 +216,61 @@ async fn change_password(
                 &audit::Event::new(audit::PASSWORD_CHANGED, "User").subject(user.id),
             )
             .await?;
-            Ok(())
+
+            // Other browsers sign out; the one that made the change stays in.
+            // The last statement, so the others end exactly when the new
+            // password commits.
+            let Some(cookie) = jar.get(session::SESSION_COOKIE) else {
+                return Ok(PasswordChange::Changed(None));
+            };
+            let revocation = sessions
+                .revoke_all_except(transaction, user.id, cookie.value())
+                .await?;
+            Ok(PasswordChange::Changed(Some(revocation)))
         })
         .await
         .map_err(log_internal)?;
+    // Back in the pool before the store is read or swept; see
+    // `crate::auth::session`.
+    drop(connection);
 
-    // Other browsers sign out; the one that made the change stays in.
-    if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
-        session::delete_all_except(&mut connection, user.id, cookie.value())
-            .await
-            .map_err(log_internal)?;
+    let revocation = match outcome {
+        PasswordChange::Changed(revocation) => revocation,
+        PasswordChange::Interrupted => {
+            // Refused either way, since the current password was checked
+            // against a hash that has been replaced since. Whether this
+            // browser is still signed in decides the answer: a reset ended
+            // its session, while a concurrent change from this same browser,
+            // a double submit or a second tab, kept it.
+            let still_signed_in = match jar.get(session::SESSION_COOKIE) {
+                Some(cookie) => sessions
+                    .find_user(&state.pool, cookie.value())
+                    .await
+                    .map_err(log_internal)?
+                    .is_some_and(|signed_in| signed_in.id == user.id),
+                None => false,
+            };
+            if still_signed_in {
+                tracing::debug!(
+                    user.id = %user.id,
+                    "a password change for {{user.id}} was refused: another change from \
+                     the same browser committed first",
+                );
+                return Err(ApiError::conflict(
+                    "Your password was just changed by another request.",
+                ));
+            }
+            tracing::debug!(
+                user.id = %user.id,
+                "a password change for {{user.id}} was refused: the account signed out \
+                 everywhere after its session was checked",
+            );
+            return Err(ApiError::unauthorized("You are not signed in."));
+        }
+    };
+
+    if let Some(revocation) = revocation {
+        sessions.sweep(revocation).await;
     }
 
     Ok(Json(MessageBody {
@@ -322,75 +388,43 @@ async fn confirm_email_change(
 }
 
 #[derive(Serialize)]
-struct SessionEntry {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    /// True for the session making this request.
-    current: bool,
-}
-
-#[derive(Serialize)]
 struct SessionsBody {
-    sessions: Vec<SessionEntry>,
+    sessions: Vec<ListedSession>,
 }
 
 async fn list_sessions(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
-    let current_hash = jar
-        .get(session::SESSION_COOKIE)
-        .map(|cookie| token::hash(cookie.value()));
+    let current_token = jar.get(session::SESSION_COOKIE).map(Cookie::value);
 
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let rows: Vec<(Uuid, DateTime<Utc>, DateTime<Utc>, String)> = sessions::table
-        .filter(sessions::user_id.eq(user.id))
-        .filter(sessions::expires_at.gt(Utc::now()))
-        .select((
-            sessions::id,
-            sessions::created_at,
-            sessions::expires_at,
-            sessions::token_hash,
-        ))
-        .order(sessions::created_at.asc())
-        .load(&mut connection)
+    let listed = sessions
+        .list(&state.pool, user.id, current_token)
         .await
         .map_err(log_internal)?;
 
-    let entries = rows
-        .into_iter()
-        .map(|(id, created_at, expires_at, token_hash)| SessionEntry {
-            id,
-            created_at,
-            expires_at,
-            current: current_hash.as_deref() == Some(token_hash.as_str()),
-        })
-        .collect();
-
-    Ok(Json(SessionsBody { sessions: entries }))
+    Ok(Json(SessionsBody { sessions: listed }))
 }
 
 async fn revoke_session(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     context: audit::Context,
     Path(session_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let deleted = diesel::delete(
-        sessions::table
-            .filter(sessions::id.eq(session_id))
-            .filter(sessions::user_id.eq(user.id)),
-    )
-    .execute(&mut connection)
-    .await
-    .map_err(log_internal)?;
+    let revoked = sessions
+        .revoke_by_id(&state.pool, user.id, session_id)
+        .await
+        .map_err(log_internal)?;
 
-    if deleted == 0 {
+    if !revoked {
         return Err(ApiError::not_found());
     }
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
 
     audit::record(
         &mut connection,
@@ -411,12 +445,13 @@ struct DeleteAccountBody {
 /// Deletes the account and settles the tenancy it leaves behind.
 ///
 /// One transaction removes the user's memberships, dissolves organizations
-/// nobody can reach any more, keeps the surviving ones administrable, and then
-/// deletes the user, so the account can never be half gone. The rules live in
-/// `docs/tenancy.md`.
+/// nobody can reach any more, keeps the surviving ones administrable, ends
+/// every session, and then deletes the user, so the account can never be half
+/// gone. The rules live in `docs/tenancy.md`.
 async fn delete_account(
     State(state): State<AuthState>,
     CurrentUser(user): CurrentUser,
+    sessions: Sessions,
     context: audit::Context,
     jar: CookieJar,
     Json(body): Json<DeleteAccountBody>,
@@ -424,8 +459,8 @@ async fn delete_account(
     verify_password_or_reject(&state.hasher, &user, body.password).await?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+    let revocation = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
             // Recorded before the account goes, and it outlives it: the row's
             // `user_id` is set to null by the delete while `actor_name` keeps
             // who this was, which is the whole reason the name is copied.
@@ -442,10 +477,16 @@ async fn delete_account(
             diesel::delete(users::table.find(user.id))
                 .execute(transaction)
                 .await?;
-            Ok(())
+            // The account's sessions end with it, since every lookup reads the
+            // account; this hands the store what is left of them to sweep, which
+            // a Redis store needs because it has no foreign key to cascade.
+            sessions.revoke_all(transaction, user.id).await
         })
         .await
         .map_err(log_internal)?;
+
+    drop(connection);
+    sessions.sweep(revocation).await;
 
     let removal = Cookie::build((session::SESSION_COOKIE, ""))
         .path("/")

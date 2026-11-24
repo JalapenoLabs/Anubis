@@ -85,6 +85,23 @@
 //! A response that arrives already encoded, a precompressed file straight off
 //! disk among them, passes through untouched.
 //!
+//! # Sessions
+//!
+//! [`harden`] also puts the session store `SESSION_STORE` chose on every
+//! request, once, for every router the application composed, so the session
+//! cookie means the same thing on every route: Postgres by default, Redis when
+//! configured. That is the whole of opting in; no router is built differently.
+//! A Redis store connects on its first command, so [`serve`] asks it whether it
+//! can hold sessions before binding, and refuses to start, naming
+//! `SESSION_STORE`, when Redis does not answer, is older than 7.0, or may evict
+//! keys; it logs a warning when Redis persists less than an append-only file.
+//! A deployment that cannot check a session cannot serve anyone signed in, and
+//! finding out at the first request would mean every sign-in failing instead
+//! of one boot. An application that
+//! pairs [`harden`] with [`serve_with_shutdown`] skips that check, and its
+//! Redis store connects on the first request that needs it. See
+//! `docs/sessions.md`.
+//!
 //! # Shutdown
 //!
 //! `SIGTERM` (the signal an orchestrator sends first) and ctrl-c both start a
@@ -115,11 +132,11 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, Response};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::{Extension, Router};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::compression::CompressionLayer;
@@ -127,6 +144,7 @@ use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
 use uuid::Uuid;
 
+use crate::auth::session::{self, Sessions};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::http::ApiError;
@@ -208,8 +226,8 @@ impl Display for RequestId {
 /// the module docs.
 ///
 /// # Errors
-/// Returns an [`Error`] when the address cannot be bound, or when the accept
-/// loop fails.
+/// Returns an [`Error`] when the session store `SESSION_STORE` chose does not
+/// answer, when the address cannot be bound, or when the accept loop fails.
 pub async fn serve(router: Router, pool: DbPool, config: &AppConfig) -> Result<(), Error> {
     serve_with(router, pool, config, Hardening::default()).await
 }
@@ -224,12 +242,26 @@ pub async fn serve_with(
     config: &AppConfig,
     hardening: Hardening,
 ) -> Result<(), Error> {
-    let app = harden_with(router, pool, config, hardening);
+    // Before binding, so a deployment that cannot check a session never
+    // accepts a request it would have to fail; see the module docs.
+    let sessions = Sessions::from_config(config);
+    sessions.verify().await.map_err(|source| {
+        Error::new(
+            "SESSION_STORE is redis, and the Redis REDIS_URL names cannot keep sessions",
+            ErrorSource::Sessions(source),
+        )
+    })?;
+    tracing::info!(
+        session.store = %config.session_store,
+        "sessions are kept in {{session.store}}",
+    );
+
+    let app = stack(router, pool, config, hardening, sessions);
 
     let configured = config.server.socket_addr();
-    let listener = TcpListener::bind(configured)
-        .await
-        .map_err(|source| Error::new("failed to bind the server address", source))?;
+    let listener = TcpListener::bind(configured).await.map_err(|source| {
+        Error::new("failed to bind the server address", ErrorSource::Io(source))
+    })?;
 
     // The bound address, which differs from the configured one only when the
     // port was 0 and the kernel picked it.
@@ -386,24 +418,55 @@ struct Untimed {
 
 /// Wraps an application's router in the framework's production middleware.
 ///
-/// Mounts the probes described in the module docs and applies the middleware
-/// stack listed there. [`serve`] calls this; call it directly only to drive the
-/// same application from somewhere else, such as an integration test.
+/// Mounts the probes described in the module docs, applies the middleware
+/// stack listed there, and puts the configured session store on every
+/// request. [`serve`] calls this; call it directly only to drive the same
+/// application from somewhere else, such as an integration test.
+///
+/// # Panics
+/// Panics outside a tokio runtime when `SESSION_STORE` is redis, because the
+/// store's connection is supervised by a task spawned here. Building a router
+/// to serve already happens inside one.
 pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
     harden_with(router, pool, config, Hardening::default())
 }
 
 /// [`harden`], with what an application declares beyond its router.
+///
+/// # Panics
+/// As [`harden`].
 pub fn harden_with(
     router: Router,
     pool: DbPool,
     config: &AppConfig,
     hardening: Hardening,
 ) -> Router {
+    stack(
+        router,
+        pool,
+        config,
+        hardening,
+        Sessions::from_config(config),
+    )
+}
+
+/// The stack [`harden_with`] describes, around a session store already built.
+///
+/// Split out so [`serve_with`] can prove its store answers before serving
+/// with that same store, rather than building a second one.
+fn stack(
+    router: Router,
+    pool: DbPool,
+    config: &AppConfig,
+    hardening: Hardening,
+    sessions: Sessions,
+) -> Router {
     // Each call wraps what came before, so the last layer is the outermost.
     // The stack is documented outermost-first in the module docs; read this
-    // bottom to top to match it.
+    // bottom to top to match it. The session store goes on the application's
+    // routes alone, since the probes never read a session.
     let app = router
+        .layer(Extension(sessions))
         .merge(health::router(pool))
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(hardening),
@@ -582,30 +645,68 @@ async fn shutdown_signal() {
 
 /// Renders an accept-loop failure as this module's error.
 fn stopped(source: std::io::Error) -> Error {
-    Error::new("the server stopped", source)
+    Error::new("the server stopped", ErrorSource::Io(source))
 }
 
-/// The server could not bind its address, or its accept loop failed.
+/// The server could not start, could not bind its address, or its accept loop
+/// failed.
 #[derive(Debug)]
 pub struct Error {
     context: &'static str,
-    source: std::io::Error,
+    source: ErrorSource,
     backtrace: Backtrace,
 }
 
+/// What went wrong underneath an [`Error`].
+#[derive(Debug)]
+enum ErrorSource {
+    /// Binding or accepting failed.
+    Io(std::io::Error),
+    /// The configured session store did not answer at boot, or cannot hold
+    /// sessions.
+    Sessions(session::Error),
+}
+
+impl ErrorSource {
+    /// The underlying error, whichever kind it is.
+    fn as_error(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Io(source) => source,
+            Self::Sessions(source) => source,
+        }
+    }
+}
+
 impl Error {
-    fn new(context: &'static str, source: std::io::Error) -> Self {
+    fn new(context: &'static str, source: ErrorSource) -> Self {
+        // A session store error carries its own backtrace and prints it, so
+        // capturing a second one here would print two, back to back.
+        let backtrace = match source {
+            ErrorSource::Io(_) => Backtrace::capture(),
+            ErrorSource::Sessions(_) => Backtrace::disabled(),
+        };
         Self {
             context,
             source,
-            backtrace: Backtrace::capture(),
+            backtrace,
         }
+    }
+
+    /// Returns `true` when the boot stopped because the session store the
+    /// configuration chose did not answer, or cannot hold sessions.
+    ///
+    /// A deployment problem: `REDIS_URL` names a Redis that is down,
+    /// unreachable from here, older than 7.0, or free to evict keys, while
+    /// `SESSION_STORE` keeps sessions there.
+    #[must_use]
+    pub fn is_session_store(&self) -> bool {
+        matches!(self.source, ErrorSource::Sessions(_))
     }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.context, self.source)?;
+        write!(f, "{}: {}", self.context, self.source.as_error())?;
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
         }
@@ -615,7 +716,7 @@ impl Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_error())
     }
 }
 

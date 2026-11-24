@@ -36,5 +36,9 @@ pub use model::{User, UserResponse};
 pub(crate) use policy::{check_password_policy, normalize_email};
 #[doc(inline)]
 pub use routes::{Options, router, router_with};
+/// What a Redis says about whether it can hold sessions, for `anubis doctor`
+/// to ask exactly what the server's boot asks. No application needs these.
+#[doc(hidden)]
+pub use session::{Eviction, Persistence, RedisInspection, inspect_redis};
 #[doc(inline)]
 pub use session::{SESSION_COOKIE, SESSION_TTL_DAYS, SignInMethod};

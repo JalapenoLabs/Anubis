@@ -8,7 +8,7 @@ anubis::server::serve(app, pool, &config).await?;
 
 `main` composes routers; the framework owns everything that turns a router into a server people can deploy. That split is deliberate: production behavior nobody has to remember to add is the only kind every application actually has.
 
-`serve` mounts the probes, applies the middleware stack, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal. `serve_with` and `harden_with` take a `Hardening` beside the router, which is where an application declares the routes the request timeout leaves alone (below).
+`serve` mounts the probes, applies the middleware stack, puts the configured session store on every request, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal. `serve_with` and `harden_with` take a `Hardening` beside the router, which is where an application declares the routes the request timeout leaves alone (below).
 
 ## The middleware stack
 
@@ -25,6 +25,10 @@ Layers, outermost first. The order is the design:
 | Request timeout | 30 seconds, innermost; skipped for a route the application declared untimed |
 
 The request id is outermost so every later layer logs under it. The timeout is innermost so the response it produces still leaves with an id and the security headers on it.
+
+### The session store
+
+Beside the layers, the stack puts the session store `SESSION_STORE` chose on every request the application's routers answer, so the session cookie means the same thing on every route, the application's own included. Choosing Redis is therefore a setting and nothing more. A Redis store connects on first use, so `serve` asks it whether it can hold sessions before binding, and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when it gets no answer, a version older than 7.0, or a memory limit with a policy that evicts keys: a deployment that cannot check a session cannot serve anyone signed in. It logs a warning when Redis persists less than an append-only file. An application that pairs `harden` with `serve_with_shutdown` itself skips that check, and its Redis store connects on the first request that needs it. A router driven without `harden` reads sessions from Postgres, the default, except the authentication routes, which refuse a request whose store disagrees with `SESSION_STORE`. See [sessions.md](sessions.md).
 
 ### Request ids
 
@@ -215,6 +219,7 @@ Allowed requests may carry `Authorization`, `Content-Type` and `X-Reported-Locat
 | `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive |
 | `TRUSTED_PROXY_HEADER` | unset | Forwarding header naming the client address; see [rate limiting](api.md#rate-limiting) |
 | `SPA_DIR` | unset | Directory of built frontend assets; see [architecture](architecture.md#deployment) |
+| `SESSION_STORE` | `postgres` | Where sessions are kept, `postgres` or `redis`; `redis` requires `REDIS_URL`. See [sessions](sessions.md) |
 
 The timeout, the drain window, and the readiness timeout are constants rather than variables. They are properties of the deployment shape the framework targets, and a knob per timeout is a knob nobody tunes correctly and everybody has to understand. The one thing an application may say about the timeout is which routes it does not apply to, and only because an upload's duration is not the server's to bound.
 

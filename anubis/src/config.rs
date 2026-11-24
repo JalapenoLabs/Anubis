@@ -15,6 +15,7 @@
 //! | `PORT` | `3000` | TCP port the server binds to |
 //! | `DATABASE_URL` | unset | Postgres connection URL, e.g. `postgres://user:pass@host/db` |
 //! | `REDIS_URL` | unset | Redis connection URL, e.g. `redis://localhost:6379`; fans realtime channels out across instances |
+//! | `SESSION_STORE` | `postgres` | Where browser sessions are kept: `postgres` or `redis`. `redis` requires `REDIS_URL` |
 //! | `APP_URL` | `http://<host>:<port>` | Public base URL used in email links |
 //! | `ANUBIS_SECRET_KEY` | development key | Base64 for exactly 32 bytes; encrypts recoverable secrets at rest. Required in production |
 //! | `SMTP_URL` | unset | SMTP relay, e.g. `smtps://user:password@smtp.example.com:465`; setting it delivers real email |
@@ -139,9 +140,27 @@
 //! `rediss://` (TLS) are understood, credentials ride in the URL, and the URL
 //! is a secret, so it is never echoed in errors or logs.
 //!
-//! Redis is a fanout here and nothing else. Nothing durable is stored in it,
-//! and losing it costs live delivery until it returns, never data. See
+//! For realtime, Redis is a fanout and nothing else. Nothing durable is stored
+//! for it, and losing it costs live delivery until it returns, never data. See
 //! [`crate::realtime`] and `docs/realtime.md`.
+//!
+//! # Session store
+//!
+//! `SESSION_STORE` chooses where browser sessions are kept. Unset, or
+//! `postgres`, they live in the `sessions` table beside everything else, which
+//! is the default and needs nothing configured. `redis` keeps them in the Redis
+//! `REDIS_URL` names, so it requires that variable, and a configuration naming
+//! one without the other stops the boot. Any other value stops the boot too,
+//! because a typo that quietly fell back to Postgres would be a deployment
+//! nobody could explain.
+//!
+//! The choice is its own variable rather than a consequence of `REDIS_URL`
+//! because the two are separate decisions: an application fanning realtime
+//! channels out across instances need not want its sessions in Redis. Choosing
+//! Redis for sessions does put realtime fanout there too, since both read the
+//! one `REDIS_URL`. A Redis holding sessions has to persist them, because a
+//! restart without persistence signs everyone out; `anubis doctor` reports
+//! what the configured Redis does. See [`crate::server`] and `docs/sessions.md`.
 //!
 //! # Rate limiting
 //!
@@ -250,6 +269,7 @@ use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZero;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use axum::http::HeaderName;
 use url::{Origin, Url};
@@ -279,6 +299,12 @@ const REDIS_URL_VAR: &str = "REDIS_URL";
 /// What a valid `REDIS_URL` looks like, quoted back in errors.
 const REDIS_URL_FORM: &str =
     "a redis:// or rediss:// connection URL, e.g. `redis://localhost:6379`";
+
+/// Chooses where browser sessions are kept.
+const SESSION_STORE_VAR: &str = "SESSION_STORE";
+
+/// What a valid `SESSION_STORE` looks like, quoted back in errors.
+const SESSION_STORE_FORM: &str = "one of postgres, redis";
 
 /// Public base URL of the application, used when building email links.
 const APP_URL_VAR: &str = "APP_URL";
@@ -533,6 +559,60 @@ impl Display for Environment {
     }
 }
 
+/// Where browser sessions are kept, from `SESSION_STORE`.
+///
+/// Postgres is the default and needs nothing configured; Redis keeps sessions
+/// in the Redis `REDIS_URL` names. Behaviour is identical either way: the
+/// cookie, the expiry, signing out, the session list, and the audit events.
+/// See the module docs and `docs/sessions.md`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionStore {
+    /// The `sessions` table, the default when `SESSION_STORE` is unset.
+    #[default]
+    Postgres,
+    /// The Redis `REDIS_URL` names.
+    Redis,
+}
+
+impl SessionStore {
+    /// The spelling `SESSION_STORE` takes for this store.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Redis => "redis",
+        }
+    }
+}
+
+impl Display for SessionStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SessionStore {
+    type Err = Error;
+
+    /// Reads a `SESSION_STORE` value, ignoring case and surrounding space.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] naming `SESSION_STORE` for anything but `postgres`
+    /// or `redis`, so a typo stops the boot rather than choosing a store.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "postgres" => Ok(Self::Postgres),
+            "redis" => Ok(Self::Redis),
+            _ => Err(Error::invalid(
+                SESSION_STORE_VAR,
+                trimmed,
+                SESSION_STORE_FORM,
+            )),
+        }
+    }
+}
+
 /// Where the application server binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -573,10 +653,12 @@ impl fmt::Debug for DatabaseConfig {
     }
 }
 
-/// Redis connection settings for the realtime fanout.
+/// Redis connection settings, for the realtime fanout and the session store.
 ///
 /// The URL may embed credentials, so this type never exposes it through
-/// `Debug` or `Display`; read it deliberately with [`RedisConfig::url`].
+/// `Debug` or `Display`; read it deliberately with [`RedisConfig::url`]. It is
+/// parsed when the configuration loads, so a URL held here always opens a
+/// client.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RedisConfig {
     url: String,
@@ -739,8 +821,14 @@ pub struct AppConfig {
     /// Redis connection settings, when `REDIS_URL` is set.
     ///
     /// Present fans realtime channels out across instances, absent serves them
-    /// inside the process; see the module docs and [`crate::realtime`].
+    /// inside the process; see the module docs and [`crate::realtime`]. It is
+    /// also where sessions live when [`AppConfig::session_store`] says Redis.
     pub redis: Option<RedisConfig>,
+    /// Where browser sessions are kept, from `SESSION_STORE`.
+    ///
+    /// [`SessionStore::Redis`] only ever appears beside a [`AppConfig::redis`],
+    /// because loading refuses the one without the other; see the module docs.
+    pub session_store: SessionStore,
     /// Public base URL of the application, without a trailing slash.
     ///
     /// Used when building links in outgoing email. Defaults to the bind
@@ -857,17 +945,18 @@ impl AppConfig {
             Some(url) => Some(DatabaseConfig { url }),
         };
 
-        let redis = match non_empty(lookup(REDIS_URL_VAR)) {
-            None => None,
-            Some(url) => {
-                let url = url.trim().to_owned();
-                if !url.starts_with("redis://") && !url.starts_with("rediss://") {
-                    // The URL may carry a password, so it is never quoted back.
-                    return Err(Error::invalid_secret(REDIS_URL_VAR, REDIS_URL_FORM));
-                }
-                Some(RedisConfig { url })
-            }
+        let redis = redis_config(&lookup)?;
+        let session_store = match non_empty(lookup(SESSION_STORE_VAR)) {
+            None => SessionStore::default(),
+            Some(value) => value.parse()?,
         };
+        if session_store == SessionStore::Redis && redis.is_none() {
+            return Err(Error::missing(
+                REDIS_URL_VAR,
+                "the Redis to keep sessions in, because SESSION_STORE is redis; e.g. \
+                 `redis://localhost:6379`",
+            ));
+        }
 
         let app_url = match lookup(APP_URL_VAR) {
             None => format!("http://{host}:{port}"),
@@ -922,6 +1011,7 @@ impl AppConfig {
             server: ServerConfig { host, port },
             database,
             redis,
+            session_store,
             app_url,
             secret_key,
             smtp,
@@ -936,6 +1026,32 @@ impl AppConfig {
             initial_admin,
         })
     }
+}
+
+/// Resolves the Redis connection, when the environment names one.
+///
+/// The URL is parsed the way a Redis client parses it, not only checked for a
+/// scheme, so every service built from the configuration can open a client
+/// without a failure path of its own: a malformed URL stops the boot here,
+/// beside every other configuration mistake, rather than at the first publish
+/// or the first sign-in. The URL may carry a password, so it is never quoted
+/// back.
+fn redis_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<RedisConfig>, Error> {
+    let Some(url) = non_empty(lookup(REDIS_URL_VAR)) else {
+        return Ok(None);
+    };
+    let url = url.trim().to_owned();
+
+    // `unix://` and `redis+unix://` parse too, and are refused: the framework
+    // documents and tests the two network schemes only.
+    if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+        return Err(Error::invalid_secret(REDIS_URL_VAR, REDIS_URL_FORM));
+    }
+    if redis::Client::open(url.as_str()).is_err() {
+        return Err(Error::invalid_secret(REDIS_URL_VAR, REDIS_URL_FORM));
+    }
+
+    Ok(Some(RedisConfig { url }))
 }
 
 /// Resolves what an avatar upload may cost.
@@ -1585,7 +1701,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
 
-    use super::{AppConfig, Environment};
+    use super::{AppConfig, Environment, SessionStore};
     use crate::auth::secret_box::SecretKey;
 
     /// A syntactically valid `ANUBIS_SECRET_KEY`, for tests that need one.
@@ -1719,6 +1835,78 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("hunter2"), "got: {rendered}");
         assert!(rendered.contains("rediss://"), "got: {rendered}");
+    }
+
+    #[test]
+    fn a_redis_url_no_client_could_open_is_rejected_without_echoing_it() {
+        let lookup = lookup_from(&[("REDIS_URL", "redis://default:hunter2@cache:not-a-port")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("the port does not parse");
+
+        assert_eq!(error.variable(), "REDIS_URL");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("hunter2"), "got: {rendered}");
+    }
+
+    #[test]
+    fn sessions_stay_in_postgres_until_the_store_is_named() {
+        let unset = AppConfig::from_lookup(|_name| None).expect("unset is fine");
+        assert_eq!(unset.session_store, SessionStore::Postgres);
+
+        // A Redis for realtime alone leaves the sessions where they were.
+        let fanout_only = lookup_from(&[("REDIS_URL", "redis://localhost:6379")]);
+        let config = AppConfig::from_lookup(fanout_only).expect("a fanout needs nothing else");
+        assert_eq!(config.session_store, SessionStore::Postgres);
+
+        let named = lookup_from(&[("SESSION_STORE", "postgres")]);
+        let config = AppConfig::from_lookup(named).expect("postgres is a store");
+        assert_eq!(config.session_store, SessionStore::Postgres);
+    }
+
+    #[test]
+    fn sessions_move_to_redis_when_the_store_and_the_url_are_both_set() {
+        for value in ["redis", " Redis ", "REDIS"] {
+            let lookup = lookup_from(&[
+                ("SESSION_STORE", value),
+                ("REDIS_URL", "redis://localhost:6379"),
+            ]);
+            let config = AppConfig::from_lookup(lookup).expect("redis with a URL is complete");
+            assert_eq!(config.session_store, SessionStore::Redis, "for {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_redis_session_store_without_a_redis_url_stops_the_boot() {
+        let lookup = lookup_from(&[("SESSION_STORE", "redis")]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("redis needs somewhere to live");
+
+        assert_eq!(error.variable(), "REDIS_URL");
+        let rendered = error.to_string();
+        assert!(rendered.contains("SESSION_STORE"), "got: {rendered}");
+    }
+
+    #[test]
+    fn an_unknown_session_store_stops_the_boot_rather_than_choosing_one() {
+        let lookup = lookup_from(&[
+            ("SESSION_STORE", "memcached"),
+            ("REDIS_URL", "redis://localhost:6379"),
+        ]);
+
+        let error = AppConfig::from_lookup(lookup).expect_err("only two stores exist");
+
+        assert_eq!(error.variable(), "SESSION_STORE");
+        let rendered = error.to_string();
+        assert!(rendered.contains("memcached"), "got: {rendered}");
+        assert!(rendered.contains("postgres, redis"), "got: {rendered}");
+    }
+
+    #[test]
+    fn session_store_spellings_round_trip() {
+        for store in [SessionStore::Postgres, SessionStore::Redis] {
+            let parsed: SessionStore = store.to_string().parse().expect("a spelling parses back");
+            assert_eq!(parsed, store);
+        }
     }
 
     #[test]
