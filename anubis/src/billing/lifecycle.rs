@@ -1,8 +1,8 @@
 //! Keeping the subscription projection in line with Stripe.
 //!
-//! Money lives at Stripe; the `subscriptions` table is the projection this
-//! application authorizes and renders from. [`Reconciler`] is the only thing
-//! that writes it, and it has two ways in:
+//! Money lives at Stripe; the `subscriptions` and `subscription_items` tables
+//! are the projection this application authorizes and renders from.
+//! [`Reconciler`] is the only thing that writes them, and it has these ways in:
 //!
 //! - **Events**, the normal path. [`ProcessStripeEvent`] runs one stored event
 //!   from `stripe_billing_events`, and the receiver
@@ -13,6 +13,15 @@
 //! - **Seat synchronization**, the outbound path. [`SyncSeats`] runs through
 //!   [`Reconciler::sync_seats`] after a membership changes, tells Stripe the
 //!   new quantity of a per-seat price, and writes back what Stripe answers.
+//! - **Application changes**, the other outbound path.
+//!   [`Subscriptions`](super::Subscriptions) changes or cancels a subject
+//!   subscription at Stripe and writes back the answer through the same
+//!   convergence.
+//!
+//! A subscription and its line items are written together, in one
+//! transaction behind one ordering guard, so an event too old to change a
+//! subscription cannot change its items either, and the items written are
+//! exactly the ones Stripe reported: an item Stripe no longer lists is deleted.
 //!
 //! # Reading rather than trusting
 //!
@@ -37,8 +46,12 @@
 //! events created in the same second both apply, which is safe because each
 //! writes the state read back from Stripe rather than its own body.
 //!
-//! Reconciliation stamps `now`, because it read Stripe directly and is
-//! therefore at least as current as any event in flight.
+//! A write that read Stripe directly (reconciliation, seat synchronization,
+//! an application's change) is stamped with the moment its read *began*, in
+//! whole seconds; see [`read_began`]. Anything Stripe recorded before then is
+//! in what it read, so an older event is rightly ignored, and anything later
+//! may not be, so a newer event is free to apply. Letting an event win is
+//! always safe, because processing one reads Stripe back.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::BTreeMap;
@@ -54,13 +67,16 @@ use uuid::Uuid;
 
 use super::event::StripeBillingEvent;
 use super::limits;
-use super::model::{Subscription, SubscriptionStatus};
+use super::model::{Subject, Subscription, SubscriptionStatus};
 use super::plans::{Interval, PlanSet};
-use super::stripe::{self, CompletedCheckout};
+use super::stripe::{
+    self, CompletedCheckout, ItemUpdate, ORGANIZATION_METADATA, PLAN_METADATA, SUBJECT_ID_METADATA,
+    SUBJECT_TYPE_METADATA, SubscriptionUpdate,
+};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::jobs::{BoxError, Job};
-use crate::schema::{organizations, subscriptions};
+use crate::schema::{organizations, subscription_items, subscriptions};
 
 /// The queue billing events are processed on.
 ///
@@ -93,12 +109,6 @@ const SUBSCRIPTION_UPDATED: &str = "customer.subscription.updated";
 
 /// A subscription ended, and nothing further will be charged for it.
 const SUBSCRIPTION_DELETED: &str = "customer.subscription.deleted";
-
-/// Stripe's metadata key naming the organization a subscription belongs to.
-const ORGANIZATION_METADATA: &str = "organization_id";
-
-/// Stripe's metadata key naming the plan a checkout bought.
-const PLAN_METADATA: &str = "plan_key";
 
 /// The background job that processes one stored Stripe event.
 ///
@@ -203,10 +213,12 @@ impl Reconciler {
     /// Bills an organization for the seats it is actually using.
     ///
     /// Runs [`SyncSeats`], and does nothing at all unless every condition for a
-    /// per-seat charge holds: billing configured, a subscription that grants
-    /// access, and a price its plan sells per seat. The quantity is read back
-    /// from Stripe and written into the projection, so the row a screen renders
-    /// agrees with the invoice the customer will get.
+    /// per-seat charge holds: billing configured, a plan subscription that
+    /// grants access, and a price its plan sells per seat. The quantity is set
+    /// on the line item billing that price, which need not be the first one
+    /// when the subscription carries add-ons, and Stripe's answer is written
+    /// into the projection, so the row a screen renders agrees with the invoice
+    /// the customer will get.
     ///
     /// Proration is Stripe's default, `create_prorations`: a seat added
     /// mid-period is charged for the part of the period it exists, and a seat
@@ -232,9 +244,9 @@ impl Reconciler {
         else {
             return Ok(());
         };
-        if !self.charges_per_seat(&held) {
+        let Some(per_seat_price) = self.per_seat_price(&held) else {
             return Ok(());
-        }
+        };
 
         // At least one: Stripe refuses a quantity of zero, and an organization
         // whose last member just left still holds the subscription they bought.
@@ -245,21 +257,37 @@ impl Reconciler {
             return Ok(());
         }
 
+        let read_at = read_began();
         let current = stripe
             .retrieve_subscription(&held.stripe_subscription_id)
             .await?;
-        let item_id = current.item_id().ok_or_else(|| {
+        let item = current.item_for_price(per_seat_price).ok_or_else(|| {
             Error::new(
                 ErrorKind::Data,
                 format!(
-                    "Stripe subscription {} has no line item to set a quantity on",
+                    "Stripe subscription {} has no line item billing {per_seat_price} to set \
+                     a quantity on",
                     held.stripe_subscription_id,
                 ),
             )
         })?;
 
+        let update = SubscriptionUpdate {
+            items: vec![ItemUpdate::SetQuantity {
+                item_id: item.id(),
+                quantity: seats,
+            }],
+            cancel_at_period_end: None,
+        };
+        // The row's last write is the revision: a retry of this job before
+        // anything is written sends the same key, and the next membership
+        // change, after this one's answer is recorded, sends a new one.
         let updated = stripe
-            .update_subscription_quantity(&held.stripe_subscription_id, item_id, seats)
+            .update_subscription(
+                &held.stripe_subscription_id,
+                &update,
+                &held.updated_at.to_rfc3339(),
+            )
             .await?;
 
         tracing::info!(
@@ -271,47 +299,55 @@ impl Reconciler {
              {{billing.seats.current}}",
         );
 
-        // Written from Stripe's answer, stamped now, exactly as reconciliation
-        // is: this read Stripe directly and is at least as current as anything
-        // in flight.
+        // Written from Stripe's answer, stamped when the read began, exactly
+        // as reconciliation is.
         let origin = Origin {
             organization_id: Some(job.organization_id),
             metadata: None,
         };
-        self.converge(&mut connection, &updated, &origin, Utc::now())
+        self.converge(&mut connection, &updated, &origin, read_at)
             .await?;
 
         Ok(())
     }
 
-    /// Whether the subscription's own price is charged per seat.
+    /// The Stripe price the plan subscription bills per seat, if it does.
     ///
     /// Read from the plan the row names rather than from Stripe, because that
     /// is the same file the checkout bought from and the events keep current.
-    fn charges_per_seat(&self, held: &Subscription) -> bool {
+    fn per_seat_price(&self, held: &Subscription) -> Option<&str> {
         self.plans
-            .find(&held.plan_key)
+            .find(held.plan_key.as_deref()?)
             .zip(Interval::parse(&held.billing_interval))
             .and_then(|(plan, interval)| plan.price(interval))
-            .is_some_and(super::plans::Price::is_per_seat)
+            .filter(|price| price.is_per_seat())
+            .map(super::plans::Price::stripe_price_id)
     }
 
     /// Converges an organization's subscriptions with Stripe's own record.
     ///
     /// This is the repair path for an event that was never delivered, never
     /// processed, or processed against a plan the file did not define yet. It
-    /// reads every subscription Stripe holds for the organization's customer
-    /// and writes each one, so a row that drifted is corrected and a row that
-    /// should exist is created.
+    /// reads every subscription Stripe holds for the organization's customer,
+    /// following Stripe's pages to the end, and writes each one with its line
+    /// items, so a row that drifted is corrected and a row that should exist
+    /// is created.
     ///
-    /// Returns the organization's live subscription afterwards, which is `None`
-    /// when it is on the free plan. An organization that never reached Stripe
-    /// has nothing to converge and answers with what it already had.
+    /// Each subscription converges in its own transaction. One that cannot be
+    /// recorded (a price `config/billing.yml` does not sell, a second live
+    /// subscription for one subject) leaves its own row as it was and is named
+    /// in the error, and every other subscription is still repaired: an
+    /// organization paying for a hundred records is not held hostage by one.
+    ///
+    /// Returns the organization's live subscriptions afterwards, plan
+    /// subscription first. An organization that never reached Stripe has
+    /// nothing to converge and answers with what it already had.
     ///
     /// # Errors
     /// Returns an [`Error`] when billing is not configured, when Stripe refuses
-    /// or cannot be reached, or when the database write fails.
-    pub async fn reconcile(&self, organization_id: Uuid) -> Result<Option<Subscription>, Error> {
+    /// or cannot be reached, when a database write fails, or when any
+    /// subscription could not be recorded.
+    pub async fn reconcile(&self, organization_id: Uuid) -> Result<Vec<Subscription>, Error> {
         let stripe = self.stripe.as_ref().ok_or_else(Error::unconfigured)?;
         let mut connection = self.pool.get().await.map_err(|source| {
             Error::new(
@@ -324,41 +360,59 @@ impl Reconciler {
             // No customer means no purchase was ever started, so Stripe holds
             // nothing for this organization and there is nothing to correct.
             return Ok(
-                Subscription::current_for_organization(&mut connection, organization_id).await?,
+                Subscription::live_for_organization(&mut connection, organization_id).await?,
             );
         };
 
+        let read_at = read_began();
         let mut held = stripe.list_subscriptions(&customer_id).await?;
         // Finished subscriptions first: a row this application still believes is
         // live has to be corrected before the live one can take its place, or
-        // the one-live-subscription index refuses the insert.
+        // the one-live-subscription indexes refuse the insert.
         held.sort_by_key(|subscription| !is_terminal(&subscription.status));
 
-        let read_at = Utc::now();
         let organization = Origin {
             organization_id: Some(organization_id),
             metadata: None,
         };
-        // One transaction for the whole customer, so a subscription that cannot
-        // be recorded leaves the projection as it was rather than half moved.
-        connection
-            .transaction::<_, Error, _>(async |connection| {
-                for subscription in &held {
-                    self.converge(connection, subscription, &organization, read_at)
-                        .await?;
-                }
-                Ok(())
-            })
-            .await?;
+        let mut unrecorded = Vec::new();
+        for subscription in &held {
+            if let Err(failure) = self
+                .converge(&mut connection, subscription, &organization, read_at)
+                .await
+            {
+                tracing::warn!(
+                    organization.id = %organization_id,
+                    billing.subscription.id = subscription.id,
+                    error.message = failure.message(),
+                    "reconciliation could not record {{billing.subscription.id}}: \
+                     {{error.message}}",
+                );
+                unrecorded.push(format!("{}: {}", subscription.id, failure.message()));
+            }
+        }
 
         tracing::info!(
             organization.id = %organization_id,
             billing.subscriptions.read = held.len(),
+            billing.subscriptions.unrecorded = unrecorded.len(),
             "reconciled {{billing.subscriptions.read}} Stripe subscriptions for \
              organization {{organization.id}}",
         );
+        if !unrecorded.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Data,
+                format!(
+                    "{} of {} Stripe subscriptions could not be recorded; the rest were \
+                     repaired. {}",
+                    unrecorded.len(),
+                    held.len(),
+                    unrecorded.join("; "),
+                ),
+            ));
+        }
 
-        Ok(Subscription::current_for_organization(&mut connection, organization_id).await?)
+        Ok(Subscription::live_for_organization(&mut connection, organization_id).await?)
     }
 
     /// Acts on one stored event, whatever kind it turns out to be.
@@ -419,8 +473,9 @@ impl Reconciler {
             }
             SUBSCRIPTION_DELETED => {
                 // Trusted as it arrives: a cancelled subscription is over, and
-                // nothing Stripe could say about it later would be newer.
-                let ended = read_subscription(object)?;
+                // nothing Stripe could say about it later would be newer. Only a
+                // long item list is read further, which costs nothing otherwise.
+                let ended = stripe.complete_items(read_subscription(object)?).await?;
                 self.converge(connection, &ended, &Origin::default(), event_at)
                     .await
             }
@@ -439,8 +494,12 @@ impl Reconciler {
         }
     }
 
-    /// Writes one Stripe subscription into the projection.
-    async fn converge(
+    /// Writes one Stripe subscription, and its line items, into the projection.
+    ///
+    /// Both in one transaction behind the ordering guard: when the guard keeps
+    /// the subscription as it is, the items are left alone too, and when it
+    /// applies, the items become exactly the ones Stripe reported.
+    pub(super) async fn converge(
         &self,
         connection: &mut AsyncPgConnection,
         subscription: &stripe::Subscription,
@@ -453,10 +512,27 @@ impl Reconciler {
         // would be ambiguous with every ordinary `table.filter(..)`.
         use diesel::query_dsl::methods::FilterDsl as _;
 
+        if !subscription.items_complete() {
+            // Deleting the items Stripe did not list is only right when the
+            // list is whole, and the client completes one before handing it
+            // over, so this is a page that could not be completed.
+            return Err(Error::new(
+                ErrorKind::Data,
+                format!(
+                    "Stripe subscription {} arrived with only part of its item list",
+                    subscription.id,
+                ),
+            ));
+        }
+
         let organization_id = self
             .resolve_organization(connection, subscription, origin)
             .await?;
-        let (plan_key, interval) = self.resolve_plan(subscription)?;
+        let subject = read_subject(subscription)?;
+        let bought = match &subject {
+            None => self.resolve_plan(subscription)?,
+            Some(_subject) => Bought::subject(subscription)?,
+        };
 
         if SubscriptionStatus::parse(&subscription.status).is_none() {
             // Stored verbatim anyway: an unfamiliar word grants no access and
@@ -470,38 +546,50 @@ impl Reconciler {
             );
         }
 
-        let quantity = i32::try_from(subscription.quantity()).unwrap_or(i32::MAX);
+        let quantity = i32::try_from(bought.quantity).unwrap_or(i32::MAX);
         let period_end = subscription
             .period_end()
             .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
         let values = (
             subscriptions::organization_id.eq(organization_id),
-            subscriptions::plan_key.eq(plan_key),
+            subscriptions::plan_key.eq(bought.plan_key),
+            subscriptions::subject_type.eq(subject.as_ref().map(Subject::kind)),
+            subscriptions::subject_id.eq(subject.as_ref().map(Subject::id)),
             subscriptions::stripe_subscription_id.eq(&subscription.id),
             subscriptions::status.eq(&subscription.status),
-            subscriptions::billing_interval.eq(interval.as_str()),
+            subscriptions::billing_interval.eq(bought.interval.as_str()),
             subscriptions::quantity.eq(quantity),
             subscriptions::current_period_end.eq(period_end),
             subscriptions::cancel_at_period_end.eq(subscription.cancel_at_period_end),
             subscriptions::stripe_event_at.eq(event_at),
         );
 
-        let written =
-            diesel::insert_into(subscriptions::table)
-                .values(values)
-                .on_conflict(subscriptions::stripe_subscription_id)
-                .do_update()
-                .set(values)
-                // The ordering guard: an event older than the one already applied
-                // changes nothing. See the module docs.
-                .filter(subscriptions::stripe_event_at.is_null().or(
-                    subscriptions::stripe_event_at.le(excluded(subscriptions::stripe_event_at)),
-                ))
-                .execute(connection)
-                .await
-                .map_err(|source| write_failed(subscription, organization_id, source))?;
+        let written = connection
+            .transaction::<_, Error, _>(async |connection| {
+                let written: Option<Uuid> = diesel::insert_into(subscriptions::table)
+                    .values(values)
+                    .on_conflict(subscriptions::stripe_subscription_id)
+                    .do_update()
+                    .set(values)
+                    // The ordering guard: an event older than the one already
+                    // applied changes nothing. See the module docs.
+                    .filter(subscriptions::stripe_event_at.is_null().or(
+                        subscriptions::stripe_event_at.le(excluded(subscriptions::stripe_event_at)),
+                    ))
+                    .returning(subscriptions::id)
+                    .get_result(connection)
+                    .await
+                    .optional()
+                    .map_err(|source| write_failed(subscription, organization_id, source))?;
 
-        if written == 0 {
+                if let Some(row_id) = written {
+                    write_items(connection, row_id, subscription).await?;
+                }
+                Ok(written)
+            })
+            .await?;
+
+        if written.is_none() {
             tracing::info!(
                 billing.subscription.id = subscription.id,
                 organization.id = %organization_id,
@@ -568,23 +656,53 @@ impl Reconciler {
             })
     }
 
-    /// The plan and interval a Stripe subscription buys.
+    /// What a plan subscription buys: its plan, its interval, and its seats.
     ///
     /// The price is the authority, because changing plan in the customer portal
     /// changes the price and leaves the metadata saying what was bought first.
-    fn resolve_plan(&self, subscription: &stripe::Subscription) -> Result<(&str, Interval), Error> {
-        let price_id = subscription.price_id().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Data,
-                format!("Stripe subscription {} has no price", subscription.id),
-            )
-        })?;
-
-        if let Some((plan, interval)) = self.plans.find_by_price_id(price_id) {
-            return Ok((plan.key(), interval));
+    /// Any of the subscription's items may carry it, since a plan subscription
+    /// can carry add-ons beside the plan, but only one plan's price may appear.
+    fn resolve_plan(&self, subscription: &stripe::Subscription) -> Result<Bought<'_>, Error> {
+        let mut found: Option<Bought<'_>> = None;
+        for item in subscription.items() {
+            let Some((plan, interval)) = item
+                .price_id()
+                .and_then(|price_id| self.plans.find_by_price_id(price_id))
+            else {
+                continue;
+            };
+            if let Some(earlier) = found.as_ref().and_then(|bought| bought.plan_key)
+                && earlier != plan.key()
+            {
+                return Err(Error::new(
+                    ErrorKind::Data,
+                    format!(
+                        "Stripe subscription {} carries the prices of two plans, {earlier} and \
+                         {}; a plan subscription buys one",
+                        subscription.id,
+                        plan.key(),
+                    ),
+                ));
+            }
+            found = Some(Bought {
+                plan_key: Some(plan.key()),
+                interval,
+                quantity: item.quantity().unwrap_or(1),
+            });
+        }
+        if let Some(bought) = found {
+            return Ok(bought);
         }
 
-        // The price is not one `config/billing.yml` sells. The subscription may
+        let Some(first) = subscription.items().next() else {
+            return Err(Error::new(
+                ErrorKind::Data,
+                format!("Stripe subscription {} has no price", subscription.id),
+            ));
+        };
+        let price_id = first.price_id().unwrap_or("(none)");
+
+        // No price is one `config/billing.yml` sells. The subscription may
         // still name a plan this application knows, which is what a price
         // replaced in Stripe but not here looks like.
         let announced = subscription
@@ -600,7 +718,11 @@ impl Reconciler {
                     "Stripe price {{billing.price}} is not in config/billing.yml; falling back \
                      to the plan the subscription's metadata names, {{billing.plan}}",
                 );
-                Ok((plan.key(), interval))
+                Ok(Bought {
+                    plan_key: Some(plan.key()),
+                    interval,
+                    quantity: first.quantity().unwrap_or(1),
+                })
             }
             _unknown => Err(Error::new(
                 ErrorKind::Data,
@@ -615,6 +737,152 @@ impl Reconciler {
     }
 }
 
+/// What a subscription buys, in the columns the projection stores it in.
+#[derive(Debug)]
+struct Bought<'plans> {
+    /// The plan, for a plan subscription; `None` for a subject subscription.
+    plan_key: Option<&'plans str>,
+    /// How often it bills.
+    interval: Interval,
+    /// Seats bought: the plan item's quantity, and one for a subject.
+    quantity: i64,
+}
+
+impl Bought<'_> {
+    /// What a subject subscription buys: no plan, on its prices' interval.
+    ///
+    /// Its prices are the application's own rather than `config/billing.yml`'s,
+    /// so nothing here looks them up; only the recurrence has to be one the
+    /// framework records.
+    fn subject(subscription: &stripe::Subscription) -> Result<Self, Error> {
+        let recurrence = subscription.recurring_interval();
+        let interval = recurrence.and_then(Interval::parse).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Data,
+                format!(
+                    "Stripe subscription {} recurs every {}, and subscriptions are recorded \
+                     monthly or yearly",
+                    subscription.id,
+                    recurrence.unwrap_or("(no interval)"),
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            plan_key: None,
+            interval,
+            quantity: 1,
+        })
+    }
+}
+
+/// The record a Stripe subscription pays for, from the metadata checkout put on it.
+///
+/// Both keys or neither: a subscription naming half a subject is a mistake
+/// somebody made in the Stripe dashboard, and recording it as the plan
+/// subscription would be a second one.
+fn read_subject(subscription: &stripe::Subscription) -> Result<Option<Subject>, Error> {
+    let kind = subscription
+        .metadata(SUBJECT_TYPE_METADATA)
+        .filter(|value| !value.is_empty());
+    let id = subscription
+        .metadata(SUBJECT_ID_METADATA)
+        .filter(|value| !value.is_empty());
+
+    match (kind, id) {
+        (None, None) => Ok(None),
+        (Some(kind), Some(id)) => id
+            .parse::<Uuid>()
+            .map(|id| Some(Subject::new(kind, id)))
+            .map_err(|source| {
+                Error::new(
+                    ErrorKind::Data,
+                    format!(
+                        "Stripe subscription {} names subject id {id:?}, which is not a UUID: \
+                         {source}",
+                        subscription.id,
+                    ),
+                )
+            }),
+        _half => Err(Error::new(
+            ErrorKind::Data,
+            format!(
+                "Stripe subscription {} names half a subject in its metadata; set both \
+                 {SUBJECT_TYPE_METADATA} and {SUBJECT_ID_METADATA}, or neither",
+                subscription.id,
+            ),
+        )),
+    }
+}
+
+/// Makes a subscription's stored line items exactly the ones Stripe reported.
+///
+/// Runs inside the transaction that wrote the subscription, after its ordering
+/// guard applied: an item Stripe no longer lists is deleted, and every listed
+/// one is inserted or brought up to date by its Stripe id.
+async fn write_items(
+    connection: &mut AsyncPgConnection,
+    subscription_id: Uuid,
+    subscription: &stripe::Subscription,
+) -> Result<(), Error> {
+    let reported: Vec<&str> = subscription
+        .items()
+        .map(stripe::SubscriptionItem::id)
+        .collect();
+    diesel::delete(
+        subscription_items::table
+            .filter(subscription_items::subscription_id.eq(subscription_id))
+            .filter(subscription_items::stripe_item_id.ne_all(&reported)),
+    )
+    .execute(connection)
+    .await?;
+
+    for item in subscription.items() {
+        let Some(price_id) = item.price_id().filter(|_price| !item.id().is_empty()) else {
+            return Err(Error::new(
+                ErrorKind::Data,
+                format!(
+                    "Stripe subscription {} lists a line item without an id or a price",
+                    subscription.id,
+                ),
+            ));
+        };
+        let quantity = item
+            .quantity()
+            .map(|quantity| i32::try_from(quantity).unwrap_or(i32::MAX));
+        let values = (
+            subscription_items::subscription_id.eq(subscription_id),
+            subscription_items::stripe_item_id.eq(item.id()),
+            subscription_items::stripe_price_id.eq(price_id),
+            subscription_items::quantity.eq(quantity),
+        );
+
+        diesel::insert_into(subscription_items::table)
+            .values(values)
+            .on_conflict(subscription_items::stripe_item_id)
+            .do_update()
+            .set(values)
+            .execute(connection)
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// The stamp for a write that read Stripe directly, rather than for an event.
+///
+/// Two rules in one value. It is when the read *began*, not when the write
+/// lands: anything Stripe recorded after that moment may be missing from what
+/// was read, so an event created then must stay free to apply, and letting an
+/// event win is always safe because processing one reads Stripe back. And it
+/// is in whole seconds, because an event's `created` is: a cancellation created
+/// later in the same second would otherwise compare as older than this write
+/// and be dropped, leaving a cancelled subscription granting access.
+pub(super) fn read_began() -> DateTime<Utc> {
+    let now = Utc::now();
+    DateTime::from_timestamp(now.timestamp(), 0).unwrap_or(now)
+}
+
 /// Explains a refused write in the terms of what it was trying to do.
 fn write_failed(
     subscription: &stripe::Subscription,
@@ -625,14 +893,18 @@ fn write_failed(
         source,
         diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::UniqueViolation, _)
     ) {
-        // The only unique index this write can trip is the one live
-        // subscription per organization, and hitting it means Stripe holds two.
-        // A person has to decide which one the customer keeps.
+        // The unique indexes this write can trip are the two live-subscription
+        // ones, and hitting either means Stripe holds two subscriptions for
+        // one slot. A person has to decide which one the customer keeps.
+        let slot = read_subject(subscription).ok().flatten().map_or_else(
+            || "a live plan subscription".to_owned(),
+            |subject| format!("a live subscription for {subject}"),
+        );
         return Error::new(
             ErrorKind::Data,
             format!(
-                "organization {organization_id} already holds a live subscription, so Stripe \
-                 subscription {} could not be recorded; cancel one of them at Stripe",
+                "organization {organization_id} already holds {slot}, so Stripe subscription {} \
+                 could not be recorded; cancel one of them at Stripe",
                 subscription.id,
             ),
         );
@@ -654,11 +926,11 @@ impl fmt::Debug for Reconciler {
 
 /// What a caller already knows about who a Stripe subscription belongs to.
 #[derive(Debug, Default)]
-struct Origin<'a> {
+pub(super) struct Origin<'a> {
     /// The organization, when the caller resolved it already.
-    organization_id: Option<Uuid>,
+    pub(super) organization_id: Option<Uuid>,
     /// A checkout session's metadata, when the subscription carries none.
-    metadata: Option<&'a BTreeMap<String, String>>,
+    pub(super) metadata: Option<&'a BTreeMap<String, String>>,
 }
 
 /// Reads a subscription out of an event's `data.object`.
@@ -674,8 +946,8 @@ fn read_subscription(object: &serde_json::Value) -> Result<stripe::Subscription,
 /// Whether a status word means the subscription is over.
 ///
 /// A word this version does not know is not terminal, which keeps an unfamiliar
-/// subscription occupying the organization's one live slot rather than letting a
-/// second one start beside it.
+/// subscription occupying its live slot rather than letting a second one start
+/// beside it.
 fn is_terminal(status: &str) -> bool {
     SubscriptionStatus::parse(status).is_some_and(SubscriptionStatus::is_terminal)
 }

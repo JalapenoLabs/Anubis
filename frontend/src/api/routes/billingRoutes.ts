@@ -29,16 +29,26 @@ type WirePlan = {
   limits: Record<string, WirePlanLimit>
 }
 
+type WireSubscriptionItem = {
+  id: string
+  stripe_item_id: string
+  stripe_price_id: string
+  quantity: number | null
+}
+
 type WireSubscription = {
   id: string
   organization_id: string
-  plan_key: string
+  plan_key: string | null
+  subject_type: string | null
+  subject_id: string | null
   stripe_subscription_id: string
   status: string
   billing_interval: string
   quantity: number
   current_period_end: string | null
   cancel_at_period_end: boolean
+  items: WireSubscriptionItem[]
   created_at: string
   updated_at: string
 }
@@ -46,6 +56,7 @@ type WireSubscription = {
 type WireBilling = {
   plan: WirePlan
   subscription: WireSubscription | null
+  subscriptions: WireSubscription[]
   billing_enabled: boolean
   seats_used: number
 }
@@ -76,12 +87,20 @@ function toSubscription(wire: WireSubscription): BillingSubscription {
     id: wire.id,
     organizationId: wire.organization_id,
     planKey: wire.plan_key,
+    subjectType: wire.subject_type,
+    subjectId: wire.subject_id,
     stripeSubscriptionId: wire.stripe_subscription_id,
     status: wire.status,
     interval: wire.billing_interval,
     quantity: wire.quantity,
     currentPeriodEnd: wire.current_period_end,
     cancelAtPeriodEnd: wire.cancel_at_period_end,
+    items: wire.items.map((item) => ({
+      id: item.id,
+      stripeItemId: item.stripe_item_id,
+      stripePriceId: item.stripe_price_id,
+      quantity: item.quantity,
+    })),
     createdAt: wire.created_at,
     updatedAt: wire.updated_at,
   }
@@ -93,17 +112,21 @@ function toOverview(wire: WireBilling): BillingOverview {
     subscription: wire.subscription
       ? toSubscription(wire.subscription)
       : null,
+    subscriptions: wire.subscriptions.map((subscription) => toSubscription(subscription)),
     billingEnabled: wire.billing_enabled,
     seatsUsed: wire.seats_used,
   }
 }
 
 /**
- * The organization's plan, and the two Stripe redirects that change it.
+ * The organization's plan and subscriptions, and the two Stripe redirects that
+ * change its plan.
  *
  * Money lives at Stripe: buying a plan and managing one both answer with a URL
  * to send the browser to, and nothing here renders a card form. Reading is open
- * to every member; the three writes need the `admin` or `billing` role.
+ * to every member; the three writes need the `admin` or `billing` role. A
+ * subscription paying for one of the application's records is bought and
+ * changed through the application's own routes.
  */
 export function createBillingRoutes(client: KyInstance) {
   async function getBilling(organizationId: string): Promise<BillingOverview> {

@@ -4,19 +4,24 @@
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
-//! | `GET /organizations/{organization_id}` | org member | The plan in force, the subscription behind it, and the seats in use |
+//! | `GET /organizations/{organization_id}` | org member | The plan in force, every live subscription with its items, and the seats in use |
 //! | `POST /organizations/{organization_id}/checkout` | org admin or billing | Opens a Stripe Checkout session and answers with its URL |
 //! | `POST /organizations/{organization_id}/portal` | org admin or billing | Opens the Stripe customer portal and answers with its URL |
-//! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscription this application shows |
+//! | `POST /organizations/{organization_id}/reconcile` | org admin or billing | Reads Stripe and corrects the subscriptions this application shows |
 //!
 //! Reading is open to every member because the plan and its limits explain
 //! what the whole organization can do. Spending money is not: it takes the
 //! `admin` role, or the `billing` role, which the starter's `roles.yml`
 //! defines for exactly this.
 //!
-//! Both write routes answer `503` when `STRIPE_SECRET_KEY` is unset, and the
+//! The write routes answer `503` when `STRIPE_SECRET_KEY` is unset, and the
 //! read route keeps working: an application with no Stripe account is on the
 //! free plan, which is a complete and correct answer.
+//!
+//! Subject subscriptions are listed here but bought and changed through the
+//! application's own routes, which call [`super::Subscriptions`]: only the
+//! application knows whether a record belongs to the organization, who may
+//! spend money on it, and which prices it sells it at.
 
 use std::sync::Arc;
 
@@ -24,22 +29,21 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::lifecycle::{self, Reconciler};
 use super::limits;
-use super::model::Subscription;
+use super::model::{Subscription, SubscriptionWithItems};
 use super::plans::{Interval, Plan, PlanSet};
-use super::stripe::{self, NewCheckoutSession, NewCustomer, NewPortalSession};
+use super::stripe::{self, LineItem, NewPortalSession, Purchase};
+use super::subscriptions::{self, Subscriptions};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::OrganizationMember;
 use crate::http::ApiError;
 use crate::roles::RoleSet;
-use crate::schema::organizations;
 use crate::tenancy::ADMIN_ROLE;
 
 /// Role key that may spend the organization's money without administering it.
@@ -73,14 +77,16 @@ const FLAT_QUANTITY: i64 = 1;
 /// config supplies the Stripe credentials and the public base URL the return
 /// links are built from.
 pub fn router(pool: DbPool, roles: RoleSet, plans: PlanSet, config: &AppConfig) -> Router {
+    // The service holds the same plans, because it resolves the plan a Stripe
+    // price belongs to; building it here rather than taking one is what keeps
+    // the application's mount a single call.
+    let subscriptions = Subscriptions::new(pool.clone(), plans.clone(), config);
     let state = BillingState {
         pool: pool.clone(),
-        // The reconciler holds the same plans, because it resolves the plan a
-        // Stripe price belongs to; building it here rather than taking one is
-        // what keeps the application's mount a single call.
-        reconciler: Reconciler::new(pool.clone(), plans.clone(), config),
+        reconciler: subscriptions.reconciler.clone(),
+        stripe: subscriptions.stripe.clone(),
+        subscriptions,
         plans: Arc::new(plans),
-        stripe: config.stripe.as_ref().map(stripe::Client::new),
         app_url: config.app_url.clone(),
     };
 
@@ -107,15 +113,19 @@ struct BillingState {
     /// Absent until `STRIPE_SECRET_KEY` is set, which disables every write.
     stripe: Option<stripe::Client>,
     reconciler: Reconciler,
+    subscriptions: Subscriptions,
     app_url: String,
 }
 
 #[derive(Serialize)]
 struct BillingBody {
-    /// The plan in force: the subscription's, or the free plan.
+    /// The plan in force: the plan subscription's, or the free plan.
     plan: Plan,
-    /// The subscription behind that plan, absent on the free plan.
-    subscription: Option<Subscription>,
+    /// The plan subscription behind that plan, absent on the free plan.
+    subscription: Option<SubscriptionWithItems>,
+    /// Every live subscription the organization holds, each with its line
+    /// items: the plan subscription first, then those paying for its records.
+    subscriptions: Vec<SubscriptionWithItems>,
     /// Whether this deployment can start a checkout at all.
     billing_enabled: bool,
     /// People who can reach the organization, claimed and invited alike.
@@ -139,33 +149,56 @@ struct RedirectBody {
     url: String,
 }
 
-/// The plan an organization is on, and the subscription behind it.
+/// The plan an organization is on, and every subscription it holds.
 ///
-/// Resolution is total: a subscription that grants access names its plan, and
-/// everything else, including no subscription at all, is the free plan.
+/// Resolution is total: a plan subscription that grants access names its plan,
+/// and everything else, including no subscription at all, is the free plan.
 async fn show(
     State(state): State<BillingState>,
     member: OrganizationMember,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let subscription =
-        Subscription::current_for_organization(&mut connection, member.organization.id)
-            .await
-            .map_err(log_internal)?;
-    let seats_used = limits::seats_used(&mut connection, member.organization.id)
+    let live = Subscription::live_for_organization(&mut connection, member.organization.id)
         .await
         .map_err(log_internal)?;
 
+    let body = overview(&mut connection, &state, member.organization.id, live).await?;
+    Ok(Json(body))
+}
+
+/// The body both [`show`] and [`reconcile`] answer with.
+async fn overview(
+    connection: &mut AsyncPgConnection,
+    state: &BillingState,
+    organization_id: Uuid,
+    live: Vec<Subscription>,
+) -> Result<BillingBody, ApiError> {
+    let subscriptions = SubscriptionWithItems::load(connection, live)
+        .await
+        .map_err(log_internal)?;
+    let seats_used = limits::seats_used(connection, organization_id)
+        .await
+        .map_err(log_internal)?;
+
+    let subscription = subscriptions
+        .iter()
+        .find(|held| held.subscription.subject_type.is_none())
+        .cloned();
     // Cloned into the response: a plan is a handful of strings, and the
     // alternative is a body that borrows the request's own state.
-    let plan = resolve_plan(&state.plans, subscription.as_ref()).clone();
+    let plan = limits::plan_in_force(
+        &state.plans,
+        subscription.as_ref().map(|held| &held.subscription),
+    )
+    .clone();
 
-    Ok(Json(BillingBody {
+    Ok(BillingBody {
         plan,
         subscription,
+        subscriptions,
         billing_enabled: state.stripe.is_some(),
         seats_used,
-    }))
+    })
 }
 
 /// Opens a Stripe Checkout session for one plan and interval.
@@ -179,7 +212,7 @@ async fn start_checkout(
     Json(body): Json<CheckoutBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_billing_authority(&member)?;
-    let stripe = configured(&state)?;
+    configured(&state)?;
 
     let plan = state.plans.find(&body.plan_key).ok_or_else(|| {
         ApiError::validation(format!(
@@ -202,8 +235,9 @@ async fn start_checkout(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
     // Changing plans is the portal's job: it prorates, it handles the card, and
-    // it is the screen Stripe keeps current. Starting a second subscription
-    // here would bill the organization twice.
+    // it is the screen Stripe keeps current. Starting a second plan
+    // subscription here would bill the organization twice. Subscriptions
+    // paying for the organization's records are no obstacle: they buy those.
     if Subscription::current_for_organization(&mut connection, member.organization.id)
         .await
         .map_err(log_internal)?
@@ -226,26 +260,19 @@ async fn start_checkout(
         FLAT_QUANTITY
     };
 
-    let customer_id = ensure_customer(&mut connection, stripe, &member).await?;
-    let landing = return_url(&state.app_url, member.organization.id);
-    // `{CHECKOUT_SESSION_ID}` is a placeholder Stripe substitutes on the way
-    // back, which is what lets the return page name the session that just
-    // completed. The doubled braces escape it past this format string.
-    let success_url = format!("{landing}?checkout=success&session_id={{CHECKOUT_SESSION_ID}}");
-    let cancel_url = format!("{landing}?checkout=canceled");
+    drop(connection);
 
-    let session = stripe
-        .create_checkout_session(NewCheckoutSession {
-            customer_id: &customer_id,
-            price_id: price.stripe_price_id(),
-            quantity,
-            success_url: &success_url,
-            cancel_url: &cancel_url,
-            organization_id: member.organization.id,
-            plan_key: plan.key(),
-        })
-        .await
-        .map_err(|error| stripe_failed(&error, "open a checkout session"))?;
+    let landing = return_url(&state.app_url, member.organization.id);
+    let session = state
+        .subscriptions
+        .open_checkout(
+            member.organization.id,
+            Purchase::Plan(plan.key()),
+            &[LineItem::new(price.stripe_price_id(), quantity)],
+            &landing,
+            Some(&member.user.email),
+        )
+        .await?;
 
     tracing::info!(
         organization.id = %member.organization.id,
@@ -275,24 +302,15 @@ async fn reconcile(
     require_billing_authority(&member)?;
     configured(&state)?;
 
-    let subscription = state
+    let live = state
         .reconciler
         .reconcile(member.organization.id)
         .await
         .map_err(|error| reconcile_failed(&error))?;
-    let plan = resolve_plan(&state.plans, subscription.as_ref()).clone();
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let seats_used = limits::seats_used(&mut connection, member.organization.id)
-        .await
-        .map_err(log_internal)?;
-
-    Ok(Json(BillingBody {
-        plan,
-        subscription,
-        billing_enabled: true,
-        seats_used,
-    }))
+    let body = overview(&mut connection, &state, member.organization.id, live).await?;
+    Ok(Json(body))
 }
 
 /// Opens the Stripe customer portal for an organization that has a customer.
@@ -304,8 +322,9 @@ async fn open_portal(
     let stripe = configured(&state)?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let customer_id = stored_customer_id(&mut connection, member.organization.id)
-        .await?
+    let customer_id = subscriptions::stored_customer_id(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?
         .ok_or_else(|| {
             ApiError::conflict(
                 "This organization has no billing account yet. Start a subscription first.",
@@ -322,94 +341,6 @@ async fn open_portal(
         .map_err(|error| stripe_failed(&error, "open the billing portal"))?;
 
     Ok(Json(RedirectBody { url: session.url }))
-}
-
-/// The plan a subscription puts in force, or the free plan.
-fn resolve_plan<'plans>(
-    plans: &'plans PlanSet,
-    subscription: Option<&Subscription>,
-) -> &'plans Plan {
-    // A subscription that grants nothing (incomplete, unpaid, paused) leaves
-    // the organization on free, which is the same place a cancellation lands.
-    let Some(subscription) = subscription.filter(|held| held.grants_access()) else {
-        return plans.free();
-    };
-
-    plans.find(&subscription.plan_key).unwrap_or_else(|| {
-        // The plan was renamed or removed while a subscription still named it.
-        // Falling back to free keeps the page answering; the log is what tells
-        // an operator to reconcile `config/billing.yml` with Stripe.
-        tracing::error!(
-            billing.plan = subscription.plan_key,
-            organization.id = %subscription.organization_id,
-            "subscription names plan {{billing.plan}}, which config/billing.yml no longer \
-             defines; falling back to the free plan",
-        );
-        plans.free()
-    })
-}
-
-/// The organization's Stripe customer, creating one on first use.
-///
-/// The write is conditional on the column still being null, so two checkouts
-/// started at the same instant cannot overwrite each other. They cannot even
-/// create two customers: the create call carries an idempotency key derived
-/// from the organization, so Stripe answers the second one with the customer
-/// the first one made.
-async fn ensure_customer(
-    connection: &mut AsyncPgConnection,
-    stripe: &stripe::Client,
-    member: &OrganizationMember,
-) -> Result<String, ApiError> {
-    if let Some(existing) = stored_customer_id(connection, member.organization.id).await? {
-        return Ok(existing);
-    }
-
-    let customer = stripe
-        .create_customer(NewCustomer {
-            organization_id: member.organization.id,
-            name: &member.organization.name,
-            email: Some(&member.user.email),
-        })
-        .await
-        .map_err(|error| stripe_failed(&error, "create a billing account"))?;
-
-    diesel::update(
-        organizations::table
-            .find(member.organization.id)
-            .filter(organizations::stripe_customer_id.is_null()),
-    )
-    .set(organizations::stripe_customer_id.eq(&customer.id))
-    .execute(connection)
-    .await
-    .map_err(log_internal)?;
-
-    // Re-read rather than returning what was just created: whoever won the
-    // write is the customer this organization is billed as.
-    stored_customer_id(connection, member.organization.id)
-        .await?
-        .ok_or_else(|| {
-            tracing::error!(
-                organization.id = %member.organization.id,
-                "the organization vanished between creating its Stripe customer and storing it",
-            );
-            ApiError::internal()
-        })
-}
-
-/// The Stripe customer stored on an organization, if it has one.
-async fn stored_customer_id(
-    connection: &mut AsyncPgConnection,
-    organization_id: Uuid,
-) -> Result<Option<String>, ApiError> {
-    organizations::table
-        .find(organization_id)
-        .select(organizations::stripe_customer_id)
-        .first::<Option<String>>(connection)
-        .await
-        .optional()
-        .map(Option::flatten)
-        .map_err(log_internal)
 }
 
 /// The Stripe client, or the honest answer that this deployment has none.
@@ -496,82 +427,7 @@ fn log_internal(error: impl std::fmt::Display) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_plan, return_url};
-    use crate::billing::PlanSet;
-
-    const PLANS: &str = "
-plans:
-  - key: free
-    name: Free
-  - key: pro
-    name: Pro
-    prices:
-      monthly:
-        stripe_price_id: price_pro_monthly
-        amount: 2900
-        currency: usd
-";
-
-    /// A subscription row shaped by hand, since the database is not involved.
-    fn subscription(plan_key: &str, status: &str) -> crate::billing::Subscription {
-        let now = chrono::Utc::now();
-        crate::billing::Subscription {
-            id: uuid::Uuid::new_v4(),
-            organization_id: uuid::Uuid::new_v4(),
-            plan_key: plan_key.to_owned(),
-            stripe_subscription_id: "sub_test".to_owned(),
-            status: status.to_owned(),
-            billing_interval: "monthly".to_owned(),
-            quantity: 1,
-            current_period_end: None,
-            cancel_at_period_end: false,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[test]
-    fn no_subscription_resolves_to_the_free_plan() {
-        let plans = PlanSet::from_yaml(PLANS).expect("the plans must parse");
-
-        assert_eq!(resolve_plan(&plans, None).key(), "free");
-    }
-
-    #[test]
-    fn a_paying_subscription_resolves_to_its_plan() {
-        let plans = PlanSet::from_yaml(PLANS).expect("the plans must parse");
-
-        for status in ["active", "trialing", "past_due"] {
-            let held = subscription("pro", status);
-            assert_eq!(
-                resolve_plan(&plans, Some(&held)).key(),
-                "pro",
-                "for status {status}",
-            );
-        }
-    }
-
-    #[test]
-    fn a_subscription_that_grants_nothing_resolves_to_free() {
-        let plans = PlanSet::from_yaml(PLANS).expect("the plans must parse");
-
-        for status in ["incomplete", "unpaid", "paused", "an_unknown_word"] {
-            let held = subscription("pro", status);
-            assert_eq!(
-                resolve_plan(&plans, Some(&held)).key(),
-                "free",
-                "for status {status}",
-            );
-        }
-    }
-
-    #[test]
-    fn a_plan_the_file_no_longer_defines_resolves_to_free() {
-        let plans = PlanSet::from_yaml(PLANS).expect("the plans must parse");
-        let held = subscription("legacy_gold", "active");
-
-        assert_eq!(resolve_plan(&plans, Some(&held)).key(), "free");
-    }
+    use super::return_url;
 
     #[test]
     fn the_return_url_lands_on_the_organizations_own_billing_page() {

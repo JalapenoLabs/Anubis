@@ -2,11 +2,11 @@
 //!
 //! Anubis talks to Stripe over its REST API directly, with [`Client`], rather
 //! than through a generated SDK. The reasoning is in `docs/billing.md`, and it
-//! comes down to surface area: the whole integration is six calls, four
-//! form-encoded POSTs and two reads, every one of them answering flat JSON.
-//! The framework already carries a `reqwest` client built on rustls for
-//! outgoing webhooks, so this module adds no dependency, no second TLS stack,
-//! and no compile time worth measuring.
+//! comes down to surface area: the whole integration is eight calls, five
+//! writes and three reads, every one of them answering flat JSON. The
+//! framework already carries a `reqwest` client built on rustls for outgoing
+//! webhooks, so this module adds no dependency, no second TLS stack, and no
+//! compile time worth measuring.
 //!
 //! # What is here
 //!
@@ -15,14 +15,16 @@
 //! | [`Client::create_customer`] | `POST /v1/customers` | The first checkout an organization starts |
 //! | [`Client::create_checkout_session`] | `POST /v1/checkout/sessions` | Starting a subscription |
 //! | [`Client::create_portal_session`] | `POST /v1/billing_portal/sessions` | Managing an existing one |
-//! | [`Client::update_subscription_quantity`] | `POST /v1/subscriptions/{id}` | Billing a per-seat price for the seats in use |
+//! | [`Client::update_subscription`] | `POST /v1/subscriptions/{id}` | Changing line items, seats, and cancelling at period end |
+//! | [`Client::cancel_subscription`] | `DELETE /v1/subscriptions/{id}` | Cancelling a subscription now |
 //! | [`Client::retrieve_subscription`] | `GET /v1/subscriptions/{id}` | Reading current state when an event arrives |
 //! | [`Client::list_subscriptions`] | `GET /v1/subscriptions` | Reconciling an organization against Stripe |
+//! | [`Client::complete_items`] | `GET /v1/subscription_items` | Reading the rest of a long item list |
 //!
-//! The two reads exist because an event's body is a snapshot of the moment it
-//! was created, and a job may process it minutes later. Stripe's own guidance
-//! is to treat a payload as possibly stale and read the object back, which is
-//! what [`crate::billing::Reconciler`] does; see `docs/billing.md`.
+//! The reads exist because an event's body is a snapshot of the moment it was
+//! created, and a job may process it minutes later. Stripe's own guidance is to
+//! treat a payload as possibly stale and read the object back, which is what
+//! [`crate::billing::Reconciler`] does; see `docs/billing.md`.
 //!
 //! # Conventions
 //!
@@ -34,7 +36,12 @@
 //!
 //! Creating a customer carries an [idempotency key][idempotency] derived from
 //! the organization, so two checkouts started at the same instant converge on
-//! one customer instead of racing to create two.
+//! one customer instead of racing to create two. An update to a subscription
+//! carries one too, derived from the request and from a *revision* the caller
+//! names: the state the change was computed from. A retry of one change is
+//! therefore one change at Stripe, and the same change asked for again after
+//! the subscription moved on is a second one. Cancelling needs none, because
+//! Stripe treats a `DELETE` as idempotent by definition.
 //!
 //! No `Stripe-Version` header is sent, so calls run on the account's default
 //! API version. Pinning one is a single constant here when a deployment wants
@@ -51,6 +58,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use super::model::Subject;
 use crate::config::StripeConfig;
 
 /// Stripe's own API host, and the default for `STRIPE_API_BASE`.
@@ -69,13 +77,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// cannot fill a log line.
 const MAX_MESSAGE_LENGTH: usize = 2_000;
 
-/// How many of a customer's subscriptions one reconciliation reads.
+/// How many records one page of a Stripe list carries.
 ///
-/// Stripe's own maximum for a list page. An organization that has held more
-/// subscriptions than this has a decade of history and the oldest of them are
-/// long over, so a second page would correct nothing; taking one page keeps
-/// reconciliation a single call.
-const MAX_SUBSCRIPTIONS_LISTED: u8 = 100;
+/// Stripe's own maximum, so reading a long list costs as few calls as it can.
+const PAGE_SIZE: &str = "100";
+
+/// The most pages one listing of a customer's subscriptions follows.
+///
+/// An organization that pays per record can hold hundreds of subscriptions
+/// over its life, so a listing pages through them rather than stopping at the
+/// first hundred. The ceiling, ten thousand subscriptions, is a guard against a
+/// list that never reports its end rather than a size anybody reaches: hitting
+/// it is an error, never a silent truncation.
+const MAX_LIST_PAGES: usize = 100;
 
 /// A Stripe API client, holding the secret key and the base URL.
 ///
@@ -122,16 +136,16 @@ impl Client {
 
         // The key makes a retry, or a second concurrent checkout, return the
         // customer the first call created rather than making another one.
-        let idempotency_key = format!("anubis-customer-{}", customer.organization_id);
-        self.post("/v1/customers", &form, Some(&idempotency_key))
-            .await
+        let key = format!("anubis-customer-{}", customer.organization_id);
+        self.post("/v1/customers", &form, Some(&key)).await
     }
 
     /// Opens a Stripe Checkout session for one subscription purchase.
     ///
-    /// The session carries the organization and plan in its metadata, and on
-    /// the subscription it creates, so the events that follow identify the
-    /// tenant without a lookup table of Stripe ids.
+    /// The session carries the organization, and the plan or subject being
+    /// bought, in its metadata and on the subscription it creates, so the
+    /// events that follow identify the tenant and what it pays for without a
+    /// lookup table of Stripe ids.
     ///
     /// # Errors
     /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
@@ -144,20 +158,31 @@ impl Client {
         let mut form = Form::new();
         form.text("mode", "subscription");
         form.text("customer", session.customer_id);
-        form.text("line_items[0][price]", session.price_id);
-        form.text("line_items[0][quantity]", &session.quantity.to_string());
+        for (index, item) in session.line_items.iter().enumerate() {
+            form.text(&format!("line_items[{index}][price]"), item.price_id());
+            form.text(
+                &format!("line_items[{index}][quantity]"),
+                &item.quantity().to_string(),
+            );
+        }
         form.text("success_url", session.success_url);
         form.text("cancel_url", session.cancel_url);
         // Stripe echoes this on the completed-session event; the metadata below
         // rides the subscription itself, which is what every later event names.
         form.text("client_reference_id", &organization_id);
-        form.text("metadata[organization_id]", &organization_id);
-        form.text("metadata[plan_key]", session.plan_key);
-        form.text(
-            "subscription_data[metadata][organization_id]",
-            &organization_id,
-        );
-        form.text("subscription_data[metadata][plan_key]", session.plan_key);
+
+        let mut metadata = vec![(ORGANIZATION_METADATA, organization_id)];
+        match session.purchase {
+            Purchase::Plan(plan_key) => metadata.push((PLAN_METADATA, plan_key.to_owned())),
+            Purchase::Subject(subject) => {
+                metadata.push((SUBJECT_TYPE_METADATA, subject.kind().to_owned()));
+                metadata.push((SUBJECT_ID_METADATA, subject.id().to_string()));
+            }
+        }
+        for (name, value) in &metadata {
+            form.text(&format!("metadata[{name}]"), value);
+            form.text(&format!("subscription_data[metadata][{name}]"), value);
+        }
 
         self.post("/v1/checkout/sessions", &form, None).await
     }
@@ -194,60 +219,160 @@ impl Client {
         // Percent-encoded because the id reaches this call from an event body,
         // and a path segment is never a place to paste unescaped input.
         let path = format!("/v1/subscriptions/{}", encode_path_segment(id));
-        self.get(&path, &[]).await
+        let subscription = self.get(&path, &[]).await?;
+        self.complete_items(subscription).await
     }
 
-    /// Sets how many seats a subscription's single line item bills for.
+    /// Changes a subscription's line items, or sets it to cancel at period end.
     ///
-    /// Stripe carries the quantity on the item rather than on the subscription,
-    /// so the item's id has to be named; [`Subscription::item_id`] is where it
-    /// comes from. Nothing about proration is sent, which leaves Stripe's own
-    /// default of `create_prorations`: a seat added mid-period is charged for
-    /// the rest of that period, and a seat removed earns a credit. Changing
-    /// that is an account-level decision rather than a framework one.
+    /// Every item change rides one request, so a swap (one price removed,
+    /// another added) is one change with one set of prorations rather than two.
+    /// Nothing about proration is sent, which leaves Stripe's own default of
+    /// `create_prorations`: an item or a seat added mid-period is charged for
+    /// the rest of that period, and one removed earns a credit against the next
+    /// invoice. Changing that is an account-level decision rather than a
+    /// framework one.
+    ///
+    /// `revision` names the state the change was computed from, and keys the
+    /// request at Stripe together with the change itself; see the module docs.
     ///
     /// Answers with the subscription as it stands afterwards, which is what the
     /// caller writes into the projection.
     ///
     /// # Errors
     /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
-    pub async fn update_subscription_quantity(
+    pub async fn update_subscription(
         &self,
         subscription_id: &str,
-        item_id: &str,
-        quantity: i64,
+        update: &SubscriptionUpdate<'_>,
+        revision: &str,
     ) -> Result<Subscription, Error> {
         let mut form = Form::new();
-        form.text("items[0][id]", item_id);
-        form.text("items[0][quantity]", &quantity.to_string());
+        for (index, change) in update.items.iter().enumerate() {
+            match *change {
+                ItemUpdate::Add { price_id, quantity } => {
+                    form.text(&format!("items[{index}][price]"), price_id);
+                    form.text(&format!("items[{index}][quantity]"), &quantity.to_string());
+                }
+                ItemUpdate::SetQuantity { item_id, quantity } => {
+                    form.text(&format!("items[{index}][id]"), item_id);
+                    form.text(&format!("items[{index}][quantity]"), &quantity.to_string());
+                }
+                ItemUpdate::Remove { item_id } => {
+                    form.text(&format!("items[{index}][id]"), item_id);
+                    form.text(&format!("items[{index}][deleted]"), "true");
+                }
+            }
+        }
+        if let Some(cancel) = update.cancel_at_period_end {
+            form.text(
+                "cancel_at_period_end",
+                if cancel { "true" } else { "false" },
+            );
+        }
 
         // Percent-encoded for the same reason `retrieve_subscription` does it:
         // the id reaches here from a stored row that an event body wrote.
         let path = format!("/v1/subscriptions/{}", encode_path_segment(subscription_id));
-        self.post(&path, &form, None).await
+        let key = idempotency_key("POST", &path, &form.finish(), revision);
+        let subscription = self.post(&path, &form, Some(&key)).await?;
+        self.complete_items(subscription).await
+    }
+
+    /// Cancels a subscription now, rather than at the end of its period.
+    ///
+    /// Nothing is sent beside the request, which leaves Stripe's defaults: no
+    /// credit for the unused part of the period and no final invoice. Both are
+    /// the account's policy to choose, not the framework's. No idempotency key
+    /// either: Stripe ignores one on a `DELETE`, which is idempotent by
+    /// definition, since a cancelled subscription cannot be cancelled twice.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    pub async fn cancel_subscription(&self, subscription_id: &str) -> Result<Subscription, Error> {
+        let path = format!("/v1/subscriptions/{}", encode_path_segment(subscription_id));
+        let request = self
+            .http
+            .delete(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.secret_key);
+
+        let subscription = self.send(request, &path).await?;
+        self.complete_items(subscription).await
     }
 
     /// Lists every subscription a customer has ever held, newest first.
     ///
     /// `status=all` is deliberate: reconciliation has to see the cancelled ones
     /// too, or a row this application still believes is live would have nothing
-    /// to correct it.
+    /// to correct it. The listing follows Stripe's pages to the end, because a
+    /// customer paying per record holds a subscription per record.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached,
+    /// and when the list runs past [`MAX_LIST_PAGES`] pages.
+    pub async fn list_subscriptions(&self, customer_id: &str) -> Result<Vec<Subscription>, Error> {
+        let path = "/v1/subscriptions";
+        let mut held = Vec::new();
+        let mut after: Option<String> = None;
+
+        for _page in 0..MAX_LIST_PAGES {
+            let mut query = vec![
+                ("customer", customer_id),
+                ("status", "all"),
+                ("limit", PAGE_SIZE),
+            ];
+            if let Some(last) = after.as_deref() {
+                query.push(("starting_after", last));
+            }
+
+            let page: List<Subscription> = self.get(path, &query).await?;
+            after = page.data.last().map(|subscription| subscription.id.clone());
+            for subscription in page.data {
+                held.push(self.complete_items(subscription).await?);
+            }
+            if !page.has_more || after.is_none() {
+                return Ok(held);
+            }
+        }
+
+        Err(Error::decode(
+            path,
+            &format!("the list did not end within {MAX_LIST_PAGES} pages"),
+        ))
+    }
+
+    /// Fills in a subscription's line items when Stripe sent only the first page.
+    ///
+    /// A subscription embeds its items as a list, and a long one arrives with
+    /// `has_more` set. The projection deletes the items Stripe no longer
+    /// reports, so writing a partial list would delete items that still exist;
+    /// this reads the rest first. A subscription holds at most twenty items, so
+    /// one page of the item list is all of them. Returns the subscription
+    /// untouched, without a call, when its list is already whole, which is the
+    /// common case.
     ///
     /// # Errors
     /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
-    pub async fn list_subscriptions(&self, customer_id: &str) -> Result<Vec<Subscription>, Error> {
-        let list: List<Subscription> = self
+    pub async fn complete_items(
+        &self,
+        mut subscription: Subscription,
+    ) -> Result<Subscription, Error> {
+        if !subscription.items.has_more {
+            return Ok(subscription);
+        }
+
+        let items: List<SubscriptionItem> = self
             .get(
-                "/v1/subscriptions",
-                &[
-                    ("customer", customer_id),
-                    ("status", "all"),
-                    ("limit", &MAX_SUBSCRIPTIONS_LISTED.to_string()),
-                ],
+                "/v1/subscription_items",
+                &[("subscription", &subscription.id), ("limit", PAGE_SIZE)],
             )
             .await?;
+        subscription.items = SubscriptionItems {
+            data: items.data,
+            has_more: items.has_more,
+        };
 
-        Ok(list.data)
+        Ok(subscription)
     }
 
     /// POSTs a form to one Stripe endpoint and parses what comes back.
@@ -271,7 +396,7 @@ impl Client {
             )
             .body(form.finish());
         if let Some(key) = idempotency_key {
-            request = request.header("Idempotency-Key", key);
+            request = request.header(IDEMPOTENCY_HEADER, key);
         }
 
         self.send(request, path).await
@@ -336,23 +461,145 @@ pub struct NewCustomer<'a> {
     pub email: Option<&'a str>,
 }
 
+/// Stripe's metadata key naming the organization a subscription belongs to.
+pub(super) const ORGANIZATION_METADATA: &str = "organization_id";
+
+/// Stripe's metadata key naming the plan a checkout bought.
+pub(super) const PLAN_METADATA: &str = "plan_key";
+
+/// Stripe's metadata key naming the model of the record a subscription pays for.
+pub(super) const SUBJECT_TYPE_METADATA: &str = "subject_type";
+
+/// Stripe's metadata key naming the id of the record a subscription pays for.
+pub(super) const SUBJECT_ID_METADATA: &str = "subject_id";
+
+/// The header Stripe deduplicates writes by.
+const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+
 /// One subscription purchase, about to be handed to Stripe Checkout.
 #[derive(Debug, Clone)]
 pub struct NewCheckoutSession<'a> {
     /// The Stripe customer paying, e.g. `cus_1Q...`.
     pub customer_id: &'a str,
-    /// The Stripe price being bought, from `config/billing.yml`.
-    pub price_id: &'a str,
-    /// Seats bought. One for flat pricing.
-    pub quantity: i64,
+    /// The prices being bought and how many of each: one line for a plan, as
+    /// many as the application sells for a subject.
+    pub line_items: &'a [LineItem],
     /// Where Stripe returns the browser after a completed purchase.
     pub success_url: &'a str,
     /// Where Stripe returns the browser when the customer backs out.
     pub cancel_url: &'a str,
     /// The organization being subscribed, carried into Stripe's metadata.
     pub organization_id: Uuid,
-    /// The plan being bought, carried into Stripe's metadata.
-    pub plan_key: &'a str,
+    /// What the subscription buys, carried into Stripe's metadata.
+    pub purchase: Purchase<'a>,
+}
+
+/// What a subscription buys: the organization's plan, or one of its records.
+///
+/// One or the other, never both, which is the rule the `subscriptions` table
+/// holds as a check constraint; a type of its own makes the third shape
+/// unwritable here too.
+#[derive(Debug, Clone, Copy)]
+pub enum Purchase<'a> {
+    /// A plan from `config/billing.yml`, named by its key.
+    Plan(&'a str),
+    /// One of the application's records.
+    Subject(&'a Subject),
+}
+
+/// A Stripe price and how many of it: one line of a purchase.
+///
+/// # Examples
+/// ```
+/// use anubis::billing::LineItem;
+///
+/// let cores = LineItem::new("price_core_monthly", 2);
+/// assert_eq!(cores.price_id(), "price_core_monthly");
+/// assert_eq!(cores.quantity(), 2);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineItem {
+    price_id: String,
+    quantity: i64,
+}
+
+impl LineItem {
+    /// One line: `quantity` of the Stripe price `price_id`.
+    #[must_use]
+    pub fn new(price_id: impl Into<String>, quantity: i64) -> Self {
+        Self {
+            price_id: price_id.into(),
+            quantity,
+        }
+    }
+
+    /// The Stripe price, e.g. `price_1Q...`.
+    #[must_use]
+    pub fn price_id(&self) -> &str {
+        &self.price_id
+    }
+
+    /// How many of the price.
+    #[must_use]
+    pub fn quantity(&self) -> i64 {
+        self.quantity
+    }
+}
+
+/// A change to one subscription, as [`Client::update_subscription`] sends it.
+#[derive(Debug, Clone, Default)]
+pub struct SubscriptionUpdate<'a> {
+    /// Line-item changes, applied together in one request.
+    pub items: Vec<ItemUpdate<'a>>,
+    /// `Some(true)` sets the subscription to cancel at the end of its period.
+    pub cancel_at_period_end: Option<bool>,
+}
+
+impl SubscriptionUpdate<'_> {
+    /// Whether the update would send nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.cancel_at_period_end.is_none()
+    }
+}
+
+/// One line-item change, in the terms Stripe's update takes.
+///
+/// An item that exists is named by its Stripe item id; a new one by its price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemUpdate<'a> {
+    /// Adds a new line item for a price the subscription does not bill yet.
+    Add {
+        /// The Stripe price to add.
+        price_id: &'a str,
+        /// How many of it.
+        quantity: i64,
+    },
+    /// Sets how many of an existing item's price the subscription bills.
+    SetQuantity {
+        /// Stripe's id for the item, e.g. `si_1Q...`.
+        item_id: &'a str,
+        /// The new quantity.
+        quantity: i64,
+    },
+    /// Removes an existing item.
+    Remove {
+        /// Stripe's id for the item, e.g. `si_1Q...`.
+        item_id: &'a str,
+    },
+}
+
+/// The idempotency key for one write, from the request and its revision.
+///
+/// Hashed rather than concatenated, so a key stays inside Stripe's 255
+/// characters however many items the request names, and names nothing about
+/// the customer to whoever reads Stripe's request log.
+fn idempotency_key(method: &str, path: &str, body: &str, revision: &str) -> String {
+    let transition = format!("{method} {path}\n{revision}\n{body}");
+    format!(
+        "anubis-subscription-{}",
+        crate::auth::token::hash(&transition)
+    )
 }
 
 /// One visit to the customer portal, about to be opened.
@@ -432,51 +679,43 @@ pub struct Subscription {
     /// What `subscription_data[metadata]` carried through the checkout.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    /// The line items, one per price. The framework bills a single price.
+    /// The line items, one per price.
     #[serde(default)]
     items: SubscriptionItems,
 }
 
 impl Subscription {
-    /// The Stripe price this subscription buys, which names the plan.
-    ///
-    /// `None` for a subscription with no line items, which Stripe does not
-    /// produce but a mock or a future API version might.
-    #[must_use]
-    pub fn price_id(&self) -> Option<&str> {
-        self.first_item()
-            .and_then(|item| item.price.as_ref())
-            .map(|price| price.id.as_str())
+    /// Every line item, in the order Stripe lists them.
+    pub fn items(&self) -> impl Iterator<Item = &SubscriptionItem> {
+        self.items.data.iter()
     }
 
-    /// The price's recurrence as Stripe spells it, `month` or `year`.
+    /// Whether [`Subscription::items`] is the whole list rather than its first page.
     ///
-    /// Read only when a price is not one `config/billing.yml` names, which is
-    /// the one case where the interval cannot come from the plan.
+    /// [`Client`] completes a partial list before handing a subscription over,
+    /// so this is false only for one read out of an event body that nothing
+    /// has completed yet.
+    #[must_use]
+    pub fn items_complete(&self) -> bool {
+        !self.items.has_more
+    }
+
+    /// The line item billing `price_id`, when the subscription has one.
+    ///
+    /// A subscription bills each price on one item at most, which Stripe
+    /// enforces, so a price names an item.
+    #[must_use]
+    pub fn item_for_price(&self, price_id: &str) -> Option<&SubscriptionItem> {
+        self.items().find(|item| item.price_id() == Some(price_id))
+    }
+
+    /// The recurrence its prices share, as Stripe spells it: `month` or `year`.
+    ///
+    /// Stripe requires every item of a subscription to recur on the same
+    /// interval, so the first item answers for all of them.
     #[must_use]
     pub fn recurring_interval(&self) -> Option<&str> {
-        self.first_item()
-            .and_then(|item| item.price.as_ref())
-            .and_then(|price| price.recurring.as_ref())
-            .map(|recurring| recurring.interval.as_str())
-    }
-
-    /// The line item a quantity is set on, when the subscription has one.
-    ///
-    /// The framework bills a single price, so the first item is the item.
-    #[must_use]
-    pub fn item_id(&self) -> Option<&str> {
-        self.first_item()
-            .map(|item| item.id.as_str())
-            .filter(|id| !id.is_empty())
-    }
-
-    /// Seats bought, which is the line item's quantity.
-    #[must_use]
-    pub fn quantity(&self) -> i64 {
-        self.first_item()
-            .and_then(|item| item.quantity)
-            .unwrap_or(1)
+        self.items().find_map(SubscriptionItem::recurring_interval)
     }
 
     /// When the paid-for period ends, as Unix seconds.
@@ -487,7 +726,7 @@ impl Subscription {
     #[must_use]
     pub fn period_end(&self) -> Option<i64> {
         self.current_period_end
-            .or_else(|| self.first_item().and_then(|item| item.current_period_end))
+            .or_else(|| self.items().find_map(|item| item.current_period_end))
     }
 
     /// The value Stripe's metadata holds under `name`.
@@ -495,23 +734,22 @@ impl Subscription {
     pub fn metadata(&self, name: &str) -> Option<&str> {
         self.metadata.get(name).map(String::as_str)
     }
-
-    fn first_item(&self) -> Option<&SubscriptionItem> {
-        self.items.data.first()
-    }
 }
 
-/// The line items of a subscription.
+/// The line items of a subscription, as Stripe embeds them.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct SubscriptionItems {
     #[serde(default)]
     data: Vec<SubscriptionItem>,
+    /// Whether Stripe sent only the first page of a longer list.
+    #[serde(default)]
+    has_more: bool,
 }
 
 /// One line item: its id, a price, how many of it, and when its period ends.
 #[derive(Debug, Clone, Deserialize)]
-struct SubscriptionItem {
-    /// Stripe's id for the item, e.g. `si_1Q...`, which a quantity update names.
+pub struct SubscriptionItem {
+    /// Stripe's id for the item, e.g. `si_1Q...`, which an update names.
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -520,6 +758,35 @@ struct SubscriptionItem {
     quantity: Option<i64>,
     #[serde(default)]
     current_period_end: Option<i64>,
+}
+
+impl SubscriptionItem {
+    /// Stripe's id for the item, e.g. `si_1Q...`.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The Stripe price the item bills, when Stripe named one.
+    #[must_use]
+    pub fn price_id(&self) -> Option<&str> {
+        self.price.as_ref().map(|price| price.id.as_str())
+    }
+
+    /// How many of the price; `None` for a metered price, which bills usage.
+    #[must_use]
+    pub fn quantity(&self) -> Option<i64> {
+        self.quantity
+    }
+
+    /// The price's recurrence as Stripe spells it, `month` or `year`.
+    #[must_use]
+    pub fn recurring_interval(&self) -> Option<&str> {
+        self.price
+            .as_ref()
+            .and_then(|price| price.recurring.as_ref())
+            .map(|recurring| recurring.interval.as_str())
+    }
 }
 
 /// A price on a line item, as much of one as the framework reads.
@@ -540,6 +807,9 @@ struct Recurring {
 #[derive(Debug, Clone, Deserialize)]
 struct List<T> {
     data: Vec<T>,
+    /// Whether another page follows this one.
+    #[serde(default)]
+    has_more: bool,
 }
 
 /// Stripe's error envelope, the one shape every refusal arrives in.
@@ -715,7 +985,9 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{API_BASE, Client, Error, Form, Subscription, encode_path_segment};
+    use super::{
+        API_BASE, Client, Error, Form, Subscription, encode_path_segment, idempotency_key,
+    };
     use crate::config::AppConfig;
 
     /// A key shaped like a real one, belonging to nobody.
@@ -776,52 +1048,87 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_reads_its_price_quantity_and_period_from_either_shape() {
-        // The 2025 shape: the period lives on the line item.
+    fn a_subscription_reads_its_items_and_period_from_either_shape() {
+        // The 2025 shape: the period lives on the line items.
         let on_the_item: Subscription = serde_json::from_str(
             r#"{
                 "id": "sub_1", "object": "subscription", "status": "active",
                 "customer": "cus_1", "cancel_at_period_end": false,
                 "metadata": { "organization_id": "9f4a", "plan_key": "pro" },
-                "items": { "object": "list", "data": [{
-                    "id": "si_1", "quantity": 3, "current_period_end": 1760000000,
-                    "price": { "id": "price_pro_monthly", "recurring": { "interval": "month" } }
-                }] }
+                "items": { "object": "list", "has_more": false, "data": [
+                    { "id": "si_1", "quantity": 3, "current_period_end": 1760000000,
+                      "price": { "id": "price_pro_monthly", "recurring": { "interval": "month" } } },
+                    { "id": "si_2", "current_period_end": 1760000000,
+                      "price": { "id": "price_egress", "recurring": { "interval": "month" } } }
+                ] }
             }"#,
         )
         .expect("Stripe's subscription must parse");
 
-        assert_eq!(on_the_item.item_id(), Some("si_1"));
-        assert_eq!(on_the_item.price_id(), Some("price_pro_monthly"));
+        let seats = on_the_item
+            .item_for_price("price_pro_monthly")
+            .expect("the plan's item is found by its price");
+        assert_eq!(seats.id(), "si_1");
+        assert_eq!(seats.quantity(), Some(3));
+        let metered = on_the_item
+            .item_for_price("price_egress")
+            .expect("an item that is not first is found too");
+        assert_eq!(metered.quantity(), None, "a metered price has no quantity");
+        assert!(on_the_item.item_for_price("price_nope").is_none());
+        assert_eq!(on_the_item.items().count(), 2);
+        assert!(on_the_item.items_complete());
         assert_eq!(on_the_item.recurring_interval(), Some("month"));
-        assert_eq!(on_the_item.quantity(), 3);
         assert_eq!(on_the_item.period_end(), Some(1_760_000_000));
         assert_eq!(on_the_item.metadata("plan_key"), Some("pro"));
         assert_eq!(on_the_item.metadata("nothing"), None);
 
-        // The older shape: the period lives on the subscription, and fields the
-        // framework does not read are simply absent.
+        // The older shape: the period lives on the subscription, the list says
+        // more items follow, and fields the framework does not read are absent.
         let on_the_subscription: Subscription = serde_json::from_str(
             r#"{
                 "id": "sub_2", "status": "canceled", "customer": "cus_2",
                 "current_period_end": 1750000000,
-                "items": { "data": [{ "price": { "id": "price_pro_yearly" } }] }
+                "items": { "has_more": true, "data": [{ "price": { "id": "price_pro_yearly" } }] }
             }"#,
         )
         .expect("the older shape must parse too");
 
         assert_eq!(on_the_subscription.period_end(), Some(1_750_000_000));
         assert_eq!(on_the_subscription.recurring_interval(), None);
-        assert_eq!(
-            on_the_subscription.item_id(),
-            None,
-            "an item with no id is no place to set a quantity",
+        assert!(
+            !on_the_subscription.items_complete(),
+            "a first page is not the whole list",
         );
+    }
+
+    #[test]
+    fn an_update_is_keyed_by_its_revision_as_well_as_its_body() {
+        let path = "/v1/subscriptions/sub_1";
+        let body = "items%5B0%5D%5Bprice%5D=price_backups&items%5B0%5D%5Bquantity%5D=1";
+
+        let first = idempotency_key("POST", path, body, "2026-11-24T10:00:00Z");
+        let retried = idempotency_key("POST", path, body, "2026-11-24T10:00:00Z");
+        let later = idempotency_key("POST", path, body, "2026-11-24T11:30:00Z");
+
         assert_eq!(
-            on_the_subscription.quantity(),
-            1,
-            "a line item without a quantity is one seat",
+            first, retried,
+            "a retry of one change is one change at Stripe"
         );
+        assert_ne!(
+            first, later,
+            "the same change asked for after the row moved on is a new one",
+        );
+        assert_ne!(
+            first,
+            idempotency_key(
+                "POST",
+                path,
+                "cancel_at_period_end=true",
+                "2026-11-24T10:00:00Z"
+            ),
+        );
+        assert!(first.starts_with("anubis-subscription-"));
+        assert!(first.len() <= 255, "Stripe caps a key at 255 characters");
     }
 
     #[test]

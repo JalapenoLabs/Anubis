@@ -11,6 +11,7 @@ export type {
   BillingPlanLimit,
   BillingPlanPrice,
   BillingSubscription,
+  BillingSubscriptionItem,
   ChangePasswordRequest,
   ClaimedInvitation,
   ConnectedClient,
