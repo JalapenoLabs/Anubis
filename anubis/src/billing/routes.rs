@@ -417,7 +417,7 @@ fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
 /// Refuses a member who may see the plan but not buy one.
 ///
 /// Spending is `Billing::Subscription.update`, which the administrator role
-/// always holds and the `billing` key has always carried, and which an
+/// always holds and the `billing` key carries, and which an
 /// organization may hand to a role of its own.
 fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError> {
     if member.can(Action::Update, SUBSCRIPTION) {

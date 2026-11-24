@@ -57,11 +57,12 @@ pub(crate) const FRAMEWORK_SUBJECTS: [(&str, &[Action]); 3] = [
     (SUBSCRIPTION, &[Action::Update]),
 ];
 
-/// Grants the framework attaches to the role keys it has always given meaning.
+/// Grants the framework attaches to the role keys it gives meaning.
 ///
-/// Before roles were data, holding the `billing` key is what let a member pay
-/// for the organization. Carrying that here keeps every `roles.yml` written
-/// then meaning what it meant, without each application restating it.
+/// Holding the `billing` key is what lets a member pay for the organization,
+/// whether or not `roles.yml` grants it anything. Attaching it here means a
+/// `roles.yml` that declares `billing` bare still pays, and no application has
+/// to restate the framework's own permission.
 pub(crate) const FRAMEWORK_GRANTS: [(&str, &str, &[Action]); 1] =
     [(BILLING_ROLE, SUBSCRIPTION, &[Action::Update])];
 

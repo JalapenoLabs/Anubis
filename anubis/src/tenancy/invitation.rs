@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::auth::token;
 use crate::schema::{
-    invitation_roles, invitations, organization_memberships, role_grants, team_memberships,
+    invitation_roles, invitations, organization_memberships, organizations, role_grants,
+    team_memberships,
 };
 use crate::tenancy::grants::{self, Holder};
 use crate::tenancy::model::{NewOrganizationMembership, NewTeamMembership, TeamMembership};
@@ -288,14 +289,35 @@ pub(crate) async fn offered_role_ids(
 /// simply not granted. A claimant who is already a member absorbs the
 /// invitation and keeps exactly what they held.
 ///
-/// The invitation row is locked first, so two claims of one token are ordered
-/// and the second finds nothing.
+/// The organization row is locked first, as every role and grant change locks
+/// it, so a role deleted or a grant changed while the claim is in flight lands
+/// wholly before or after it, rather than as a foreign key failure or a
+/// deadlock between the two. The invitation row is locked next, so two claims
+/// of one token are ordered and the second finds nothing.
 pub(crate) async fn claim(
     connection: &mut AsyncPgConnection,
     raw_token: &str,
     claimant: Uuid,
 ) -> Result<Option<Claimed>, diesel::result::Error> {
     let token_hash = token::hash(raw_token);
+
+    let organization_id: Option<Uuid> = invitations::table
+        .filter(invitations::token_hash.eq(&token_hash))
+        .select(invitations::organization_id)
+        .first(connection)
+        .await
+        .optional()?;
+    let Some(organization_id) = organization_id else {
+        return Ok(None);
+    };
+    // An organization deleted since leaves no invitation behind, which the
+    // locked read below answers as an unknown token.
+    organizations::table
+        .find(organization_id)
+        .select(organizations::id)
+        .for_update()
+        .execute(connection)
+        .await?;
 
     let invitation: Option<Invitation> = invitations::table
         .filter(invitations::token_hash.eq(&token_hash))

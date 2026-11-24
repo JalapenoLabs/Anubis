@@ -181,9 +181,8 @@ pub const DEFAULT_ROLE: &str = "default";
 
 /// Role key that may spend the organization's money without administering it.
 ///
-/// Before roles were data, holding this key was the permission. The framework
-/// keeps granting `Billing::Subscription.update` to it, so a `roles.yml`
-/// declaring `billing` with no grants of its own means what it always meant.
+/// The framework grants `Billing::Subscription.update` to it, so a `roles.yml`
+/// declaring `billing` with no grants of its own still lets its holders pay.
 pub const BILLING_ROLE: &str = "billing";
 
 /// The colour a role declares none of.
@@ -271,7 +270,7 @@ impl RoleSet {
     ///
     /// Resolution flattens `includes` transitively, expands `manage` into
     /// every action a subject takes, and adds the grants the framework gives
-    /// the keys it has always given meaning (see [`permission`]).
+    /// the keys it gives meaning (see [`permission`]).
     ///
     /// # Errors
     /// Returns an [`Error`] on malformed YAML, a role including an undefined
@@ -963,8 +962,8 @@ roles:
 
     #[test]
     fn the_billing_key_keeps_paying_for_the_organization() {
-        // A roles.yml written before roles were data declares `billing` with
-        // no grants of its own: holding the key was the whole permission.
+        // A roles.yml may declare `billing` with no grants of its own: the
+        // framework's grant is then the whole permission.
         let set = RoleSet::from_yaml(BASELINE).expect("baseline must parse");
 
         assert!(

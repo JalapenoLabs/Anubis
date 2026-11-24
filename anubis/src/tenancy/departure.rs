@@ -70,6 +70,19 @@ pub(crate) async fn settle_departure(
         .await?;
     organization_ids.extend(sub_tenant_organization_ids);
 
+    // Every role and grant change locks its organization first, so the
+    // settlement does too, and in one order (Postgres locks the rows as the
+    // sort returns them) so two departures never deadlock. The administrator
+    // promoted below is then chosen from the roster as it stands, never from
+    // one a concurrent grant or revocation is still rewriting.
+    organizations::table
+        .filter(organizations::id.eq_any(&organization_ids))
+        .order(organizations::id)
+        .select(organizations::id)
+        .for_update()
+        .load::<Uuid>(connection)
+        .await?;
+
     diesel::delete(
         organization_memberships::table.filter(organization_memberships::user_id.eq(user_id)),
     )

@@ -1,15 +1,15 @@
 //! The runtime roles migration, run over an application's real rows.
 //!
-//! Before roles were data, a member's roles were a `TEXT[]` of `roles.yml`
-//! keys on each membership. The migration turns every one of those keys into
-//! a grant of the organization's role seeded from it. This suite builds the
-//! rows an application stamped before it would hold (organization and team
+//! The legacy schema keeps a member's roles as a `TEXT[]` of `roles.yml` keys
+//! on each membership. The migration turns every one of those keys into a
+//! grant of the organization's role seeded from it. This suite builds the rows
+//! an application holds in the legacy schema (organization and team
 //! administrators, a team administrator with no organization membership,
 //! editors, a billing member, a guest with a sub-tenant grant, a suspended
 //! member, members holding nothing, a second organization, and invitations
 //! still in flight), runs the migration, and pins that every member can do
-//! exactly what their keys let them do before: nothing lost, and nothing
-//! gained but the default role every member now holds.
+//! exactly what their keys let them do: nothing lost, and nothing gained but
+//! the default role every converted member holds.
 //!
 //! Requires `DATABASE_URL`; without it the test logs a skip and passes. CI
 //! always provides one.
@@ -150,7 +150,7 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
                 .await
                 .expect("resolution must run")
                 .expect("an organization member reaches the organization");
-        assert_access(&set, &access, keys);
+        assert_access(&set, &access, keys, keys.contains(&"admin"));
     }
     for user in [legacy.suspended, legacy.team_admin, legacy.other_admin] {
         assert!(
@@ -166,7 +166,7 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
             .await
             .expect("resolution must run")
             .expect("the other organization keeps its own administrator");
-    assert_access(&set, &access, &["admin"]);
+    assert_access(&set, &access, &["admin"], true);
 
     // ---------------------------------------------------------------------
     // Teams: a team's roles were the team membership's alone, and still are.
@@ -182,7 +182,7 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
                 .await
                 .expect("resolution must run")
                 .expect("a team member reaches their team");
-        assert_access(&set, &access, keys);
+        assert_access(&set, &access, keys, keys.contains(&"admin"));
     }
     assert!(
         resolve_team_access(&mut connection, &set, legacy.suspended, legacy.general, &[])
@@ -193,32 +193,55 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
     );
 
     // ---------------------------------------------------------------------
-    // Sub-tenants: the union of every applying grant, as before.
+    // Sub-tenants: the union of every applying grant. A team's administrator
+    // key keeps every permission it carried here, but administering one team
+    // is not administering the sub-tenant, so it does not rank as one.
     // ---------------------------------------------------------------------
-    for (sub_tenant, user, reach, keys) in [
+    for (sub_tenant, user, reach, keys, administrator) in [
         (
             legacy.atlas,
             legacy.admin,
             Reach::Administrator,
             &["admin"][..],
+            true,
         ),
-        (legacy.atlas, legacy.team_admin, Reach::Team, &["admin"][..]),
+        (
+            legacy.atlas,
+            legacy.team_admin,
+            Reach::Team,
+            &["admin"][..],
+            false,
+        ),
         (
             legacy.atlas,
             legacy.editor,
             Reach::Organization,
             &["default", "editor"][..],
+            false,
         ),
         (
             legacy.atlas,
             legacy.biller,
             Reach::Organization,
             &["billing", "default"][..],
+            false,
         ),
         // The guest's organization `editor` never cascaded; their grant here
         // is what they hold.
-        (legacy.atlas, legacy.guest, Reach::Grant, &["editor"][..]),
-        (legacy.main, legacy.plain, Reach::Organization, &[][..]),
+        (
+            legacy.atlas,
+            legacy.guest,
+            Reach::Grant,
+            &["editor"][..],
+            false,
+        ),
+        (
+            legacy.main,
+            legacy.plain,
+            Reach::Organization,
+            &[][..],
+            false,
+        ),
     ] {
         let (_sub_tenant, standing) =
             resolve_sub_tenant_access(&mut connection, &set, user, sub_tenant)
@@ -226,7 +249,7 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
                 .expect("resolution must run")
                 .expect("each of these reached the sub-tenant before");
         assert_eq!(standing.reach, reach);
-        assert_access(&set, &standing.access, keys);
+        assert_access(&set, &standing.access, keys, administrator);
     }
     for (sub_tenant, user) in [
         (legacy.main, legacy.guest),
@@ -280,14 +303,14 @@ async fn every_member_keeps_exactly_what_their_keys_granted() {
             .await
             .expect("resolution must run")
             .expect("the claim joined the team");
-    assert_access(&set, &access, &["editor"]);
+    assert_access(&set, &access, &["editor"], false);
     let organization_invitee_id = account(&mut connection, ORGANIZATION_INVITEE).await;
     let (_organization, _membership, access) =
         resolve_organization_access(&mut connection, &set, organization_invitee_id, legacy.acme)
             .await
             .expect("resolution must run")
             .expect("the claim joined the organization");
-    assert_access(&set, &access, &["billing", "ghost"]);
+    assert_access(&set, &access, &["billing", "ghost"], false);
 }
 
 #[tokio::test]
@@ -363,20 +386,21 @@ struct KeysRow {
     roles: Vec<String>,
 }
 
-/// Asserts that `access` is exactly what holding `keys` meant before.
+/// Asserts that `access` is exactly what holding the legacy `keys` meant.
 ///
-/// Before, a member held their keys and nothing else; the administrator key
-/// passed every framework check by name. Now every member also holds the
-/// default role, and the administrator role carries the framework's
-/// permissions as permissions. Any difference beyond those two is access the
-/// migration lost or invented.
-fn assert_access(set: &RoleSet, access: &Access, keys: &[&str]) {
+/// A legacy key granted its `roles.yml` permissions and nothing else, and the
+/// administrator key passed every framework check by name. Converted, every
+/// member also holds the default role, and the administrator role carries the
+/// framework's permissions as permissions. Any difference beyond those two is
+/// access the migration lost or invented. Whether the result ranks as the
+/// administrator there is asserted separately, as `administrator`, because a
+/// team's administrator key reaches a sub-tenant without administering it.
+fn assert_access(set: &RoleSet, access: &Access, keys: &[&str], administrator: bool) {
     let mut expected: BTreeSet<Permission> = set.permissions_of("default");
     for key in keys {
         expected.extend(set.permissions_of(key));
     }
-    let administrator = keys.contains(&"admin");
-    if administrator {
+    if keys.contains(&"admin") {
         expected.extend(
             [
                 (MEMBERSHIP, Action::Create),

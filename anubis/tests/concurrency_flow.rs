@@ -895,6 +895,72 @@ async fn a_role_deleted_while_granted_leaves_no_grant() {
     assert_eq!(left, 0, "a deleted role is held by nobody");
 }
 
+/// A role deleted while an invitation offering it is claimed leaves no grant
+/// behind: the claim takes the organization lock every role change takes, so
+/// it lands wholly before the delete (whose cascade then removes the grant)
+/// or wholly after it (and finds the role no longer offered), never as a
+/// foreign key failure or a deadlock between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_deleted_while_its_invitation_is_claimed_leaves_no_grant() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let court = TwoAdministrators::open(&database).await;
+    let editor = role_id(&court.harness.router, &court.first, court.team, "editor").await;
+
+    let invite = json!({
+        "email": "claimant@example.com",
+        "organization_id": court.organization,
+        "role_ids": [editor],
+    });
+    let (status, _headers, body) = send(
+        &court.harness.router,
+        "POST",
+        "/tenancy/invitations",
+        Some(&invite),
+        Some(&court.first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let token = invitation_token(&court.harness.outbox, "claimant@example.com");
+    let claimant = register(&court.harness.router, "claimant@example.com").await;
+
+    let (deleted, claimed) = court
+        .race(
+            (
+                "DELETE",
+                format!(
+                    "/tenancy/organizations/{}/roles/{editor}",
+                    court.organization
+                ),
+                json!({}),
+                &court.first,
+            ),
+            (
+                "POST",
+                "/tenancy/invitations/claim".to_owned(),
+                json!({ "token": token }),
+                &claimant,
+            ),
+        )
+        .await;
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+    assert_eq!(
+        claimed,
+        StatusCode::OK,
+        "the claim succeeds either way, with the role or without it",
+    );
+
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    let left: i64 = role_grants::table
+        .filter(role_grants::role_id.eq(editor))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(left, 0, "a deleted role is held by nobody");
+}
+
 // ---------------------------------------------------------------------------
 // Realtime channels
 // ---------------------------------------------------------------------------
