@@ -155,11 +155,8 @@ async fn is_deserted(
 /// Grants the administrator role to the longest-standing member when an
 /// organization has none left.
 ///
-/// The successor must be able to use the role. A suspended member reaches
-/// nothing, so they are never chosen, and a guest is passed over while a full
-/// member remains, because the role would carry them past the guest
-/// boundary; an organization left with only guests is administered by the
-/// longest-standing of them rather than by nobody.
+/// Who that is, [`organization_successor`] decides. A successor reached only
+/// through a team or a sub-tenant gains the organization membership too.
 async fn ensure_organization_admin(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
@@ -171,40 +168,84 @@ async fn ensure_organization_admin(
         return Ok(());
     }
 
-    let administrator = role::administrator_role(connection, organization_id).await?;
+    let Some(successor) = organization_successor(connection, organization_id).await? else {
+        tracing::warn!(
+            organization.id = %organization_id,
+            "organization {{organization.id}} survives with nobody who could administer it",
+        );
+        return Ok(());
+    };
 
-    let longest_standing: Option<Uuid> = organization_memberships::table
+    let membership_id = match successor {
+        Successor::Member(membership_id) => membership_id,
+        Successor::Newcomer(user_id) => {
+            diesel::insert_into(organization_memberships::table)
+                .values(NewOrganizationMembership {
+                    organization_id,
+                    user_id,
+                })
+                .returning(organization_memberships::id)
+                .get_result(connection)
+                .await?
+        }
+    };
+    let administrator = role::administrator_role(connection, organization_id).await?;
+    grants::grant(
+        connection,
+        organization_id,
+        administrator.id,
+        Holder::Organization { membership_id },
+        None,
+    )
+    .await
+}
+
+/// Who takes the administrator role over when an organization has none left.
+enum Successor {
+    /// An organization member, by membership.
+    Member(Uuid),
+    /// Somebody the organization reaches only through a team or a sub-tenant,
+    /// by account, who gains an organization membership with the role.
+    Newcomer(Uuid),
+}
+
+/// The longest-standing member able to use the administrator role.
+///
+/// In order: an organization member who is not suspended, full members before
+/// guests, because the role carries a guest past the guest boundary and an
+/// organization left with only guests is better administered by one of them
+/// than by nobody. Then, when the organization survives through its teams or
+/// its sub-tenants, a member of either who holds no organization membership,
+/// teams first because a team member works in the organization where a
+/// sub-tenant grant may be a guest's, and never one suspended in the
+/// sub-tenant they are reached through. Last, when everybody left is
+/// suspended, the longest-standing of them, full members first: the role
+/// gives nothing while the suspension holds, and without it nobody could ever
+/// grant the role again once the application lifts one.
+async fn organization_successor(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+) -> Result<Option<Successor>, diesel::result::Error> {
+    let members_first = (
+        organization_memberships::access
+            .eq(OrganizationAccess::Guest)
+            .asc(),
+        organization_memberships::created_at.asc(),
+    );
+
+    let reachable: Option<Uuid> = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(organization_id))
         .filter(organization_memberships::suspended_at.is_null())
         .select(organization_memberships::id)
-        .order((
-            organization_memberships::access
-                .eq(OrganizationAccess::Guest)
-                .asc(),
-            organization_memberships::created_at.asc(),
-        ))
+        .order(members_first)
         .first(connection)
         .await
         .optional()?;
-    if let Some(membership_id) = longest_standing {
-        return grants::grant(
-            connection,
-            organization_id,
-            administrator.id,
-            Holder::Organization { membership_id },
-            None,
-        )
-        .await;
+    if let Some(membership_id) = reachable {
+        return Ok(Some(Successor::Member(membership_id)));
     }
 
-    // No organization member can take it, and the organization survives
-    // through its teams or its sub-tenants: the longest-standing member of
-    // either takes it over. Teams come first because a team member works in
-    // the organization, where a sub-tenant grant may be a guest's. Somebody
-    // with an organization membership already, a suspended one, is not a
-    // candidate, and neither is anybody suspended in the sub-tenant they are
-    // reached through.
-    let team_successor: Option<Uuid> = team_memberships::table
+    let through_team: Option<Uuid> = team_memberships::table
         .inner_join(teams::table)
         .left_join(
             organization_memberships::table.on(organization_memberships::organization_id
@@ -235,46 +276,37 @@ async fn ensure_organization_admin(
         .await
         .optional()?
         .flatten();
-
-    let successor = match team_successor {
-        Some(successor) => Some(successor),
-        None => sub_tenant_memberships::table
-            .inner_join(sub_tenants::table)
-            .left_join(
-                organization_memberships::table.on(organization_memberships::organization_id
-                    .eq(sub_tenants::organization_id)
-                    .and(organization_memberships::user_id.eq(sub_tenant_memberships::user_id))),
-            )
-            .filter(sub_tenants::organization_id.eq(organization_id))
-            .filter(sub_tenant_memberships::suspended_at.is_null())
-            .filter(organization_memberships::id.is_null())
-            .select(sub_tenant_memberships::user_id)
-            .order(sub_tenant_memberships::created_at.asc())
-            .first(connection)
-            .await
-            .optional()?,
-    };
-
-    if let Some(successor) = successor {
-        let membership_id: Uuid = diesel::insert_into(organization_memberships::table)
-            .values(NewOrganizationMembership {
-                organization_id,
-                user_id: successor,
-            })
-            .returning(organization_memberships::id)
-            .get_result(connection)
-            .await?;
-        grants::grant(
-            connection,
-            organization_id,
-            administrator.id,
-            Holder::Organization { membership_id },
-            None,
-        )
-        .await?;
+    if let Some(user_id) = through_team {
+        return Ok(Some(Successor::Newcomer(user_id)));
     }
 
-    Ok(())
+    let through_sub_tenant: Option<Uuid> = sub_tenant_memberships::table
+        .inner_join(sub_tenants::table)
+        .left_join(
+            organization_memberships::table.on(organization_memberships::organization_id
+                .eq(sub_tenants::organization_id)
+                .and(organization_memberships::user_id.eq(sub_tenant_memberships::user_id))),
+        )
+        .filter(sub_tenants::organization_id.eq(organization_id))
+        .filter(sub_tenant_memberships::suspended_at.is_null())
+        .filter(organization_memberships::id.is_null())
+        .select(sub_tenant_memberships::user_id)
+        .order(sub_tenant_memberships::created_at.asc())
+        .first(connection)
+        .await
+        .optional()?;
+    if let Some(user_id) = through_sub_tenant {
+        return Ok(Some(Successor::Newcomer(user_id)));
+    }
+
+    let suspended: Option<Uuid> = organization_memberships::table
+        .filter(organization_memberships::organization_id.eq(organization_id))
+        .select(organization_memberships::id)
+        .order(members_first)
+        .first(connection)
+        .await
+        .optional()?;
+    Ok(suspended.map(Successor::Member))
 }
 
 /// Grants the administrator role to the longest-standing claimed member when a
@@ -334,6 +366,19 @@ async fn ensure_team_admin(
         .first(connection)
         .await
         .optional()?;
+    // Everybody left suspended still leaves the role with the longest-standing
+    // of them, for the reason the organization does.
+    let longest_standing = match longest_standing {
+        Some(membership_id) => Some(membership_id),
+        None => team_memberships::table
+            .filter(team_memberships::team_id.eq(team_id))
+            .filter(team_memberships::user_id.is_not_null())
+            .select(team_memberships::id)
+            .order(team_memberships::created_at.asc())
+            .first(connection)
+            .await
+            .optional()?,
+    };
     let Some(membership_id) = longest_standing else {
         return Ok(());
     };

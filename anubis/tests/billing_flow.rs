@@ -498,6 +498,89 @@ async fn checkout_refuses_a_plan_nobody_can_buy() {
     );
 }
 
+/// A guest reaches only what was granted by name, so a role carrying
+/// `Billing::Subscription.update` organization-wide spends nothing in their
+/// hands and shows them none of the records the organization pays for: the
+/// organization standing counts only for full members and administrators.
+#[tokio::test]
+async fn a_guest_holding_the_billing_role_spends_nothing() {
+    let Some(database) = TestDatabase::create("billing_flow").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let (stripe_base, _stripe_log) = start_mock_stripe().await;
+    let config = config(&stripe_base);
+    let billing = billing_router(harness.pool.clone(), &config);
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    let path = format!("/billing/organizations/{organization_id}");
+
+    let guest_email = format!("guest-{}@example.com", Uuid::new_v4());
+    let guest = register(&harness.router, &guest_email).await;
+    let mut connection = harness.pool.get().await.expect("a connection");
+    let guest_id: Uuid = anubis::schema::users::table
+        .filter(anubis::schema::users::email.eq(&guest_email))
+        .select(anubis::schema::users::id)
+        .first(&mut connection)
+        .await
+        .expect("the account must exist");
+    let membership_id: Uuid = diesel::insert_into(organization_memberships::table)
+        .values((
+            organization_memberships::organization_id.eq(organization_id),
+            organization_memberships::user_id.eq(guest_id),
+            organization_memberships::access.eq("guest"),
+        ))
+        .returning(organization_memberships::id)
+        .get_result(&mut connection)
+        .await
+        .expect("the membership must insert");
+
+    let roles_path = format!("/tenancy/organizations/{organization_id}/roles");
+    let (status, _headers, listing) =
+        send(&harness.router, "GET", &roles_path, None, Some(&owner)).await;
+    assert_eq!(status, StatusCode::OK, "body: {listing}");
+    let billing_role = listing["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .find(|role| role["key"] == "billing")
+        .and_then(|role| role["id"].as_str())
+        .expect("every organization is offered the billing role")
+        .to_owned();
+    let (status, _headers, body) = send(
+        &harness.router,
+        "PATCH",
+        &format!("/tenancy/organizations/{organization_id}/members/{membership_id}"),
+        Some(&json!({ "role_ids": [billing_role] })),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, _headers, body) = send(&billing, "GET", &path, None, Some(&guest)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["subscriptions"].is_null(),
+        "a guest is not shown what each record costs: {body}",
+    );
+    for endpoint in ["checkout", "portal", "reconcile"] {
+        let (status, _headers, body) = send(
+            &billing,
+            "POST",
+            &format!("{path}/{endpoint}"),
+            Some(&json!({ "plan_key": "pro", "interval": "monthly" })),
+            Some(&guest),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "for {endpoint}: {body}");
+    }
+}
+
 #[tokio::test]
 async fn only_members_who_may_spend_money_reach_the_write_endpoints() {
     let Some(database) = TestDatabase::create("billing_flow").await else {

@@ -45,6 +45,7 @@ use crate::db::DbPool;
 use crate::guard::OrganizationMember;
 use crate::http::ApiError;
 use crate::roles::{Action, RoleSet, SUBSCRIPTION};
+use crate::tenancy::OrganizationAccess;
 
 /// Where Stripe returns the browser, under `APP_URL`.
 ///
@@ -160,7 +161,7 @@ async fn show(
     // Only what the caller may see is loaded: an organization paying per
     // record can hold hundreds of subscriptions, which a member who may not
     // spend on them is never shown.
-    let list_all = member.can(Action::Update, SUBSCRIPTION);
+    let list_all = holds_billing_authority(&member);
     let live = if list_all {
         Subscription::live_for_organization(&mut connection, member.organization.id).await
     } else {
@@ -372,13 +373,23 @@ fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
     })
 }
 
-/// Refuses a member who may see the plan but not buy one.
+/// Whether a member may spend the organization's money and see what it buys.
 ///
 /// Spending is `Billing::Subscription.update`, which the administrator role
-/// always holds and the `billing` key carries, and which an
-/// organization may hand to a role of its own.
+/// always holds and the `billing` key carries, and which an organization may
+/// hand to a role of its own. It counts only for a full member or an
+/// administrator: a guest reaches only what was granted by name, and the
+/// organization's subscriptions pay for records across every sub-tenant, so a
+/// guest's organization-wide roles spend nothing, as they manage nothing.
+fn holds_billing_authority(member: &OrganizationMember) -> bool {
+    let standing_counts =
+        member.membership.access == OrganizationAccess::Full || member.access.is_administrator();
+    standing_counts && member.can(Action::Update, SUBSCRIPTION)
+}
+
+/// Refuses a member who may see the plan but not buy one.
 fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError> {
-    if member.can(Action::Update, SUBSCRIPTION) {
+    if holds_billing_authority(member) {
         Ok(())
     } else {
         Err(ApiError::forbidden(

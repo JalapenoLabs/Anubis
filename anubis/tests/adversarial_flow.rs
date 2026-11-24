@@ -2354,3 +2354,63 @@ async fn a_departure_promotes_only_a_reachable_successor() {
         .expect("the grants are readable");
     assert_eq!(team_successor, [member_in_team], "the team's successor");
 }
+
+/// When everybody left is suspended, the administrator role still goes to the
+/// longest-standing of them: it gives nothing while the suspension holds, and
+/// without it nobody could ever grant the role again once one is lifted.
+#[tokio::test]
+async fn a_departure_leaves_the_role_with_a_suspended_successor_rather_than_nobody() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let moderator = court.organization_membership("moderator-").await;
+    let member = court.organization_membership("member-").await;
+    let moderator_in_team = court.team_membership("moderator-").await;
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    diesel::update(
+        organization_memberships::table
+            .filter(organization_memberships::id.eq_any([moderator, member])),
+    )
+    .set(organization_memberships::suspended_at.eq(Some(chrono::Utc::now())))
+    .execute(&mut connection)
+    .await
+    .expect("everybody but the owner is suspended");
+
+    let (status, _headers, body) = court
+        .send(
+            "DELETE",
+            "/auth/account",
+            Some(&json!({ "password": PASSWORD })),
+            &court.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
+
+    let administrator = court.roles.administrator;
+    let organization_successor: Vec<Uuid> = role_grants::table
+        .filter(role_grants::role_id.eq(administrator))
+        .filter(role_grants::organization_membership_id.is_not_null())
+        .select(role_grants::organization_membership_id.assume_not_null())
+        .load(&mut connection)
+        .await
+        .expect("the grants are readable");
+    assert_eq!(
+        organization_successor,
+        [moderator],
+        "the longest-standing suspended member holds the role",
+    );
+
+    let team_successor: Vec<Uuid> = role_grants::table
+        .filter(role_grants::role_id.eq(administrator))
+        .filter(role_grants::team_membership_id.is_not_null())
+        .select(role_grants::team_membership_id.assume_not_null())
+        .load(&mut connection)
+        .await
+        .expect("the grants are readable");
+    assert_eq!(
+        team_successor,
+        [moderator_in_team],
+        "and so does the team's"
+    );
+}
