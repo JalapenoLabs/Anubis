@@ -325,6 +325,62 @@ async fn a_late_sweep_spares_a_session_a_later_sign_out_everywhere_kept() {
     store.assert_gone(&deployment.pool, user_id, &ended).await;
 }
 
+/// Every sign-in records `session.created` before it creates the session, and
+/// that insert's foreign key holds `FOR KEY SHARE` on the account's row until
+/// the sign-in commits. A sign-out-everywhere must never wait on that lock: the
+/// sign-in goes on to ask for `FOR SHARE`, which waits on the sign-out, and the
+/// two would deadlock, failing one of them with `500`. The store does not
+/// matter, since the generation moves in Postgres for both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_never_waits_on_a_sign_in_that_has_recorded_itself() {
+    let Some(database) = TestDatabase::create("session_store_key_share").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database, &Store::Postgres).await;
+    let email = format!("key-share-{}@example.com", Uuid::new_v4());
+    support::register(&deployment.router, &email).await;
+    let user_id = deployment.user_id(&email).await;
+    let (status, _headers, _body) = send(
+        &deployment.router,
+        "POST",
+        "/auth/password-reset/request",
+        Some(&json!({ "email": email })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let reset = deployment.reset_token(&email);
+
+    let mut signing_in = deployment.pool.get().await.expect("a connection");
+    let status = signing_in
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            // The lock a sign-in's audit insert holds from here to its commit.
+            users::table
+                .find(user_id)
+                .select(users::id)
+                .for_key_share()
+                .first::<Uuid>(transaction)
+                .await?;
+
+            let body = json!({ "token": reset, "password": RESET_PASSWORD });
+            let confirm = send(
+                &deployment.router,
+                "POST",
+                "/auth/password-reset/confirm",
+                Some(&body),
+                None,
+            );
+            let (status, _headers, _body) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), confirm)
+                    .await
+                    .expect("a reset must not wait on the lock a sign-in in flight holds");
+            Ok(status)
+        })
+        .await
+        .expect("holding the account must succeed");
+    assert_eq!(status, StatusCode::OK);
+}
+
 /// Waits until the account's generation is no longer `before`, which is how
 /// the late sweep test knows the reset it started has committed.
 async fn wait_for_the_generation_to_leave(

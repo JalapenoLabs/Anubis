@@ -581,7 +581,12 @@ struct GenerationMove {
 ///
 /// The generation being ended is read under the row lock the move then holds
 /// until its transaction commits, so it is exactly the one replaced, which is
-/// what the sweep afterwards removes. The new value is drawn from
+/// what the sweep afterwards removes. The lock is `FOR NO KEY UPDATE`, the one
+/// the `UPDATE` itself takes, never `FOR UPDATE`: every sign-in holds
+/// `FOR KEY SHARE` on this row from its audit insert's foreign key until it
+/// commits, and then asks for the `FOR SHARE` that waits on this move, so a
+/// move that waited on `KEY SHARE` in turn would deadlock with it. The new
+/// value is drawn from
 /// [`GENERATION_SEQUENCE`] rather than computed from the current one, so a
 /// value a rolled-back transaction drew is never the account's; see the
 /// module docs.
@@ -592,7 +597,7 @@ async fn advance_generation(
     let Some(ended) = users::table
         .find(user_id)
         .select(users::session_generation)
-        .for_update()
+        .for_no_key_update()
         .first(connection)
         .await
         .optional()?
