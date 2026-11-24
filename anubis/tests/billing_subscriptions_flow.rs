@@ -1900,3 +1900,162 @@ async fn a_change_waits_for_whoever_holds_the_subscription_row() {
         .expect("the change applies once the row is free");
     assert_eq!(scene.mock.subscription_writes().len(), 1);
 }
+
+/// A webhook arriving while a change holds the subscription waits, then applies.
+///
+/// The change's answer is held at Stripe; meanwhile an item is added at Stripe
+/// directly and its event is processed. The event waits on the row the change
+/// holds, and once the change commits it applies, because it was created after
+/// the change's read began: both the change and the dashboard's item stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_webhook_racing_a_change_waits_for_it_and_both_stand() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    let record = server();
+    scene.mock.hold(
+        "sub_contended",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_contended", Utc::now().timestamp() - 600)
+        .await;
+
+    let (arrived, release) = scene.mock.hold_next_update();
+    let changing = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        let record = record.clone();
+        async move {
+            scene
+                .subscriptions
+                .change_items(
+                    &Context::system(),
+                    scene.organization_id,
+                    &record,
+                    &[ItemChange::set(BACKUPS, 1)],
+                )
+                .await
+        }
+    });
+    arrived.notified().await;
+
+    scene.mock.bill("sub_contended", LOGS, 1);
+    let object = scene.mock.snapshot("sub_contended");
+    scene
+        .deliver(
+            "evt_contended",
+            "customer.subscription.updated",
+            Utc::now().timestamp(),
+            &object,
+        )
+        .await;
+    let processing = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        async move { scene.process_all().await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut connection = scene.connection().await;
+    let processed: Option<chrono::DateTime<Utc>> = stripe_billing_events::table
+        .filter(stripe_billing_events::stripe_event_id.eq("evt_contended"))
+        .select(stripe_billing_events::processed_at)
+        .first(&mut connection)
+        .await
+        .expect("the event is stored");
+    assert!(
+        processed.is_none(),
+        "the event waits for the change holding the row"
+    );
+    release.notify_one();
+
+    changing
+        .await
+        .expect("the task must join")
+        .expect("the change applies");
+    for (event_id, outcome) in processing.await.expect("the task must join") {
+        outcome.unwrap_or_else(|error| panic!("event {event_id} must process: {error}"));
+    }
+
+    let held = scene.live(&record).await.expect("still paid for");
+    assert_eq!(
+        stored(&held),
+        pairs(&[(SMALL, 1), (BACKUPS, 1), (LOGS, 1)]),
+        "the change and the item added at Stripe both stand",
+    );
+}
+
+/// With Stripe unset or unreachable, a change says so and writes nothing.
+#[tokio::test]
+async fn without_a_reachable_stripe_a_change_says_so_and_writes_nothing() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    let context = Context::system();
+    scene.mock.hold(
+        "sub_offline",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_offline", Utc::now().timestamp() - 600)
+        .await;
+
+    let unconfigured = AppConfig::from_lookup(|name| match name {
+        "ANUBIS_ENV" => Some("test".to_owned()),
+        _other => None,
+    })
+    .expect("the test config must parse");
+    let offline = Subscriptions::new(scene.harness.pool.clone(), plans(), &unconfigured);
+    let refused = offline
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect_err("billing is off");
+    assert!(refused.is_unconfigured(), "{refused}");
+    let refused = offline
+        .cancel(&context, scene.organization_id, &record, Cancellation::Now)
+        .await
+        .expect_err("billing is off");
+    assert!(refused.is_unconfigured(), "{refused}");
+
+    // A port nothing listens on: the request never reaches Stripe.
+    let unreachable = Subscriptions::new(
+        scene.harness.pool.clone(),
+        plans(),
+        &config("http://127.0.0.1:9"),
+    );
+    let failed = unreachable
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect_err("Stripe cannot be reached");
+    assert!(failed.is_transport(), "{failed}");
+    let answered: anubis::http::ApiError = failed.into();
+    assert_eq!(answered.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let held = scene.live(&record).await.expect("still paid for");
+    assert_eq!(stored(&held), pairs(&[(SMALL, 1)]), "nothing was written");
+    assert!(
+        scene
+            .audited(anubis::audit::SUBSCRIPTION_ITEMS_CHANGED)
+            .await
+            .is_empty(),
+        "and nothing was recorded",
+    );
+}

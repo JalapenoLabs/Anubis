@@ -93,6 +93,8 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `OAUTH_REVOKED` | `oauth.revoked` | A connection ends, from account settings, by the client's own revocation, or with every other connection when a temporary password is set or a password reset completes |
 | `OAUTH_CODE_REUSED` | `oauth.code_reused` | A spent authorization code is presented again, revoking its grant |
 | `OAUTH_REFRESH_REUSED` | `oauth.refresh_reused` | A rotated-away refresh token is presented again, revoking its grant |
+| `SUBSCRIPTION_ITEMS_CHANGED` | `subscription.items_changed` | An application adds, resizes, or removes line items on a record's subscription through `billing::Subscriptions`; the change set carries `items` before and after as `{price, quantity}`. See [billing.md](billing.md#subscriptions-per-record) |
+| `SUBSCRIPTION_CANCELED` | `subscription.canceled` | An application cancels a record's subscription; the change set is `cancel_at_period_end` or `status` |
 
 The dot is what tells the two vocabularies apart at a glance, and it is why a scaffolded model's `created` can never collide with a framework verb.
 

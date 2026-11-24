@@ -554,7 +554,10 @@ plans:
 ```
 
 Exactly one plan sells no prices, and that is the free plan: an organization
-with no subscription row is on it, so plan resolution is always total. The
+with no plan subscription is on it, so plan resolution is always total. An
+application that sells a subscription per record (a server, a workspace) starts
+and changes those through `anubis::billing::Subscriptions`; see
+[billing.md](billing.md#subscriptions-per-record). The
 billing screen is at `/organizations/:organizationId/billing`, linked from
 organization settings.
 

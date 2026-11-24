@@ -1,24 +1,37 @@
 # Billing
 
-Anubis bills organizations for subscription plans through Stripe. Plans live in one configuration file, money lives at Stripe, and the application keeps only the projection it has to authorize from.
+Anubis bills organizations through Stripe: for a plan, and for as many of the application's own records as it sells one subscription per (a server, a workspace), each with its add-ons as line items. Plans live in one configuration file, money lives at Stripe, and the application keeps only the projection it has to authorize from.
 
 This mirrors Bullet Train's billing experience (`bullet_train-billing` plus `bullet_train-billing-stripe`) with one file of products and prices, Stripe Checkout for the purchase, the Stripe Billing customer portal for every change after it, and per-plan usage limits. What differs is where things attach: Bullet Train subscribes a Team, Anubis subscribes an **Organization**, because the organization is the tenant that owns teams and pays for them. See [tenancy.md](tenancy.md).
 
 ## The module
 
-Everything below is built: plans in configuration, the Stripe client, checkout and the customer portal, the webhook lifecycle and reconciliation, limit enforcement with per-seat pricing, and the billing screen. Run against Stripe's test mode until a live key and a live endpoint are configured.
+Everything below is built: plans in configuration, the Stripe client, checkout and the customer portal, subscriptions per record with their line items, the webhook lifecycle and reconciliation, limit enforcement with per-seat pricing, and the billing screen. Run against Stripe's test mode until a live key and a live endpoint are configured.
 
 ## The model
 
 - **Plans** are configuration, not rows. `config/billing.yml` names every plan, the Stripe price behind each billing interval, and the limits the plan grants. The backend embeds the file with `include_str!` and validates it at boot, exactly as it treats `config/roles.yml`.
-- **A subscription** is a row in `subscriptions`, one per organization at a time, mirroring Stripe's own record: plan key, Stripe id, status, interval, quantity, period end, and whether it cancels at the end of the period.
-- **The Stripe customer** is stored on the organization, in `organizations.stripe_customer_id`. It is null until the first checkout, so an organization that never pays never reaches Stripe at all.
+- **A subscription** is a row in `subscriptions`, mirroring Stripe's own record: Stripe id, status, interval, quantity, period end, and whether it cancels at the end of the period. It is one of two kinds:
+  - the **plan subscription**, which names a plan key and no subject. An organization holds at most one live.
+  - a **subject subscription**, which pays for one of the application's records, named by `subject_type` and `subject_id` (a model name and a row id, the pair the audit log names a subject with), and names no plan. An organization holds any number, one live per record.
+- **Line items** are rows in `subscription_items`, one per Stripe price: the Stripe item id, the price, and the quantity (null for a metered price). An add-on is an item beside the thing it adds to.
+- **The Stripe customer** is stored on the organization, in `organizations.stripe_customer_id`. It is null until the first checkout, so an organization that never pays never reaches Stripe at all. One customer pays for every subscription the organization holds.
 
 ### The free plan is the absence of a row
 
-Exactly one plan in `billing.yml` sells no prices, and that is the free plan. An organization with no subscription is on it. Nothing is written at signup, nothing is backfilled when a plan is renamed, and a cancellation lands back where a new organization starts.
+Exactly one plan in `billing.yml` sells no prices, and that is the free plan. An organization with no live plan subscription is on it. Nothing is written at signup, nothing is backfilled when a plan is renamed, and a cancellation lands back where a new organization starts.
 
 The payoff is that plan resolution is **total**: every organization is always on a plan, so no handler, no limit check, and no UI branch has to answer "what does an unsubscribed organization get". `PlanSet::free()` returns a plan rather than an option because validation guarantees there is one.
+
+### Which plan is in force
+
+One function decides it, and every caller goes through it: `Limits::plan_for`, the billing endpoints, and seat enforcement all agree because none of them works it out for itself.
+
+- **The plan subscription decides.** A live plan subscription that grants access puts its plan in force; the database holds an organization to one, so the answer is single-valued however many subscriptions it pays for.
+- **Subject subscriptions never move the plan.** Each buys its own record, not the organization's limits, so an organization paying for a hundred servers is on whatever its plan subscription says, which is the free plan when it has none.
+- A plan subscription that grants nothing, or names a plan the file no longer defines (logged for an operator), leaves the organization on the free plan.
+
+Counting an organization as paid while it holds any subscription that grants access, or a positive prepaid balance, is on the roadmap, and it extends this same function rather than adding a rule beside it.
 
 ### Statuses
 
@@ -26,7 +39,11 @@ The payoff is that plan resolution is **total**: every organization is always on
 
 Two predicates read that column, and both are in `anubis::billing::SubscriptionStatus`:
 
-- `is_terminal()` is `canceled` or `incomplete_expired`, the two statuses that mean the subscription is over. A partial unique index on `subscriptions (organization_id) WHERE status NOT IN ('canceled', 'incomplete_expired')` enforces **one live subscription per organization** in the database rather than in a handler, because two events arriving at once would otherwise each write a row and neither would know. Change the predicate and change the index in the same migration.
+- `is_terminal()` is `canceled` or `incomplete_expired`, the two statuses that mean the subscription is over. Two partial unique indexes exclude them, and between them they are the live-subscription rule, enforced in the database rather than in a handler because two events arriving at once would otherwise each write a row and neither would know:
+  - `subscriptions (organization_id) WHERE subject_type IS NULL AND status NOT IN (...)`: **one live plan subscription per organization**.
+  - `subscriptions (subject_type, subject_id) WHERE subject_type IS NOT NULL AND status NOT IN (...)`: **one live subscription per record**, across every organization, because a record is paid for once.
+
+  A check constraint holds the two kinds apart: a subscription names a plan and no subject, or a subject and no plan. Change the predicate and change both indexes in the same migration.
 - `grants_access()` is `trialing`, `active`, or `past_due`. `past_due` counts on purpose: Stripe is still retrying the card, and cutting a paying customer off during a retry window is how a failed payment becomes a cancelled account. An organization whose subscription grants nothing falls back to the free plan.
 
 ## config/billing.yml
@@ -126,11 +143,78 @@ A price marked `per_seat: true` is charged per seat rather than per organization
 
 1. **Checkout buys the seats in use.** The line item's quantity is `seats_used` at the moment of purchase, never below one, so the first invoice is right without waiting for a membership to change.
 2. **Membership changes update Stripe.** Creating, claiming, or revoking an invitation, removing a member, leaving, and deleting a team each queue `anubis::billing::SyncSeats` on the `billing` queue, inside the transaction that made the change. A change that rolls back queues nothing. The job carries the organization and nothing else, so a burst of invitations converges on one number rather than replaying every intermediate one.
-3. **The job is a no-op unless it has work.** It returns without calling Stripe when billing is off, when the organization has no subscription that grants access, when the plan's price is not per-seat, or when the quantity is already right. `PlanSet::sells_per_seat` is checked before queueing at all, so a flat-priced application never writes a job row.
+3. **The job is a no-op unless it has work.** It returns without calling Stripe when billing is off, when the organization has no plan subscription that grants access, when the plan's price is not per-seat, or when the quantity is already right. `PlanSet::sells_per_seat` is checked before queueing at all, so a flat-priced application never writes a job row.
 
-The update is `POST /v1/subscriptions/{id}` with `items[0][id]` and `items[0][quantity]`, because Stripe carries the quantity on the line item rather than on the subscription. Nothing about proration is sent, which leaves **Stripe's default, `create_prorations`**: a seat added mid-period is charged for the rest of that period, and a seat removed earns a credit against the next invoice. That is what customers expect from per-seat billing, and changing it is an account-level decision rather than a framework one.
+The update is `POST /v1/subscriptions/{id}` with `items[0][id]` and `items[0][quantity]`, because Stripe carries the quantity on the line item rather than on the subscription. The item is the one billing the plan's per-seat price, found by its price, so add-ons beside it on the same subscription are never mistaken for the seats. Nothing about proration is sent, which leaves **Stripe's default, `create_prorations`**: a seat added mid-period is charged for the rest of that period, and a seat removed earns a credit against the next invoice. That is what customers expect from per-seat billing, and changing it is an account-level decision rather than a framework one. The request carries an idempotency key naming the subscription row's last write, so a retried job is one change at Stripe.
 
-The answer Stripe gives is written straight into the projection, stamped `now`, exactly as reconciliation is: the row a screen renders agrees with the invoice the customer will get.
+The answer Stripe gives is written straight into the projection, exactly as reconciliation is: the row a screen renders agrees with the invoice the customer will get.
+
+## Subscriptions per record
+
+An application that sells one subscription per thing (each always-on server its own subscription, at its own size and region) holds a **subject subscription** for each, beside the organization's plan subscription. `anubis::billing::Subscriptions` is what it calls to start, change, and cancel them:
+
+```rust
+let subscriptions = anubis::billing::Subscriptions::new(pool.clone(), plans.clone(), &config);
+let server = anubis::billing::Subject::new("Server", server_id);
+
+// Start: answers a Checkout session; the browser goes to its URL.
+let session = subscriptions
+    .checkout(organization_id, NewSubscription {
+        subject: &server,
+        line_items: &[LineItem::new(size_price, 1), LineItem::new(backups_price, 1)],
+        return_path: &format!("/servers/{server_id}"),
+        email: Some(&user.email),
+    })
+    .await?;
+
+// Change: an add-on bought or dropped mid-period, on Stripe's proration.
+subscriptions
+    .change_items(&audit_context, organization_id, &server, &[ItemChange::set(logs_price, 1)])
+    .await?;
+
+// End it, now or when the paid-for period does.
+subscriptions.cancel(&audit_context, organization_id, &server, Cancellation::AtPeriodEnd).await?;
+```
+
+### Why the application owns the routes
+
+The framework serves no endpoint that starts or changes a subject subscription, and that is deliberate. Three questions decide whether one is allowed, and only the application can answer them: whether the record belongs to the organization, who may spend money on it, and which Stripe prices it is sold at. The last is the sharpest: an endpoint taking price ids from a browser would let a customer buy any price in the Stripe account. So the application's own route authorizes the caller against its own record and its own permission model, computes the prices, and calls `Subscriptions`, which owns doing it correctly at Stripe. The framework's `/billing` endpoints list every subscription the organization holds, with its items, and reconcile them. A route that spends money on a record should require what the framework's own billing writes require, the `admin` or `billing` organization role, unless the application has a reason to grant it more narrowly.
+
+Every method names the organization, and a record that organization holds no live subscription for answers as not found, so a record another tenant pays for cannot be changed through this one.
+
+### Starting one
+
+`checkout` opens a Stripe Checkout session in subscription mode, with every line item and with `organization_id`, `subject_type`, and `subject_id` in the session's and the subscription's metadata. Nothing is written: the subscription exists at Stripe once the customer pays, and arrives as an event like any other, naming its record. The return links are built from `APP_URL` and the application's `return_path`, so they can never leave the application. It refuses, before Stripe hears of it, a record that already has a live subscription (`409`), a return path that is not a path under `APP_URL`, and line items Stripe would refuse: none, more than twenty (Stripe's ceiling), a price named twice, a quantity below one (`400`).
+
+Two purchases of one record that both complete (two tabs, two checkouts) are the one case refusing up front cannot cover. The record's unique index lets exactly one of them become the live row; the other event's job fails with a message naming the record, because which payment the customer keeps is a decision a person makes.
+
+### Changing one
+
+`change_items` takes changes that say where an item should end up rather than what to do to it: `ItemChange::set(price, quantity)` bills that many of a price, adding the item or setting its quantity, and `ItemChange::remove(price)` stops billing it. All of them go to Stripe as one update, so a swap is one change with one set of prorations, and Stripe's default proration applies: an item added mid-period is charged for the rest of it, and one removed earns a credit. Asking for what is already there sends nothing, and a change that would leave no items is refused: that is a cancellation.
+
+`cancel` ends one with `Cancellation::AtPeriodEnd`, which sets `cancel_at_period_end` and leaves it running to the end of the paid-for period, or `Cancellation::Now`, a `DELETE` on Stripe's defaults (no credit for the unused time, no final invoice). Cancelling one already set to end, or already over at Stripe, sends nothing.
+
+Each change runs the same way:
+
+1. **Lock.** The subscription's row is locked (`SELECT ... FOR UPDATE`) for the change's whole length, so two changes to one subscription run one after the other, each computed from what the previous one left. A webhook writing the same row waits for the lock and then applies or not by its own timestamp.
+2. **Read back.** The subscription is read from Stripe, not from the row, and the change is reduced to the smallest request that reaches it. A subscription Stripe says is over answers `409` for a change, with its terminal state written into the projection.
+3. **Send, keyed.** The request carries an idempotency key derived from the request and the row's last write, so a retry of a change whose answer was lost is one change at Stripe, and the same change asked for again after the projection moved on is a second one.
+4. **Write back and record.** Stripe's answer is written into the projection, items included, and the change is recorded in the audit log (`subscription.items_changed` with the items before and after, or `subscription.canceled`), on the organization, attributed by the `audit::Context` the caller passes, all in the transaction that holds the lock.
+
+If the local write fails after Stripe answered, the change still happened at Stripe, which is the system of record: the event Stripe sends about it repairs the projection, and so does reconciliation.
+
+### Errors
+
+`anubis::billing::subscriptions::Error` says which failure it is, and converts into `ApiError`, so an application handler forwards one with `?`:
+
+| Predicate | Answer | When |
+|---|---|---|
+| `is_unconfigured()` | `503`, naming `STRIPE_SECRET_KEY` | Billing is off |
+| `is_not_found()` | `404` | The organization holds no live subscription for that record |
+| `is_invalid()` | `400` | A change or purchase Stripe would refuse |
+| `is_conflict()` | `409` | The record already has a live subscription, or its subscription has ended at Stripe |
+| `is_transport()` | `503` | Stripe could not be reached; retrying may work |
+| none of these | `500`, detail in the log | Stripe refused, or the database did |
 
 ## Configuration
 
@@ -162,10 +246,10 @@ Two mounts, both in the application's `main.rs` and both listed by `anubis route
 
 | Route | Guard | Effect |
 |---|---|---|
-| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the subscription behind it, the seats in use, and whether billing is configured |
+| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the plan subscription behind it, every live subscription with its line items, the seats in use, and whether billing is configured |
 | `POST /billing/organizations/{organization_id}/checkout` | org `admin` or `billing` | Opens a Stripe Checkout session, answers with its URL |
 | `POST /billing/organizations/{organization_id}/portal` | org `admin` or `billing` | Opens the Stripe customer portal, answers with its URL |
-| `POST /billing/organizations/{organization_id}/reconcile` | org `admin` or `billing` | Reads Stripe and corrects what this application shows |
+| `POST /billing/organizations/{organization_id}/reconcile` | org `admin` or `billing` | Reads Stripe and corrects every subscription this application shows |
 | `POST /webhooks/stripe-billing` | a Stripe signature | Stores one Stripe event and queues the job that acts on it |
 
 Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. Spending money takes the `admin` role or the `billing` role, which the starter's `roles.yml` ships described as "can manage billing and subscriptions"; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on all four, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
@@ -190,15 +274,26 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
   },
   "subscription": {
     "id": "…", "organization_id": "…", "plan_key": "pro",
+    "subject_type": null, "subject_id": null,
     "stripe_subscription_id": "sub_…", "status": "active",
     "billing_interval": "monthly", "quantity": 2,
     "current_period_end": "2026-09-13T00:00:00Z", "cancel_at_period_end": false,
+    "items": [
+      { "id": "…", "subscription_id": "…", "stripe_item_id": "si_…",
+        "stripe_price_id": "price_…", "quantity": 2, "created_at": "…", "updated_at": "…" }
+    ],
     "created_at": "…", "updated_at": "…"
   },
+  "subscriptions": [
+    { "…": "the plan subscription again, first" },
+    { "plan_key": null, "subject_type": "Server", "subject_id": "…", "items": ["…"], "…": "…" }
+  ],
   "billing_enabled": true,
   "seats_used": 2
 }
 ```
+
+`subscription` is the plan subscription, the one behind `plan`; `subscriptions` is everything the organization pays for, the plan subscription first and then its records, grouped by model and oldest first. A screen that shows a record's subscription usually shows it where the record lives, and reads it from here or from `Subscription::live_for_subject`.
 
 `seats_used` is the one usage figure the framework can count for every application, because memberships are its own table. A screen reads it against the plan's `seats` limit to show how full the organization is; an application's own limits are counted by the application.
 
@@ -209,7 +304,7 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
 | `403` | The caller holds neither `admin` nor `billing` |
 | `503` | `STRIPE_SECRET_KEY` is unset |
 | `400` | Unknown plan, the free plan, an unknown interval, or an interval that plan does not sell |
-| `409` | The organization already has a live subscription; changing plans is the portal's job |
+| `409` | The organization already has a live plan subscription; changing plans is the portal's job. Subscriptions for its records are no obstacle |
 
 `POST .../portal` answers `409` when the organization has no Stripe customer yet, because there is nothing to manage before the first purchase.
 
@@ -259,16 +354,20 @@ With `STRIPE_WEBHOOK_SECRET` unset the endpoint answers `503` naming the variabl
 
 | Event | What the framework does |
 |---|---|
-| `checkout.session.completed` | Resolves the organization, reads the new subscription back from Stripe, and upserts the row |
+| `checkout.session.completed` | Resolves the organization, reads the new subscription back from Stripe, and upserts the row and its items |
 | `customer.subscription.created` | Same, for a subscription created anywhere else, including the Stripe dashboard |
-| `customer.subscription.updated` | Same: status, period end, quantity, `cancel_at_period_end`, and a plan change through the portal |
+| `customer.subscription.updated` | Same: status, period end, quantity, `cancel_at_period_end`, a plan change through the portal, and any item added, removed, or resized, which Stripe announces as an update |
 | `customer.subscription.deleted` | Writes the terminal status from the event's own body |
 
 Every other event type is **stored, marked processed, and ignored**, which is what makes "send all events" a safe way to configure the endpoint. A receiver that failed on the types it does not know would fail on every feature Stripe ships.
 
 **The organization** comes from the subscription's `metadata[organization_id]`, which checkout put there, then from the checkout session's own metadata, and finally from `organizations.stripe_customer_id`, which is the mapping this application wrote itself when the customer was created. That last fallback is what makes a subscription started in the Stripe dashboard land correctly. An event that resolves to no organization fails the job and stays on the row as evidence.
 
-**The plan** comes from the price, through `PlanSet::find_by_price_id`, because changing plan in the customer portal changes the price and leaves the metadata naming what was bought first. A price `config/billing.yml` does not sell falls back to the plan the metadata names, and if that fails too the job fails with a message naming the price: the fix is to add the price to the file or to stop offering the product in the portal.
+**The record** comes from the subscription's `metadata[subject_type]` and `metadata[subject_id]`, which `Subscriptions::checkout` put there. Both or neither: a subscription naming half a record, or a record id that is not a UUID, fails the job, because recording it as the plan subscription would be a second one. A subscription naming a record buys no plan, and its prices are the application's own, so nothing looks them up; its interval comes from their recurrence, which has to be monthly or yearly.
+
+**The plan**, for a subscription naming no record, comes from the price, through `PlanSet::find_by_price_id`, because changing plan in the customer portal changes the price and leaves the metadata naming what was bought first. Any of its items may carry the plan's price, since a plan subscription can carry add-ons beside it, but only one plan's price may appear. A price `config/billing.yml` does not sell falls back to the plan the metadata names, and if that fails too the job fails with a message naming the price: the fix is to add the price to the file or to stop offering the product in the portal.
+
+**The items** are written beside the subscription, in the same transaction and behind the same ordering guard: an item Stripe no longer lists is deleted, and every listed one is inserted or brought up to date by its Stripe item id. Stripe embeds a subscription's items as a list and sends only its first page when there are many; the client reads the rest before anything is written, and a list that still arrives partial fails rather than deleting items that exist.
 
 ### Reading rather than trusting
 
@@ -287,9 +386,11 @@ WHERE subscriptions.stripe_event_at IS NULL
    OR subscriptions.stripe_event_at <= excluded.stripe_event_at
 ```
 
-So a late `customer.subscription.updated` cannot undo a cancellation that arrived first. Two events created in the same second both apply, which is safe precisely because each one writes the state read back from Stripe rather than its own body. Reconciliation stamps `now`, because it read Stripe directly and is therefore at least as current as anything in flight.
+So a late `customer.subscription.updated` cannot undo a cancellation that arrived first, and since a subscription's items are written only when its row is, a late event cannot bring back an add-on that was removed either. Two events created in the same second both apply, which is safe precisely because each one writes the state read back from Stripe rather than its own body.
 
-The **one live subscription per organization** index from slab 1 holds under all of this: the upsert is keyed on `stripe_subscription_id`, so a resubscription after a cancellation inserts a second row while the first is terminal, and a customer who somehow holds two live subscriptions at Stripe fails the job with a message saying so, because that is a decision a person has to make.
+A write that read Stripe directly (reconciliation, seat synchronization, an application's change) is stamped with **the moment its read began, in whole seconds**. Both halves matter. Anything Stripe recorded before the read is in what it read, so an older event is rightly ignored, while anything later may be missing from it, so a newer event must stay free to apply; letting an event win is always safe, because processing one reads Stripe back. A write stamped when it lands would instead overwrite a newer event with the older state it read first. And Stripe's `created` is whole seconds, so a write stamped with a fraction of a second would sort after a cancellation created later in the same second, dropping it and leaving a cancelled subscription granting access.
+
+The **live-subscription indexes** hold under all of this: the upsert is keyed on `stripe_subscription_id`, so a resubscription after a cancellation inserts a second row while the first is terminal, and a customer who somehow holds two live plan subscriptions, or two live subscriptions for one record, fails the job with a message naming which, because that is a decision a person has to make.
 
 ### Processing
 
@@ -311,7 +412,9 @@ Delivery is at-least-once, like every job on this queue, so the handler is idemp
 
 A missed event would otherwise leave the projection wrong forever: an endpoint misconfigured for a week, a deployment down while Stripe gave up retrying, a price that reached `config/billing.yml` after the first customer bought it.
 
-`Reconciler::reconcile(organization_id)` is the repair, and it is the same convergence the events drive. It reads every subscription Stripe holds for the organization's customer (`GET /v1/subscriptions?customer=…&status=all`, the other read), writes each one, and answers with the organization's live subscription afterwards. Finished subscriptions are written first, so a row this application still believes is live releases the slot before the live one takes it, and the whole pass runs in one transaction, so a subscription that cannot be recorded leaves the projection as it was.
+`Reconciler::reconcile(organization_id)` is the repair, and it is the same convergence the events drive. It reads every subscription Stripe holds for the organization's customer (`GET /v1/subscriptions?customer=…&status=all`, following Stripe's pages to the end, because a customer paying per record holds a subscription per record), writes each one with its items, and answers with the organization's live subscriptions afterwards, plan subscription first. Finished subscriptions are written first, so a row this application still believes is live releases its slot before the live one takes it.
+
+Each subscription converges in its own transaction. One that cannot be recorded (a price `config/billing.yml` does not sell, a second live subscription for one record) leaves its own row as it was and is named in the error, and every other subscription is still repaired: an organization paying for a hundred records is not held back by one.
 
 `POST /billing/organizations/{id}/reconcile` exposes it, guarded like the other writes, and answers with the same body as the `GET`, so the screen that triggered it re-renders from the answer. An organization that never reached Stripe has nothing to converge and answers with what it already had. Being unable to reach Stripe answers `503`; anything else answers `500` with the detail in the log.
 
@@ -319,9 +422,9 @@ There is no periodic sweep yet, because there are no recurring schedules yet; th
 
 ## Why a hand-written Stripe client
 
-`anubis::billing::stripe::Client` is roughly 200 lines over the `reqwest` client the framework already carries. The alternative considered was the `async-stripe` crate.
+`anubis::billing::stripe::Client` is a few hundred lines over the `reqwest` client the framework already carries. The alternative considered was the `async-stripe` crate.
 
-- **Surface area**: the whole integration is six calls, four form-encoded POSTs and two reads, every one answering flat JSON. A generated SDK models the entire Stripe API to serve six calls.
+- **Surface area**: the whole integration is eight calls, five writes and three reads, every one answering flat JSON: create a customer, open a checkout session, open a portal session, update a subscription (its items, a seat count, or cancelling at period end), cancel one now, read one, list a customer's, and read the rest of a long item list. A generated SDK models the entire Stripe API to serve eight calls.
 - **Pure-Rust TLS is mandatory** here, and both options can satisfy it, but `reqwest` with rustls is already in the tree for outgoing webhook delivery, so this adds no dependency and no second TLS stack. `cargo tree -i openssl` matches nothing, and CI keeps it that way.
 - **Compile time**: this workspace compiles in seconds and that is worth protecting. `async-stripe` is one of the larger crates in the ecosystem, and its API surface changes with Stripe's.
 - **The escape hatch stays open**: the client is one module behind a small surface. An application that needs more of Stripe than the framework uses can depend on `async-stripe` itself without fighting anything here.
@@ -331,7 +434,8 @@ Conventions the client holds to:
 - Requests are `application/x-www-form-urlencoded` with Stripe's nested parameter syntax (`metadata[organization_id]`, `line_items[0][price]`).
 - Responses are parsed into the few fields the framework reads. Stripe adds fields constantly, and a struct insisting on all of them would break on their schedule rather than ours.
 - Creating a customer carries an `Idempotency-Key` derived from the organization, so two checkouts started at the same instant converge on one customer instead of racing to create two. The store is then conditional on the column still being null, so neither request can overwrite the other.
-- Checkout sessions carry `client_reference_id`, `metadata[organization_id]`, `metadata[plan_key]`, and the same two values under `subscription_data[metadata]`, so every event that follows identifies the tenant without a lookup table of Stripe ids.
+- Updating a subscription carries an `Idempotency-Key` hashed from the request and a revision the caller names, the subscription row's last write: a retry of one change is one change at Stripe, and the same change asked for after the row moved on is another. A cancellation needs none, because Stripe treats a `DELETE` as idempotent by definition.
+- Checkout sessions carry `client_reference_id`, `metadata[organization_id]`, and what was bought, `metadata[plan_key]` for a plan or `metadata[subject_type]` and `metadata[subject_id]` for a record, with the same values under `subscription_data[metadata]`, so every event that follows identifies the tenant and what it pays for without a lookup table of Stripe ids.
 - No `Stripe-Version` header is sent, so calls run on the account's default API version. Pinning one is a single constant when a deployment wants its upgrades to be deliberate. Because the version is the account's, a subscription's `current_period_end` is read from the subscription and from its first line item, which is where Stripe moved it in the 2025 versions.
 - Ids that arrive in an event body are percent-encoded before they reach a path, because a path is never a place to paste input.
 
@@ -340,7 +444,7 @@ Conventions the client holds to:
 1. Create the products and prices in the Stripe dashboard (start in test mode: <https://dashboard.stripe.com/test/products>).
 2. Copy each price id into `config/billing.yml`.
 3. Put the secret key in `.env` as `STRIPE_SECRET_KEY` (<https://dashboard.stripe.com/test/apikeys>).
-4. Activate the customer portal and choose which products it may switch between (<https://dashboard.stripe.com/test/settings/billing/portal>). List only plans this application defines, or a plan change will produce an event naming a price no plan sells.
+4. Activate the customer portal and choose which products it may switch between (<https://dashboard.stripe.com/test/settings/billing/portal>). List only plans this application defines, or a plan change will produce an event naming a price no plan sells. The portal lists every subscription the customer holds, records' included, so decide whether customers may cancel there too: a cancellation in the portal arrives as an event like any other, and the application learns of it by reading the projection.
 5. Add a webhook endpoint at `<APP_URL>/webhooks/stripe-billing` (<https://dashboard.stripe.com/test/webhooks/create>), selecting the four events in `anubis::billing::HANDLED_EVENTS`. Selecting every event works too; the rest are stored and ignored.
 6. Copy that endpoint's signing secret into `.env` as `STRIPE_WEBHOOK_SECRET`.
 7. Repeat all of it in live mode before launch, including a live `STRIPE_SECRET_KEY` and the live endpoint's own signing secret. The two secrets are per mode and per endpoint, so nothing carries over.
@@ -349,16 +453,18 @@ In development, Stripe cannot reach `localhost`. Forward the events with `stripe
 
 ## Testing
 
-Three narratives, all against a **mock Stripe**: a small axum server serving the endpoints the framework calls, pointed at with `STRIPE_API_BASE`, exactly as `oauth_flow.rs` serves a mock OpenID Connect provider. Nothing in the code under test is special-cased for a test.
+Four narratives, all against a **mock Stripe**: a small axum server serving the endpoints the framework calls, pointed at with `STRIPE_API_BASE`, exactly as `oauth_flow.rs` serves a mock OpenID Connect provider. Nothing in the code under test is special-cased for a test.
 
 - `anubis/tests/billing_flow.rs` covers the purchase: the plan resolved from configuration, the customer created and stored, the checkout session opened with the price the plan names, and the portal. The assertions read the real request bodies, down to the idempotency key and the `Authorization` header.
 - `anubis/tests/billing_webhooks_flow.rs` covers the lifecycle: events signed with Stripe's scheme and the configured secret, a refused signature (missing, wrong, tampered, replayed) storing nothing, a redelivery becoming one row and one job, a full lifecycle from completed checkout through a plan change to cancellation and a fresh subscription, an out-of-order event changing nothing, reconciliation correcting a drifted row, and two organizations that never see each other's subscriptions.
+
+- `anubis/tests/billing_subscriptions_flow.rs` covers several live subscriptions and their items, against a stateful mock that applies updates, keeps Stripe's idempotency cache, pages its lists, and embeds only the first page of a long item list: a plan subscription and two records held at once with the plan deciding the limits, a second live subscription for one plan or one record refused with a message naming it, a record bought through Checkout and arriving as an event, add-ons bought, resized, swapped, and removed mid-period with keyed requests and audit rows, a repeated change sending nothing, a late event leaving items alone and a newer one winning, a redelivery changing nothing twice, a record another organization pays for answering not found, both cancellations, changes refused with `503` and nothing written when Stripe is unset or unreachable, and reconciliation following pages and long item lists, deleting drifted items, and repairing the rest past one it cannot record. The races run for real: two changes to one subscription with the first held open at Stripe, a change waiting on a row lock the test holds, a webhook arriving while a change holds the row, two purchases of one record converging at once, a reconciliation whose older read lands after a newer event, and a cancellation in the same second as a write.
 
 - `anubis/tests/billing_limits_flow.rs` covers the limits: an invitation past the free plan's seats refused with the plan named, a re-invitation of somebody who already holds a seat costing nothing, a soft limit letting a record through where a hard one refuses (both against a real subscription row, so plan resolution is exercised rather than assumed), a membership change queueing `SyncSeats` only when a price is per-seat, and the job telling a stateful mock Stripe the new quantity exactly once.
 
 The lifecycle suite proves the retrieve-rather-than-trust decision directly: the event bodies it delivers carry a status the mock no longer agrees with, and the row that lands is the mock's.
 
-All three use `TestDatabase`, so each narrative owns a database and can count rows; see [testing.md](testing.md). On the frontend, `BillingPage.test.tsx` renders the screen against a stubbed `fetch` in three states: billing disabled, the free plan with its grid, and a live subscription set to cancel.
+All four use `TestDatabase`, so each narrative owns a database and can count rows; see [testing.md](testing.md). On the frontend, `BillingPage.test.tsx` renders the screen against a stubbed `fetch` in three states: billing disabled, the free plan with its grid, and a live subscription set to cancel.
 
 ## The plan catalog in the frontend
 
@@ -386,6 +492,8 @@ It renders in one shape with a few states:
 | Over the seat limit | A warning line under the seat count, which is where a soft limit shows itself |
 | Back from Stripe | `?checkout=success` or `?checkout=canceled` opens the page with the matching sentence. Neither is trusted: the subscription appears when Stripe's event arrives |
 
+The screen renders the plan subscription. The subscriptions an application sells per record arrive in the same response, for the application to render where each record lives rather than on a page that cannot name them.
+
 Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for `admin` or `billing`, read from the compiled `roles.generated.ts` through `permissions.ts`, which is the same authority the endpoints enforce.
 
 The refresh action is `POST .../reconcile`. It exists on the screen because the one thing a customer does after paying is come back and look, and an event that has not landed yet is the one moment the page can be wrong.
@@ -397,4 +505,8 @@ The refresh action is `POST .../reconcile`. It exists on the screen because the 
 - **Notifying a customer whose card failed.** `past_due` reaches the row and the screen says so, but nobody is emailed. The event to hang that on is `invoice.payment_failed`, and the surface it needs is notification rather than billing.
 - **Time-based usage limits.** Bullet Train's usage trackers meter verbs over a window ("one publish per three days"). Anubis meters counts. A window needs a tracker table and a cycling schedule, which is a larger feature than a limit and is not obviously worth it.
 - **A periodic reconciliation sweep.** `Reconciler::reconcile` is written to be called from a schedule; there are no recurring schedules yet. See [jobs.md](jobs.md#roadmap).
-- **Multiple live subscriptions, add-ons, and metered prices.** One organization, one subscription, one line item. A customer holding two live subscriptions at Stripe fails the job with a message saying so, because that is a decision a person has to make.
+- **Changing a plan subscription's items from the application.** The portal changes a plan subscription, and `Subscriptions` changes the subscriptions an application sells per record; add-ons on the plan subscription itself go through the portal.
+- **Telling the application a record's subscription changed.** A subscription cancelled in the portal, or one Stripe gave up collecting, reaches the projection and the screen; an application that acts on it (stopping the record it paid for) reads `Subscription::live_for_subject` where it decides. A hook the lifecycle calls on each change is future work.
+- **Usage reporting for metered prices.** A metered item is projected, with no quantity; reporting usage to Stripe is the application's.
+
+On the roadmap: counting an organization as paid while it holds any subscription that grants access or a positive prepaid balance, a prepaid credit wallet, and both in the plan resolution above.

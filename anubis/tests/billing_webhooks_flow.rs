@@ -357,7 +357,7 @@ async fn rows_for(connection: &mut AsyncPgConnection, organization_id: Uuid) -> 
         .collect()
 }
 
-/// The organization's one live subscription, as the endpoints resolve it.
+/// The organization's live plan subscription, as the endpoints resolve it.
 async fn live_subscription(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,

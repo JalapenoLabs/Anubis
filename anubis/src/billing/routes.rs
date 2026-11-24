@@ -66,7 +66,7 @@ fn return_url(app_url: &str, organization_id: Uuid) -> String {
 
 /// Seats bought by a checkout of a price that is not sold per seat.
 ///
-/// One organization, one line item. A price marked `per_seat` in
+/// One organization, one plan line. A price marked `per_seat` in
 /// `billing.yml` is bought with the organization's seat count instead, and
 /// [`super::SyncSeats`] keeps that number current afterwards.
 const FLAT_QUANTITY: i64 = 1;
