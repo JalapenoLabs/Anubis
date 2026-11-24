@@ -688,6 +688,7 @@ The image bakes the deployment shape and none of its secrets:
 | `SMTP_URL`, `MAIL_FROM` | to send real email | Otherwise mail goes to the log |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | to charge money | Otherwise every organization is on the free plan |
 | `REDIS_URL` | for more than one instance | Fans realtime channels out across instances |
+| `SESSION_STORE` | to keep sessions in Redis | `redis` keeps them in the Redis `REDIS_URL` names, which must then persist; unset, they stay in Postgres. See [sessions.md](sessions.md) |
 | `CORS_ALLOWED_ORIGINS` | for cross-origin API callers | Exact origins, comma separated |
 | `TRUSTED_PROXY_HEADER` | behind a proxy | Names the header carrying the client address |
 

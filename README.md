@@ -75,7 +75,7 @@ and rehearsed, ready for a screencast.
 ## The stack
 
 - **Backend**: Rust on tokio, Axum, tower, Diesel with diesel-async, PostgreSQL,
-  optional Redis for realtime fanout and caching.
+  optional Redis for realtime fanout and, when chosen, sessions.
 - **Frontend**: React SPA with Vite, TypeScript, HeroUI, TailwindCSS, Redux
   Toolkit, React Router, ky with SWR, react-hook-form with zod, i18next.
 - **Contract**: OpenAPI 3.1 generated from the Rust handlers, driving a
@@ -93,7 +93,7 @@ feature categories are on the left.
 
 | Area | Status | What that means |
 |---|---|---|
-| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation, avatars, account deletion, and operator-set temporary passwords that admit nothing until replaced |
+| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation (sessions in Postgres, or Redis by one setting), avatars, account deletion, and operator-set temporary passwords that admit nothing until replaced |
 | **OAuth / SSO** | Ships | OpenID Connect with PKCE. Google in the registry; a provider is two environment variables, and `anubis scaffold oauth <provider>` prints them |
 | **Multi-tenancy** | Ships | User, TeamMembership, Team, Organization, OrganizationMembership, and Invitation. A personal organization and default team at signup. Team and organization settings screens, rosters, and the switcher |
 | **Platform tier** | Partial | A role scoped to `platform` is held on the account and operates the whole deployment, behind the `PlatformMember` guard. `ANUBIS_INITIAL_ADMIN_EMAIL` appoints the first operator at boot, and operators invite people (optionally as operators) with 24-hour links the invitee accepts by choosing a password. The primitives ship; operator screens do not yet, and the scaffolder still chains every model to a Team |
