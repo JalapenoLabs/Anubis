@@ -230,10 +230,36 @@ async fn change_password(
         })
         .await
         .map_err(log_internal)?;
+    // Back in the pool before the store is read or swept; see
+    // `crate::auth::session`.
+    drop(connection);
 
     let revocation = match outcome {
         PasswordChange::Changed(revocation) => revocation,
         PasswordChange::Interrupted => {
+            // Refused either way, since the current password was checked
+            // against a hash that has been replaced since. Whether this
+            // browser is still signed in decides the answer: a reset ended
+            // its session, while a concurrent change from this same browser,
+            // a double submit or a second tab, kept it.
+            let still_signed_in = match jar.get(session::SESSION_COOKIE) {
+                Some(cookie) => sessions
+                    .find_user(&state.pool, cookie.value())
+                    .await
+                    .map_err(log_internal)?
+                    .is_some_and(|signed_in| signed_in.id == user.id),
+                None => false,
+            };
+            if still_signed_in {
+                tracing::debug!(
+                    user.id = %user.id,
+                    "a password change for {{user.id}} was refused: another change from \
+                     the same browser committed first",
+                );
+                return Err(ApiError::conflict(
+                    "Your password was just changed by another request.",
+                ));
+            }
             tracing::debug!(
                 user.id = %user.id,
                 "a password change for {{user.id}} was refused: the account signed out \
@@ -243,9 +269,6 @@ async fn change_password(
         }
     };
 
-    // After the commit and with the connection back in the pool; see
-    // `crate::auth::session`.
-    drop(connection);
     if let Some(revocation) = revocation {
         sessions.sweep(revocation).await;
     }

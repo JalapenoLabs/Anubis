@@ -512,7 +512,7 @@ async fn a_password_change_racing_a_reset_never_overwrites_it() {
                 .await;
                 status
             });
-            wait_for_a_lock_wait(&deployment.pool).await;
+            wait_for_lock_waits(&deployment.pool, 1).await;
 
             diesel::update(users::table.find(user_id))
                 .set((
@@ -546,13 +546,141 @@ async fn a_password_change_racing_a_reset_never_overwrites_it() {
     );
 }
 
+/// Two changes sent from one browser, a double submit or a second tab, are
+/// both checked against the same generation. The first commits and keeps this
+/// browser signed in; the second is refused, since its current password was
+/// checked against a hash the first replaced, but the browser is still signed
+/// in, so it must not be told otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_change_from_the_same_browser_keeps_it_signed_in() {
+    let Some(database) = TestDatabase::create("session_store_double_change").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database, &Store::Postgres).await;
+    let email = format!("double-{}@example.com", Uuid::new_v4());
+    let session = support::register(&deployment.router, &email).await;
+    let user_id = deployment.user_id(&email).await;
+
+    // Both changes get past their session check and argon2 to the update,
+    // where the held row queues them, so both were checked under the same
+    // generation.
+    let mut blocker = deployment.pool.get().await.expect("a connection");
+    let changes = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            users::table
+                .find(user_id)
+                .select(users::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let changes: Vec<_> = (0..2)
+                .map(|_change| {
+                    let router = deployment.router.clone();
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        let (status, _headers, _body) = send(
+                            &router,
+                            "POST",
+                            "/auth/change-password",
+                            Some(&json!({
+                                "current_password": PASSWORD,
+                                "new_password": CHANGED_PASSWORD,
+                            })),
+                            Some(&session),
+                        )
+                        .await;
+                        status
+                    })
+                })
+                .collect();
+            wait_for_lock_waits(&deployment.pool, 2).await;
+            Ok(changes)
+        })
+        .await
+        .expect("holding the account must succeed");
+    drop(blocker);
+
+    let mut statuses = Vec::with_capacity(changes.len());
+    for change in changes {
+        statuses.push(change.await.expect("the change must not panic"));
+    }
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "one change commits and the other is refused as a conflict",
+    );
+    assert_eq!(
+        deployment.whoami(&session).await,
+        StatusCode::OK,
+        "the browser both changes came from is still signed in",
+    );
+}
+
+/// A password sign-in reads the account's generation with its credentials,
+/// then spends an argon2 check before it writes the session. A reset that
+/// commits in that gap must end the sign-in too: creating the session reads
+/// the generation again under `FOR SHARE`, waits for the reset, sees it moved,
+/// and refuses with `401` instead of issuing a session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_sign_in_racing_a_reset_is_refused() {
+    let Some(database) = TestDatabase::create("session_store_sign_in_race").await else {
+        return;
+    };
+    let deployment = Deployment::boot(&database, &Store::Postgres).await;
+    let email = format!("sign-in-race-{}@example.com", Uuid::new_v4());
+    support::register(&deployment.router, &email).await;
+    let user_id = deployment.user_id(&email).await;
+
+    // The reset's new generation is written and left uncommitted while the
+    // sign-in reads the old one with its credentials and reaches `create`,
+    // whose `FOR SHARE` waits on it. Only then does the reset commit.
+    let mut resetting = deployment.pool.get().await.expect("a connection");
+    let signing_in = resetting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::update(users::table.find(user_id))
+                .set(users::session_generation.eq(nextval("session_generations")))
+                .execute(transaction)
+                .await?;
+            let router = deployment.router.clone();
+            let email = email.clone();
+            let signing_in = tokio::spawn(async move {
+                send(
+                    &router,
+                    "POST",
+                    "/auth/login",
+                    Some(&json!({ "email": email, "password": PASSWORD })),
+                    None,
+                )
+                .await
+            });
+            wait_for_lock_waits(&deployment.pool, 1).await;
+            Ok(signing_in)
+        })
+        .await
+        .expect("the reset must commit");
+    drop(resetting);
+
+    let (status, headers, body) = signing_in.await.expect("the sign-in must not panic");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert!(
+        headers.get(axum::http::header::SET_COOKIE).is_none(),
+        "a refused sign-in sets no cookie: {headers:?}",
+    );
+    assert_eq!(
+        session_rows(&deployment.pool, user_id).await.len(),
+        1,
+        "only the registration's session exists",
+    );
+}
+
 /// What the racing reset sets the password hash to, so the test can tell
 /// whether the change overwrote it. Never a hash anything verifies against.
 const RESET_HASH_MARKER: &str = "set-by-the-racing-reset";
 
-/// Waits until a backend in this test's database is waiting on a lock, which
-/// is how the race test knows its racer reached the row it holds.
-async fn wait_for_a_lock_wait(pool: &DbPool) {
+/// Waits until `expected` backends in this test's database are waiting on a
+/// lock, which is how a race test knows its racers reached the row it holds.
+async fn wait_for_lock_waits(pool: &DbPool, expected: i64) {
     #[derive(QueryableByName)]
     struct Waiting {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -568,7 +696,7 @@ async fn wait_for_a_lock_wait(pool: &DbPool) {
         .get_result(&mut connection)
         .await
         .expect("pg_stat_activity must be readable");
-        if waiting.waiting > 0 {
+        if waiting.waiting >= expected {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
