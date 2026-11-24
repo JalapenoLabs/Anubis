@@ -9,6 +9,11 @@
 -- transaction as every entry, under this row's lock, so the two never drift.
 CREATE TABLE wallets (
     organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+    -- The currency every amount here and in the ledger is micro-units of,
+    -- written when the wallet is created. A `billing.yml` naming another one
+    -- is refused at the next write rather than reinterpreting money already
+    -- sold.
+    currency TEXT NOT NULL,
     -- Below zero only after a refund returned credit that was already spent:
     -- the money has left at Stripe, so the debit cannot be refused. A spend
     -- never takes the balance below zero.
@@ -33,6 +38,10 @@ CREATE TABLE wallets (
     recharge_attempt_revision INTEGER NOT NULL DEFAULT 0,
     recharge_armed_at TIMESTAMPTZ,
     recharge_queued_at TIMESTAMPTZ,
+    -- When a run last sent the attempt to Stripe. While a request under its
+    -- key may still be open, the attempt is never replaced by one under
+    -- another key, which Stripe would carry out as a second charge.
+    recharge_charge_started_at TIMESTAMPTZ,
     -- Why the last recharge failed, kept for the screen after a decline turned
     -- auto-recharge off.
     recharge_failed_at TIMESTAMPTZ,
@@ -49,7 +58,8 @@ CREATE TABLE wallets (
     ),
     CONSTRAINT wallets_recharge_attempt_complete CHECK (
         (recharge_attempt_id IS NULL AND recharge_attempt_amount_micros IS NULL
-            AND recharge_armed_at IS NULL AND recharge_queued_at IS NULL)
+            AND recharge_armed_at IS NULL AND recharge_queued_at IS NULL
+            AND recharge_charge_started_at IS NULL)
         OR (recharge_attempt_id IS NOT NULL AND recharge_attempt_amount_micros > 0
             AND recharge_armed_at IS NOT NULL AND recharge_queued_at IS NOT NULL)
     )

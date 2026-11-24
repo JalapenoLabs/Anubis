@@ -25,6 +25,7 @@ use anubis::billing::{
     PlanSet, ProcessStripeEvent, RechargeWallet, Reconciler, Spend, Subject, Wallets,
 };
 use anubis::config::AppConfig;
+use anubis::jobs::Job as _;
 use anubis::roles::RoleSet;
 use anubis::schema::{
     audit_events, jobs, notifications, organization_memberships, organizations,
@@ -43,6 +44,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use support::{Harness, TestDatabase, register, send};
+use tokio::sync::Notify;
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
@@ -124,14 +126,27 @@ struct Ledger {
     next_id: u32,
 }
 
+/// A held request: it signals the first when it arrives, and answers once the
+/// second is notified.
+type Gate = (Arc<Notify>, Arc<Notify>);
+
 #[derive(Clone, Default)]
 struct Mock {
     ledger: Arc<Mutex<Ledger>>,
+    /// Holds the next listing of payments open, which is a recharge's search.
+    list_gate: Arc<Mutex<Option<Gate>>>,
 }
 
 impl Mock {
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         unlock(&self.ledger)
+    }
+
+    /// Holds the next listing of payments open once it has read them: (arrived, release).
+    fn hold_next_list(&self) -> Gate {
+        let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *unlock(&self.list_gate) = Some(gate.clone());
+        gate
     }
 
     /// Puts a payment at Stripe.
@@ -184,11 +199,11 @@ async fn list_payments(
     State(mock): State<Mock>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
-    let ledger = mock.ledger();
     let since: i64 = query
         .get("created[gte]")
         .map_or(0, |value| value.parse().expect("a timestamp"));
-    let mut held: Vec<Value> = ledger
+    let mut held: Vec<Value> = mock
+        .ledger()
         .payments
         .values()
         .filter(|payment| {
@@ -198,6 +213,12 @@ async fn list_payments(
         .cloned()
         .collect();
     held.reverse();
+
+    let gate = unlock(&mock.list_gate).take();
+    if let Some((arrived, release)) = gate {
+        arrived.notify_one();
+        release.notified().await;
+    }
     Json(json!({ "object": "list", "data": held, "has_more": false }))
 }
 
@@ -1356,6 +1377,7 @@ async fn without_stripe_the_wallet_reads_and_every_write_says_so() {
     diesel::insert_into(wallets::table)
         .values((
             wallets::organization_id.eq(scene.organization_id),
+            wallets::currency.eq("usd"),
             wallets::balance_micros.eq(5 * DOLLAR),
             wallets::recharge_payment_method_id.eq("pm_card_visa"),
             wallets::auto_recharge_threshold_micros.eq(4 * DOLLAR),
@@ -1728,4 +1750,171 @@ async fn reconciliation_credits_back_a_refund_that_failed_while_its_events_were_
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(scene.balance().await, 20 * DOLLAR);
     assert_eq!(scene.audited("wallet.refund_reversed").await, 1);
+}
+
+#[tokio::test]
+async fn a_retrying_recharge_is_never_queued_again_beside_itself() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+    let queued = scene.recharges_queued().await;
+
+    // The job has been retrying for hours and fails again; that run touches
+    // its attempt, so the next spend finds it current rather than stale.
+    scene.dead_letter_recharge().await;
+    scene.mock.ledger().next_update = Mishap::ServerError;
+    scene
+        .recharge()
+        .await
+        .expect_err("an unknown outcome retries");
+    scene
+        .spend(DOLLAR, "while-retrying")
+        .await
+        .expect("covered");
+    assert_eq!(
+        scene.recharges_queued().await,
+        queued - 1,
+        "the retrying job is the only one"
+    );
+    assert_eq!(
+        RechargeWallet::MAX_ATTEMPTS,
+        48,
+        "a day and a half of retries"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_auto_recharge_off_during_a_recharge_charges_nothing_and_on_again_arms_afresh() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+
+    let (arrived, release) = scene.mock.hold_next_list();
+    let running = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        async move { scene.recharge().await }
+    });
+    arrived.notified().await;
+    let (status, body) = scene
+        .request("DELETE", "/wallet/auto-recharge", None, &scene.owner)
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["recharging"], false, "off ends the armed attempt");
+    release.notify_one();
+    running
+        .await
+        .expect("the task must join")
+        .expect("the run ends cleanly");
+    assert_eq!(
+        scene.mock.ledger().charges,
+        0,
+        "nothing is charged after it was turned off"
+    );
+
+    // On again below the threshold arms a new attempt and queues its job.
+    let queued = scene.recharges_queued().await;
+    scene.enable_auto_recharge().await;
+    assert_eq!(scene.recharges_queued().await, queued + 1);
+    scene.recharge().await.expect("the recharge runs");
+    assert_eq!(scene.mock.ledger().charges, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wallet_drained_during_a_recharges_search_is_still_recharged() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    // $3 arms an attempt, and a top-up lifts the wallet to $13 before it runs.
+    scene.spend(7 * DOLLAR, "dip").await.expect("covered");
+    scene.top_up("pi_manual", 1_000, false).await;
+
+    let (arrived, release) = scene.mock.hold_next_list();
+    let running = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        async move { scene.recharge().await }
+    });
+    arrived.notified().await;
+    scene.spend(13 * DOLLAR, "drain").await.expect("covered");
+    release.notify_one();
+    running
+        .await
+        .expect("the task must join")
+        .expect("the recharge runs");
+
+    assert_eq!(
+        scene.mock.ledger().charges,
+        1,
+        "the drained wallet is recharged"
+    );
+    assert_eq!(scene.balance().await, 10 * DOLLAR);
+}
+
+#[tokio::test]
+async fn an_attempt_whose_request_may_still_be_open_keeps_its_key_and_amount() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    let (status, body) = scene.set_auto_recharge(5 * DOLLAR, 50 * DOLLAR).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+
+    // A run sent the $50 moments ago and its answer timed out; the person
+    // then lowers the recharge to $10. A new key now would be a second charge
+    // beside the one Stripe may still be carrying out.
+    let mut connection = scene.connection().await;
+    diesel::update(wallets::table.find(scene.organization_id))
+        .set(wallets::recharge_charge_started_at.eq(Utc::now()))
+        .execute(&mut connection)
+        .await
+        .expect("the attempt must stamp");
+    let (status, body) = scene.set_auto_recharge(5 * DOLLAR, 10 * DOLLAR).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    scene.recharge().await.expect("the recharge runs");
+    assert_eq!(
+        scene.recharge_amounts(),
+        [5_000],
+        "charged as armed, under its own key"
+    );
+}
+
+#[tokio::test]
+async fn a_wallet_refuses_writes_once_billing_yml_names_another_currency() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_seed", 1_000, false).await;
+
+    let in_yen = PlanSet::from_yaml(&BILLING_YML.replace("currency: usd", "currency: jpy"))
+        .expect("plans must parse");
+    let yen = Wallets::new(in_yen, &config(None));
+    let mut connection = scene.connection().await;
+    let refused = yen
+        .spend(
+            &mut connection,
+            scene.organization_id,
+            Spend {
+                amount_micros: DOLLAR,
+                key: "in-yen",
+                description: None,
+                subject: None,
+            },
+        )
+        .await
+        .expect_err("the wallet holds dollars");
+    assert!(refused.message().contains("cannot change"), "{refused}");
+    assert_eq!(scene.balance().await, 10 * DOLLAR, "nothing was spent");
 }

@@ -179,6 +179,11 @@ struct WalletBody {
     balance_micros: i64,
     /// The smallest top-up, and the smallest recharge.
     minimum_top_up_micros: i64,
+    /// The smallest step a charge moves in: a cent, or a whole yen.
+    ///
+    /// Sent rather than worked out in the browser, whose currency tables are
+    /// display rules that disagree with Stripe's for some currencies.
+    charge_step_micros: i64,
     /// The balance below which a spend tells the billing members.
     low_balance_micros: Option<i64>,
     /// The auto-recharge settings, when auto-recharge is on.
@@ -220,6 +225,8 @@ impl WalletBody {
             currency: terms.currency().to_owned(),
             balance_micros: wallet.map_or(0, |held| held.balance_micros),
             minimum_top_up_micros: terms.minimum_top_up_micros(),
+            charge_step_micros: currency::charge_step_micros(terms.currency())
+                .expect("billing.yml validation refuses a wallet currency with no charge step"),
             low_balance_micros: terms.low_balance_micros(),
             auto_recharge: wallet.and_then(Wallet::auto_recharge).map(
                 |(threshold_micros, amount_micros)| AutoRechargeBody {

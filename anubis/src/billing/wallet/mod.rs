@@ -10,16 +10,21 @@
 //! let wallets = anubis::billing::Wallets::new(plans.clone(), &config);
 //!
 //! // Inside the transaction that records an hour of a server's usage:
-//! let spent = wallets
+//! let charged = wallets
 //!     .spend(&mut connection, organization_id, Spend {
 //!         amount_micros: 87_500,
 //!         key: &format!("server:{server_id}:hour:{hour}"),
 //!         description: Some("Server alpha, one hour awake"),
 //!         subject: Some(&Subject::new("Server", server_id)),
 //!     })
-//!     .await?;
-//! if spent.uncovered_micros() > 0 {
+//!     .await;
+//! match charged {
 //!     // The wallet ran dry part way through this hour: stop the server.
+//!     Ok(spent) if spent.uncovered_micros() > 0 => stop_server(server_id),
+//!     Ok(_spent) => {}
+//!     // Nothing was left: stop the server, and commit like any other answer.
+//!     Err(refused) if refused.is_insufficient() => stop_server(server_id),
+//!     Err(failed) => return Err(failed.into()),
 //! }
 //! ```
 //!
@@ -73,7 +78,7 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -95,14 +100,15 @@ pub use model::{EntryKind, Wallet, WalletEntry};
 /// The longest idempotency key a spend may carry, Stripe's own ceiling.
 const MAX_KEY_LENGTH: usize = 255;
 
-/// How long an armed recharge may stay unresolved before a spend arms it again.
+/// How long since its job last ran before an armed recharge is queued again.
 ///
-/// The recharge job retries on the queue's own backoff for about ten minutes;
-/// an attempt armed for an hour has been dead-lettered, or is waiting on a
-/// payment Stripe is still processing. Arming it again re-runs the same
-/// attempt, which reads Stripe back before it sends anything, so it can never
-/// charge twice.
-const RECHARGE_STALE_AFTER: TimeDelta = TimeDelta::hours(1);
+/// Every run of [`RechargeWallet`] touches the attempt, and the queue's backoff
+/// caps at an hour between runs, so a job still retrying is never this stale
+/// and is never queued a second time beside itself. One this stale was
+/// dead-lettered, or waits on a payment Stripe is still processing. Queuing it
+/// again re-runs the same attempt, which reads Stripe back before it sends
+/// anything, so it can never charge twice.
+const RECHARGE_STALE_AFTER: TimeDelta = TimeDelta::hours(2);
 
 /// The background job that charges a wallet's saved card.
 ///
@@ -122,6 +128,10 @@ impl Job for RechargeWallet {
     /// Namespaced, for the same reason [`super::ProcessStripeEvent`] is.
     const KIND: &'static str = "anubis.billing.recharge_wallet";
     const QUEUE: &'static str = QUEUE;
+    /// About a day and a half of retries on the queue's backoff, which caps at
+    /// an hour: an outcome Stripe leaves unknown keeps being read back for
+    /// that long rather than leaving a drained wallet waiting on a person.
+    const MAX_ATTEMPTS: i32 = 48;
 }
 
 /// Spends an organization's credit, and reads its balance.
@@ -216,6 +226,11 @@ impl Wallets {
     /// members, and when it leaves it at or below the auto-recharge threshold it arms
     /// a recharge, once per dip, both in the caller's transaction.
     ///
+    /// A refusal for lack of credit is an answer to commit rather than a
+    /// failure to roll back: it may carry the re-queue of a stuck recharge, so
+    /// a caller spending inside its own transaction acts on it (it stops usage)
+    /// and commits, as the [module docs](self) show.
+    ///
     /// # Errors
     /// Returns an [`Error`] that [`Error::is_insufficient`] reports when the
     /// balance is already zero or below, [`Error::is_conflict`] when the key
@@ -247,7 +262,8 @@ impl Wallets {
         // with it.
         connection
             .transaction::<_, Error, _>(async |connection| {
-                let Some(mut wallet) = ledger::lock(connection, organization_id).await? else {
+                let Some(mut wallet) = ledger::lock(connection, organization_id, terms).await?
+                else {
                     return Ok(Err(Error::insufficient(organization_id, 0)));
                 };
                 if let Some(entry) =
@@ -447,6 +463,33 @@ async fn requeue_stale(connection: &mut AsyncPgConnection, wallet: &Wallet) -> R
     Ok(())
 }
 
+/// Clears the armed attempt, so the next dip to the threshold arms a new one.
+///
+/// Only when `attempt` is still the one armed: a caller that read the wallet
+/// without its lock never clears an attempt armed after its read.
+pub(super) async fn disarm(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    attempt: Uuid,
+) -> QueryResult<()> {
+    diesel::update(
+        wallets::table
+            .find(organization_id)
+            .filter(wallets::recharge_attempt_id.eq(attempt)),
+    )
+    .set((
+        wallets::recharge_attempt_id.eq(None::<Uuid>),
+        wallets::recharge_attempt_amount_micros.eq(None::<i64>),
+        wallets::recharge_attempt_revision.eq(0),
+        wallets::recharge_armed_at.eq(None::<DateTime<Utc>>),
+        wallets::recharge_queued_at.eq(None::<DateTime<Utc>>),
+        wallets::recharge_charge_started_at.eq(None::<DateTime<Utc>>),
+    ))
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
 /// The organization's balance in micro-units, zero when it has no wallet.
 ///
 /// # Errors
@@ -488,11 +531,20 @@ pub(super) async fn set_auto_recharge(
 
     connection
         .transaction::<_, Error, _>(async |connection| {
-            let wallet = ledger::lock_or_create(connection, organization_id).await?;
+            let wallet = ledger::lock_or_create(connection, organization_id, terms).await?;
             if settings.is_some() && wallet.recharge_payment_method_id.is_none() {
                 return Err(Error::conflict(
                     "Auto-recharge charges a saved card. Top up once and save the card first.",
                 ));
+            }
+            // Off means off: an armed attempt ends with it, so no run still
+            // in its search charges the card afterwards, and turning it back
+            // on arms afresh. A charge already sent is still credited, by its
+            // payment's own event.
+            if settings.is_none()
+                && let Some(attempt) = wallet.recharge_attempt_id
+            {
+                disarm(connection, organization_id, attempt).await?;
             }
             let before = wallet.auto_recharge();
             let updated: Wallet = diesel::update(wallets::table.find(organization_id))
@@ -501,7 +553,7 @@ pub(super) async fn set_auto_recharge(
                         .eq(settings.map(|(threshold, _amount)| threshold)),
                     wallets::auto_recharge_amount_micros
                         .eq(settings.map(|(_threshold, amount)| amount)),
-                    wallets::recharge_failed_at.eq(None::<chrono::DateTime<Utc>>),
+                    wallets::recharge_failed_at.eq(None::<DateTime<Utc>>),
                     wallets::recharge_failure.eq(None::<String>),
                 ))
                 .returning(Wallet::as_returning())

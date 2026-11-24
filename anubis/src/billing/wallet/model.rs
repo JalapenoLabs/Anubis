@@ -85,6 +85,8 @@ impl Display for EntryKind {
 pub struct Wallet {
     /// The organization the wallet belongs to, which is its key.
     pub organization_id: Uuid,
+    /// The currency every amount is micro-units of, fixed when the wallet was created.
+    pub currency: String,
     /// The balance in micro-units: the sum of the organization's ledger.
     pub balance_micros: i64,
     /// The balance below which a spend arms a recharge, when auto-recharge is on.
@@ -103,8 +105,10 @@ pub struct Wallet {
     pub recharge_attempt_revision: i32,
     /// When the recharge in flight was armed, which bounds the search for its payment.
     pub recharge_armed_at: Option<DateTime<Utc>>,
-    /// When the recharge in flight's job was last queued.
+    /// When the recharge in flight's job was last queued, or last ran.
     pub recharge_queued_at: Option<DateTime<Utc>>,
+    /// When a run last sent the recharge in flight to Stripe.
+    pub recharge_charge_started_at: Option<DateTime<Utc>>,
     /// When the last recharge failed, turning auto-recharge off.
     pub recharge_failed_at: Option<DateTime<Utc>>,
     /// Why it failed, in Stripe's words, for an operator.

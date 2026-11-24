@@ -403,6 +403,7 @@ diesel::table! {
     /// moved in the same transaction as each entry under this row's lock.
     wallets (organization_id) {
         organization_id -> Uuid,
+        currency -> Text,
         balance_micros -> Int8,
         auto_recharge_threshold_micros -> Nullable<Int8>,
         auto_recharge_amount_micros -> Nullable<Int8>,
@@ -413,6 +414,7 @@ diesel::table! {
         recharge_attempt_revision -> Int4,
         recharge_armed_at -> Nullable<Timestamptz>,
         recharge_queued_at -> Nullable<Timestamptz>,
+        recharge_charge_started_at -> Nullable<Timestamptz>,
         recharge_failed_at -> Nullable<Timestamptz>,
         recharge_failure -> Nullable<Text>,
         created_at -> Timestamptz,

@@ -69,6 +69,7 @@ type WireWallet = {
   currency: string
   balance_micros: number
   minimum_top_up_micros: number
+  charge_step_micros: number
   low_balance_micros: number | null
   auto_recharge: WireAutoRecharge | null
   card_saved: boolean
@@ -162,6 +163,7 @@ function toWallet(wire: WireWallet): BillingWallet {
     currency: wire.currency,
     balanceMicros: wire.balance_micros,
     minimumTopUpMicros: wire.minimum_top_up_micros,
+    chargeStepMicros: wire.charge_step_micros,
     lowBalanceMicros: wire.low_balance_micros,
     autoRecharge: wire.auto_recharge
       ? {

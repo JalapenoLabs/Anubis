@@ -8,17 +8,24 @@ import { describe, expect, expectTypeOf, it } from 'vitest'
 // Misc
 import {
   MICROS_PER_UNIT,
-  chargeStepMicros,
-  currencySymbol,
+    currencySymbol,
   findAmountProblem,
   formatMicros,
   parseMicros,
 } from './money'
 
+/** The step a two-decimal currency charges in, as the server sends it. */
+const CENT = 10_000
+
 describe('formatMicros', () => {
   it('should show a balance in the decimals of its currency', () => {
     expect(formatMicros(10_000_000, 'usd')).toBe('$10.00')
     expect(formatMicros(4_912_500, 'usd')).toBe('$4.91')
+  })
+
+  it('should round toward zero, never showing more credit than there is', () => {
+    expect(formatMicros(4_919_999, 'usd')).toBe('$4.91')
+    expect(formatMicros(10_500_000, 'jpy')).toBe('¥10')
   })
 
   it('should keep a sub-cent ledger charge visible when precise', () => {
@@ -48,18 +55,6 @@ describe('currencySymbol', () => {
   })
 })
 
-describe('chargeStepMicros', () => {
-  it('should charge in cents and in whole yen', () => {
-    expect(chargeStepMicros('usd')).toBe(10_000)
-    expect(chargeStepMicros('jpy')).toBe(MICROS_PER_UNIT)
-  })
-
-  it('should charge whole krónur and shillings, which Stripe writes in hundredths', () => {
-    expect(chargeStepMicros('isk')).toBe(MICROS_PER_UNIT)
-    expect(chargeStepMicros('ugx')).toBe(MICROS_PER_UNIT)
-  })
-})
-
 describe('parseMicros', () => {
   it('should read dollars as micro-units', () => {
     expect(parseMicros('10')).toBe(10_000_000)
@@ -85,26 +80,31 @@ describe('parseMicros', () => {
 
 describe('findAmountProblem', () => {
   it('should accept a whole-cent amount at the minimum or above', () => {
-    expect(findAmountProblem(10_000_000, 10_000_000, 'usd')).toBeNull()
-    expect(findAmountProblem(12_340_000, 10_000_000, 'usd')).toBeNull()
+    expect(findAmountProblem(10_000_000, 10_000_000, CENT)).toBeNull()
+    expect(findAmountProblem(12_340_000, 10_000_000, CENT)).toBeNull()
   })
 
   it('should ask for an amount before anything else', () => {
-    expect(findAmountProblem(null, 10_000_000, 'usd')).toBe('missing')
+    expect(findAmountProblem(null, 10_000_000, CENT)).toBe('missing')
   })
 
   it('should refuse an amount below the floor, a negative one included', () => {
-    expect(findAmountProblem(9_990_000, 10_000_000, 'usd')).toBe('belowMinimum')
-    expect(findAmountProblem(-1_000_000, 0, 'usd')).toBe('belowMinimum')
+    expect(findAmountProblem(9_990_000, 10_000_000, CENT)).toBe('belowMinimum')
+    expect(findAmountProblem(-1_000_000, 0, CENT)).toBe('belowMinimum')
   })
 
   it('should refuse a fraction of what Stripe charges in', () => {
-    expect(findAmountProblem(10_005_000, 10_000_000, 'usd')).toBe('partialUnit')
+    expect(findAmountProblem(10_005_000, 10_000_000, CENT)).toBe('partialUnit')
     // Half a yen, in a currency Stripe charges in whole units.
-    expect(findAmountProblem(1_000_500_000, 1_000_000_000, 'jpy')).toBe('partialUnit')
+    expect(findAmountProblem(1_000_500_000, 1_000_000_000, MICROS_PER_UNIT)).toBe('partialUnit')
+  })
+
+  it('should take the step the server charges in, not the browser\'s display digits', () => {
+    // Forints are charged in fillér, though browsers display them whole.
+    expect(findAmountProblem(2_500_500_000, 2_500_500_000, CENT)).toBeNull()
   })
 
   it('should answer one of the named problems', () => {
-    expectTypeOf(findAmountProblem(null, 0, 'usd')).toEqualTypeOf<AmountProblem | null>()
+    expectTypeOf(findAmountProblem(null, 0, CENT)).toEqualTypeOf<AmountProblem | null>()
   })
 })

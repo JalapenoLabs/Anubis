@@ -49,6 +49,7 @@ const WALLET = {
   currency: 'usd',
   balance_micros: -25_000_000,
   minimum_top_up_micros: 10_000_000,
+  charge_step_micros: 10_000,
   low_balance_micros: 2_000_000,
   auto_recharge: null,
   card_saved: true,

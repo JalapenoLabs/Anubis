@@ -433,6 +433,8 @@ export type BillingWallet = {
   balanceMicros: number
   /** The smallest top-up, and the smallest recharge. */
   minimumTopUpMicros: number
+  /** The smallest step a charge moves in, as Stripe charges this currency: a cent, or a whole yen. */
+  chargeStepMicros: number
   /** The balance below which a spend warns the billing members; null for never. */
   lowBalanceMicros: number | null
   /** Null while auto-recharge is off. */

@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::Error;
 use super::model::{EntryKind, Wallet, WalletEntry};
 use crate::billing::Subject;
+use crate::billing::plans::WalletTerms;
 use crate::schema::{wallet_entries, wallets};
 
 /// One entry about to be appended.
@@ -33,19 +34,37 @@ pub(super) struct NewEntry<'a> {
 
 /// Locks the organization's wallet for the rest of the transaction, if it has one.
 ///
+/// Every write locks first, so this is also where a wallet created in one
+/// currency is refused once `billing.yml` names another: its amounts are
+/// micro-units of the first, and reading them as the second would misvalue
+/// money already sold.
+///
 /// # Errors
-/// Returns the underlying Diesel error when the query fails.
+/// Returns an [`Error`] when the query fails, or when the wallet holds another
+/// currency than `terms`.
 pub(super) async fn lock(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
-) -> QueryResult<Option<Wallet>> {
-    wallets::table
+    terms: &WalletTerms,
+) -> Result<Option<Wallet>, Error> {
+    let wallet: Option<Wallet> = wallets::table
         .find(organization_id)
         .select(Wallet::as_select())
         .for_update()
         .first(connection)
         .await
-        .optional()
+        .optional()?;
+    if let Some(held) = &wallet
+        && held.currency != terms.currency()
+    {
+        return Err(Error::internal(format!(
+            "organization {organization_id}'s wallet holds {}, and config/billing.yml now sells \
+             credit in {}; a wallet's currency cannot change, so nothing is written to it",
+            held.currency,
+            terms.currency(),
+        )));
+    }
+    Ok(wallet)
 }
 
 /// Creates the organization's wallet when it has none, then locks it.
@@ -54,23 +73,30 @@ pub(super) async fn lock(
 /// row and then inserts nothing, and both lock the one that exists.
 ///
 /// # Errors
-/// Returns an [`Error`] when a write fails.
+/// Returns an [`Error`] when a write fails, or when the wallet holds another
+/// currency than `terms`.
 pub(super) async fn lock_or_create(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
+    terms: &WalletTerms,
 ) -> Result<Wallet, Error> {
     diesel::insert_into(wallets::table)
-        .values(wallets::organization_id.eq(organization_id))
+        .values((
+            wallets::organization_id.eq(organization_id),
+            wallets::currency.eq(terms.currency()),
+        ))
         .on_conflict(wallets::organization_id)
         .do_nothing()
         .execute(connection)
         .await?;
 
-    lock(connection, organization_id).await?.ok_or_else(|| {
-        Error::internal(format!(
-            "organization {organization_id}'s wallet vanished between creating and locking it"
-        ))
-    })
+    lock(connection, organization_id, terms)
+        .await?
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "organization {organization_id}'s wallet vanished between creating and locking it"
+            ))
+        })
 }
 
 /// Appends one entry and moves the balance by its amount.

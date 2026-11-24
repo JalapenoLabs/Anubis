@@ -264,7 +264,7 @@ Every amount is an integer number of **micro-units** of the wallet's currency: 1
 | `refund` | - | A Stripe refund of a wallet payment, keyed by the refund |
 | `refund_reversal` | + | That refund failing or being cancelled after it was debited |
 
-`wallets.balance_micros` is the sum of the ledger, moved in the same transaction as each entry under the wallet's row lock. Every write takes that lock first, reads, then writes, and none calls Stripe while holding it, so two writers to one wallet are ordered rather than one overwriting the other's balance, and an idempotency key checked under the lock cannot be written twice. Unique indexes back both keys: one per kind and key per organization, and one credit per PaymentIntent across every path that could credit it.
+Each wallet records the currency it was created in, and every write refuses a wallet whose currency is not the one `billing.yml` now names: its amounts are micro-units of the first, and reading them as the second would misvalue money already sold. `wallets.balance_micros` is the sum of the ledger, moved in the same transaction as each entry under the wallet's row lock. Every write takes that lock first, reads, then writes, and none calls Stripe while holding it, so two writers to one wallet are ordered rather than one overwriting the other's balance, and an idempotency key checked under the lock cannot be written twice. Unique indexes back both keys: one per kind and key per organization, and one credit per PaymentIntent across every path that could credit it.
 
 ### Spending
 
@@ -273,18 +273,25 @@ The application calls `anubis::billing::Wallets` from its own metering, on its o
 ```rust
 let wallets = anubis::billing::Wallets::new(plans.clone(), &config);
 
-let spent = wallets
+let charged = wallets
     .spend(&mut connection, organization_id, Spend {
         amount_micros: 87_500,
         key: &format!("server:{server_id}:hour:{hour}"),
         description: Some("Server alpha, one hour awake"),
         subject: Some(&Subject::new("Server", server_id)),
     })
-    .await?;
-if spent.uncovered_micros() > 0 {
+    .await;
+match charged {
     // The credit ran out during this hour: stop the server.
+    Ok(spent) if spent.uncovered_micros() > 0 => stop_server(server_id),
+    Ok(_spent) => {}
+    // Nothing was left: stop the server, and commit like any other answer.
+    Err(refused) if refused.is_insufficient() => stop_server(server_id),
+    Err(failed) => return Err(failed.into()),
 }
 ```
+
+A refusal for lack of credit is an answer, not a failure: commit the transaction it was given in, as the match above does, rather than rolling it back with `?`. It can carry the re-queue of a stuck recharge.
 
 **A spend drains to zero, and never below.** A spend the balance covers takes its amount. One larger than the balance takes what is left, leaving exactly zero, and reports how much it could not cover; one made at zero or below is refused (`402`, `Error::is_insufficient`) with nothing written. Metering charges for usage that already happened, so refusing it whole would leave a remainder that no later charge fits, and an organization holding a fraction of a cent would count as paying forever. An overdraft would be credit extended, which needs a limit, a policy, and collections. **The application learns the wallet ran dry from the spend itself**, in the same call: that is the earliest anything could tell it, and it is exactly where usage is stopped. A balance the application wants to read ahead of time is `Wallets::balance`, and every spend answers with the balance it left.
 
@@ -314,7 +321,9 @@ Nothing is credited by the request. The payment arrives as events, `checkout.ses
 | No answer, a key still in use | Read back; a charge found is credited, and otherwise the job fails and the queue retries under the same key |
 | A server error | Read back; Stripe saves that answer under the key and would replay it, so with nothing found the attempt's revision moves and the retry is a new request |
 
-An attempt left armed for an hour, because its job was dead-lettered or its payment is still processing, is queued again by the next spend at or below the threshold, or by the next spend refused at zero, since a drained wallet sees no other spend, under the same attempt, which reads Stripe back first. A refund never arms a recharge: charging a customer again for the credit they were just refunded is not what they asked for.
+**A recharge whose outcome Stripe leaves unknown keeps trying for about a day and a half.** `RechargeWallet` has 48 attempts on the queue's backoff, which caps at an hour, and every run reads Stripe back before it sends anything, so retrying never charges twice. Each run touches its attempt, so a job still retrying is never queued a second time beside itself. An attempt whose job did run out, untouched for two hours, is queued again by the next spend at or below the threshold, or by a spend refused at zero that the caller commits. A refund never arms a recharge: charging a customer again for the credit they were just refunded is not what they asked for.
+
+**The charge is decided under the wallet's lock, right before it is sent**, after the search: an attempt settled by another run or by its payment's event is left alone; with auto-recharge turned off, or the balance back over the threshold, it ends without a charge; and an attempt armed for an amount the person has since changed is replaced by one for the current amount under a new key, but only once no request under its own key can still be open (ten minutes after a run last sent it). Until then it is charged as armed, and Stripe answers that key. **Turning auto-recharge off ends the armed attempt**, so no run still in its search charges the card afterwards and turning it on again arms afresh; a charge already sent is credited by its payment's own event.
 
 ### Refunds
 

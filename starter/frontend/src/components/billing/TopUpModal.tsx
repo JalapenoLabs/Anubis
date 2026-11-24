@@ -25,7 +25,6 @@ import {
 // Misc
 import {
   MICROS_PER_UNIT,
-  chargeStepMicros,
   currencySymbol,
   findAmountProblem,
   formatMicros,
@@ -57,7 +56,7 @@ const reasonByProblem = {
 export function TopUpModal(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
-  const { currency, minimumTopUpMicros } = props.wallet
+  const { currency, minimumTopUpMicros, chargeStepMicros: stepMicros } = props.wallet
 
   const [ amount, setAmount ] = useState('')
   const [ saveCard, setSaveCard ] = useState(false)
@@ -79,8 +78,7 @@ export function TopUpModal(props: Props) {
   }, [ props.isOpen ])
 
   const amountMicros = parseMicros(amount)
-  const problem = findAmountProblem(amountMicros, minimumTopUpMicros, currency)
-  const stepMicros = chargeStepMicros(currency)
+  const problem = findAmountProblem(amountMicros, minimumTopUpMicros, stepMicros)
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()

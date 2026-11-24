@@ -24,7 +24,6 @@ import {
 // Misc
 import {
   MICROS_PER_UNIT,
-  chargeStepMicros,
   currencySymbol,
   findAmountProblem,
   formatMicros,
@@ -78,7 +77,7 @@ function toTyped(micros: number | null): string {
 export function AutoRechargeModal(props: Props) {
   const { t } = useTranslation()
   const api = useAnubisApi()
-  const { currency, minimumTopUpMicros, autoRecharge, cardSaved } = props.wallet
+  const { currency, minimumTopUpMicros, chargeStepMicros: stepMicros, autoRecharge, cardSaved } = props.wallet
 
   const [ threshold, setThreshold ] = useState('')
   const [ amount, setAmount ] = useState('')
@@ -103,13 +102,12 @@ export function AutoRechargeModal(props: Props) {
 
   const thresholdMicros = parseMicros(threshold)
   const amountMicros = parseMicros(amount)
-  const stepMicros = chargeStepMicros(currency)
   // One floor carries both of the amount's lower bounds: the smallest top-up,
   // and the threshold, so a single recharge always clears it.
   const amountFloorMicros = Math.max(minimumTopUpMicros, thresholdMicros ?? 0)
 
-  const thresholdProblem = findAmountProblem(thresholdMicros, 0, currency)
-  const amountProblem = findAmountProblem(amountMicros, amountFloorMicros, currency)
+  const thresholdProblem = findAmountProblem(thresholdMicros, 0, stepMicros)
+  const amountProblem = findAmountProblem(amountMicros, amountFloorMicros, stepMicros)
 
   const reasonValues = {
     minimum: formatMicros(amountFloorMicros, currency),

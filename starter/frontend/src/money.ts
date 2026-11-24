@@ -48,7 +48,15 @@ export function formatMicros(micros: number, currency: string, options: FormatOp
       : 'auto',
   })
 
-  return formatter.format(micros / MICROS_PER_UNIT)
+  // Toward zero at the digits shown, as the backend's own notices round, so a
+  // balance never reads as more credit than there is: 10.50 yen shows as 10,
+  // not 11. `roundingMode: 'trunc'` would say this, but is newer than the
+  // ES2022 library this package builds against.
+  const digits = formatter.resolvedOptions().maximumFractionDigits ?? 2
+  const scale = 10 ** digits
+  const truncated = Math.trunc((micros / MICROS_PER_UNIT) * scale) / scale
+
+  return formatter.format(truncated)
 }
 
 /** The currency's symbol as the reader's locale writes it, for an amount field: `$`. */
@@ -58,27 +66,6 @@ export function currencySymbol(currency: string): string {
     .formatToParts(0)
 
   return parts.find((part) => part.type === 'currency')?.value ?? code
-}
-
-/**
- * The smallest step Stripe charges in, in micro-units: one cent for usd.
- *
- * A currency read in whole units, jpy, or isk and ugx (which Stripe writes in
- * hundredths but charges only whole units of), charges whole units. Every
- * other one a wallet can hold charges hundredths. That is the backend's own
- * rule (`anubis::billing::currency::charge_step_micros`), and checking it here
- * only spares the person a refusal.
- */
-export function chargeStepMicros(currency: string): number {
-  const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency: currency.toUpperCase() })
-    .resolvedOptions()
-    .maximumFractionDigits
-
-  if (digits === 0) {
-    return MICROS_PER_UNIT
-  }
-
-  return MICROS_PER_UNIT / 100
 }
 
 /**
@@ -110,12 +97,14 @@ export function parseMicros(typed: string): number | null {
  * Why `micros` cannot be charged with `minimumMicros` as its floor, or null when it can.
  *
  * The backend's checks, in the order a person fixes them: an amount at all,
- * then enough of it, then one Stripe can charge.
+ * then enough of it, then one Stripe can charge. `stepMicros` is the wallet's
+ * own `chargeStepMicros`, the step the server charges in, so the browser never
+ * applies a currency rule of its own that could disagree with Stripe's.
  */
 export function findAmountProblem(
   micros: number | null,
   minimumMicros: number,
-  currency: string,
+  stepMicros: number,
 ): AmountProblem | null {
   if (micros === null) {
     return 'missing'
@@ -125,7 +114,7 @@ export function findAmountProblem(
     return 'belowMinimum'
   }
 
-  if (micros % chargeStepMicros(currency)) {
+  if (micros % stepMicros) {
     return 'partialUnit'
   }
 
