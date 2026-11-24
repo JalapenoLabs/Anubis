@@ -222,7 +222,10 @@ struct EntriesBody {
 impl WalletBody {
     fn new(terms: &WalletTerms, wallet: Option<&Wallet>) -> Self {
         Self {
-            currency: terms.currency().to_owned(),
+            // The wallet's own currency when it has one: its balance is
+            // micro-units of that, whatever billing.yml names now.
+            currency: wallet
+                .map_or_else(|| terms.currency().to_owned(), |held| held.currency.clone()),
             balance_micros: wallet.map_or(0, |held| held.balance_micros),
             minimum_top_up_micros: terms.minimum_top_up_micros(),
             charge_step_micros: currency::charge_step_micros(terms.currency())
@@ -490,6 +493,22 @@ async fn start_top_up(
     require_billing_authority(&member)?;
     let terms = wallet_terms(&state)?;
     configured(&state)?;
+
+    // A wallet's currency is fixed, so credit in another one could never be
+    // recorded: refused here, before Stripe takes the money for it.
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let held = Wallet::find(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?;
+    drop(connection);
+    if let Some(held) = held.filter(|held| held.currency != terms.currency()) {
+        return Err(ApiError::conflict(format!(
+            "This organization's credit is held in {}, and this deployment now sells credit in \
+             {}. A wallet's currency cannot change, so no top-up can be taken.",
+            held.currency.to_uppercase(),
+            terms.currency().to_uppercase(),
+        )));
+    }
 
     if body.amount_micros < terms.minimum_top_up_micros() {
         return Err(ApiError::validation(format!(

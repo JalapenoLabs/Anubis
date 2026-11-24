@@ -1917,4 +1917,84 @@ async fn a_wallet_refuses_writes_once_billing_yml_names_another_currency() {
         .expect_err("the wallet holds dollars");
     assert!(refused.message().contains("cannot change"), "{refused}");
     assert_eq!(scene.balance().await, 10 * DOLLAR, "nothing was spent");
+
+    // Money is never taken for credit that could not be recorded: a top-up
+    // is refused before Checkout, and the balance keeps its own currency.
+    let (yen_base, yen_mock) = start_mock_stripe().await;
+    let roles = RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
+    let in_yen = PlanSet::from_yaml(&BILLING_YML.replace("currency: usd", "currency: jpy"))
+        .expect("plans must parse");
+    let billing = Router::new().nest(
+        "/billing",
+        anubis::billing::router(
+            scene.harness.pool.clone(),
+            roles,
+            in_yen,
+            &config(Some(&yen_base)),
+        ),
+    );
+    let path = format!("/billing/organizations/{}", scene.organization_id);
+    let (status, _headers, body) = send(
+        &billing,
+        "POST",
+        &format!("{path}/wallet/top-up"),
+        Some(&json!({ "amount_micros": 10_000 * DOLLAR })),
+        Some(&scene.owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        yen_mock.ledger().sessions.is_empty(),
+        "Stripe never heard of it"
+    );
+    let (status, _headers, body) = send(&billing, "GET", &path, None, Some(&scene.owner)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["wallet"]["currency"], "usd",
+        "the balance is still dollars"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_auto_recharge_off_and_on_while_a_sent_recharge_is_unrecorded_charges_once() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+    // $4 left, below the $5 threshold: one dip, attempt X armed.
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+
+    // X's run: the search passes, Stripe charges the card, the answer is
+    // lost, and the read-back that would find the payment is held open.
+    let (search_arrived, search_release) = scene.mock.hold_next_list();
+    scene.mock.ledger().next_update = Mishap::LostAnswer;
+    let running = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        async move { scene.recharge().await }
+    });
+    search_arrived.notified().await;
+    let (read_back_arrived, read_back_release) = scene.mock.hold_next_list();
+    search_release.notify_one();
+    read_back_arrived.notified().await;
+    assert_eq!(scene.mock.ledger().charges, 1, "X charged at Stripe");
+
+    // The person turns auto-recharge off and on again while X is unrecorded,
+    // and the next run reads X back under its own id rather than charging anew.
+    let (status, body) = scene
+        .request("DELETE", "/wallet/auto-recharge", None, &scene.owner)
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    scene.enable_auto_recharge().await;
+    scene.recharge().await.expect("the next run reads X back");
+    read_back_release.notify_one();
+    running
+        .await
+        .expect("the task must join")
+        .expect("X's run finds its payment");
+
+    assert_eq!(scene.mock.ledger().charges, 1, "one dip, one charge");
+    assert_eq!(scene.recharge_amounts(), [1_000]);
+    assert_eq!(scene.balance().await, 14 * DOLLAR);
 }

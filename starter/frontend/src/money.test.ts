@@ -26,6 +26,23 @@ describe('formatMicros', () => {
   it('should round toward zero, never showing more credit than there is', () => {
     expect(formatMicros(4_919_999, 'usd')).toBe('$4.91')
     expect(formatMicros(10_500_000, 'jpy')).toBe('¥10')
+    expect(formatMicros(-2_509_999, 'usd')).toBe('-$2.50')
+  })
+
+  it('should never lose a cent to floating point', () => {
+    expect(formatMicros(1_150_000, 'usd')).toBe('$1.15')
+    expect(formatMicros(290_000, 'usd')).toBe('$0.29')
+    expect(formatMicros(249, 'usd', { precise: true })).toBe('$0.000249')
+    expect(formatMicros(4_099_999, 'usd', { precise: true, signed: true })).toBe('+$4.099999')
+    expect(formatMicros(1_000_000_000, 'jpy')).toBe('¥1,000')
+
+    // Every whole-cent amount over a range, so a lucky handful cannot pass:
+    // the integer cents read back exactly from what is shown.
+    for (let cents = -2_000; cents <= 20_000; cents += 1) {
+      const shown = formatMicros(cents * 10_000, 'usd')
+      const readBack = Math.round(Number(shown.replace(/[$,]/g, '')) * 100)
+      expect(readBack).toBe(cents)
+    }
   })
 
   it('should keep a sub-cent ledger charge visible when precise', () => {

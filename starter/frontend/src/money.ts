@@ -50,13 +50,14 @@ export function formatMicros(micros: number, currency: string, options: FormatOp
 
   // Toward zero at the digits shown, as the backend's own notices round, so a
   // balance never reads as more credit than there is: 10.50 yen shows as 10,
-  // not 11. `roundingMode: 'trunc'` would say this, but is newer than the
-  // ES2022 library this package builds against.
+  // not 11. Truncated in whole micro-units, because micro-units divided into
+  // a float are inexact and would drop a cent ($0.29 as $0.28). `%` keeps the
+  // dividend's sign, so a negative balance truncates toward zero too.
   const digits = formatter.resolvedOptions().maximumFractionDigits ?? 2
-  const scale = 10 ** digits
-  const truncated = Math.trunc((micros / MICROS_PER_UNIT) * scale) / scale
+  const perDigitMicros = MICROS_PER_UNIT / 10 ** digits
+  const truncatedMicros = micros - (micros % perDigitMicros)
 
-  return formatter.format(truncated)
+  return formatter.format(truncatedMicros / MICROS_PER_UNIT)
 }
 
 /** The currency's symbol as the reader's locale writes it, for an amount field: `$`. */

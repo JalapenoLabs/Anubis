@@ -537,11 +537,14 @@ pub(super) async fn set_auto_recharge(
                     "Auto-recharge charges a saved card. Top up once and save the card first.",
                 ));
             }
-            // Off means off: an armed attempt ends with it, so no run still
-            // in its search charges the card afterwards, and turning it back
-            // on arms afresh. A charge already sent is still credited, by its
-            // payment's own event.
+            // Off means off: an armed attempt that was never sent ends with
+            // it, so turning it back on arms afresh. One already sent to
+            // Stripe stays armed: its own run reads it back under its own key,
+            // where a fresh attempt would search for another id, find nothing,
+            // and charge the dip a second time. Its run, seeing auto-recharge
+            // off, sends nothing more.
             if settings.is_none()
+                && wallet.recharge_charge_started_at.is_none()
                 && let Some(attempt) = wallet.recharge_attempt_id
             {
                 disarm(connection, organization_id, attempt).await?;

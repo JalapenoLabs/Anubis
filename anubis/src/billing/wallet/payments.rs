@@ -565,22 +565,30 @@ async fn claim_charge(
             let Some(armed) = Attempt::of(&wallet).filter(|armed| armed.id == attempt_id) else {
                 return Ok(None);
             };
-            let (Some(card), Some((threshold, wanted))) = (
-                wallet.recharge_payment_method_id.clone(),
-                wallet.auto_recharge(),
-            ) else {
-                disarm(connection, organization_id, armed.id).await?;
-                return Ok(None);
-            };
-            if wallet.balance_micros > threshold {
-                disarm(connection, organization_id, armed.id).await?;
-                return Ok(None);
-            }
-
             let now = Utc::now();
             let request_may_be_open = wallet
                 .recharge_charge_started_at
                 .is_some_and(|started| now - started < CHARGE_SETTLED_AFTER);
+            let wanted_now = wallet
+                .recharge_payment_method_id
+                .clone()
+                .zip(wallet.auto_recharge())
+                .filter(|(_card, (threshold, _wanted))| wallet.balance_micros <= *threshold);
+            let Some((card, (_threshold, wanted))) = wanted_now else {
+                // Off, or back over the threshold: nothing more is sent. An
+                // attempt whose request may still be open stays armed until a
+                // read-back can find it, because ending it would let a fresh
+                // attempt charge the same dip again.
+                if request_may_be_open {
+                    return Err(Error::data(format!(
+                        "recharge {} was sent moments ago and is not found yet; it is read back \
+                         again before anything else is decided",
+                        armed.id,
+                    )));
+                }
+                disarm(connection, organization_id, armed.id).await?;
+                return Ok(None);
+            };
             let attempt = if wanted == armed.amount_micros || request_may_be_open {
                 armed
             } else {
