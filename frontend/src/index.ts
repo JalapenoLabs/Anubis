@@ -35,10 +35,17 @@ export type {
   PasskeyRegistrationChallenge,
   ProfileUpdate,
   Registration,
+  ResourceRoles,
+  Role,
+  RoleCatalog,
+  RoleDraft,
+  RoleSummary,
+  RoleUpdate,
   SignInResult,
   TeamRosterMember,
   TenancyOrganization,
   TenancyTeam,
+  TenantAccess,
   TotpEnrollment,
   User,
   UserEnvelope,
@@ -59,6 +66,11 @@ export type { NotificationBellLabels } from './react/NotificationBell'
 export type { NotificationsResult } from './react/useNotifications'
 export type { OauthProvidersResult } from './react/useOauthProviders'
 export type { RetryCountdown } from './react/useRetryCountdown'
+export type { RoleCatalogScope, RolesResult } from './react/useRoles'
+export type { MemberRolesPickerLabels } from './roles/MemberRolesPicker'
+export type { RoleFormLabels, RoleFormValues } from './roles/RoleForm'
+export type { RoleLadderLabels } from './roles/RoleLadder'
+export type { AssignabilityRefusal, PermissionAction, PermissionGroup } from './roles/permissions'
 export type {
   AnubisFieldProps,
   CodeLanguage,
@@ -142,6 +154,25 @@ export { useInvitation } from './react/useInvitation'
 export { useMemberships } from './react/useMemberships'
 export { useOauthProviders } from './react/useOauthProviders'
 export { useRetryCountdown } from './react/useRetryCountdown'
+export { useRoles } from './react/useRoles'
+
+// Runtime roles
+export { MemberRolesPicker } from './roles/MemberRolesPicker'
+export { RoleForm } from './roles/RoleForm'
+export { RoleLadder } from './roles/RoleLadder'
+export { isMovable, moveRole, reorderRequest } from './roles/ladder'
+export {
+  MEMBERSHIP_SUBJECT,
+  PERMISSION_ACTIONS,
+  ROLE_SUBJECT,
+  SUBSCRIPTION_SUBJECT,
+  allows,
+  assignability,
+  groupPermissions,
+  holdsAll,
+  outranks,
+  outranksMember,
+} from './roles/permissions'
 
 /**
  * The version of the Anubis frontend package.
