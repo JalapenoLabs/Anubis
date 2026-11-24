@@ -12,7 +12,10 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use crate::roles::ADMIN_ROLE;
-use crate::schema::{organization_memberships, role_grants, roles as role_rows, team_memberships};
+use crate::schema::{
+    organization_memberships, role_grants, roles as role_rows, sub_tenant_memberships,
+    team_memberships, teams,
+};
 
 /// The membership a grant hangs off, which is the grant's scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,8 +160,11 @@ pub(crate) async fn held_role_ids(
 /// The people holding the administrator role team-wide, by account.
 ///
 /// Claimed memberships only, because an invitation is not a person: it cannot
-/// administer anything and it cannot read an inbox. Ordered by account so a
-/// caller notifying several people writes their rows in a stable order.
+/// administer anything and it cannot read an inbox. Suspended ones are left
+/// out too, because a suspension is a deny every resolver honours: somebody
+/// who cannot reach the team administers nothing in it, and must not be the
+/// administrator that keeps it administrable. Ordered by account so a caller
+/// notifying several people writes their rows in a stable order.
 ///
 /// # Errors
 /// Returns the underlying Diesel error when the query fails.
@@ -173,10 +179,32 @@ pub(crate) async fn team_administrators(
                 .nullable()
                 .eq(role_grants::team_membership_id)),
         )
+        .inner_join(teams::table.on(teams::id.eq(team_memberships::team_id)))
+        .left_join(
+            organization_memberships::table.on(organization_memberships::organization_id
+                .eq(teams::organization_id)
+                .and(
+                    organization_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
+        .left_join(
+            sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
+                .nullable()
+                .eq(teams::sub_tenant_id)
+                .and(
+                    sub_tenant_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
         .filter(role_grants::team_id.eq(team_id))
         .filter(role_grants::resource_id.is_null())
         .filter(role_rows::key.eq(ADMIN_ROLE))
         .filter(team_memberships::user_id.is_not_null())
+        .filter(organization_memberships::suspended_at.is_null())
+        .filter(sub_tenant_memberships::suspended_at.is_null())
         .select(team_memberships::user_id)
         .order(team_memberships::user_id.asc())
         .load(connection)
@@ -186,6 +214,9 @@ pub(crate) async fn team_administrators(
 }
 
 /// The people holding the administrator role organization-wide, by account.
+///
+/// Suspended members are left out, for the reason [`team_administrators`]
+/// gives.
 ///
 /// # Errors
 /// Returns the underlying Diesel error when the query fails.
@@ -202,6 +233,7 @@ pub(crate) async fn organization_administrators(
         )
         .filter(role_grants::organization_id.eq(organization_id))
         .filter(role_rows::key.eq(ADMIN_ROLE))
+        .filter(organization_memberships::suspended_at.is_null())
         .select(organization_memberships::user_id)
         .order(organization_memberships::user_id.asc())
         .load(connection)

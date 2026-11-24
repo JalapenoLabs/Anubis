@@ -13,7 +13,9 @@
 //! 2. **You can only give what you hold.** Every permission a change adds to a
 //!    role, or hands to a member through a role, must be one the actor holds
 //!    in that place. Toggling a permission off is held to the same rule, so an
-//!    edit made from a stale screen cannot quietly undo somebody else's.
+//!    edit made from a stale screen cannot quietly undo somebody else's. And
+//!    nobody, the administrator included, gives a role a permission no tenancy
+//!    role in `roles.yml` grants: the file is the ceiling on what a tenant holds.
 //! 3. **The administrator is the top of the ladder, and exempt from it.** The
 //!    administrator role is the framework's answer to "who appoints the next
 //!    administrator": its holders may act on any role, the administrator role
@@ -70,6 +72,30 @@ pub(crate) fn require_holds<'a>(
         if !actor.permissions().contains(permission) {
             return Err(ApiError::forbidden(format!(
                 "You can only grant permissions you hold, and you do not hold {permission}."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a permission no tenancy role in `roles.yml` grants.
+///
+/// The administrator is exempt from holding what they hand out, which is what
+/// lets them grant a recommended role carrying something their own role does
+/// not, but not from the file: no organization's role carries what the
+/// application never lets a tenant hold.
+///
+/// # Errors
+/// Returns `403` naming the first permission outside [`RoleSet::grantable`].
+pub(crate) fn require_grantable<'a>(
+    roles: &RoleSet,
+    permissions: impl IntoIterator<Item = &'a Permission>,
+) -> Result<(), ApiError> {
+    for permission in permissions {
+        if !roles.grantable().contains(permission) {
+            return Err(ApiError::forbidden(format!(
+                "No role in this application grants {permission}, so no role in an \
+                 organization can carry it."
             )));
         }
     }

@@ -27,6 +27,10 @@ use uuid::Uuid;
 use super::TestDatabase;
 
 /// The starter's role vocabulary, which is what tenancy bootstrapping needs.
+///
+/// Two entries exist for the suites that probe what an organization's roles
+/// may carry: `Invoice` is named with less than every action, and `Ledger` is
+/// named only by a platform role, so neither is wholly a tenant's to grant.
 const ROLES_YML: &str = "
 roles:
   default:
@@ -41,6 +45,11 @@ roles:
     includes: [editor, billing]
     models:
       Team: [manage]
+      Invoice: [read]
+  operator:
+    scopes: [platform]
+    models:
+      Ledger: [manage]
 ";
 
 /// The password every account in these suites registers with.

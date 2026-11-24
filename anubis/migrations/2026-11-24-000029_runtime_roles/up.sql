@@ -130,6 +130,8 @@ CREATE INDEX role_grants_sub_tenant_membership_idx
 CREATE INDEX role_grants_team_membership_idx
     ON role_grants (team_membership_id) WHERE team_membership_id IS NOT NULL;
 CREATE INDEX role_grants_organization_idx ON role_grants (organization_id);
+-- A team's roster and its administrators are read by team alone.
+CREATE INDEX role_grants_team_idx ON role_grants (team_id) WHERE team_id IS NOT NULL;
 
 -- The roles an organization invitation offers. A team invitation needs none:
 -- it pre-creates the membership it will hand over, and that membership holds

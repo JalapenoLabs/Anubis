@@ -29,13 +29,19 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audit::{self, Changes};
+use crate::auth::User;
 use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::{ApiError, absent_or_null};
 use crate::roles::{Action, MAX_ROLE_NAME_CHARS, Permission, ROLE, RoleSet, is_hex_color};
-use crate::schema::{role_grants, roles as role_rows, team_memberships};
-use crate::tenancy::access::{Access, AccessView};
+use crate::schema::{
+    role_grants, roles as role_rows, sub_tenant_memberships, team_memberships, teams,
+};
+use crate::tenancy::access::{
+    Access, AccessView, resolve_sub_tenant_access, team_membership_access,
+};
 use crate::tenancy::hierarchy;
 use crate::tenancy::management::{lock_organization, organization_standing};
+use crate::tenancy::model::Team;
 use crate::tenancy::role::{self, NewRole, Role, RoleView};
 use crate::tenancy::routes::{TenancyState, log_internal, role_names};
 
@@ -146,8 +152,20 @@ async fn list_team_roles(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let roles = offered_roles(&mut connection, &state.roles, member.team.organization_id).await?;
+    // Offering a newly recommended role moves every role above the default
+    // one up a rung, so the standing the guard read before it would answer a
+    // rank from another ladder than the one listed beside it.
+    let viewer = team_membership_access(
+        &mut connection,
+        &state.roles,
+        &member.team,
+        member.membership.id,
+        &[],
+    )
+    .await
+    .map_err(log_internal)?;
 
-    Ok(Json(roles_body(&state.roles, &roles, member.access.view())))
+    Ok(Json(roles_body(&state.roles, &roles, viewer.view())))
 }
 
 /// The organization's roles, highest first, offering any newly recommended.
@@ -212,6 +230,7 @@ async fn create_role(
                     "You can only create roles below your highest role.",
                 ));
             }
+            hierarchy::require_grantable(&state.roles, &permissions)?;
             hierarchy::require_holds(&actor, &permissions)?;
 
             diesel::update(
@@ -297,7 +316,13 @@ async fn update_role(
 
             let current = find_role(transaction, organization_id, role_id).await?;
             hierarchy::require_outranks_role(&actor, &current)?;
-            require_permissions_change(&state.roles, &actor, &current, &change)?;
+            let narrower = match &change {
+                PermissionsChange::Keep => Vec::new(),
+                _change => {
+                    narrower_standings(transaction, &state.roles, &member.user, current.id).await?
+                }
+            };
+            require_permissions_change(&state.roles, &actor, &narrower, &current, &change)?;
             let renamed = RoleChanges {
                 name: name.as_deref(),
                 color: color.as_deref(),
@@ -352,15 +377,20 @@ async fn update_role(
 ///
 /// Every permission the change switches on or off is held to what the actor
 /// holds, measured against the role as it stands under the lock, so an edit
-/// made from a stale screen cannot undo somebody else's.
+/// made from a stale screen cannot undo somebody else's. `narrower` is the
+/// actor's standing in each team and sub-tenant where they hold the role
+/// themselves (see [`narrower_standings`]), and the change is held to each.
 ///
 /// # Errors
 /// Returns `400` for the administrator role, whose permissions are not edited,
 /// and for returning a role the organization made to `roles.yml`, which it
-/// never followed; `403` from [`hierarchy::require_holds`].
+/// never followed; `403` from [`hierarchy::require_grantable`] and
+/// [`hierarchy::require_holds`], and for a change the actor could not make in
+/// a narrower place they hold the role in.
 fn require_permissions_change(
     roles: &RoleSet,
     actor: &Access,
+    narrower: &[Access],
     current: &Role,
     change: &PermissionsChange,
 ) -> Result<(), ApiError> {
@@ -385,7 +415,81 @@ fn require_permissions_change(
     };
 
     let before = current.permissions(roles);
-    hierarchy::require_holds(actor, hierarchy::toggled(&before, &after))
+    let toggled = hierarchy::toggled(&before, &after);
+    hierarchy::require_grantable(roles, after.difference(&before))?;
+    hierarchy::require_holds(actor, toggled.iter().copied())?;
+
+    // The role applies wherever it is held, so an editor who holds it in a
+    // team or a sub-tenant is held to what they hold there as well: an
+    // organization-wide editor must not raise their own standing in a team,
+    // where they may hold no standing to change anything.
+    for standing in narrower {
+        hierarchy::require_holds(standing, toggled.iter().copied()).map_err(|_refusal| {
+            ApiError::forbidden(
+                "You hold this role in a team or sub-tenant where you do not hold every \
+                 permission this change switches, so it would change your own standing there.",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The actor's standing in every team and sub-tenant where they hold `role_id`.
+///
+/// A grant on one record of a team is measured on that record, which is where
+/// the role reaches for them. A sub-tenant they no longer reach, a suspension
+/// above all, is left out: the role does not apply to them there.
+async fn narrower_standings(
+    connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
+    user: &User,
+    role_id: Uuid,
+) -> Result<Vec<Access>, ApiError> {
+    let in_teams: Vec<(Team, Uuid, Option<Uuid>)> = role_grants::table
+        .inner_join(
+            team_memberships::table.on(team_memberships::id
+                .nullable()
+                .eq(role_grants::team_membership_id)),
+        )
+        .inner_join(teams::table.on(teams::id.eq(team_memberships::team_id)))
+        .filter(role_grants::role_id.eq(role_id))
+        .filter(team_memberships::user_id.eq(user.id))
+        .select((
+            Team::as_select(),
+            team_memberships::id,
+            role_grants::resource_id,
+        ))
+        .load(connection)
+        .await?;
+
+    let mut standings = Vec::new();
+    for (team, membership_id, resource_id) in in_teams {
+        let resources: Vec<Uuid> = resource_id.into_iter().collect();
+        let standing =
+            team_membership_access(connection, roles, &team, membership_id, &resources).await?;
+        standings.push(standing);
+    }
+
+    let in_sub_tenants: Vec<Uuid> = role_grants::table
+        .inner_join(
+            sub_tenant_memberships::table.on(sub_tenant_memberships::id
+                .nullable()
+                .eq(role_grants::sub_tenant_membership_id)),
+        )
+        .filter(role_grants::role_id.eq(role_id))
+        .filter(sub_tenant_memberships::user_id.eq(user.id))
+        .select(sub_tenant_memberships::sub_tenant_id)
+        .load(connection)
+        .await?;
+    for sub_tenant_id in in_sub_tenants {
+        if let Some((_sub_tenant, standing)) =
+            resolve_sub_tenant_access(connection, roles, user.id, sub_tenant_id).await?
+        {
+            standings.push(standing.access);
+        }
+    }
+
+    Ok(standings)
 }
 
 /// What an update moved, as the audit log records it.
@@ -463,11 +567,21 @@ async fn delete_role(
                     .organization(organization_id)
                     .subject(doomed.id)
                     .label(&name)
-                    .changes(Changes::new().field(
-                        "permissions",
-                        spelled(&doomed.permissions(&state.roles)),
-                        Vec::<String>::new(),
-                    )),
+                    .changes(
+                        Changes::new()
+                            .field(
+                                "permissions",
+                                spelled(&doomed.permissions(&state.roles)),
+                                Vec::<String>::new(),
+                            )
+                            // Whose grants went with it, by account, so the log
+                            // answers who lost access when a role was deleted.
+                            .field(
+                                "holders",
+                                holders.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                                Vec::<String>::new(),
+                            ),
+                    ),
             )
             .await?;
 
@@ -609,7 +723,7 @@ async fn holders_of(
     organization_id: Uuid,
     role_id: Uuid,
 ) -> Result<BTreeSet<Uuid>, ApiError> {
-    use crate::schema::{organization_memberships, sub_tenant_memberships};
+    use crate::schema::organization_memberships;
 
     let mut holders = BTreeSet::new();
     let through_organization: Vec<Uuid> = role_grants::table

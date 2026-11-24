@@ -124,11 +124,14 @@ struct NameBody {
     name: String,
 }
 
+/// Replaces roles wholesale, so it is strict: a body that does not name the
+/// roles, or names a field this server does not take, is refused rather than
+/// read as "none", which would revoke everything at that scope.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RolesBody {
     /// The roles the member is to hold at this scope, replacing what they
     /// held there. Empty leaves them with the default role alone.
-    #[serde(default)]
     role_ids: Vec<Uuid>,
     /// Narrows the grant to one record of the team; absent means team-wide.
     #[serde(default)]

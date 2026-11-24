@@ -51,7 +51,7 @@ use crate::tenancy::access::{
 use crate::tenancy::hierarchy;
 use crate::tenancy::invitation::{self, Invitation, InvitationTarget};
 use crate::tenancy::management::lock_organization;
-use crate::tenancy::model::{Organization, Team};
+use crate::tenancy::model::{Organization, OrganizationAccess, Team};
 use crate::tenancy::role::{Role, RoleSummary};
 
 /// Returns the tenancy routes for an application to mount.
@@ -143,7 +143,10 @@ impl TenancyState {
     }
 }
 
+/// Unknown fields are refused, so a client sending a shape this server does
+/// not take learns so rather than having half of it read.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateInvitationBody {
     email: String,
     /// Exactly one of `team_id` or `organization_id` must be set.
@@ -679,26 +682,27 @@ async fn create_invitation(
     let mut connection = state.pool.get().await.map_err(log_internal)?;
     let target = load_target(&mut connection, &body).await?;
     let organization_id = target.organization_id();
+    // Asked once before the transaction takes the organization's lock, so an
+    // account with no standing there is turned away without queueing the
+    // organization's changes behind it. The answer that counts is read again
+    // under the lock.
+    inviter_standings(&mut connection, &state.roles, inviter.id, &target).await?;
 
     let (invitation, token) = connection
         .transaction::<(Invitation, String), ApiError, _>(async |transaction| {
             lock_organization(transaction, organization_id).await?;
 
             let offered = load_roles(transaction, organization_id, &body.role_ids).await?;
+            let replaced = replaced_offer(transaction, &target, &email).await?;
             let standings =
                 inviter_standings(transaction, &state.roles, inviter.id, &target).await?;
-            let standing = authorize_offer(&standings, &offered, target.tier(), &state.roles)?;
-
-            // Inviting an address again replaces its pending invitation, which
-            // is revoking the old offer, so it answers to the same rule.
-            if let Some((replaced, pending_membership)) =
-                invitation::pending_for(transaction, target.invitation_target(), &email).await?
-            {
-                let role_ids =
-                    invitation::offered_by(transaction, replaced, pending_membership).await?;
-                let replaced_offer = load_roles(transaction, organization_id, &role_ids).await?;
-                hierarchy::require_outranks_offer(standing, &replaced_offer)?;
-            }
+            authorize_offer(
+                &standings,
+                &offered,
+                replaced.as_deref(),
+                target.tier(),
+                &state.roles,
+            )?;
 
             state.rate_limit.check_recipient(&email)?;
             if let Some(limits) = state.limits.as_ref() {
@@ -841,10 +845,32 @@ pub(super) async fn load_roles(
     }
 }
 
+/// What the pending invitation to `email` offers, if the address has one.
+///
+/// Inviting an address again replaces its pending invitation, which is
+/// revoking the old offer, so the standing that allows the new offer has to
+/// answer for this one too.
+async fn replaced_offer(
+    connection: &mut AsyncPgConnection,
+    target: &Target,
+    email: &str,
+) -> Result<Option<Vec<Role>>, ApiError> {
+    let Some((pending, pending_membership)) =
+        invitation::pending_for(connection, target.invitation_target(), email).await?
+    else {
+        return Ok(None);
+    };
+    let role_ids = invitation::offered_by(connection, pending, pending_membership).await?;
+    let offered = load_roles(connection, target.organization_id(), &role_ids).await?;
+    Ok(Some(offered))
+}
+
 /// Where the inviter stands that could let them invite into `target`.
 ///
 /// Into a team: the team and its organization, whichever they reach. Into an
-/// organization: the organization. Answers `404` when they reach neither.
+/// organization: the organization. The organization counts only for a full
+/// member or an administrator. Answers `404` when they reach neither, and
+/// `403` to a guest inviting into the organization.
 async fn inviter_standings(
     connection: &mut AsyncPgConnection,
     roles: &RoleSet,
@@ -860,12 +886,24 @@ async fn inviter_standings(
     {
         standings.push(access);
     }
-    if let Some((_organization, _membership, access)) =
+    if let Some((_organization, membership, access)) =
         resolve_organization_access(connection, roles, inviter_id, target.organization_id())
             .await
             .map_err(log_internal)?
     {
-        standings.push(access);
+        // A guest reaches only what was granted by name, so their standing
+        // across the organization never lets them invite: into the
+        // organization it would make a full member of anybody, and into a team
+        // it would carry them, or anybody, past the boundary. They invite only
+        // through a team they belong to. The administrator role outranks the
+        // guest marker here as it does everywhere.
+        if membership.access == OrganizationAccess::Full || access.is_administrator() {
+            standings.push(access);
+        } else if matches!(target, Target::Organization(_)) {
+            return Err(ApiError::forbidden(
+                "Guests cannot invite people into the organization.",
+            ));
+        }
     }
 
     if standings.is_empty() {
@@ -874,27 +912,36 @@ async fn inviter_standings(
     Ok(standings)
 }
 
-/// The first standing that allows all of the offer, which then answers for
-/// the rest of the invitation.
+/// Allows the invitation when one standing allows all of it.
 ///
-/// Each standing is judged whole, never mixed with another: a team's rank and
-/// an organization's permissions are never combined into an authority nobody
+/// All of it is the offer and, when the address has a pending invitation, the
+/// offer that one makes, which inviting again replaces. Each standing is
+/// judged whole, never mixed with another: a team's rank and an
+/// organization's permissions are never combined into an authority nobody
 /// holds in one place.
-fn authorize_offer<'standing>(
-    standings: &'standing [Access],
+fn authorize_offer(
+    standings: &[Access],
     offered: &[Role],
+    replaced: Option<&[Role]>,
     tier: Scope,
     roles: &RoleSet,
-) -> Result<&'standing Access, ApiError> {
+) -> Result<(), ApiError> {
     let mut first_refusal = None;
     for standing in standings {
-        let verdict = standing.require(Action::Create, MEMBERSHIP).and_then(|()| {
-            offered
-                .iter()
-                .try_for_each(|role| hierarchy::require_assignable(standing, role, tier, roles))
-        });
+        let verdict = standing
+            .require(Action::Create, MEMBERSHIP)
+            .and_then(|()| {
+                offered
+                    .iter()
+                    .try_for_each(|role| hierarchy::require_assignable(standing, role, tier, roles))
+            })
+            .and_then(|()| {
+                replaced.map_or(Ok(()), |replaced| {
+                    hierarchy::require_outranks_offer(standing, replaced)
+                })
+            });
         match verdict {
-            Ok(()) => return Ok(standing),
+            Ok(()) => return Ok(()),
             Err(refusal) => {
                 first_refusal.get_or_insert(refusal);
             }

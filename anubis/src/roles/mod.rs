@@ -28,11 +28,15 @@
 //!
 //! # Two things the file is
 //!
-//! **The permission vocabulary.** Every model the file names contributes its
-//! four actions, and the framework adds its own subjects (see
+//! **The permission vocabulary.** Every model a tenancy role names contributes
+//! its four actions, and the framework adds its own subjects (see
 //! [`permission`]). An organization's roles are bundles drawn from this
 //! vocabulary and nothing else, so every check stays typed in Rust and in the
-//! TypeScript `anubis roles generate-ts` writes.
+//! TypeScript `anubis roles generate-ts` writes. A model only a platform role
+//! names belongs to the deployment and is not in it, and of the rest an
+//! organization's role carries only what some tenancy role here grants
+//! ([`RoleSet::grantable`]), so the file stays the ceiling on what any tenant,
+//! an administrator included, can hold.
 //!
 //! **The recommended roles.** An organization's roles are rows it can rename,
 //! recolour, reorder, edit, and delete (see [`crate::tenancy`]). The roles
@@ -263,6 +267,7 @@ pub struct RoleSet {
     /// Role keys in declaration order, least senior first.
     order: Vec<String>,
     vocabulary: BTreeSet<Permission>,
+    grantable: BTreeSet<Permission>,
 }
 
 impl RoleSet {
@@ -314,23 +319,50 @@ impl RoleSet {
                     .map(|action| Permission::new(*subject, *action))
             })
             .collect();
+        let mut grantable = vocabulary.clone();
 
         for (key, definition) in &file.roles {
             let mut grants = ModelGrants::new();
             let mut in_progress = Vec::new();
             collect_grants(&definitions, key, &mut grants, &mut in_progress)?;
 
-            // A model declared with an empty action list still names a
-            // subject an organization may want to grant.
-            for model in definition.models.keys() {
-                vocabulary.extend(
-                    vocabulary_actions(model)
-                        .iter()
-                        .map(|action| Permission::new(model.clone(), *action)),
-                );
+            // Attached to the key itself after its includes are resolved, so a
+            // role including `billing` inherits the file's grants to it and
+            // never the framework's: spending stays with the key that names it.
+            for (role, subject, actions) in FRAMEWORK_GRANTS {
+                if role == key {
+                    grants
+                        .entry(subject.to_owned())
+                        .or_default()
+                        .extend(actions.iter().copied());
+                }
             }
 
-            scopes.insert(key.clone(), collect_scopes(key, definition)?);
+            let role_scopes = collect_scopes(key, definition)?;
+            // Only what a tenant's role may carry is vocabulary, and only what
+            // some tenancy role grants is grantable: a model only a platform
+            // role names is the deployment's, never an organization's. A model
+            // declared with an empty action list still names a subject an
+            // organization may want to grant.
+            if role_scopes
+                .iter()
+                .any(|scope| Scope::TENANCY.contains(scope))
+            {
+                for (model, actions) in &grants {
+                    vocabulary.extend(
+                        vocabulary_actions(model)
+                            .iter()
+                            .map(|action| Permission::new(model.clone(), *action)),
+                    );
+                    grantable.extend(
+                        actions
+                            .iter()
+                            .map(|action| Permission::new(model.clone(), *action)),
+                    );
+                }
+            }
+
+            scopes.insert(key.clone(), role_scopes);
             names.insert(key.clone(), collect_name(key, definition)?);
             colors.insert(key.clone(), collect_color(key, definition)?);
             resolved.insert(key.clone(), grants);
@@ -347,6 +379,7 @@ impl RoleSet {
                 .map(|(key, _definition)| key)
                 .collect(),
             vocabulary,
+            grantable,
         })
     }
 
@@ -416,6 +449,17 @@ impl RoleSet {
     #[must_use]
     pub fn vocabulary(&self) -> &BTreeSet<Permission> {
         &self.vocabulary
+    }
+
+    /// Every permission an organization's role may carry: what some tenancy
+    /// role in the file grants, and the framework's own subjects.
+    ///
+    /// The ceiling even the administrator gives within. The vocabulary names
+    /// every action of every tenancy model, so a role editor can lay them out;
+    /// this is the part of it the application lets a tenant hold at all.
+    #[must_use]
+    pub fn grantable(&self) -> &BTreeSet<Permission> {
+        &self.grantable
     }
 
     /// Returns `true` when the permission is in this application's vocabulary.
@@ -618,17 +662,6 @@ fn collect_grants(
                 )));
             }
             actions.extend(named.iter().copied());
-        }
-    }
-
-    // Applied while walking, so a role including `billing` inherits what the
-    // framework gives `billing` exactly as it inherits the file's grants.
-    for (role, subject, actions) in FRAMEWORK_GRANTS {
-        if role == key {
-            grants
-                .entry(subject.to_owned())
-                .or_default()
-                .extend(actions.iter().copied());
         }
     }
 
@@ -971,13 +1004,77 @@ roles:
                 .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
         );
         assert!(
-            set.permissions_of("admin")
-                .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
-            "a role including billing inherits it",
-        );
-        assert!(
             !set.permissions_of("editor")
                 .contains(&Permission::new(SUBSCRIPTION, Action::Update)),
+        );
+    }
+
+    #[test]
+    fn spending_is_the_billing_keys_alone_and_never_inherited() {
+        // The framework names the key that spends, so a role including it
+        // gains the file's grants and not the framework's: `finance` reads what
+        // `billing` reads, and spends nothing unless the file says so.
+        let yaml = "
+roles:
+  billing:
+    models:
+      Invoice: [read]
+  finance:
+    includes: [billing]
+    models: {}
+";
+        let set = RoleSet::from_yaml(yaml).expect("must parse");
+        let spending = Permission::new(SUBSCRIPTION, Action::Update);
+
+        assert!(set.permissions_of("billing").contains(&spending));
+        assert!(
+            set.permissions_of("finance")
+                .contains(&Permission::new("Invoice", Action::Read)),
+        );
+        assert!(
+            !set.permissions_of("finance").contains(&spending),
+            "including billing does not inherit the framework's grant to it",
+        );
+    }
+
+    #[test]
+    fn a_tenant_holds_only_what_tenancy_roles_grant() {
+        let yaml = "
+roles:
+  default:
+    models:
+      Invoice: [read]
+  admin:
+    includes: [default]
+    models: {}
+  operator:
+    scopes: [platform]
+    models:
+      Ledger: [manage]
+";
+        let set = RoleSet::from_yaml(yaml).expect("must parse");
+
+        assert!(
+            set.is_permission(&Permission::new("Invoice", Action::Destroy)),
+            "a tenancy model's every action is vocabulary",
+        );
+        assert!(
+            !set.is_permission(&Permission::new("Ledger", Action::Read)),
+            "a model only a platform role names is not a tenant's to carry",
+        );
+        assert!(
+            set.grantable()
+                .contains(&Permission::new("Invoice", Action::Read))
+        );
+        assert!(
+            !set.grantable()
+                .contains(&Permission::new("Invoice", Action::Destroy)),
+            "no tenancy role grants it, so no organization's role may carry it",
+        );
+        assert!(
+            set.grantable()
+                .contains(&Permission::new(MEMBERSHIP, Action::Destroy)),
+            "the framework's own subjects are always grantable",
         );
     }
 

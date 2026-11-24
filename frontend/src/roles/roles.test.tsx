@@ -3,6 +3,7 @@
 import type { Role, TenantAccess } from '../api/types'
 
 // Core
+import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 // User interface
@@ -53,6 +54,7 @@ describe('MemberRolesPicker', () => {
         roles={ladder}
         viewer={moderator}
         tier='team'
+        held={[]}
         value={[]}
         onChange={vi.fn()}
       />
@@ -73,6 +75,7 @@ describe('MemberRolesPicker', () => {
         roles={ladder}
         viewer={moderator}
         tier='team'
+        held={[ 'Billing' ]}
         value={[ 'Billing' ]}
         onChange={onChange}
       />
@@ -82,6 +85,31 @@ describe('MemberRolesPicker', () => {
     expect(billing).toHaveProperty('disabled', false)
     await userEvent.click(billing)
     expect(onChange).toHaveBeenCalledWith([])
+  })
+
+  it('lets a held role taken away in this edit be given back in it', async () => {
+    function Editing() {
+      const [ value, setValue ] = useState([ 'Billing' ])
+      return <MemberRolesPicker
+        roles={ladder}
+        viewer={moderator}
+        tier='team'
+        held={[ 'Billing' ]}
+        value={value}
+        onChange={setValue}
+      />
+    }
+    render(<HeroUIProvider>
+      <Editing />
+    </HeroUIProvider>)
+
+    const billing = screen.getByRole('checkbox', { name: /Billing/ })
+    await userEvent.click(billing)
+    expect(billing).toHaveProperty('checked', false)
+    expect(billing, 'giving back what the member held gives them nothing new')
+      .toHaveProperty('disabled', false)
+    await userEvent.click(billing)
+    expect(billing).toHaveProperty('checked', true)
   })
 })
 

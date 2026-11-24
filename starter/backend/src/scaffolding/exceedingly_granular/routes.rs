@@ -553,6 +553,20 @@ async fn update(
     let (record, tangible_thing, creative_concept, access) =
         load(&mut connection, &state.roles, user.id, granular_detail_id).await?;
     access.require(Action::Update, MODEL)?;
+    // Moving the record is creating it under another parent, so the move is
+    // held to what the caller may create there: a role granted on one parent
+    // reaches that parent alone. A parent outside the team reaches nothing,
+    // and `apply_changes` refuses it as one this team cannot use.
+    if let Some(requested) = body
+        .tangible_thing_id
+        .filter(|requested| *requested != tangible_thing.id)
+        && let Some((_destination, _root, destination_access)) =
+            TangibleThing::load_for_member(&mut connection, &state.roles, user.id, requested)
+                .await
+                .map_err(log_internal)?
+    {
+        destination_access.require(Action::Create, MODEL)?;
+    }
 
     let granular_detail = apply_changes(
         &mut connection,

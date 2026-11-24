@@ -17,7 +17,8 @@ mod support;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use support::{
-    boot, bootstrapped_team, invite_and_claim, platform_token, register, send, send_as_token,
+    boot, bootstrapped_team, grant_on_record, invite_and_claim, platform_token, register, send,
+    send_as_token,
 };
 use uuid::Uuid;
 
@@ -168,6 +169,33 @@ async fn the_tangible_thing_slice_serves_full_crud() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A role granted on one record reaches that record alone, so it lets its
+    // holder change the record, but not carry it into another creative concept
+    // of the team, where they may not create.
+    grant_on_record(
+        &router,
+        &owner_cookie,
+        &team_id,
+        &outsider_email,
+        &["editor"],
+        &tangible_thing_id,
+    )
+    .await;
+    let annex_id = create_parent(&router, &owner_cookie, &team_id, "Annex").await;
+    let (status, _body) = send(
+        &router,
+        "PATCH",
+        &member_path,
+        Some(&json!({ "creative_concept_id": annex_id })),
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "moving a record is creating it under the new parent",
+    );
 
     // Update: the trigger keeps updated_at moving, and a blank description
     // clears the column.

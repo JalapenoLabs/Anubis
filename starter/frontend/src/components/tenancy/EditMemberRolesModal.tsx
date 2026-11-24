@@ -84,6 +84,7 @@ export function EditMemberRolesModal(props: Props) {
               roles={props.catalog.roles}
               viewer={props.catalog.viewer}
               tier={props.tier}
+              held={props.heldRoleIds}
               value={selected}
               onChange={setSelected}
               isDisabled={isSaving}

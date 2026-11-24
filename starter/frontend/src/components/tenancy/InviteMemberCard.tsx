@@ -1,11 +1,17 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { RoleCatalog } from '@jalapenolabs/anubis'
+import type { RoleCatalog, TenantAccess } from '@jalapenolabs/anubis'
 
 // Core
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { assignability, getApiErrorMessage, useAnubisApi } from '@jalapenolabs/anubis'
+import {
+  MEMBERSHIP_SUBJECT,
+  allows,
+  assignability,
+  getApiErrorMessage,
+  useAnubisApi,
+} from '@jalapenolabs/anubis'
 
 // UI
 import { Button, Card, CardBody, Input, Select, SelectItem } from '@heroui/react'
@@ -21,6 +27,11 @@ type Props = {
   organizationId?: string
   /** The organization's roles, with the inviter's standing where they invite. */
   catalog: RoleCatalog | undefined
+  /**
+   * Into a team, the inviter's organization-wide standing too: an
+   * organization's managers staff its teams, so either standing may invite.
+   */
+  organizationViewer?: TenantAccess
   /** Revalidates the roster, where the invitation now holds a place. */
   onInvited: () => void
 }
@@ -46,8 +57,15 @@ export function InviteMemberCard(props: Props) {
   const tier = props.teamId
     ? 'team'
     : 'organization'
+  // Each standing that may invite is judged whole, as the server judges it,
+  // so a role is offered when one of them may hand it out.
+  const standings = [ catalog?.viewer, props.organizationViewer ]
+    .filter((standing): standing is TenantAccess => Boolean(standing))
+    .filter((standing) => allows(standing, 'create', MEMBERSHIP_SUBJECT))
   const offered = catalog
-    ? catalog.roles.filter((candidate) => assignability(catalog.viewer, candidate, tier) === null)
+    ? catalog.roles.filter((candidate) => standings.some(
+      (standing) => assignability(standing, candidate, tier) === null,
+    ))
     : []
   const defaultRole = catalog?.roles.find((candidate) => candidate.isDefault)
 

@@ -107,6 +107,7 @@ export function TeamSettingsPage() {
           title={t('team.members.inviteTitle')}
           teamId={team.id}
           catalog={roles.catalog}
+          organizationViewer={organization.access}
           onInvited={() => {
             void roster.mutate()
           }}

@@ -29,6 +29,11 @@ type Props = {
   viewer: TenantAccess
   /** Where the roles are granted. */
   tier: GrantTier
+  /**
+   * The ids the member holds before this edit. Unticking one is a revocation,
+   * and ticking it again gives back what they held, so neither is a grant.
+   */
+  held: string[]
   /** The ids ticked now. */
   value: string[]
   onChange: (roleIds: string[]) => void
@@ -53,7 +58,8 @@ const DEFAULT_LABELS: MemberRolesPickerLabels = {
  * with the reason beneath it, never hidden, so a manager can see what holds
  * them back. A role a member already holds that the viewer outranks may be
  * taken away even when it carries something the viewer lacks, because taking
- * a role away gives nobody anything.
+ * a role away gives nobody anything, and given back within the same edit,
+ * because that gives them only what they held.
  */
 export function MemberRolesPicker(props: Props) {
   const labels = {
@@ -61,7 +67,7 @@ export function MemberRolesPicker(props: Props) {
     ...props.labels,
     refusals: { ...DEFAULT_LABELS.refusals, ...props.labels?.refusals },
   }
-  const held = new Set(props.value)
+  const held = new Set(props.held)
   const offered = props.roles.filter((role) => !role.isDefault)
 
   return <CheckboxGroup
@@ -73,10 +79,10 @@ export function MemberRolesPicker(props: Props) {
     {
       offered.map((role) => {
         const refusal = assignability(props.viewer, role, props.tier)
-        // Unticking a held role is a revocation, which the hierarchy alone
-        // decides; ticking one is a grant, which must carry nothing new.
-        const mayUntick = held.has(role.id) && outranks(props.viewer, role)
-        const isLocked = refusal !== null && !mayUntick
+        // A role the member held is the hierarchy's alone to take away or
+        // give back; ticking any other is a grant, which must carry nothing new.
+        const mayToggle = held.has(role.id) && outranks(props.viewer, role)
+        const isLocked = refusal !== null && !mayToggle
 
         return <Checkbox
           key={role.id}

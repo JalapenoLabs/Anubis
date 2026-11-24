@@ -963,6 +963,44 @@ async fn a_role_deleted_while_its_invitation_is_claimed_leaves_no_grant() {
     assert_eq!(left, 0, "a deleted role is held by nobody");
 }
 
+/// An account outside an organization is turned away before an invitation
+/// takes the organization's lock, so nobody can queue an organization's role
+/// and membership changes behind requests it was never going to accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outsiders_invitation_never_waits_on_the_organization_lock() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let court = TwoAdministrators::open(&database).await;
+    let outsider = register(&court.harness.router, "outsider@example.com").await;
+
+    let mut blocker = court.harness.pool.get().await.expect("connection");
+    let answered = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            organizations::table
+                .find(court.organization)
+                .select(organizations::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let invite = json!({ "email": "anyone@example.com", "team_id": court.team });
+            let request = send(
+                &court.harness.router,
+                "POST",
+                "/tenancy/invitations",
+                Some(&invite),
+                Some(&outsider),
+            );
+            Ok(tokio::time::timeout(Duration::from_secs(5), request).await)
+        })
+        .await
+        .expect("holding the organization lock must succeed");
+
+    let (status, _headers, _body) =
+        answered.expect("the outsider is answered while the lock is still held");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // Realtime channels
 // ---------------------------------------------------------------------------

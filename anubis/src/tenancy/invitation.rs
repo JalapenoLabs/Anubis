@@ -356,9 +356,7 @@ pub(crate) async fn claim(
             };
             claim_team(connection, team_id, membership_id, claimant).await?
         }
-        None => {
-            claim_organization(connection, invitation.organization_id, &offered, claimant).await?
-        }
+        None => claim_organization(connection, &invitation, &offered, claimant).await?,
     };
 
     Ok(Some(Claimed {
@@ -410,12 +408,17 @@ async fn claim_team(
 }
 
 /// Creates the claimant's organization membership with the offered roles.
+///
+/// The grants are the inviter's act, made when the claimant arrives, so they
+/// are recorded as the inviter's: the audit trail of who handed out a role
+/// does not stop at an invitation.
 async fn claim_organization(
     connection: &mut AsyncPgConnection,
-    organization_id: Uuid,
+    invitation: &Invitation,
     offered: &[Uuid],
     claimant: Uuid,
 ) -> Result<Vec<Uuid>, diesel::result::Error> {
+    let organization_id = invitation.organization_id;
     let joined: Option<Uuid> = diesel::insert_into(organization_memberships::table)
         .values(NewOrganizationMembership {
             organization_id,
@@ -436,7 +439,7 @@ async fn claim_organization(
             organization_id,
             *role_id,
             Holder::Organization { membership_id },
-            None,
+            invitation.invited_by,
         )
         .await?;
     }
