@@ -10,6 +10,7 @@ import { useTeamContext } from '../../context/TeamProvider'
 // UI
 import { Card, CardBody, Spinner } from '@heroui/react'
 import { AppShell } from '../../components/AppShell'
+import { CreditCard } from '../../components/billing/CreditCard'
 import { CurrentPlanCard } from '../../components/billing/CurrentPlanCard'
 import { PlansGrid } from '../../components/billing/PlansGrid'
 
@@ -27,7 +28,18 @@ import { getOrganizationSettingsUrl } from '../../urls'
 const CHECKOUT_PARAM = 'checkout'
 
 /**
- * What one organization is paying for: its plan, its seats, and the plans it could move to.
+ * Query parameter Stripe returns the browser on after buying credit, with
+ * `success` or `canceled`.
+ *
+ * Its own parameter rather than `checkout`'s, because the two purchases end in
+ * different places: a subscription appears in the plan card, credit in the
+ * balance. Trusted for nothing, like `checkout`: the credit lands with
+ * Stripe's event.
+ */
+const TOP_UP_PARAM = 'top_up'
+
+/**
+ * What one organization is paying for: its plan, its seats, its credit, and the plans it could move to.
  *
  * The route is `/organizations/:organizationId/billing`, which is where Stripe
  * returns the browser after a checkout or a portal visit, so a cold load has to
@@ -76,7 +88,21 @@ export function BillingPage() {
   const canManage = organization.roles.some(
     (role) => role === ADMIN_ROLE || role === BILLING_ROLE,
   )
+
+  // Anything but `success` reads as a cancellation, as a checkout's always has.
   const checkoutOutcome = searchParams.get(CHECKOUT_PARAM)
+  const topUpOutcome = searchParams.get(TOP_UP_PARAM)
+  let returnSentence: string | null = null
+  if (checkoutOutcome) {
+    returnSentence = checkoutOutcome === 'success'
+      ? t('billing.checkoutSuccess')
+      : t('billing.checkoutCanceled')
+  }
+  else if (topUpOutcome) {
+    returnSentence = topUpOutcome === 'success'
+      ? t('billing.wallet.topUpSuccess')
+      : t('billing.wallet.topUpCanceled')
+  }
 
   return <AppShell
     user={user}
@@ -94,13 +120,11 @@ export function BillingPage() {
         }</p>
     </div>
 
-    { checkoutOutcome
+    { returnSentence
       ? <Card className='relaxed p-2'>
           <CardBody>
             <p>{
-                checkoutOutcome === 'success'
-                  ? t('billing.checkoutSuccess')
-                  : t('billing.checkoutCanceled')
+                returnSentence
               }</p>
           </CardBody>
         </Card>
@@ -127,6 +151,15 @@ export function BillingPage() {
             canManage={canManage}
             onReconciled={() => billing.mutate()}
           />
+          { billing.data.wallet
+            ? <CreditCard
+                organizationId={organization.id}
+                wallet={billing.data.wallet}
+                billingEnabled={billing.data.billingEnabled}
+                onChanged={() => billing.mutate()}
+              />
+            : null
+          }
           { billing.data.billingEnabled
             ? <PlansGrid
                 organizationId={organization.id}

@@ -32,6 +32,8 @@ export const UrlTree = {
    * `/billing`: the backend reserves that prefix for the API itself.
    */
   organizationBilling: '/organizations/:organizationId/billing',
+  /** The prepaid credit ledger: every top-up, recharge, spend, and refund. */
+  organizationBillingActivity: '/organizations/:organizationId/billing/activity',
   claimInvitation: '/claim-invitation',
   /**
    * Where a connecting program such as Claude Code sends the person to approve
@@ -189,6 +191,10 @@ export function getOrganizationSettingsUrl(organizationId: string): string {
 
 export function getOrganizationBillingUrl(organizationId: string): string {
   return UrlTree.organizationBilling.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationBillingActivityUrl(organizationId: string): string {
+  return UrlTree.organizationBillingActivity.replace(':organizationId', organizationId)
 }
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {

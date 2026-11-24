@@ -8,6 +8,7 @@ import {
   UrlTree,
   getCreativeConceptUrl,
   getConsentRequestUrl,
+  getOrganizationBillingActivityUrl,
   getOauthStartUrl,
   getUrlWithDestination,
   sanitizeDestination,
@@ -84,6 +85,13 @@ describe('getConsentRequestUrl', () => {
   it('should name the request the consent screen reads', () => {
     expect(getConsentRequestUrl('5f0c2a1e-0000-4000-8000-000000000001'))
       .toBe('/consent?request=5f0c2a1e-0000-4000-8000-000000000001')
+  })
+})
+
+describe('getOrganizationBillingActivityUrl', () => {
+  it('should nest the credit activity under the billing screen it belongs to', () => {
+    expect(getOrganizationBillingActivityUrl('3f1a2b3c-0000-4000-8000-000000000001'))
+      .toBe('/organizations/3f1a2b3c-0000-4000-8000-000000000001/billing/activity')
   })
 })
 

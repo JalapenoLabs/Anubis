@@ -614,7 +614,7 @@ Five narratives, all against a **mock Stripe**: a small axum server serving the 
 
 The lifecycle suite proves the retrieve-rather-than-trust decision directly: the event bodies it delivers carry a status the mock no longer agrees with, and the row that lands is the mock's.
 
-All five use `TestDatabase`, so each narrative owns a database and can count rows; see [testing.md](testing.md). On the frontend, `BillingPage.test.tsx` renders the screen against a stubbed `fetch` in three states: billing disabled, the free plan with its grid, and a live subscription set to cancel.
+All five use `TestDatabase`, so each narrative owns a database and can count rows; see [testing.md](testing.md). On the frontend, `BillingPage.test.tsx` renders the screen against a stubbed `fetch`: billing disabled, the free plan with its grid, a live subscription set to cancel, and the wallet (its balance and dialogs, a declined recharge, a balance below zero, the `paid_status` line, and both `?top_up=` landings). `CreditActivityPage.test.tsx` pages the ledger through a refund, a spend the wallet only partly covered, and a sub-cent charge; the two dialogs, `PlanCard`, and the `money.ts` helpers that turn micro-units into dollars and back have tests of their own.
 
 ## The plan catalog in the frontend
 
