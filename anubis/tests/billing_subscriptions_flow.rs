@@ -105,8 +105,11 @@ struct Ledger {
     /// Subscriptions by id, each with its whole item list.
     subscriptions: BTreeMap<String, Value>,
     requests: Vec<Received>,
-    /// Stripe's idempotency cache: a key seen before answers what it answered.
-    answered: BTreeMap<String, Value>,
+    /// Stripe's idempotency cache: a key seen before answers what it answered,
+    /// a refusal included, as Stripe does for a day.
+    answered: BTreeMap<String, (StatusCode, Value)>,
+    /// Updates still to refuse with a `500`, saved under their key.
+    refusals: u32,
     next_item: u32,
     /// Subscriptions per page of the list; Stripe's own is up to a hundred.
     page_size: usize,
@@ -350,8 +353,19 @@ async fn update(
 
     let answer = {
         let mut ledger = mock.ledger();
-        if let Some(cached) = key.as_ref().and_then(|key| ledger.answered.get(key)) {
-            return (StatusCode::OK, Json(cached.clone()));
+        if let Some((status, cached)) = key.as_ref().and_then(|key| ledger.answered.get(key)) {
+            return (*status, Json(cached.clone()));
+        }
+        if ledger.refusals > 0 {
+            ledger.refusals -= 1;
+            let refusal =
+                json!({ "error": { "type": "api_error", "message": "An unknown error occurred" } });
+            if let Some(key) = key {
+                ledger
+                    .answered
+                    .insert(key, (StatusCode::INTERNAL_SERVER_ERROR, refusal.clone()));
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(refusal));
         }
         let mut subscription = ledger.subscriptions[&id].clone();
 
@@ -409,7 +423,9 @@ async fn update(
 
         let answer = embed(&ledger, &subscription);
         if let Some(key) = key {
-            ledger.answered.insert(key, answer.clone());
+            ledger
+                .answered
+                .insert(key, (StatusCode::OK, answer.clone()));
         }
         answer
     };
@@ -2057,5 +2073,190 @@ async fn without_a_reachable_stripe_a_change_says_so_and_writes_nothing() {
             .await
             .is_empty(),
         "and nothing was recorded",
+    );
+}
+
+/// A change Stripe refused is sent afresh next time rather than replayed.
+///
+/// Stripe saves a key's first answer, a `500` included, and replays it to every
+/// retry with that key for a day. The refusal moves the row's revision, so the
+/// next attempt is a new request; it reads Stripe back first, which is what
+/// keeps a fresh key from repeating a change that did apply.
+#[tokio::test]
+async fn a_change_stripe_refused_is_sent_afresh_on_the_next_attempt() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    let context = Context::system();
+    scene.mock.hold(
+        "sub_refused",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_refused", Utc::now().timestamp() - 600)
+        .await;
+    scene.mock.ledger().refusals = 1;
+
+    let refused = scene
+        .subscriptions
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect_err("Stripe refuses the first attempt");
+    assert!(!refused.is_transport(), "Stripe answered: {refused}");
+    let answered: anubis::http::ApiError = refused.into();
+    assert_eq!(answered.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let held = scene.live(&record).await.expect("still paid for");
+    assert_eq!(stored(&held), pairs(&[(SMALL, 1)]), "nothing changed");
+    assert!(
+        scene
+            .audited(anubis::audit::SUBSCRIPTION_ITEMS_CHANGED)
+            .await
+            .is_empty(),
+        "a refused change is not recorded as made",
+    );
+
+    let held = scene
+        .subscriptions
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect("the retry is a new request, and Stripe takes it");
+    assert_eq!(stored(&held), pairs(&[(SMALL, 1), (BACKUPS, 1)]));
+    let writes = scene.mock.subscription_writes();
+    assert_eq!(writes.len(), 2);
+    assert_ne!(
+        writes[0].idempotency_key, writes[1].idempotency_key,
+        "the refusal moved the key",
+    );
+}
+
+/// A change whose caller goes away still finishes, and frees the row.
+///
+/// A request that times out drops the future awaiting the change while its
+/// answer is still at Stripe. The change runs on its own task, so it reaches its
+/// commit: Stripe's answer is written back, and the next change to the same
+/// subscription is not left waiting on a lock nobody will release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_whose_caller_goes_away_still_finishes_and_frees_the_row() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    let record = server();
+    scene.mock.hold(
+        "sub_abandoned",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_abandoned", Utc::now().timestamp() - 600)
+        .await;
+
+    let (arrived, release) = scene.mock.hold_next_update();
+    let abandoned = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        let record = record.clone();
+        async move {
+            scene
+                .subscriptions
+                .change_items(
+                    &Context::system(),
+                    scene.organization_id,
+                    &record,
+                    &[ItemChange::set(BACKUPS, 1)],
+                )
+                .await
+        }
+    });
+    arrived.notified().await;
+    abandoned.abort();
+    let _aborted = abandoned.await;
+    release.notify_one();
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(5),
+        scene.subscriptions.change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(LOGS, 1)],
+        ),
+    )
+    .await
+    .expect("the next change is not left waiting on the abandoned one's lock")
+    .expect("the next change applies");
+    assert_eq!(
+        stored(&next),
+        pairs(&[(SMALL, 1), (BACKUPS, 1), (LOGS, 1)]),
+        "the abandoned change was written back too",
+    );
+}
+
+/// The plan is every member's to read; what each record costs is not.
+#[tokio::test]
+async fn a_member_without_billing_authority_reads_the_plan_but_not_each_record() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    scene.mock.hold(
+        "sub_private",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene.announce("sub_private", Utc::now().timestamp()).await;
+
+    let email = format!("member-{}@example.com", Uuid::new_v4());
+    let member = register(&scene.harness.router, &email).await;
+    let mut connection = scene.connection().await;
+    let member_id: Uuid = anubis::schema::users::table
+        .filter(anubis::schema::users::email.eq(&email))
+        .select(anubis::schema::users::id)
+        .first(&mut connection)
+        .await
+        .expect("the account exists");
+    diesel::insert_into(anubis::schema::organization_memberships::table)
+        .values((
+            anubis::schema::organization_memberships::organization_id.eq(scene.organization_id),
+            anubis::schema::organization_memberships::user_id.eq(member_id),
+            anubis::schema::organization_memberships::roles.eq(vec!["default".to_owned()]),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("the membership inserts");
+
+    let path = format!("/billing/organizations/{}", scene.organization_id);
+    let (status, _headers, body) = send(&scene.billing, "GET", &path, None, Some(&member)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["plan"]["key"], "free", "body: {body}");
+    assert!(
+        body["subscriptions"].is_null(),
+        "a member without billing authority is not shown each record's subscription: {body}",
+    );
+
+    let body = scene.billing_body().await;
+    assert_eq!(
+        body["subscriptions"][0]["subject_id"],
+        json!(record.id().to_string()),
+        "the owner is: {body}",
     );
 }

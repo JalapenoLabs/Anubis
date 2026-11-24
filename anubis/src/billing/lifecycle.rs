@@ -282,13 +282,21 @@ impl Reconciler {
         // The row's last write is the revision: a retry of this job before
         // anything is written sends the same key, and the next membership
         // change, after this one's answer is recorded, sends a new one.
-        let updated = stripe
+        let updated = match stripe
             .update_subscription(
                 &held.stripe_subscription_id,
                 &update,
                 &held.updated_at.to_rfc3339(),
             )
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(refused) if refused.is_api() => {
+                move_revision(&mut connection, held.id).await?;
+                return Err(refused.into());
+            }
+            Err(unanswered) => return Err(unanswered.into()),
+        };
 
         tracing::info!(
             organization.id = %job.organization_id,
@@ -866,6 +874,28 @@ async fn write_items(
             .await?;
     }
 
+    Ok(())
+}
+
+/// Moves a subscription row's revision after Stripe refused a write to it.
+///
+/// A write's idempotency key is derived from the row's last write, and Stripe
+/// saves the first answer to a key, refusals and `500`s included, replaying it
+/// to every retry for a day. Without this a refused write would be refused
+/// again on each retry until something else happened to write the row. A
+/// fresh key is safe because every write reads Stripe back first: a change
+/// that did apply is found there and not sent again.
+///
+/// # Errors
+/// Returns the underlying Diesel error when the update fails.
+pub(super) async fn move_revision(
+    connection: &mut AsyncPgConnection,
+    subscription_id: Uuid,
+) -> QueryResult<()> {
+    diesel::update(subscriptions::table.find(subscription_id))
+        .set(subscriptions::updated_at.eq(Utc::now()))
+        .execute(connection)
+        .await?;
     Ok(())
 }
 

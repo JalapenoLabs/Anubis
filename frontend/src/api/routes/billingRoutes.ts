@@ -56,7 +56,7 @@ type WireSubscription = {
 type WireBilling = {
   plan: WirePlan
   subscription: WireSubscription | null
-  subscriptions: WireSubscription[]
+  subscriptions: WireSubscription[] | null
   billing_enabled: boolean
   seats_used: number
 }
@@ -112,7 +112,9 @@ function toOverview(wire: WireBilling): BillingOverview {
     subscription: wire.subscription
       ? toSubscription(wire.subscription)
       : null,
-    subscriptions: wire.subscriptions.map((subscription) => toSubscription(subscription)),
+    subscriptions: wire.subscriptions
+      ? wire.subscriptions.map((subscription) => toSubscription(subscription))
+      : null,
     billingEnabled: wire.billing_enabled,
     seatsUsed: wire.seats_used,
   }

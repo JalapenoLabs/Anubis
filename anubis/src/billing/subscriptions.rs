@@ -59,7 +59,11 @@
 //! sends it with an idempotency key naming the row's last write. A retry of a
 //! change whose answer was lost is therefore one change at Stripe, and the
 //! answer is written into the projection, with the change's audit event, before
-//! the lock is released.
+//! the lock is released. Stripe replays the first answer to a key for a day,
+//! refusals included, so a change Stripe refuses moves the row's revision: the
+//! next attempt is keyed afresh, which is safe because it reads Stripe back
+//! first. The change runs on a task of its own, so a caller that goes away
+//! cannot leave the row locked.
 //!
 //! The write is stamped when the read began, so an event describing anything
 //! Stripe recorded later still applies; see [`super::lifecycle`]. If the local
@@ -76,7 +80,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::lifecycle::{self, Origin, Reconciler, read_began};
+use super::lifecycle::{self, Origin, Reconciler, move_revision, read_began};
 use super::model::{
     Subject, Subscription, SubscriptionStatus, SubscriptionWithItems, terminal_statuses,
 };
@@ -189,20 +193,26 @@ pub enum Cancellation {
 }
 
 /// What one locked change asks Stripe to do.
-enum Intent<'a> {
-    Items(&'a [ItemChange]),
+///
+/// Owned, because the change runs on a task of its own.
+enum Intent {
+    Items(Vec<ItemChange>),
     Cancel(Cancellation),
 }
 
 /// How a locked change ended, decided inside its transaction and acted on after it.
 ///
-/// An ended subscription is not a rollback: its terminal state is written into
-/// the projection and committed, and only then reported to the caller.
+/// Neither failure here is a rollback: what it learned is committed first, and
+/// only then reported to the caller.
 enum Outcome {
     /// The change applied, or was already in place; this is the row it wrote.
     Applied(Uuid),
-    /// The subscription is over at Stripe, so there was nothing to change.
+    /// The subscription is over at Stripe, so there was nothing to change. Its
+    /// terminal state is written into the projection.
     Ended,
+    /// Stripe answered the change with a refusal. The row's revision is moved,
+    /// so the next attempt is keyed afresh.
+    Refused(Error),
 }
 
 /// The request a change comes down to, once the current state is known.
@@ -315,8 +325,13 @@ impl Subscriptions {
         changes: &[ItemChange],
     ) -> Result<SubscriptionWithItems, Error> {
         validate_changes(changes)?;
-        self.locked_change(context, organization_id, subject, Intent::Items(changes))
-            .await
+        self.detached_change(
+            context,
+            organization_id,
+            subject,
+            Intent::Items(changes.to_vec()),
+        )
+        .await
     }
 
     /// Cancels a subject's live subscription, now or at the end of its period.
@@ -337,7 +352,7 @@ impl Subscriptions {
         subject: &Subject,
         when: Cancellation,
     ) -> Result<SubscriptionWithItems, Error> {
-        self.locked_change(context, organization_id, subject, Intent::Cancel(when))
+        self.detached_change(context, organization_id, subject, Intent::Cancel(when))
             .await
     }
 
@@ -386,13 +401,48 @@ impl Subscriptions {
         Ok(session)
     }
 
+    /// Runs one change on a task of its own, so its caller going away cannot stop it halfway.
+    ///
+    /// A change holds a transaction, and the subscription's row lock, across
+    /// its calls to Stripe. A request that times out, or a client that hangs
+    /// up, drops the future awaiting it; were the change that future, its
+    /// transaction would be dropped open, and the pool hands a connection back
+    /// without closing it until it is next checked out, so the row would stay
+    /// locked against every later change and event for that subscription.
+    /// Spawned, the change always reaches its commit or its rollback, and one
+    /// Stripe applied is always written back, whether or not anyone is still
+    /// waiting for the answer.
+    async fn detached_change(
+        &self,
+        context: &audit::Context,
+        organization_id: Uuid,
+        subject: &Subject,
+        intent: Intent,
+    ) -> Result<SubscriptionWithItems, Error> {
+        let service = self.clone();
+        let context = context.clone();
+        let subject = subject.clone();
+        let change = tokio::spawn(async move {
+            service
+                .locked_change(&context, organization_id, &subject, &intent)
+                .await
+        });
+
+        change.await.map_err(|source| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("the subscription change stopped before it finished: {source}"),
+            )
+        })?
+    }
+
     /// Runs one change under the subscription's row lock; see the module docs.
     async fn locked_change(
         &self,
         context: &audit::Context,
         organization_id: Uuid,
         subject: &Subject,
-        intent: Intent<'_>,
+        intent: &Intent,
     ) -> Result<SubscriptionWithItems, Error> {
         let stripe = self.configured()?;
         let mut connection = self.connection().await?;
@@ -429,7 +479,7 @@ impl Subscriptions {
                 let ended = SubscriptionStatus::parse(&current.status)
                     .is_some_and(SubscriptionStatus::is_terminal);
 
-                let request = match (&intent, ended) {
+                let request = match (intent, ended) {
                     // Already over: nothing to send, and the projection catches
                     // up below. A cancellation has its answer; a change has not.
                     (_intent, true) => Request::Nothing,
@@ -443,15 +493,21 @@ impl Subscriptions {
                     // change before anything is written sends the same key, and
                     // the same change asked for again after the projection has
                     // moved on sends a new one.
-                    Request::Update(update) => {
-                        stripe
-                            .update_subscription(
-                                &held.stripe_subscription_id,
-                                update,
-                                &held.updated_at.to_rfc3339(),
-                            )
-                            .await?
-                    }
+                    Request::Update(update) => match stripe
+                        .update_subscription(
+                            &held.stripe_subscription_id,
+                            update,
+                            &held.updated_at.to_rfc3339(),
+                        )
+                        .await
+                    {
+                        Ok(answered) => answered,
+                        Err(refused) if refused.is_api() => {
+                            move_revision(connection, held.id).await?;
+                            return Ok(Outcome::Refused(refused.into()));
+                        }
+                        Err(unanswered) => return Err(unanswered.into()),
+                    },
                     Request::Delete => {
                         stripe
                             .cancel_subscription(&held.stripe_subscription_id)
@@ -480,11 +536,15 @@ impl Subscriptions {
             })
             .await?;
 
-        let Outcome::Applied(subscription_id) = outcome else {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                format!("the subscription for {subject} has ended at Stripe"),
-            ));
+        let subscription_id = match outcome {
+            Outcome::Applied(subscription_id) => subscription_id,
+            Outcome::Ended => {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    format!("the subscription for {subject} has ended at Stripe"),
+                ));
+            }
+            Outcome::Refused(refused) => return Err(refused),
         };
         let row: Subscription = subscriptions::table
             .find(subscription_id)
@@ -605,7 +665,7 @@ async fn record(
     context: &audit::Context,
     held: &Subscription,
     subject: &Subject,
-    intent: &Intent<'_>,
+    intent: &Intent,
     before: &stripe::Subscription,
     after: &stripe::Subscription,
 ) -> Result<(), Error> {

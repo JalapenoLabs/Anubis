@@ -17,13 +17,14 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anubis::billing::{Limits, PlanSet, Reconciler, SyncSeats};
 use anubis::config::AppConfig;
 use anubis::schema::{jobs, subscriptions};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
 use diesel::prelude::*;
@@ -86,6 +87,7 @@ fn plans(yaml: &str) -> PlanSet {
 struct Received {
     path: String,
     body: String,
+    idempotency_key: Option<String>,
 }
 
 type Log = Arc<Mutex<Vec<Received>>>;
@@ -101,6 +103,11 @@ type Quantity = Arc<Mutex<i64>>;
 struct MockState {
     log: Log,
     quantity: Quantity,
+    /// Updates still to refuse with a `500`.
+    refusals: Arc<Mutex<u32>>,
+    /// Stripe's idempotency cache: the first answer to each key, refusals
+    /// included, which Stripe replays to every retry with that key.
+    answered: Arc<Mutex<BTreeMap<String, (StatusCode, Value)>>>,
 }
 
 /// Serves the two subscription endpoints seat synchronization calls.
@@ -109,9 +116,17 @@ struct MockState {
 /// with afterwards, which is what makes running the job twice provably a no-op
 /// rather than an assertion about call counts alone.
 async fn start_mock_stripe() -> (String, Log, Quantity) {
+    start_mock_stripe_refusing(0).await
+}
+
+/// The same mock, refusing its first `refusals` updates with a `500` that it
+/// saves under the request's idempotency key, as Stripe does.
+async fn start_mock_stripe_refusing(refusals: u32) -> (String, Log, Quantity) {
     let state = MockState {
         log: Arc::new(Mutex::new(Vec::new())),
         quantity: Arc::new(Mutex::new(1)),
+        refusals: Arc::new(Mutex::new(refusals)),
+        answered: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
     let router = Router::new()
@@ -122,20 +137,49 @@ async fn start_mock_stripe() -> (String, Log, Quantity) {
                     unlock(&state.log).push(Received {
                         path: format!("GET /v1/subscriptions/{id}"),
                         body: String::new(),
+                        idempotency_key: None,
                     });
                     Json(subscription_body(*unlock(&state.quantity)))
                 },
             )
             .post(
-                async |State(state): State<MockState>, Path(id): Path<String>, body: String| {
+                async |State(state): State<MockState>,
+                       Path(id): Path<String>,
+                       headers: HeaderMap,
+                       body: String| {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
                     unlock(&state.log).push(Received {
                         path: format!("POST /v1/subscriptions/{id}"),
                         body: body.clone(),
+                        idempotency_key: key.clone(),
                     });
-                    if let Some(quantity) = quantity_of(&body) {
-                        *unlock(&state.quantity) = quantity;
+                    if let Some(saved) = key
+                        .as_ref()
+                        .and_then(|key| unlock(&state.answered).get(key).cloned())
+                    {
+                        return (saved.0, Json(saved.1));
                     }
-                    Json(subscription_body(*unlock(&state.quantity)))
+
+                    let answer = if *unlock(&state.refusals) > 0 {
+                        *unlock(&state.refusals) -= 1;
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({ "error": { "type": "api_error",
+                                               "message": "An unknown error occurred" } }),
+                        )
+                    } else {
+                        if let Some(quantity) = quantity_of(&body) {
+                            *unlock(&state.quantity) = quantity;
+                        }
+                        (StatusCode::OK, subscription_body(*unlock(&state.quantity)))
+                    };
+                    if let Some(key) = key {
+                        unlock(&state.answered).insert(key, answer.clone());
+                    }
+                    (answer.0, Json(answer.1))
                 },
             ),
         )
@@ -518,4 +562,64 @@ async fn seat_synchronization_tells_stripe_the_new_quantity_once() {
         .filter(|call| call.path.starts_with("POST"))
         .count();
     assert_eq!(updates, 1, "a correct quantity is never re-sent");
+}
+
+/// A seat update Stripe refused is retried under a fresh key, not replayed.
+///
+/// Stripe saves the first answer to an idempotency key, a `500` included, and
+/// replays it to every retry with that key for a day. The key names the
+/// subscription row's last write, so the refusal moves it: the job's next
+/// attempt is a new request, which Stripe can answer afresh.
+#[tokio::test]
+async fn a_seat_update_stripe_refused_is_sent_afresh_on_the_next_attempt() {
+    let Some(database) = TestDatabase::create("billing_limits_sync").await else {
+        return;
+    };
+    let harness = Harness::boot_with_plans(&database, plans(PER_SEAT_YML)).await;
+    let (stripe_base, stripe_log, stripe_quantity) = start_mock_stripe_refusing(1).await;
+    let reconciler = Reconciler::new(
+        harness.pool.clone(),
+        plans(PER_SEAT_YML),
+        &config(&stripe_base),
+    );
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    insert_subscription(&harness.pool, organization_id, 1).await;
+    let (status, body) = invite(
+        &harness.router,
+        organization_id,
+        &owner,
+        &format!("guest-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("Stripe refuses the first attempt");
+    assert_eq!(*unlock(&stripe_quantity), 1, "nothing changed at Stripe");
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect("the retry is a new request, and Stripe takes it");
+    assert_eq!(*unlock(&stripe_quantity), 2);
+
+    let keys: Vec<Option<String>> = unlock(&stripe_log)
+        .iter()
+        .filter(|call| call.path.starts_with("POST"))
+        .map(|call| call.idempotency_key.clone())
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(
+        keys.iter().all(Option::is_some),
+        "every update is keyed: {keys:?}"
+    );
+    assert_ne!(keys[0], keys[1], "the refusal moved the key");
 }

@@ -125,7 +125,12 @@ struct BillingBody {
     subscription: Option<SubscriptionWithItems>,
     /// Every live subscription the organization holds, each with its line
     /// items: the plan subscription first, then those paying for its records.
-    subscriptions: Vec<SubscriptionWithItems>,
+    ///
+    /// `None` for a member who may not manage billing. The plan explains what
+    /// the whole organization can do, which is why every member reads it, but
+    /// a record's subscription names the record, its prices, and its status,
+    /// and a member may not reach every record the organization pays for.
+    subscriptions: Option<Vec<SubscriptionWithItems>>,
     /// Whether this deployment can start a checkout at all.
     billing_enabled: bool,
     /// People who can reach the organization, claimed and invited alike.
@@ -162,16 +167,27 @@ async fn show(
         .await
         .map_err(log_internal)?;
 
-    let body = overview(&mut connection, &state, member.organization.id, live).await?;
+    let body = overview(
+        &mut connection,
+        &state,
+        member.organization.id,
+        live,
+        holds_billing_authority(&member),
+    )
+    .await?;
     Ok(Json(body))
 }
 
 /// The body both [`show`] and [`reconcile`] answer with.
+///
+/// `list_all` says whether the caller may see every subscription, rather than
+/// the plan and the plan subscription alone.
 async fn overview(
     connection: &mut AsyncPgConnection,
     state: &BillingState,
     organization_id: Uuid,
     live: Vec<Subscription>,
+    list_all: bool,
 ) -> Result<BillingBody, ApiError> {
     let subscriptions = SubscriptionWithItems::load(connection, live)
         .await
@@ -195,7 +211,7 @@ async fn overview(
     Ok(BillingBody {
         plan,
         subscription,
-        subscriptions,
+        subscriptions: list_all.then_some(subscriptions),
         billing_enabled: state.stripe.is_some(),
         seats_used,
     })
@@ -309,7 +325,7 @@ async fn reconcile(
         .map_err(|error| reconcile_failed(&error))?;
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let body = overview(&mut connection, &state, member.organization.id, live).await?;
+    let body = overview(&mut connection, &state, member.organization.id, live, true).await?;
     Ok(Json(body))
 }
 
@@ -352,15 +368,18 @@ fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
     })
 }
 
-/// Refuses a member who may see the plan but not buy one.
-fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError> {
-    let permitted = member
+/// Whether a member may spend the organization's money and see what it buys.
+fn holds_billing_authority(member: &OrganizationMember) -> bool {
+    member
         .membership
         .roles
         .iter()
-        .any(|role| role == ADMIN_ROLE || role == BILLING_ROLE);
+        .any(|role| role == ADMIN_ROLE || role == BILLING_ROLE)
+}
 
-    if permitted {
+/// Refuses a member who may see the plan but not buy one.
+fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError> {
+    if holds_billing_authority(member) {
         Ok(())
     } else {
         Err(ApiError::forbidden(

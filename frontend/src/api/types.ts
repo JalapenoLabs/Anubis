@@ -391,8 +391,12 @@ export type BillingOverview = {
   plan: BillingPlan
   /** The plan subscription; absent on the free plan, which is its absence. */
   subscription: BillingSubscription | null
-  /** Every live subscription: the plan subscription first, then subjects. */
-  subscriptions: BillingSubscription[]
+  /**
+   * Every live subscription: the plan subscription first, then subjects. Null
+   * for a member without the `admin` or `billing` role, who reads the plan but
+   * not what each record costs.
+   */
+  subscriptions: BillingSubscription[] | null
   /** False when this deployment has no Stripe key, so nothing can be bought. */
   billingEnabled: boolean
   /** People who can reach the organization, claimed and invited alike. */
