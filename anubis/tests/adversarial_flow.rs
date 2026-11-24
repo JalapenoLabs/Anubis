@@ -1599,3 +1599,56 @@ async fn a_deleted_role_leaves_its_holders_with_the_rest() {
         .collect();
     assert_eq!(positions, [3, 2, 1, 0], "the roles above close the gap");
 }
+
+/// Inviting an address again replaces the invitation it already has, so a
+/// re-invite is a revocation of the old offer and is held to the same rule:
+/// nobody replaces an offer of a role at or above their own.
+#[tokio::test]
+async fn a_re_invite_cannot_revoke_an_offer_above_the_inviter() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let invitee = format!("invitee-{}@example.com", Uuid::new_v4());
+
+    let offer =
+        |roles: Vec<Uuid>| json!({ "email": invitee, "team_id": court.team, "role_ids": roles });
+    let (status, _headers, body) = court
+        .send(
+            "POST",
+            "/tenancy/invitations",
+            Some(&offer(vec![court.roles.administrator])),
+            &court.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    let (status, _headers, _body) = court
+        .send(
+            "POST",
+            "/tenancy/invitations",
+            Some(&offer(Vec::new())),
+            &court.moderator,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "replacing an administrator offer is revoking it",
+    );
+
+    let path = format!("/tenancy/teams/{}/members", court.team);
+    let (status, _headers, roster) = court.send("GET", &path, None, &court.owner).await;
+    assert_eq!(status, StatusCode::OK, "body: {roster}");
+    let pending = roster["members"]
+        .as_array()
+        .expect("a roster lists members")
+        .iter()
+        .find(|member| member["email"] == invitee.as_str())
+        .expect("the invitation still holds its place");
+    assert_eq!(
+        pending["roles"][0]["id"],
+        json!(court.roles.administrator),
+        "and still offers what the owner offered",
+    );
+}

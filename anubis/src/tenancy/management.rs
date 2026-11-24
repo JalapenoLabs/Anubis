@@ -65,8 +65,7 @@ use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::ApiError;
 use crate::roles::{Action, MEMBERSHIP, RoleSet, Scope};
 use crate::schema::{
-    invitations, organization_memberships, organizations, role_grants, team_memberships, teams,
-    users,
+    invitations, organization_memberships, organizations, team_memberships, teams, users,
 };
 use crate::tenancy::access::{
     Access, organization_membership_access, resolve_organization_access, resolve_team_access,
@@ -891,9 +890,9 @@ async fn leave_team(
 
 /// Revokes a pending team invitation.
 ///
-/// The roles an invitation offers are grants waiting on its membership, so
-/// taking it back is a revocation, held to the same hierarchy: nobody revokes
-/// an invitation that offers a role at or above their own.
+/// An invitation is a member who has not arrived yet, holding what it offers,
+/// so taking it back is held to the rule removing a member is: nobody revokes
+/// an invitation offering a role at or above their own.
 async fn revoke_team_invitation(
     State(state): State<TenancyState>,
     member: TeamMember,
@@ -920,9 +919,7 @@ async fn revoke_team_invitation(
             let offered =
                 offered_by_invitation(transaction, team.organization_id, invitation_id, pending.0)
                     .await?;
-            for role in &offered {
-                hierarchy::require_outranks_role(&actor, role)?;
-            }
+            hierarchy::require_outranks_offer(&actor, &offered)?;
 
             revoke_invitation(transaction, invitation_id, pending.0).await?;
             audit::record(
@@ -989,9 +986,7 @@ async fn revoke_organization_invitation(
                 pending_membership,
             )
             .await?;
-            for role in &offered {
-                hierarchy::require_outranks_role(&actor, role)?;
-            }
+            hierarchy::require_outranks_offer(&actor, &offered)?;
 
             revoke_invitation(transaction, invitation_id, pending_membership).await?;
 
@@ -1015,28 +1010,14 @@ async fn revoke_organization_invitation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The roles a pending invitation offers: the grants waiting on the membership
-/// a team invitation pre-created, or the roles an organization one names.
+/// The roles a pending invitation offers, loaded.
 async fn offered_by_invitation(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
     invitation_id: Uuid,
     pending_membership: Option<Uuid>,
 ) -> Result<Vec<Role>, ApiError> {
-    let role_ids: Vec<Uuid> = match pending_membership {
-        Some(membership_id) => {
-            role_grants::table
-                .filter(role_grants::team_membership_id.eq(membership_id))
-                .select(role_grants::role_id)
-                .load(connection)
-                .await?
-        }
-        None => invitation::offered_role_ids(connection, &[invitation_id])
-            .await?
-            .into_iter()
-            .map(|(_invitation_id, role_id)| role_id)
-            .collect(),
-    };
+    let role_ids = invitation::offered_by(connection, invitation_id, pending_membership).await?;
     load_roles(connection, organization_id, &role_ids).await
 }
 

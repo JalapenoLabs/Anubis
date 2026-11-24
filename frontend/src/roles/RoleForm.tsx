@@ -69,7 +69,7 @@ type Props = {
 
 const DEFAULT_LABELS: RoleFormLabels = {
   name: 'Name',
-  color: 'Colour',
+  color: 'Color',
   permissions: 'Permissions',
   subject: 'Area',
   administratorNote: 'The administrator role holds every permission.',

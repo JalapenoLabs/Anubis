@@ -99,6 +99,29 @@ pub(crate) fn require_outranks_member(
     Ok(())
 }
 
+/// Refuses unless `actor` outranks a pending invitation's offer.
+///
+/// An invitation is a member who has not arrived yet, holding what it offers,
+/// so revoking or replacing one is held to the rule removing a member is: the
+/// actor must outrank the highest role offered, and an invitation offering
+/// nothing ranks with the default role.
+///
+/// # Errors
+/// Returns `403` for an offer of the administrator role to anybody else, and
+/// for one at or above the actor's rank.
+pub(crate) fn require_outranks_offer(actor: &Access, offered: &[Role]) -> Result<(), ApiError> {
+    if actor.is_administrator() {
+        return Ok(());
+    }
+    let highest = offered.iter().map(|role| role.position).max().unwrap_or(0);
+    if offered.iter().any(Role::is_administrator) || highest >= actor.rank() {
+        return Err(ApiError::forbidden(
+            "You can only manage invitations offering roles below your highest role.",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses unless `actor` may hand `role` to somebody at `tier`.
 ///
 /// The whole question a grant or an invitation asks of one role: that it can
@@ -212,7 +235,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        plan_reorder, require_holds, require_outranks_member, require_outranks_role, toggled,
+        plan_reorder, require_holds, require_outranks_member, require_outranks_offer,
+        require_outranks_role, toggled,
     };
     use crate::http::ApiError;
     use crate::roles::{Action, MEMBERSHIP, Permission, RoleSet};
@@ -346,6 +370,29 @@ roles:
             .expect("your own roles are held to the role rules alone");
         require_outranks_member(&administrator, &administrator, false)
             .expect("an administrator manages anybody");
+    }
+
+    #[test]
+    fn an_invitation_ranks_with_what_it_offers() {
+        let ladder = ladder();
+        let moderator = holding(&[&ladder[0], &ladder[3]]);
+        let lowest = holding(&[&ladder[0]]);
+
+        require_outranks_offer(&moderator, &[ladder[1].clone()]).expect("helper is below");
+        require_outranks_offer(&moderator, &[]).expect("an empty offer ranks with the default");
+        assert_eq!(
+            status(require_outranks_offer(&moderator, &[ladder[3].clone()])),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            status(require_outranks_offer(&moderator, &[ladder[4].clone()])),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            status(require_outranks_offer(&lowest, &[])),
+            StatusCode::FORBIDDEN,
+            "somebody ranking 0 manages no invitation, as they remove no member",
+        );
     }
 
     #[test]

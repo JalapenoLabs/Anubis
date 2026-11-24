@@ -16,7 +16,9 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use crate::auth::token;
-use crate::schema::{invitation_roles, invitations, organization_memberships, team_memberships};
+use crate::schema::{
+    invitation_roles, invitations, organization_memberships, role_grants, team_memberships,
+};
 use crate::tenancy::grants::{self, Holder};
 use crate::tenancy::model::{NewOrganizationMembership, NewTeamMembership, TeamMembership};
 
@@ -202,6 +204,64 @@ pub(crate) async fn create(
     }
 
     Ok((invitation, raw_token))
+}
+
+/// The pending invitation [`create`] would replace for `email`, if any.
+///
+/// Answers its id and the membership a team invitation pre-created.
+///
+/// # Errors
+/// Returns the underlying Diesel error when the query fails.
+pub(crate) async fn pending_for(
+    connection: &mut AsyncPgConnection,
+    target: InvitationTarget,
+    email: &str,
+) -> QueryResult<Option<(Uuid, Option<Uuid>)>> {
+    let (organization_id, team_id) = match target {
+        InvitationTarget::Organization(organization_id) => (organization_id, None),
+        InvitationTarget::Team {
+            team_id,
+            organization_id,
+        } => (organization_id, Some(team_id)),
+    };
+
+    invitations::table
+        .filter(invitations::email.eq(email))
+        .filter(invitations::organization_id.eq(organization_id))
+        .filter(invitations::team_id.is_not_distinct_from(team_id))
+        .select((invitations::id, invitations::team_membership_id))
+        .first(connection)
+        .await
+        .optional()
+}
+
+/// The roles a pending invitation offers.
+///
+/// A team invitation's are the grants waiting on the membership it
+/// pre-created; an organization invitation's are the roles it names.
+///
+/// # Errors
+/// Returns the underlying Diesel error when the query fails.
+pub(crate) async fn offered_by(
+    connection: &mut AsyncPgConnection,
+    invitation_id: Uuid,
+    pending_membership: Option<Uuid>,
+) -> QueryResult<Vec<Uuid>> {
+    match pending_membership {
+        Some(membership_id) => {
+            role_grants::table
+                .filter(role_grants::team_membership_id.eq(membership_id))
+                .filter(role_grants::resource_id.is_null())
+                .select(role_grants::role_id)
+                .load(connection)
+                .await
+        }
+        None => Ok(offered_role_ids(connection, &[invitation_id])
+            .await?
+            .into_iter()
+            .map(|(_invitation_id, role_id)| role_id)
+            .collect()),
+    }
 }
 
 /// The roles an organization invitation offers, keyed by invitation.

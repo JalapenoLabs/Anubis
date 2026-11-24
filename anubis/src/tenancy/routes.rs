@@ -687,7 +687,18 @@ async fn create_invitation(
             let offered = load_roles(transaction, organization_id, &body.role_ids).await?;
             let standings =
                 inviter_standings(transaction, &state.roles, inviter.id, &target).await?;
-            authorize_offer(&standings, &offered, target.tier(), &state.roles)?;
+            let standing = authorize_offer(&standings, &offered, target.tier(), &state.roles)?;
+
+            // Inviting an address again replaces its pending invitation, which
+            // is revoking the old offer, so it answers to the same rule.
+            if let Some((replaced, pending_membership)) =
+                invitation::pending_for(transaction, target.invitation_target(), &email).await?
+            {
+                let role_ids =
+                    invitation::offered_by(transaction, replaced, pending_membership).await?;
+                let replaced_offer = load_roles(transaction, organization_id, &role_ids).await?;
+                hierarchy::require_outranks_offer(standing, &replaced_offer)?;
+            }
 
             state.rate_limit.check_recipient(&email)?;
             if let Some(limits) = state.limits.as_ref() {
@@ -863,17 +874,18 @@ async fn inviter_standings(
     Ok(standings)
 }
 
-/// Accepts the offer when any one standing allows all of it.
+/// The first standing that allows all of the offer, which then answers for
+/// the rest of the invitation.
 ///
 /// Each standing is judged whole, never mixed with another: a team's rank and
 /// an organization's permissions are never combined into an authority nobody
 /// holds in one place.
-fn authorize_offer(
-    standings: &[Access],
+fn authorize_offer<'standing>(
+    standings: &'standing [Access],
     offered: &[Role],
     tier: Scope,
     roles: &RoleSet,
-) -> Result<(), ApiError> {
+) -> Result<&'standing Access, ApiError> {
     let mut first_refusal = None;
     for standing in standings {
         let verdict = standing.require(Action::Create, MEMBERSHIP).and_then(|()| {
@@ -882,7 +894,7 @@ fn authorize_offer(
                 .try_for_each(|role| hierarchy::require_assignable(standing, role, tier, roles))
         });
         match verdict {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(standing),
             Err(refusal) => {
                 first_refusal.get_or_insert(refusal);
             }
