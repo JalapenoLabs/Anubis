@@ -46,7 +46,7 @@ use crate::schema::{
     team_memberships, teams, users,
 };
 use crate::tenancy::access::{
-    Access, AccessView, resolve_organization_access, resolve_team_access,
+    Access, AccessView, admitted_teams, resolve_organization_access, resolve_team_access,
 };
 use crate::tenancy::hierarchy;
 use crate::tenancy::invitation::{self, Invitation, InvitationTarget};
@@ -225,9 +225,11 @@ async fn list_memberships(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let team_rows: Vec<TeamRow> = team_memberships::table
-        .inner_join(teams::table.inner_join(organizations::table))
-        .filter(team_memberships::user_id.eq(user.id))
+    // A suspension is a deny, and this overview is what the browser draws
+    // every affordance from, so it lists only the teams the user is admitted
+    // to and the organizations whose membership is not suspended.
+    let team_rows: Vec<TeamRow> = admitted_teams(user.id)
+        .inner_join(organizations::table.on(organizations::id.eq(teams::organization_id)))
         .select((
             Organization::as_select(),
             Team::as_select(),
@@ -241,6 +243,7 @@ async fn list_memberships(
     let org_rows: Vec<(Organization, Uuid)> = organization_memberships::table
         .inner_join(organizations::table)
         .filter(organization_memberships::user_id.eq(user.id))
+        .filter(organization_memberships::suspended_at.is_null())
         .select((Organization::as_select(), organization_memberships::id))
         .load(&mut connection)
         .await

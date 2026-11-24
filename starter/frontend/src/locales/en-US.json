@@ -517,7 +517,8 @@
       "subject": "Area",
       "administratorNote": "The administrator role holds every permission.",
       "defaultNote": "Everybody holds this role, so every permission here is everybody's.",
-      "notHeld": "You can only switch permissions you hold."
+      "notHeld": "You can only switch permissions you hold.",
+      "notGrantable": "No role in this application grants this permission."
     },
     "actions": {
       "read": "Read",

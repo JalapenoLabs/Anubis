@@ -75,7 +75,9 @@ use crate::tenancy::bootstrap;
 use crate::tenancy::grants::{self, Holder};
 use crate::tenancy::hierarchy;
 use crate::tenancy::invitation;
-use crate::tenancy::model::{Organization, OrganizationMembership, Team, TeamMembership};
+use crate::tenancy::model::{
+    Organization, OrganizationAccess, OrganizationMembership, Team, TeamMembership,
+};
 use crate::tenancy::role::{Role, RoleSummary};
 use crate::tenancy::routes::{TenancyState, load_roles, log_internal, role_names};
 
@@ -1177,16 +1179,26 @@ fn held_names(access: &Access) -> Vec<String> {
 /// The guard's snapshot was taken before the lock, and a request that
 /// committed since may have changed it; acting on the stale one is how a
 /// demoted manager would get one last change through.
+///
+/// A guest stands here with nothing, whatever roles they hold: a guest reaches
+/// only what was granted by name, and every change made organization-wide (a
+/// grant, a removal, a revoked invitation, a role's definition or its place on
+/// the ladder) reaches every sub-tenant. The administrator role outranks the
+/// guest marker, here as everywhere.
 pub(super) async fn organization_standing(
     connection: &mut AsyncPgConnection,
     roles: &RoleSet,
     user: &User,
     organization_id: Uuid,
 ) -> Result<Access, ApiError> {
-    resolve_organization_access(connection, roles, user.id, organization_id)
-        .await?
-        .map(|(_organization, _membership, access)| access)
-        .ok_or_else(ApiError::not_found)
+    let (_organization, membership, access) =
+        resolve_organization_access(connection, roles, user.id, organization_id)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+    if membership.access == OrganizationAccess::Guest && !access.is_administrator() {
+        return Ok(Access::from_roles(Vec::new(), roles));
+    }
+    Ok(access)
 }
 
 /// The caller's standing in a team, read again under the lock.

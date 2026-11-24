@@ -24,7 +24,10 @@
 //!    be locked out of an organization.
 //! 4. **Every reorder states the whole ladder.** A partial list is refused
 //!    rather than merged, so two people reordering at once can never interleave
-//!    into an order neither asked for, and no list can tie two positions.
+//!    into an order neither asked for, and no list can tie two positions. A
+//!    team's ladder is the organization's, so a reorder is also held to the
+//!    reorderer's standing in every team they belong to: it never lifts a role
+//!    they hold there over one they could not already act on there.
 
 use std::collections::BTreeSet;
 
@@ -180,6 +183,50 @@ pub(crate) fn require_assignable(
     require_holds(actor, &role.permissions(roles))
 }
 
+/// Refuses a reorder that would let `standing` act on a role it could not before.
+///
+/// `standing` is the reorderer's in one team, or on one record of it, and
+/// ranks by every role it holds. Every role at or above that rank before the
+/// reorder must still be at or above it after, or the reorder handed the
+/// reorderer authority there that no grant did. A standing that administers
+/// the team is exempt, as it is from the rest of the ladder.
+///
+/// # Errors
+/// Returns `403` when the planned positions lift a role the standing holds
+/// over one it could not act on.
+pub(crate) fn require_reorder_keeps_standing(
+    standing: &Access,
+    roles: &[Role],
+    planned: &[(Uuid, i32)],
+) -> Result<(), ApiError> {
+    if standing.is_administrator() {
+        return Ok(());
+    }
+    let position_after = |role_id: Uuid, position: i32| {
+        planned
+            .iter()
+            .find(|(moved, _position)| *moved == role_id)
+            .map_or(position, |(_moved, position)| *position)
+    };
+    let rank_before = standing.rank();
+    let rank_after = standing
+        .roles()
+        .iter()
+        .map(|held| position_after(held.id, held.position))
+        .max()
+        .unwrap_or(0);
+    let lifted_over = roles.iter().any(|role| {
+        role.position >= rank_before && position_after(role.id, role.position) < rank_after
+    });
+    if lifted_over {
+        return Err(ApiError::forbidden(
+            "That order would lift a role you hold in a team above one you cannot act on \
+             there.",
+        ));
+    }
+    Ok(())
+}
+
 /// The permissions in one set and not the other, either way round.
 #[must_use]
 pub(crate) fn toggled<'a>(
@@ -262,7 +309,7 @@ mod tests {
 
     use super::{
         plan_reorder, require_holds, require_outranks_member, require_outranks_offer,
-        require_outranks_role, toggled,
+        require_outranks_role, require_reorder_keeps_standing, toggled,
     };
     use crate::http::ApiError;
     use crate::roles::{Action, MEMBERSHIP, Permission, RoleSet};
@@ -498,5 +545,32 @@ roles:
             StatusCode::FORBIDDEN,
             "moving a role above your own is the escalation the hierarchy exists to stop",
         );
+    }
+
+    #[test]
+    fn a_reorder_never_lifts_the_reorderer_in_a_team() {
+        let ladder = ladder();
+        // In the team, the reorderer holds helper (1), below the custom role (2).
+        let in_team = holding(&[&ladder[0], &ladder[1]]);
+        let helper = ladder[1].id;
+        let custom = ladder[2].id;
+
+        assert_eq!(
+            status(require_reorder_keeps_standing(
+                &in_team,
+                &ladder,
+                &[(helper, 2), (custom, 1)],
+            )),
+            StatusCode::FORBIDDEN,
+            "lifting helper over the custom role hands its holders to the reorderer",
+        );
+        require_reorder_keeps_standing(&in_team, &ladder, &[(ladder[3].id, 3)])
+            .expect("a reorder that lifts nothing of theirs is theirs to make");
+        require_reorder_keeps_standing(
+            &holding(&[&ladder[0], &ladder[4]]),
+            &ladder,
+            &[(helper, 2), (custom, 1)],
+        )
+        .expect("a team's administrator is exempt, as from the rest of the ladder");
     }
 }

@@ -356,6 +356,11 @@ export type RoleCatalog = {
   roles: Role[]
   /** Every permission key a role may carry. */
   permissions: string[]
+  /**
+   * The keys among them some role in `roles.yml` grants: the only ones a role
+   * can be given, by anybody, the administrator included.
+   */
+  grantable: string[]
   /** The viewer's standing where the catalog was read, which decides what they may change. */
   viewer: TenantAccess
 }

@@ -87,6 +87,7 @@ function stubBackend() {
           { ...wireRole('default', 'Member', 0), key: 'default', is_default: true },
         ],
         permissions: [ 'Tenancy::Membership.create' ],
+        grantable: [ 'Tenancy::Membership.create' ],
         viewer: EVERYBODY,
       },
     },

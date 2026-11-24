@@ -34,7 +34,7 @@ use crate::guard::{OrganizationMember, TeamMember};
 use crate::http::{ApiError, absent_or_null};
 use crate::roles::{Action, MAX_ROLE_NAME_CHARS, Permission, ROLE, RoleSet, is_hex_color};
 use crate::schema::{
-    role_grants, roles as role_rows, sub_tenant_memberships, team_memberships, teams,
+    role_grants, roles as role_rows, sub_tenant_memberships, sub_tenants, team_memberships, teams,
 };
 use crate::tenancy::access::{
     Access, AccessView, resolve_sub_tenant_access, team_membership_access,
@@ -69,6 +69,9 @@ struct RolesBody {
     roles: Vec<RoleView>,
     /// Every permission key a role may carry, sorted.
     permissions: Vec<String>,
+    /// The keys among them some role in `roles.yml` grants, the only ones a
+    /// role can be given: the editor locks the rest, for everybody.
+    grantable: Vec<String>,
     /// The caller's standing where they asked, which is what decides which
     /// roles they may grant there and, organization-wide, which roles and
     /// permissions they may change.
@@ -194,6 +197,7 @@ fn roles_body(roles: &RoleSet, held: &[Role], viewer: AccessView) -> RolesBody {
     RolesBody {
         roles: held.iter().map(|role| role.view(roles)).collect(),
         permissions: roles.vocabulary().iter().map(ToString::to_string).collect(),
+        grantable: roles.grantable().iter().map(ToString::to_string).collect(),
         viewer,
     }
 }
@@ -319,7 +323,7 @@ async fn update_role(
             let narrower = match &change {
                 PermissionsChange::Keep => Vec::new(),
                 _change => {
-                    narrower_standings(transaction, &state.roles, &member.user, current.id).await?
+                    narrower_standings(transaction, &state.roles, &member.user, &current).await?
                 }
             };
             require_permissions_change(&state.roles, &actor, &narrower, &current, &change)?;
@@ -434,17 +438,40 @@ fn require_permissions_change(
     Ok(())
 }
 
-/// The actor's standing in every team and sub-tenant where they hold `role_id`.
+/// The actor's standing in every team and sub-tenant where they hold `role`.
 ///
 /// A grant on one record of a team is measured on that record, which is where
 /// the role reaches for them. A sub-tenant they no longer reach, a suspension
-/// above all, is left out: the role does not apply to them there.
+/// above all, is left out: the role does not apply to them there. The default
+/// role is never granted, because everybody holds it wherever they reach, so
+/// for it the places are every team they belong to and every sub-tenant they
+/// were granted.
 async fn narrower_standings(
     connection: &mut AsyncPgConnection,
     roles: &RoleSet,
     user: &User,
-    role_id: Uuid,
+    role: &Role,
 ) -> Result<Vec<Access>, ApiError> {
+    if role.is_default() {
+        let mut standings = team_standings(connection, roles, user, role.organization_id).await?;
+        let sub_tenant_ids: Vec<Uuid> = sub_tenant_memberships::table
+            .inner_join(sub_tenants::table)
+            .filter(sub_tenants::organization_id.eq(role.organization_id))
+            .filter(sub_tenant_memberships::user_id.eq(user.id))
+            .select(sub_tenant_memberships::sub_tenant_id)
+            .load(connection)
+            .await?;
+        for sub_tenant_id in sub_tenant_ids {
+            if let Some((_sub_tenant, standing)) =
+                resolve_sub_tenant_access(connection, roles, user.id, sub_tenant_id).await?
+            {
+                standings.push(standing.access);
+            }
+        }
+        return Ok(standings);
+    }
+
+    let role_id = role.id;
     let in_teams: Vec<(Team, Uuid, Option<Uuid>)> = role_grants::table
         .inner_join(
             team_memberships::table.on(team_memberships::id
@@ -641,6 +668,13 @@ async fn reorder_roles(
             if planned.is_empty() {
                 return Ok(before);
             }
+            // A team's ladder is the organization's, so the reorder is felt in
+            // every team the reorderer belongs to, and is held to each.
+            for standing in
+                team_standings(transaction, &state.roles, &member.user, organization_id).await?
+            {
+                hierarchy::require_reorder_keeps_standing(&standing, &before, &planned)?;
+            }
 
             // The new positions are a permutation of the old, so the ladder
             // passes through states where two roles share a rung; checking the
@@ -762,6 +796,53 @@ async fn holders_of(
     holders.extend(through_teams.into_iter().flatten());
 
     Ok(holders)
+}
+
+/// The actor's standing in each team of the organization they belong to.
+///
+/// Measured team-wide, and again on every record they hold a grant on there,
+/// because a record grant can rank them higher on that record than in the
+/// team. These are the places an organization-wide change to the ladder is
+/// felt by the person making it.
+async fn team_standings(
+    connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
+    user: &User,
+    organization_id: Uuid,
+) -> Result<Vec<Access>, ApiError> {
+    let memberships: Vec<(Team, Uuid)> = team_memberships::table
+        .inner_join(teams::table.on(teams::id.eq(team_memberships::team_id)))
+        .filter(teams::organization_id.eq(organization_id))
+        .filter(team_memberships::user_id.eq(user.id))
+        .select((Team::as_select(), team_memberships::id))
+        .load(connection)
+        .await?;
+    let membership_ids: Vec<Uuid> = memberships
+        .iter()
+        .map(|(_team, membership_id)| *membership_id)
+        .collect();
+    let records: Vec<(Option<Uuid>, Option<Uuid>)> = role_grants::table
+        .filter(role_grants::team_membership_id.eq_any(&membership_ids))
+        .filter(role_grants::resource_id.is_not_null())
+        .select((role_grants::team_membership_id, role_grants::resource_id))
+        .distinct()
+        .load(connection)
+        .await?;
+
+    let mut standings = Vec::new();
+    for (team, membership_id) in &memberships {
+        standings.push(team_membership_access(connection, roles, team, *membership_id, &[]).await?);
+        for (_holder, resource_id) in records
+            .iter()
+            .filter(|(holder, _resource_id)| *holder == Some(*membership_id))
+        {
+            let resources: Vec<Uuid> = resource_id.iter().copied().collect();
+            standings.push(
+                team_membership_access(connection, roles, team, *membership_id, &resources).await?,
+            );
+        }
+    }
+    Ok(standings)
 }
 
 /// Parses permission keys, refusing any outside the application's vocabulary.

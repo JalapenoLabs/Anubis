@@ -46,6 +46,7 @@ export function useRoleLabels() {
     administratorNote: t('roles.form.administratorNote'),
     defaultNote: t('roles.form.defaultNote'),
     notHeld: t('roles.form.notHeld'),
+    notGrantable: t('roles.form.notGrantable'),
     actions: {
       read: t('roles.actions.read'),
       create: t('roles.actions.create'),

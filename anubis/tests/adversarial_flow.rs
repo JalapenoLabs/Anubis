@@ -25,10 +25,12 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use anubis::schema::{audit_events, organization_memberships, role_grants, users};
+use anubis::schema::{
+    audit_events, organization_memberships, role_grants, roles, team_memberships, users,
+};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use support::{Harness, TestDatabase, register, send, stream};
+use support::{Harness, PASSWORD, TestDatabase, register, send, stream};
 
 // ---------------------------------------------------------------------------
 // Request bodies
@@ -2086,4 +2088,269 @@ async fn the_audit_log_names_who_granted_and_who_lost_a_role() {
         json!([member.to_string()]),
         "the member held editor in the team: {changes}",
     );
+}
+
+/// The default role is held everywhere and granted nowhere, so an edit to it
+/// is held to what the editor holds in every team they belong to, and an
+/// organization administrator is held to it wherever they do not administer
+/// the team.
+#[tokio::test]
+async fn the_default_role_raises_nobody_in_a_team_either() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let moderator_in_team = court.team_membership("moderator-").await;
+    assert_eq!(
+        court
+            .grant_in_team(&court.owner, moderator_in_team, &[court.roles.editor])
+            .await,
+        StatusCode::OK,
+    );
+
+    assert_eq!(
+        court
+            .set_permissions(&court.moderator, court.roles.default, &["Team.read"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "the moderator holds Team.read organization-wide, not in the team",
+    );
+
+    let moderator = court.organization_membership("moderator-").await;
+    assert_eq!(
+        court
+            .grant_in_organization(&court.owner, moderator, &[court.roles.administrator])
+            .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        court
+            .set_permissions(&court.moderator, court.roles.default, &["Team.read"])
+            .await,
+        StatusCode::FORBIDDEN,
+        "administering the organization is not administering a team they are a member of",
+    );
+}
+
+/// A team's ladder is the organization's, so a reorder is held to the
+/// reorderer's standing in every team they belong to: it may not lift a role
+/// they hold there over one they could not already act on there.
+#[tokio::test]
+async fn a_reorder_never_lifts_the_reorderer_in_a_team() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    // In the team, the moderator holds editor, which may now manage members,
+    // and the member holds billing, which outranks it.
+    assert_eq!(
+        court
+            .set_permissions(
+                &court.owner,
+                court.roles.editor,
+                &["Tenancy::Membership.update"]
+            )
+            .await,
+        StatusCode::OK,
+    );
+    let moderator_in_team = court.team_membership("moderator-").await;
+    let member_in_team = court.team_membership("member-").await;
+    for (membership, role) in [
+        (moderator_in_team, court.roles.editor),
+        (member_in_team, court.roles.billing),
+    ] {
+        assert_eq!(
+            court.grant_in_team(&court.owner, membership, &[role]).await,
+            StatusCode::OK,
+        );
+    }
+    assert_eq!(
+        court
+            .grant_in_team(&court.moderator, member_in_team, &[])
+            .await,
+        StatusCode::FORBIDDEN,
+        "billing outranks editor in the team",
+    );
+
+    let path = format!("/tenancy/organizations/{}/role-order", court.organization);
+    let lifted = json!({
+        "role_ids": [court.roles.moderator, court.roles.editor, court.roles.billing],
+    });
+    let (status, _headers, body) = court
+        .send("PUT", &path, Some(&lifted), &court.moderator)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "lifting editor over billing would hand the moderator the member: {body}",
+    );
+    assert_eq!(
+        court
+            .grant_in_team(&court.moderator, member_in_team, &[])
+            .await,
+        StatusCode::FORBIDDEN,
+    );
+}
+
+/// A guest's organization-wide roles manage nothing: granting organization
+/// roles and revoking the organization's invitations, team ones included,
+/// reach past what a guest reaches, exactly as inviting does.
+#[tokio::test]
+async fn a_guest_manages_nothing_organization_wide() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let third_email = format!("third-{}@example.com", Uuid::new_v4());
+    let third = register(&court.harness.router, &third_email).await;
+    court
+        .invite_and_claim(
+            &json!({ "email": third_email, "organization_id": court.organization }),
+            &third,
+        )
+        .await;
+
+    let member = court.organization_membership("member-").await;
+    assert_eq!(
+        court
+            .grant_in_organization(&court.owner, member, &[court.roles.moderator])
+            .await,
+        StatusCode::OK,
+    );
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    diesel::update(organization_memberships::table.find(member))
+        .set(organization_memberships::access.eq("guest"))
+        .execute(&mut connection)
+        .await
+        .expect("the member becomes a guest");
+
+    let third_membership = court.organization_membership("third-").await;
+    assert_eq!(
+        court
+            .grant_in_organization(&court.member, third_membership, &[court.roles.editor])
+            .await,
+        StatusCode::FORBIDDEN,
+        "a guest grants nothing organization-wide",
+    );
+
+    let invitee = format!("invitee-{}@example.com", Uuid::new_v4());
+    let (status, _headers, body) = court
+        .send(
+            "POST",
+            "/tenancy/invitations",
+            Some(&json!({ "email": invitee, "team_id": court.team })),
+            &court.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let roster = format!("/tenancy/teams/{}/members", court.team);
+    let (status, _headers, body) = court.send("GET", &roster, None, &court.owner).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let invitation = body["members"]
+        .as_array()
+        .expect("a roster lists members")
+        .iter()
+        .find(|entry| entry["email"] == invitee.as_str())
+        .and_then(|entry| entry["invitation_id"].as_str())
+        .expect("the invitation holds a place")
+        .to_owned();
+    let path = format!(
+        "/tenancy/organizations/{}/invitations/{invitation}",
+        court.organization
+    );
+    let (status, _headers, _body) = court.send("DELETE", &path, None, &court.member).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a guest revokes nothing through the organization",
+    );
+}
+
+/// A suspension is a deny, so the membership overview, which the browser draws
+/// every affordance from, does not answer a suspended member's access.
+#[tokio::test]
+async fn the_overview_answers_nothing_for_a_suspension() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let member = court.organization_membership("member-").await;
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    diesel::update(organization_memberships::table.find(member))
+        .set(organization_memberships::suspended_at.eq(Some(chrono::Utc::now())))
+        .execute(&mut connection)
+        .await
+        .expect("the member is suspended");
+
+    let (status, _headers, body) = court
+        .send("GET", "/tenancy/memberships", None, &court.member)
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let listed = body["organizations"]
+        .as_array()
+        .expect("the overview lists organizations")
+        .iter()
+        .any(|organization| organization["id"] == json!(court.organization));
+    assert!(
+        !listed,
+        "neither the organization nor its team is reachable: {body}",
+    );
+}
+
+/// When a departure leaves an organization or a team without an
+/// administrator, the role goes to the longest-standing member who can use it,
+/// never to a suspended one, whom every resolver would shut out.
+#[tokio::test]
+async fn a_departure_promotes_only_a_reachable_successor() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let court = Court::open(&database).await;
+    let moderator = court.organization_membership("moderator-").await;
+    let member = court.organization_membership("member-").await;
+    let member_in_team = court.team_membership("member-").await;
+    let mut connection = court.harness.pool.get().await.expect("connection");
+    diesel::update(organization_memberships::table.find(moderator))
+        .set(organization_memberships::suspended_at.eq(Some(chrono::Utc::now())))
+        .execute(&mut connection)
+        .await
+        .expect("the longest-standing member is suspended");
+
+    let (status, _headers, body) = court
+        .send(
+            "DELETE",
+            "/auth/account",
+            Some(&json!({ "password": PASSWORD })),
+            &court.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
+
+    let administrator = court.roles.administrator;
+    let organization_successor: Vec<Uuid> = role_grants::table
+        .inner_join(roles::table)
+        .filter(roles::id.eq(administrator))
+        .filter(role_grants::organization_membership_id.is_not_null())
+        .select(role_grants::organization_membership_id.assume_not_null())
+        .load(&mut connection)
+        .await
+        .expect("the grants are readable");
+    assert_eq!(
+        organization_successor,
+        [member],
+        "the organization's successor"
+    );
+
+    let team_successor: Vec<Uuid> = role_grants::table
+        .inner_join(
+            team_memberships::table.on(team_memberships::id
+                .nullable()
+                .eq(role_grants::team_membership_id)),
+        )
+        .filter(role_grants::role_id.eq(administrator))
+        .select(team_memberships::id)
+        .load(&mut connection)
+        .await
+        .expect("the grants are readable");
+    assert_eq!(team_successor, [member_in_team], "the team's successor");
 }

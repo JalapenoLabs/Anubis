@@ -34,16 +34,26 @@ const MODERATOR = {
   is_administrator: false,
 }
 
-const MEMBERSHIPS = {
-  organizations: [
-    {
-      id: ORGANIZATION_ID,
-      name: 'Acme',
-      is_member: true,
-      ...MODERATOR,
-      teams: [],
-    },
-  ],
+/** The viewer administers the organization: they hold every permission. */
+const ADMINISTRATOR = {
+  roles: [{ id: 'admin', name: 'Administrator', color: '#e11d48', position: 3 }],
+  permissions: [ 'Tenancy::Role.update', 'Project.read', 'Project.update' ],
+  rank: 3,
+  is_administrator: true,
+}
+
+function memberships(viewer: typeof MODERATOR) {
+  return {
+    organizations: [
+      {
+        id: ORGANIZATION_ID,
+        name: 'Acme',
+        is_member: true,
+        ...viewer,
+        teams: [],
+      },
+    ],
+  }
 }
 
 function wireRole(id: string, name: string, position: number, permissions: string[]) {
@@ -61,23 +71,32 @@ function wireRole(id: string, name: string, position: number, permissions: strin
   }
 }
 
-const CATALOG = {
-  roles: [
-    { ...wireRole('admin', 'Administrator', 3, []), key: 'admin', is_administrator: true },
-    wireRole(MODERATOR_ID, 'Moderator', 2, [ 'Tenancy::Role.update', 'Project.read' ]),
-    wireRole(EDITOR_ID, 'Editor', 1, [ 'Project.read', 'Project.update' ]),
-    { ...wireRole('default', 'Member', 0, []), key: 'default', is_default: true },
-  ],
-  permissions: [ 'Project.read', 'Project.update', 'Tenancy::Role.update' ],
-  viewer: MODERATOR,
+function catalog(viewer: typeof MODERATOR, grantable: string[]) {
+  return {
+    roles: [
+      { ...wireRole('admin', 'Administrator', 3, []), key: 'admin', is_administrator: true },
+      wireRole(MODERATOR_ID, 'Moderator', 2, [ 'Tenancy::Role.update', 'Project.read' ]),
+      wireRole(EDITOR_ID, 'Editor', 1, [ 'Project.read', 'Project.update' ]),
+      { ...wireRole('default', 'Member', 0, []), key: 'default', is_default: true },
+    ],
+    permissions: [ 'Project.read', 'Project.update', 'Project.destroy', 'Tenancy::Role.update' ],
+    grantable,
+    viewer,
+  }
 }
 
-function stubBackend() {
+function stubBackend(
+  viewer = MODERATOR,
+  grantable = [ 'Project.read', 'Project.update', 'Project.destroy', 'Tenancy::Role.update' ],
+) {
   stubFetch({
     '/auth/me': { status: 200, body: { user: USER }},
-    '/tenancy/memberships': { status: 200, body: MEMBERSHIPS },
+    '/tenancy/memberships': { status: 200, body: memberships(viewer) },
     '/account/notifications': { status: 200, body: { notifications: [], unread_count: 0 }},
-    [`/tenancy/organizations/${ORGANIZATION_ID}/roles`]: { status: 200, body: CATALOG },
+    [`/tenancy/organizations/${ORGANIZATION_ID}/roles`]: {
+      status: 200,
+      body: catalog(viewer, grantable),
+    },
   })
 }
 
@@ -102,5 +121,17 @@ describe('RolePage', () => {
     expect(toggle).toHaveProperty('disabled', true)
     expect(screen.queryByRole('button', { name: 'Save' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Delete role' })).toBeNull()
+  })
+
+  it('locks, even for an administrator, a switch no role in the application grants', async () => {
+    stubBackend(ADMINISTRATOR, [ 'Project.read', 'Project.update', 'Tenancy::Role.update' ])
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/roles/${EDITOR_ID}`)
+
+    const grantable = await screen.findByRole('switch', { name: 'Project: Update' })
+    const ungrantable = screen.getByRole('switch', { name: 'Project: Delete' })
+
+    expect(grantable).toHaveProperty('disabled', false)
+    expect(ungrantable, 'the server would refuse it, so the screen does not offer it')
+      .toHaveProperty('disabled', true)
   })
 })

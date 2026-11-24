@@ -43,6 +43,8 @@ export type RoleFormLabels = {
   defaultNote: string
   /** Why a toggle is locked: the viewer does not hold that permission. */
   notHeld: string
+  /** Why a toggle is locked: no role in the application grants that permission. */
+  notGrantable: string
   /** The action column headings. */
   actions: Record<PermissionAction, string>
 }
@@ -52,6 +54,8 @@ type Props = {
   control: Control<RoleFormValues>
   /** Every permission key a role may carry, as the catalog answers them. */
   vocabulary: readonly string[]
+  /** The keys a role can be given at all, as the catalog answers them. */
+  grantable: readonly string[]
   /** The viewer's organization-wide standing: they switch only what they hold. */
   viewer: TenantAccess
   /** The role being edited, or nothing for a new one. */
@@ -75,6 +79,7 @@ const DEFAULT_LABELS: RoleFormLabels = {
   administratorNote: 'The administrator role holds every permission.',
   defaultNote: 'Everybody holds this role, so every permission here is everybody\'s.',
   notHeld: 'You can only switch permissions you hold.',
+  notGrantable: 'No role in this application grants this permission.',
   actions: {
     read: 'Read',
     create: 'Create',
@@ -88,14 +93,18 @@ const DEFAULT_LABELS: RoleFormLabels = {
  *
  * A switch is locked unless the viewer holds that permission, which is the
  * server's rule for every edit: nobody switches a permission on or off that
- * they do not hold. The administrator role's permissions are all of them and
- * are not edited, so its table is shown and locked.
+ * they do not hold. One no role in the application grants is locked off for
+ * everybody, the administrator included, because the server refuses to give
+ * it; one a role already carries can still be switched off. The administrator
+ * role's permissions are all of them and are not edited, so its table is
+ * shown and locked.
  */
 export function RoleForm(props: Props) {
   const labels = { ...DEFAULT_LABELS, ...props.labels }
   const subjectLabel = props.subjectLabel ?? ((subject: string) => subject)
   const { field } = useController({ control: props.control, name: 'permissions' })
   const held = new Set(field.value)
+  const grantable = new Set(props.grantable)
   const groups = groupPermissions(props.vocabulary)
   const locked = Boolean(props.isDisabled || props.role?.isAdministrator)
 
@@ -179,18 +188,22 @@ export function RoleForm(props: Props) {
                       return <td key={action} className='px-2 text-center opacity-30'>-</td>
                     }
 
+                    const ungrantable = !grantable.has(key) && !held.has(key)
                     const lackingIt = !holdsAll(props.viewer, [ key ])
+                    const reason = ungrantable
+                      ? labels.notGrantable
+                      : labels.notHeld
                     const toggleSwitch = <Switch
                       size='sm'
                       aria-label={`${subjectLabel(group.subject)}: ${labels.actions[action]}`}
                       isSelected={held.has(key)}
-                      isDisabled={locked || lackingIt}
+                      isDisabled={locked || lackingIt || ungrantable}
                       onValueChange={(isOn) => toggle(key, isOn)}
                     />
 
                     return <td key={action} className='px-2 text-center'>{
-                        lackingIt && !locked
-                          ? <Tooltip content={labels.notHeld}>
+                        (lackingIt || ungrantable) && !locked
+                          ? <Tooltip content={reason}>
                               <div className='inline-block'>{
                                   toggleSwitch
                                 }</div>

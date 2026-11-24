@@ -71,6 +71,7 @@ type WireRole = {
 type WireRoleCatalog = {
   roles: WireRole[]
   permissions: string[]
+  grantable: string[]
   viewer: WireAccess
 }
 
@@ -102,6 +103,7 @@ function toCatalog(wire: WireRoleCatalog): RoleCatalog {
   return {
     roles: wire.roles.map(toRole),
     permissions: wire.permissions,
+    grantable: wire.grantable,
     viewer: toAccess(wire.viewer),
   }
 }

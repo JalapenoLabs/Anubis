@@ -150,6 +150,7 @@ export function NewRolePage() {
             ? <RoleForm
                 control={form.control}
                 vocabulary={roles.catalog.permissions}
+                grantable={roles.catalog.grantable}
                 viewer={roles.catalog.viewer}
                 isDisabled={form.formState.isSubmitting}
                 autoFocus

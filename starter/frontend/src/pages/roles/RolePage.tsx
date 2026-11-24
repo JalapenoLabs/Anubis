@@ -227,6 +227,7 @@ function EditRole(props: EditRoleProps) {
         <RoleForm
           control={form.control}
           vocabulary={catalog.permissions}
+          grantable={catalog.grantable}
           viewer={viewer}
           role={role}
           isDisabled={!mayEdit || form.formState.isSubmitting}

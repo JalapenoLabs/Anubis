@@ -28,7 +28,7 @@ use crate::schema::{
     teams,
 };
 use crate::tenancy::grants::{self, Holder};
-use crate::tenancy::model::NewOrganizationMembership;
+use crate::tenancy::model::{NewOrganizationMembership, OrganizationAccess};
 use crate::tenancy::role;
 
 /// Removes a user's memberships and settles the tenants they leave behind.
@@ -154,6 +154,12 @@ async fn is_deserted(
 
 /// Grants the administrator role to the longest-standing member when an
 /// organization has none left.
+///
+/// The successor must be able to use the role. A suspended member reaches
+/// nothing, so they are never chosen, and a guest is passed over while a full
+/// member remains, because the role would carry them past the guest
+/// boundary; an organization left with only guests is administered by the
+/// longest-standing of them rather than by nobody.
 async fn ensure_organization_admin(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
@@ -169,8 +175,14 @@ async fn ensure_organization_admin(
 
     let longest_standing: Option<Uuid> = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(organization_id))
+        .filter(organization_memberships::suspended_at.is_null())
         .select(organization_memberships::id)
-        .order(organization_memberships::created_at.asc())
+        .order((
+            organization_memberships::access
+                .eq(OrganizationAccess::Guest)
+                .asc(),
+            organization_memberships::created_at.asc(),
+        ))
         .first(connection)
         .await
         .optional()?;
@@ -185,14 +197,38 @@ async fn ensure_organization_admin(
         .await;
     }
 
-    // The organization has no organization memberships at all, and survives
-    // only through its teams or its sub-tenants: the longest-standing member
-    // of either takes it over. Teams come first because a team member works in
-    // the organization, where a sub-tenant grant may be a guest's.
+    // No organization member can take it, and the organization survives
+    // through its teams or its sub-tenants: the longest-standing member of
+    // either takes it over. Teams come first because a team member works in
+    // the organization, where a sub-tenant grant may be a guest's. Somebody
+    // with an organization membership already, a suspended one, is not a
+    // candidate, and neither is anybody suspended in the sub-tenant they are
+    // reached through.
     let team_successor: Option<Uuid> = team_memberships::table
         .inner_join(teams::table)
+        .left_join(
+            organization_memberships::table.on(organization_memberships::organization_id
+                .eq(teams::organization_id)
+                .and(
+                    organization_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
+        .left_join(
+            sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
+                .nullable()
+                .eq(teams::sub_tenant_id)
+                .and(
+                    sub_tenant_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
         .filter(teams::organization_id.eq(organization_id))
         .filter(team_memberships::user_id.is_not_null())
+        .filter(organization_memberships::id.is_null())
+        .filter(sub_tenant_memberships::suspended_at.is_null())
         .select(team_memberships::user_id)
         .order(team_memberships::created_at.asc())
         .first(connection)
@@ -204,7 +240,14 @@ async fn ensure_organization_admin(
         Some(successor) => Some(successor),
         None => sub_tenant_memberships::table
             .inner_join(sub_tenants::table)
+            .left_join(
+                organization_memberships::table.on(organization_memberships::organization_id
+                    .eq(sub_tenants::organization_id)
+                    .and(organization_memberships::user_id.eq(sub_tenant_memberships::user_id))),
+            )
             .filter(sub_tenants::organization_id.eq(organization_id))
+            .filter(sub_tenant_memberships::suspended_at.is_null())
+            .filter(organization_memberships::id.is_null())
             .select(sub_tenant_memberships::user_id)
             .order(sub_tenant_memberships::created_at.asc())
             .first(connection)
@@ -258,10 +301,34 @@ async fn ensure_team_admin(
         return Ok(());
     }
 
-    // An empty team keeps its records and waits for an organization admin.
+    // An empty team keeps its records and waits for an organization admin. A
+    // suspended member, in the organization or in the sub-tenant the team is
+    // scoped to, reaches nothing, so the role never goes to them.
     let longest_standing: Option<Uuid> = team_memberships::table
+        .inner_join(teams::table)
+        .left_join(
+            organization_memberships::table.on(organization_memberships::organization_id
+                .eq(teams::organization_id)
+                .and(
+                    organization_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
+        .left_join(
+            sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
+                .nullable()
+                .eq(teams::sub_tenant_id)
+                .and(
+                    sub_tenant_memberships::user_id
+                        .nullable()
+                        .eq(team_memberships::user_id),
+                )),
+        )
         .filter(team_memberships::team_id.eq(team_id))
         .filter(team_memberships::user_id.is_not_null())
+        .filter(organization_memberships::suspended_at.is_null())
+        .filter(sub_tenant_memberships::suspended_at.is_null())
         .select(team_memberships::id)
         .order(team_memberships::created_at.asc())
         .first(connection)
