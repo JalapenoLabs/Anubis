@@ -91,11 +91,14 @@
 //! request, once, for every router the application composed, so the session
 //! cookie means the same thing on every route: Postgres by default, Redis when
 //! configured. That is the whole of opting in; no router is built differently.
-//! A Redis store connects on its first command, so [`serve`] sends it a `PING`
-//! before binding and refuses to start, naming `SESSION_STORE`, when Redis does
-//! not answer. A deployment that cannot check a session cannot serve anyone
-//! signed in, and finding out at the first request would mean every sign-in
-//! failing instead of one boot. See `docs/sessions.md`.
+//! A Redis store connects on its first command, so [`serve`] asks it for its
+//! version before binding and refuses to start, naming `SESSION_STORE`, when
+//! Redis does not answer or is older than 7.0. A deployment that cannot check a
+//! session cannot serve anyone signed in, and finding out at the first request
+//! would mean every sign-in failing instead of one boot. An application that
+//! pairs [`harden`] with [`serve_with_shutdown`] skips that check, and its
+//! Redis store connects on the first request that needs it. See
+//! `docs/sessions.md`.
 //!
 //! # Shutdown
 //!
@@ -242,7 +245,7 @@ pub async fn serve_with(
     let sessions = Sessions::from_config(config);
     sessions.verify().await.map_err(|source| {
         Error::new(
-            "SESSION_STORE is redis, and the Redis REDIS_URL names did not answer",
+            "SESSION_STORE is redis, and the Redis REDIS_URL names cannot keep sessions",
             ErrorSource::Sessions(source),
         )
     })?;

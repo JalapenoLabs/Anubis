@@ -28,7 +28,7 @@ The request id is outermost so every later layer logs under it. The timeout is i
 
 ### The session store
 
-Beside the layers, the stack puts the session store `SESSION_STORE` chose on every request the application's routers answer, so the session cookie means the same thing on every route, the application's own included. Choosing Redis is therefore a setting and nothing more. A Redis store connects on first use, so `serve` sends it a `PING` before binding and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when it gets no answer: a deployment that cannot check a session cannot serve anyone signed in. A router driven without `harden` reads sessions from Postgres, the default. See [sessions.md](sessions.md).
+Beside the layers, the stack puts the session store `SESSION_STORE` chose on every request the application's routers answer, so the session cookie means the same thing on every route, the application's own included. Choosing Redis is therefore a setting and nothing more. A Redis store connects on first use, so `serve` asks it for its version before binding and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when it gets no answer or a version older than 7.0: a deployment that cannot check a session cannot serve anyone signed in. An application that pairs `harden` with `serve_with_shutdown` itself skips that check, and its Redis store connects on the first request that needs it. A router driven without `harden` reads sessions from Postgres, the default. See [sessions.md](sessions.md).
 
 ### Request ids
 

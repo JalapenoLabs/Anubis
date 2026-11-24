@@ -50,11 +50,13 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::deadpool::PoolError;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::model::User;
 use crate::config::{AppConfig, SessionStore};
+use crate::db::DbPool;
 use redis_store::RedisSessions;
 
 /// Name of the session cookie set at registration and login.
@@ -179,13 +181,15 @@ impl Sessions {
         parts.extensions.get::<Self>().cloned().unwrap_or_default()
     }
 
-    /// Proves the store answers, which is what the server's boot asks first.
+    /// Proves the store can serve, which is what the server's boot asks first.
     ///
     /// The Postgres store needs nothing: the pool was proven when it was
-    /// built. The Redis store sends a `PING`, connecting if it had not yet.
+    /// built. The Redis store asks Redis for its version, connecting if it had
+    /// not yet, and refuses one older than the commands it sends.
     ///
     /// # Errors
-    /// Returns an [`Error`] when Redis cannot be reached or does not answer.
+    /// Returns an [`Error`] when Redis cannot be reached, does not answer, or
+    /// reports a version older than 7.0.
     pub(crate) async fn verify(&self) -> Result<(), Error> {
         match &self.store {
             Store::Postgres => Ok(()),
@@ -213,17 +217,26 @@ impl Sessions {
 
     /// Resolves a raw session token to its user, if the session is live.
     ///
+    /// Takes the pool rather than a connection, because this runs on every
+    /// authenticated request: the Redis store reads the session before it
+    /// checks a connection out, so a Redis that has stalled never holds
+    /// Postgres connections everything else needs, and a token that names no
+    /// session costs no connection at all.
+    ///
     /// # Errors
-    /// Returns an [`Error`] when the store cannot be read. A token that names
-    /// no live session is `Ok(None)`, never an error.
+    /// Returns an [`Error`] when the store or the pool cannot answer. A token
+    /// that names no live session is `Ok(None)`, never an error.
     pub(crate) async fn find_user(
         &self,
-        connection: &mut AsyncPgConnection,
+        pool: &DbPool,
         token: &str,
     ) -> Result<Option<User>, Error> {
         match &self.store {
-            Store::Postgres => Ok(postgres_store::find_user(connection, token).await?),
-            Store::Redis(redis) => redis.find_user(connection, token).await,
+            Store::Postgres => {
+                let mut connection = pool.get().await?;
+                Ok(postgres_store::find_user(&mut connection, token).await?)
+            }
+            Store::Redis(redis) => redis.find_user(pool, token).await,
         }
     }
 
@@ -349,10 +362,15 @@ pub(crate) struct Error {
 #[derive(Debug)]
 enum ErrorKind {
     Database(diesel::result::Error),
+    /// No Postgres connection could be checked out to read the account.
+    Pool(PoolError),
     Redis(redis::RedisError),
     /// A stored session that does not parse, which only something other than
     /// this store writing under its keys could produce.
     Corrupt(serde_json::Error),
+    /// A Redis older than the commands the store sends, with the version it
+    /// reported.
+    Unsupported(String),
 }
 
 impl Error {
@@ -366,11 +384,21 @@ impl Error {
     fn corrupt(source: serde_json::Error) -> Self {
         Self::new(ErrorKind::Corrupt(source))
     }
+
+    fn unsupported(version: &str) -> Self {
+        Self::new(ErrorKind::Unsupported(version.to_owned()))
+    }
 }
 
 impl From<diesel::result::Error> for Error {
     fn from(source: diesel::result::Error) -> Self {
         Self::new(ErrorKind::Database(source))
+    }
+}
+
+impl From<PoolError> for Error {
+    fn from(source: PoolError) -> Self {
+        Self::new(ErrorKind::Pool(source))
     }
 }
 
@@ -384,11 +412,18 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.kind {
             ErrorKind::Database(source) => write!(f, "a session query failed: {source}")?,
+            ErrorKind::Pool(source) => {
+                write!(f, "no connection to read the session's account: {source}")?;
+            }
             // Redis errors render the address but never the password.
             ErrorKind::Redis(source) => write!(f, "the Redis session store failed: {source}")?,
             ErrorKind::Corrupt(source) => {
                 write!(f, "a session stored in Redis does not parse: {source}")?;
             }
+            ErrorKind::Unsupported(version) => write!(
+                f,
+                "the Redis session store needs Redis 7.0 or later, and this one reports {version}",
+            )?,
         }
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
@@ -401,8 +436,10 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
             ErrorKind::Database(source) => Some(source),
+            ErrorKind::Pool(source) => Some(source),
             ErrorKind::Redis(source) => Some(source),
             ErrorKind::Corrupt(source) => Some(source),
+            ErrorKind::Unsupported(_version) => None,
         }
     }
 }

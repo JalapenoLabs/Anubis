@@ -12,7 +12,7 @@
 //! when Redis goes away and comes back. It is opened lazily, so building one
 //! performs no I/O and needs only a running tokio runtime; the first command
 //! connects. A caller that must know Redis answers before it serves anything,
-//! as the server's boot does, sends a `PING` of its own.
+//! as the server's boot does, sends a command of its own first.
 
 use std::time::Duration;
 

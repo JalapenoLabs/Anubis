@@ -45,7 +45,9 @@ The security page in the starter is that list, so it reads the same against eith
 
 `anubis::server::harden`, which every served application passes through, puts the configured store on every request. That is the whole of opting in: no router is built differently, and a route an application writes reads the same store the auth routes write to.
 
-A Redis store connects on its first command, so `anubis::server::serve` sends it a `PING` before binding and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when Redis does not answer. A deployment that cannot check a session cannot serve anyone who is signed in, so finding out at boot beats every sign-in failing. Once it passes, the boot logs the store it uses as `session.store`.
+A Redis store connects on its first command, so `anubis::server::serve` asks it for its version before binding and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when Redis does not answer or reports a version older than 7.0. A deployment that cannot check a session cannot serve anyone who is signed in, so finding out at boot beats every sign-in failing. Once it passes, the boot logs the store it uses as `session.store`.
+
+An application that drives `harden` and `serve_with_shutdown` itself, to stop a job worker on the same signal, gets the store on every request but not the boot check: its Redis store connects on the first request that needs it, and an unreachable one fails that request rather than the boot.
 
 A request that never went through `harden`, such as one a test sends straight to a bare router, uses Postgres. That is what keeps an application or a suite that never names a store exactly as it was.
 
@@ -71,7 +73,7 @@ Every read checks a session's end on the application's clock as well as relying 
 
 The connection is one self-reconnecting, multiplexed connection per process, with a one-second connect timeout, a one-second response timeout, and two reconnection attempts. A Redis that stops answering fails a request promptly rather than holding it until the request timeout.
 
-One Redis, or a primary behind one URL. Redis Cluster is not supported: a session's two keys live in different hash slots, and `MULTI` needs one.
+One Redis, or a primary behind one URL, at version 7.0 or later, because the index's expiry is set with `EXPIREAT ... NX` and `GT`. The boot checks the version and `anubis doctor` reports it. Redis Cluster is not supported: a session's two keys live in different hash slots, and `MULTI` needs one.
 
 ### Persistence
 
@@ -83,11 +85,13 @@ A Redis holding sessions has to keep them across a restart, because one that com
 | RDB snapshots only (the stock `save` schedule) | Sign-ins since the last snapshot are lost | ok, with a note |
 | Neither | Everyone is signed out | warns |
 
-Run Redis with `appendonly yes`. `anubis doctor` names the store in use, and for Redis reads `CONFIG GET appendonly` and `CONFIG GET save`. Managed Redis often refuses `CONFIG`; doctor then reads `INFO persistence`, which confirms an append-only file but cannot see snapshots, so anything short of the file warns that it could not tell. A Redis store that does not answer, or a `SESSION_STORE` the server would refuse, fails the check, because either one stops the boot.
+Run Redis with `appendonly yes`. `anubis doctor` names the store in use, and for Redis reads `CONFIG GET appendonly` and `CONFIG GET save`. Managed Redis often refuses `CONFIG`; doctor then reads `INFO persistence`, which confirms an append-only file but cannot see snapshots, so anything short of the file warns that it could not tell. A Redis store that does not answer, one older than 7.0, or a `SESSION_STORE` the server would refuse, fails the check, because each one stops the boot.
 
 ### When Redis goes away
 
-Losing the session Redis is losing sign-in. Until it returns, every authenticated request answers `500`, never `401`, so no browser is told it was signed out; sign-in fails the same way. Routes that need no session keep working, and so do the probes. Nothing is lost as long as Redis persists.
+Losing the session Redis is losing sign-in. Until it returns, every authenticated request answers `500`, never `401`, so no browser is told it was signed out; sign-in fails the same way. Nothing is lost as long as Redis persists.
+
+The rest of the application keeps its Postgres connections while it waits. The per-request session check reads Redis before it checks a connection out, so a stalled Redis holds none, and a cookie naming no session costs none at all. Only the routes that manage sessions, signing in and out and the session list, hold a connection across a Redis call, and each gives up within the response timeout. Routes that need no session keep working, and so do the probes.
 
 ### Running it locally
 

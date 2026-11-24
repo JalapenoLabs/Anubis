@@ -128,16 +128,8 @@ async fn signed_in_user(parts: &Parts) -> Result<User, ApiError> {
         return Err(not_signed_in());
     };
 
-    let mut connection = pool.get().await.map_err(|error| {
-        tracing::error!(
-            error.message = %error,
-            "session lookup failed: {{error.message}}",
-        );
-        ApiError::internal()
-    })?;
-
     let user = Sessions::for_request(parts)
-        .find_user(&mut connection, cookie.value())
+        .find_user(&pool, cookie.value())
         .await
         .map_err(|error| {
             tracing::error!(

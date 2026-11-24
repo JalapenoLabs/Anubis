@@ -25,11 +25,12 @@
 //! sessions it read from the index; a sign-in racing it survives, as it does
 //! against the Postgres store's `DELETE`, and stays listed and revocable.
 //!
-//! `EXPIREAT ... NX` and `GT` need Redis 7.0 or later.
+//! `EXPIREAT ... NX` and `GT` need Redis 7.0 or later, which the server's boot
+//! checks through [`RedisSessions::verify`].
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::RunQueryDsl;
 use redis::aio::ConnectionManager;
 use redis::{AsyncTypedCommands, SetExpiry, SetOptions};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ use uuid::Uuid;
 use super::{Error, ListedSession, SESSION_TTL_DAYS};
 use crate::auth::model::User;
 use crate::auth::token;
+use crate::db::DbPool;
 use crate::schema::users;
 
 /// Prefixes a token hash to name the key holding that session.
@@ -45,6 +47,12 @@ const TOKEN_KEY_PREFIX: &str = "anubis:sessions:token:";
 
 /// Prefixes a user id to name the key indexing that user's sessions.
 const USER_KEY_PREFIX: &str = "anubis:sessions:user:";
+
+/// The oldest Redis major version whose commands this store sends.
+///
+/// `EXPIREAT` gained `NX` and `GT` in 7.0, and the index's expiry relies on
+/// both; an older Redis would refuse every sign-in.
+const MINIMUM_MAJOR_VERSION: u32 = 7;
 
 /// One session, as its token key holds it.
 ///
@@ -77,11 +85,31 @@ impl RedisSessions {
         Self { connection }
     }
 
-    /// Asks Redis to answer, connecting if this is the first command.
+    /// Asks Redis for its version, connecting if this is the first command,
+    /// and refuses one older than [`MINIMUM_MAJOR_VERSION`].
+    ///
+    /// A server that reports no version it can be held to, as some
+    /// Redis-compatible proxies do, passes with a warning: refusing it would
+    /// refuse a store that may well work, and the first sign-in says so if it
+    /// does not.
     pub(super) async fn verify(&self) -> Result<(), Error> {
         let mut redis_connection = self.connection.clone();
-        redis_connection.ping().await?;
-        Ok(())
+        let info: String = redis::cmd("INFO")
+            .arg("server")
+            .query_async(&mut redis_connection)
+            .await?;
+
+        match major_version(&info) {
+            Some((major, _version)) if major >= MINIMUM_MAJOR_VERSION => Ok(()),
+            Some((_major, version)) => Err(Error::unsupported(version)),
+            None => {
+                tracing::warn!(
+                    "the Redis session store's server reports no version; the store needs Redis \
+                     7.0 or later",
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Creates a session for `user_id` and returns the raw token for the cookie.
@@ -148,10 +176,11 @@ impl RedisSessions {
     /// The user is read from Postgres on every call, never kept in Redis, so a
     /// temporary password, a changed role, or a deleted account takes effect
     /// on the very next request. A session whose account is gone resolves to
-    /// nobody.
+    /// nobody. The connection is checked out only once Redis has named a live
+    /// session, so waiting on Redis never holds one.
     pub(super) async fn find_user(
         &self,
-        connection: &mut AsyncPgConnection,
+        pool: &DbPool,
         token: &str,
     ) -> Result<Option<User>, Error> {
         let token_hash = token::hash(token);
@@ -168,10 +197,11 @@ impl RedisSessions {
             return Ok(None);
         }
 
+        let mut connection = pool.get().await?;
         let user = users::table
             .find(session.user_id)
             .select(User::as_select())
-            .first(connection)
+            .first(&mut connection)
             .await
             .optional()?;
         Ok(user)
@@ -331,5 +361,38 @@ impl std::fmt::Debug for RedisSessions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The connection knows the URL, and the URL may carry a password.
         f.write_str("RedisSessions(..)")
+    }
+}
+
+/// The major version `INFO server` reports, with the version as written.
+///
+/// `None` when no `redis_version` line is there, or its major does not parse.
+fn major_version(info: &str) -> Option<(u32, &str)> {
+    let version = info
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("redis_version:"))?;
+    let major = version.split('.').next()?.parse().ok()?;
+    Some((major, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::major_version;
+
+    #[test]
+    fn the_major_version_is_read_off_info_server() {
+        let info = "# Server\r\nredis_version:7.4.10\r\nredis_git_sha1:00000000\r\n";
+        assert_eq!(major_version(info), Some((7, "7.4.10")));
+        assert_eq!(
+            major_version("redis_version:6.2.14\r\n"),
+            Some((6, "6.2.14"))
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_version_is_no_version() {
+        assert_eq!(major_version("# Server\r\nredis_mode:standalone\r\n"), None);
+        assert_eq!(major_version("redis_version:unknown\r\n"), None);
+        assert_eq!(major_version(""), None);
     }
 }

@@ -771,6 +771,51 @@ async fn a_redis_session_store_that_does_not_answer_stops_the_boot() {
     );
 }
 
+#[tokio::test]
+async fn a_redis_session_store_that_answers_lets_the_boot_through() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping server_flow Redis boot test: REDIS_URL is not set");
+        return;
+    };
+    // A free port, named in the configuration, so the test knows where the
+    // served application is; `serve` binds the configured address itself.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|probe| probe.local_addr())
+        .expect("an ephemeral port must be available")
+        .port()
+        .to_string();
+    let config = config(&[
+        ("SESSION_STORE", "redis"),
+        ("REDIS_URL", &redis_url),
+        ("PORT", &port),
+    ]);
+
+    let serving =
+        tokio::spawn(
+            async move { server::serve(Router::new(), unreachable_pool(), &config).await },
+        );
+
+    // The probe answering proves the boot passed the store's check and bound.
+    let mut answered = None;
+    for _attempt in 0..50 {
+        if serving.is_finished() {
+            break;
+        }
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            request_over(&mut stream, "/healthz").await;
+            answered = Some(read_response(&mut stream).await);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let still_serving = !serving.is_finished();
+    serving.abort();
+    assert!(still_serving, "a Redis that answers must not stop the boot");
+    let response = answered.expect("the served application must answer its probe");
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+}
+
 /// Reads one HTTP response off a socket, to the end of the connection.
 async fn read_response(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();

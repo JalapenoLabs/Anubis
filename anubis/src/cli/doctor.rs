@@ -180,31 +180,47 @@ fn redis_sessions_check() -> Check {
         };
     };
 
-    match read_persistence(url.trim()) {
-        Err(reason) => Check {
+    let report = match read_redis(url.trim()) {
+        Ok(report) => report,
+        Err(reason) => {
+            return Check {
+                status: Status::Fail,
+                detail: format!(
+                    "sessions are kept in Redis, and {REDIS_URL_VAR} did not answer: {reason}"
+                ),
+            };
+        }
+    };
+
+    if let Some(version) = report.version.as_deref().filter(|version| too_old(version)) {
+        return Check {
             status: Status::Fail,
             detail: format!(
-                "sessions are kept in Redis, and {REDIS_URL_VAR} did not answer: {reason}"
+                "sessions are kept in Redis {version}, older than the 7.0 the session store \
+                 needs; the server refuses to boot on it"
             ),
-        },
-        Ok(Persistence::AppendOnlyFile) => Check {
+        };
+    }
+
+    match report.persistence {
+        Persistence::AppendOnlyFile => Check {
             status: Status::Ok,
             detail: "sessions are kept in Redis, which persists them in its append-only file"
                 .to_owned(),
         },
-        Ok(Persistence::Snapshots) => Check {
+        Persistence::Snapshots => Check {
             status: Status::Ok,
             detail: "sessions are kept in Redis, which persists them in RDB snapshots; a restart \
                      loses the sign-ins since the last one, and `appendonly yes` keeps every one"
                 .to_owned(),
         },
-        Ok(Persistence::Nothing) => Check {
+        Persistence::Nothing => Check {
             status: Status::Warn,
             detail: "sessions are kept in Redis, which persists nothing (appendonly is off and \
                      save is empty): a Redis restart signs everyone out. Set `appendonly yes`"
                 .to_owned(),
         },
-        Ok(Persistence::Unreadable) => Check {
+        Persistence::Unreadable => Check {
             status: Status::Warn,
             detail: "sessions are kept in Redis, whose persistence could not be read (it refused \
                      CONFIG GET, as managed Redis often does); confirm it persists, because a \
@@ -212,6 +228,37 @@ fn redis_sessions_check() -> Check {
                 .to_owned(),
         },
     }
+}
+
+/// What doctor learned from the Redis that holds the sessions.
+struct RedisReport {
+    /// The version `INFO server` reported, when it reported one.
+    version: Option<String>,
+    persistence: Persistence,
+}
+
+/// The oldest Redis major version the session store runs on.
+///
+/// The store's commands need 7.0, and the server refuses to boot on anything
+/// older; see `anubis::auth::session`.
+const MINIMUM_REDIS_MAJOR: u32 = 7;
+
+/// The version `INFO server` reports, when it reports one.
+fn reported_version(info: &str) -> Option<&str> {
+    info.lines()
+        .find_map(|line| line.trim().strip_prefix("redis_version:"))
+}
+
+/// Returns `true` for a version the session store cannot run on.
+///
+/// A version whose major does not parse is not judged, as the server's boot
+/// does not judge it either.
+fn too_old(version: &str) -> bool {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < MINIMUM_REDIS_MAJOR)
 }
 
 /// What a Redis does to keep its data across a restart.
@@ -254,10 +301,11 @@ fn persistence_from_info(info: &str) -> Persistence {
     Persistence::Unreadable
 }
 
-/// Asks the Redis at `url` how it persists, bounded by [`REDIS_TIMEOUT`].
+/// Asks the Redis at `url` its version and how it persists, bounded by
+/// [`REDIS_TIMEOUT`].
 ///
 /// The URL may carry a password, so no error here ever quotes it.
-fn read_persistence(url: &str) -> Result<Persistence, String> {
+fn read_redis(url: &str) -> Result<RedisReport, String> {
     let client = redis::Client::open(url)
         .map_err(|_error| "it is not a redis:// or rediss:// connection URL".to_owned())?;
 
@@ -269,23 +317,34 @@ fn read_persistence(url: &str) -> Result<Persistence, String> {
     runtime.block_on(async {
         let asked = async {
             let mut connection = client.get_multiplexed_async_connection().await?;
-            let appendonly = config_value(&mut connection, "appendonly").await;
-            let save = config_value(&mut connection, "save").await;
-            if let (Ok(appendonly), Ok(save)) = (appendonly, save) {
-                return Ok(persistence(&appendonly, &save));
-            }
-
-            let info: String = redis::cmd("INFO")
-                .arg("persistence")
+            let server: String = redis::cmd("INFO")
+                .arg("server")
                 .query_async(&mut connection)
                 .await?;
-            Ok::<_, redis::RedisError>(persistence_from_info(&info))
+            let version = reported_version(&server).map(str::to_owned);
+
+            let appendonly = config_value(&mut connection, "appendonly").await;
+            let save = config_value(&mut connection, "save").await;
+            let persistence = if let (Ok(appendonly), Ok(save)) = (appendonly, save) {
+                persistence(&appendonly, &save)
+            } else {
+                let info: String = redis::cmd("INFO")
+                    .arg("persistence")
+                    .query_async(&mut connection)
+                    .await?;
+                persistence_from_info(&info)
+            };
+
+            Ok::<_, redis::RedisError>(RedisReport {
+                version,
+                persistence,
+            })
         };
 
         match tokio::time::timeout(REDIS_TIMEOUT, asked).await {
             Err(_elapsed) => Err(format!("timed out after {}s", REDIS_TIMEOUT.as_secs())),
             Ok(Err(error)) => Err(error.to_string()),
-            Ok(Ok(verdict)) => Ok(verdict),
+            Ok(Ok(report)) => Ok(report),
         }
     })
 }
@@ -430,7 +489,20 @@ fn connect_database(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Persistence, persistence, persistence_from_info};
+    use super::{Persistence, persistence, persistence_from_info, reported_version, too_old};
+
+    #[test]
+    fn the_version_is_read_off_info_server_and_judged_by_its_major() {
+        let info = "# Server\r\nredis_version:7.4.10\r\nredis_mode:standalone\r\n";
+        assert_eq!(reported_version(info), Some("7.4.10"));
+        assert_eq!(reported_version("# Server\r\n"), None);
+
+        assert!(!too_old("7.0.0"));
+        assert!(!too_old("8.0.2"));
+        assert!(too_old("6.2.14"));
+        // Unreadable is not judged, which is what the server's boot does too.
+        assert!(!too_old("unknown"));
+    }
 
     /// The snapshot schedule a stock `redis-server` runs with.
     const STOCK_SAVE: &str = "3600 1 300 100 60 10000";
