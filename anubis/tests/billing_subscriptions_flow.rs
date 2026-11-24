@@ -34,6 +34,7 @@ use anubis::webhooks::signature;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -115,6 +116,19 @@ struct Ledger {
     page_size: usize,
     /// Items embedded in a subscription before its list says `has_more`.
     embedded_items: usize,
+    /// Prices by id, as (interval, `interval_count`); one not named here bills
+    /// every month.
+    prices: BTreeMap<String, (String, i64)>,
+    /// Whether the next update's answer is lost on its way back: Stripe applies
+    /// it and saves it under its key, and the client reads garbage.
+    lose_next_answer: bool,
+    /// Whether the next read of a subscription fails with a `500`.
+    fail_next_read: bool,
+    /// Whether the read after a lost answer fails too, so the client learns
+    /// nothing about the change it sent.
+    lose_the_read_back: bool,
+    /// The body each customer key was first sent with, as Stripe compares them.
+    customers: BTreeMap<String, String>,
 }
 
 /// A held request: it signals the first when it arrives, and answers once the
@@ -130,6 +144,8 @@ struct Mock {
     update_gates: Arc<Mutex<VecDeque<Gate>>>,
     /// The same for the next list request.
     list_gate: Arc<Mutex<Option<Gate>>>,
+    /// Gates for the next customer creations, in order of arrival.
+    customer_gates: Arc<Mutex<VecDeque<Gate>>>,
 }
 
 impl Mock {
@@ -141,6 +157,27 @@ impl Mock {
     fn hold_next_update(&self) -> Gate {
         let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         unlock(&self.update_gates).push_back(gate.clone());
+        gate
+    }
+
+    /// Sets how a price recurs: every `count` of `interval`.
+    fn recur(&self, price: &str, interval: &str, count: i64) {
+        self.ledger()
+            .prices
+            .insert(price.to_owned(), (interval.to_owned(), count));
+    }
+
+    /// Loses the next update's answer, and the read after it too when `read_too`.
+    fn lose_next_answer(&self, read_too: bool) {
+        let mut ledger = self.ledger();
+        ledger.lose_next_answer = true;
+        ledger.lose_the_read_back = read_too;
+    }
+
+    /// Holds the next customer creation open, once Stripe has decided its answer.
+    fn hold_next_customer(&self) -> Gate {
+        let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        unlock(&self.customer_gates).push_back(gate.clone());
         gate
     }
 
@@ -320,7 +357,16 @@ async fn retrieve(
         &headers,
         "",
     );
-    let ledger = mock.ledger();
+    let mut ledger = mock.ledger();
+    if ledger.fail_next_read {
+        ledger.fail_next_read = false;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                json!({ "error": { "type": "api_error", "message": "An unknown error occurred" } }),
+            ),
+        );
+    }
     let Some(subscription) = ledger.subscriptions.get(&id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -333,12 +379,16 @@ async fn retrieve(
 }
 
 /// Applies an update the way Stripe does, keyed by its idempotency key.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one Stripe endpoint: replay, refusal, the items themselves, a lost answer, a held one"
+)]
 async fn update(
     State(mock): State<Mock>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: String,
-) -> (StatusCode, Json<Value>) {
+) -> Response {
     log_request(
         &mock,
         "POST",
@@ -354,7 +404,13 @@ async fn update(
     let answer = {
         let mut ledger = mock.ledger();
         if let Some((status, cached)) = key.as_ref().and_then(|key| ledger.answered.get(key)) {
-            return (*status, Json(cached.clone()));
+            // Stripe marks an answer it saved for an earlier request.
+            return (
+                *status,
+                [("idempotent-replayed", "true")],
+                Json(cached.clone()),
+            )
+                .into_response();
         }
         if ledger.refusals > 0 {
             ledger.refusals -= 1;
@@ -365,7 +421,7 @@ async fn update(
                     .answered
                     .insert(key, (StatusCode::INTERNAL_SERVER_ERROR, refusal.clone()));
             }
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(refusal));
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(refusal)).into_response();
         }
         let mut subscription = ledger.subscriptions[&id].clone();
 
@@ -376,7 +432,7 @@ async fn update(
                 continue;
             }
             let Some(rest) = name.strip_prefix("items[") else {
-                return refused(&format!("Received unknown parameter: {name}"));
+                return refused(&format!("Received unknown parameter: {name}")).into_response();
             };
             let (index, field) = rest.split_once("][").expect("items[n][field]");
             changes
@@ -408,7 +464,8 @@ async fn update(
                         // Stripe bills a price once per subscription.
                         return refused(
                             "Cannot add multiple subscription items with the same price",
-                        );
+                        )
+                        .into_response();
                     }
                     ledger.next_item += 1;
                     let quantity: i64 = change["quantity"].parse().expect("a quantity");
@@ -427,6 +484,11 @@ async fn update(
                 .answered
                 .insert(key, (StatusCode::OK, answer.clone()));
         }
+        if ledger.lose_next_answer {
+            ledger.lose_next_answer = false;
+            ledger.fail_next_read = std::mem::take(&mut ledger.lose_the_read_back);
+            return (StatusCode::OK, "<the connection dropped mid-answer").into_response();
+        }
         answer
     };
 
@@ -435,7 +497,21 @@ async fn update(
         arrived.notify_one();
         release.notified().await;
     }
-    (StatusCode::OK, Json(answer))
+    (StatusCode::OK, Json(answer)).into_response()
+}
+
+/// Answers a price, monthly unless the test said otherwise.
+async fn price(State(mock): State<Mock>, Path(id): Path<String>) -> Json<Value> {
+    let ledger = mock.ledger();
+    let (interval, count) = ledger
+        .prices
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| ("month".to_owned(), 1));
+    Json(json!({
+        "id": id, "object": "price",
+        "recurring": { "interval": interval, "interval_count": count },
+    }))
 }
 
 async fn cancel(
@@ -525,9 +601,40 @@ async fn checkout(State(mock): State<Mock>, headers: HeaderMap, body: String) ->
     Json(json!({ "id": "cs_test_record", "url": "https://checkout.stripe.test/cs_test_record" }))
 }
 
-async fn customer(State(mock): State<Mock>, headers: HeaderMap, body: String) -> Json<Value> {
+/// Creates a customer, keyed the way Stripe keys it: a key reused with the
+/// same body answers the first customer, and with a different body is refused.
+async fn customer(
+    State(mock): State<Mock>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, Json<Value>) {
     log_request(&mock, "POST", "/v1/customers".to_owned(), &headers, &body);
-    Json(json!({ "id": "cus_created" }))
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let answer = {
+        let mut ledger = mock.ledger();
+        match ledger.customers.get(&key) {
+            Some(first) if *first != body => (
+                StatusCode::BAD_REQUEST,
+                json!({ "error": { "type": "idempotency_error",
+                    "message": "Keys for idempotent requests can only be used with the same parameters they were first used with." } }),
+            ),
+            _same => {
+                ledger.customers.insert(key, body);
+                (StatusCode::OK, json!({ "id": "cus_created" }))
+            }
+        }
+    };
+
+    let gate = unlock(&mock.customer_gates).pop_front();
+    if let Some((arrived, release)) = gate {
+        arrived.notify_one();
+        release.notified().await;
+    }
+    (answer.0, Json(answer.1))
 }
 
 async fn start_mock_stripe() -> (String, Mock) {
@@ -539,6 +646,7 @@ async fn start_mock_stripe() -> (String, Mock) {
         })),
         update_gates: Arc::default(),
         list_gate: Arc::default(),
+        customer_gates: Arc::default(),
     };
     let router = Router::new()
         .route("/v1/customers", post(customer))
@@ -549,6 +657,7 @@ async fn start_mock_stripe() -> (String, Mock) {
             get(retrieve).post(update).delete(cancel),
         )
         .route("/v1/subscription_items", get(items))
+        .route("/v1/prices/{id}", get(price))
         .with_state(mock.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -947,7 +1056,7 @@ async fn an_organization_holds_its_plan_and_a_subscription_per_record() {
         "the failure names the slot: {failures:?}",
     );
     assert!(
-        failures[1].contains(&format!("a live subscription for {first}")),
+        failures[1].contains(&format!("{first} already has a live subscription")),
         "the failure names the record: {failures:?}",
     );
 
@@ -1070,6 +1179,39 @@ async fn a_record_is_bought_through_checkout_and_arrives_as_an_event() {
             .expect_err("the purchase must be refused");
         assert!(refused.is_invalid(), "{refused}");
     }
+
+    // A price that bills weekly, or every three months, is refused before
+    // Stripe takes a payment the projection would never record.
+    scene.mock.recur("price_weekly", "week", 1);
+    scene.mock.recur("price_quarterly", "month", 3);
+    for odd in ["price_weekly", "price_quarterly"] {
+        let refused = scene
+            .subscriptions
+            .checkout(
+                scene.organization_id,
+                NewSubscription {
+                    subject: &server(),
+                    line_items: &[LineItem::new(SMALL, 1), LineItem::new(odd, 1)],
+                    return_path: "/servers",
+                    email: None,
+                },
+            )
+            .await
+            .expect_err("a price that is not monthly or yearly is refused");
+        assert!(refused.is_invalid(), "{refused}");
+        assert!(refused.message().contains(odd), "{refused}");
+    }
+    let sessions_before_payment = scene
+        .mock
+        .ledger()
+        .requests
+        .iter()
+        .filter(|received| received.path == "/v1/checkout/sessions")
+        .count();
+    assert_eq!(
+        sessions_before_payment, 1,
+        "neither odd price reached Checkout"
+    );
 
     // The customer pays; Stripe's event writes the subscription.
     scene.mock.hold(
@@ -1601,12 +1743,13 @@ async fn reconciliation_converges_every_subscription_and_its_items() {
     );
 }
 
-/// Two changes to one subscription run one after the other.
+/// Two changes to one subscription never interleave, and neither is lost.
 ///
-/// The first change's answer is held at Stripe while the second is started.
-/// Were the second free to run, its answer (carrying both add-ons) would be
-/// written first and the first one's (carrying one) after it, losing an
-/// add-on the customer is paying for. The row lock makes it wait instead.
+/// The first change's answer is held at Stripe while the second is asked for.
+/// Were the second free to run, its answer (carrying both add-ons) could be
+/// written first and the first one's (carrying one) after it, losing an add-on
+/// the customer is paying for. It is refused instead, at once, and applies
+/// when asked again once the first has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_changes_to_one_subscription_are_applied_one_after_the_other() {
     let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
@@ -1643,38 +1786,38 @@ async fn two_changes_to_one_subscription_are_applied_one_after_the_other() {
     });
     arrived.notified().await;
 
-    let second = tokio::spawn({
-        let scene = Arc::clone(&scene);
-        let record = record.clone();
-        async move {
-            scene
-                .subscriptions
-                .change_items(
-                    &Context::system(),
-                    scene.organization_id,
-                    &record,
-                    &[ItemChange::set(LOGS, 1)],
-                )
-                .await
-        }
-    });
-    // Long enough for the second change to reach Stripe if nothing stops it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refused = scene
+        .subscriptions
+        .change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(LOGS, 1)],
+        )
+        .await
+        .expect_err("a change while another holds the subscription is refused");
+    assert!(refused.is_conflict(), "{refused}");
     assert_eq!(
         scene.mock.subscription_writes().len(),
         1,
-        "the second change waits for the first rather than racing it",
+        "the second change never raced the first to Stripe",
     );
     release.notify_one();
-
     first
         .await
         .expect("the task must join")
         .expect("the first change applies");
-    second
+
+    scene
+        .subscriptions
+        .change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(LOGS, 1)],
+        )
         .await
-        .expect("the task must join")
-        .expect("the second change applies");
+        .expect("asked again, the second change applies");
 
     let held = scene.live(&record).await.expect("still paid for");
     assert_eq!(stored(&held), pairs(&[(SMALL, 1), (BACKUPS, 1), (LOGS, 1)]));
@@ -1743,10 +1886,11 @@ async fn two_subscriptions_for_one_record_at_once_leave_one_live() {
 
 /// A write that read Stripe directly never undoes a newer event.
 ///
-/// Reconciliation reads a subscription, and while its answer is held, the
-/// subscription changes at Stripe and that change's event is processed. The
-/// reconciliation's write, carrying what it read before, lands last; it is
-/// stamped with when its read began, so the event's newer state stands.
+/// Reconciliation reads a subscription, and while its answer is held, an
+/// add-on is bought at Stripe and that change's event is processed, in the
+/// same second the reconciliation's read began. The reconciliation's write,
+/// carrying what it read before, lands last; it held no lock, so it loses the
+/// tie, and the event's newer state stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_holding_an_older_read_does_not_undo_a_newer_event() {
     let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
@@ -1772,9 +1916,6 @@ async fn a_write_holding_an_older_read_does_not_undo_a_newer_event() {
     });
     arrived.notified().await;
 
-    // Stripe's clock moves past the read, and the add-on bought then is
-    // announced and processed while the reconciliation is still in flight.
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
     scene.mock.bill("sub_raced", BACKUPS, 1);
     scene.announce("sub_raced", Utc::now().timestamp()).await;
     release.notify_one();
@@ -1788,6 +1929,59 @@ async fn a_write_holding_an_older_read_does_not_undo_a_newer_event() {
         stored(&held),
         pairs(&[(SMALL, 1), (BACKUPS, 1)]),
         "the older read did not remove the add-on the newer event recorded",
+    );
+}
+
+/// A cancellation processed while an older read is in flight stays a cancellation.
+///
+/// The same race with the subscription cancelled at Stripe: the deletion is the
+/// last event Stripe sends for it, so an older read written over it would leave
+/// a cancelled subscription granting access with nothing left to repair it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_during_an_older_read_is_not_undone() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    let record = server();
+    scene.mock.hold(
+        "sub_cancelled",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_cancelled", Utc::now().timestamp() - 600)
+        .await;
+
+    let (arrived, release) = scene.mock.hold_next_list();
+    let reconciling = tokio::spawn({
+        let scene = Arc::clone(&scene);
+        async move { scene.reconciler.reconcile(scene.organization_id).await }
+    });
+    arrived.notified().await;
+
+    scene.mock.set_status("sub_cancelled", "canceled");
+    let ended = scene.mock.snapshot("sub_cancelled");
+    scene
+        .deliver(
+            "evt_cancelled_mid_read",
+            "customer.subscription.deleted",
+            Utc::now().timestamp(),
+            &ended,
+        )
+        .await;
+    scene.process().await;
+    release.notify_one();
+    reconciling
+        .await
+        .expect("the task must join")
+        .expect("reconciliation runs");
+
+    assert!(
+        scene.live(&record).await.is_none(),
+        "the cancellation stands: the older read did not revive the subscription",
     );
 }
 
@@ -1844,9 +2038,9 @@ async fn a_cancellation_in_the_same_second_as_a_write_still_applies() {
 }
 
 /// The row lock is a lock the test can hold too, which is how it is shown to
-/// be the one every change takes.
+/// be the one every change takes, and that a change refuses rather than waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_change_waits_for_whoever_holds_the_subscription_row() {
+async fn a_change_refuses_while_another_holds_the_subscription_row() {
     let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
         return;
     };
@@ -1885,7 +2079,68 @@ async fn a_change_waits_for_whoever_holds_the_subscription_row() {
     });
     locked_rx.await.expect("the row is locked");
 
-    let changing = tokio::spawn({
+    let refused = tokio::time::timeout(
+        Duration::from_secs(2),
+        scene.subscriptions.change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        ),
+    )
+    .await
+    .expect("the change answers at once rather than waiting on the row")
+    .expect_err("the row is held, so the change is refused");
+    assert!(refused.is_conflict(), "{refused}");
+    let answered: anubis::http::ApiError = refused.into();
+    assert_eq!(answered.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        scene.mock.reads_of("sub_locked"),
+        reads_before,
+        "the change takes the lock before it even reads Stripe",
+    );
+    assert!(scene.mock.subscription_writes().is_empty());
+
+    let _released = release_tx.send(());
+    holding.await.expect("the holder joins");
+    scene
+        .subscriptions
+        .change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect("the change applies once the row is free");
+    assert_eq!(scene.mock.subscription_writes().len(), 1);
+}
+
+/// Changes piling up on a subscription another change holds cannot drain the pool.
+///
+/// A change holds its row across calls to Stripe. Callers retrying while it is
+/// slow must not each leave a task holding a pooled connection in a queue for
+/// that row, or the pool runs dry for every tenant: each is answered at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_piling_up_on_a_held_subscription_are_answered_at_once() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    let record = server();
+    scene.mock.hold(
+        "sub_slow",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_slow", Utc::now().timestamp() - 600)
+        .await;
+
+    let (arrived, release) = scene.mock.hold_next_update();
+    let slow = tokio::spawn({
         let scene = Arc::clone(&scene);
         let record = record.clone();
         async move {
@@ -1900,21 +2155,44 @@ async fn a_change_waits_for_whoever_holds_the_subscription_row() {
                 .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        scene.mock.reads_of("sub_locked"),
-        reads_before,
-        "the change takes the lock before it even reads Stripe",
-    );
-    assert!(scene.mock.subscription_writes().is_empty());
+    arrived.notified().await;
 
-    let _released = release_tx.send(());
-    holding.await.expect("the holder joins");
-    changing
-        .await
+    let retries: Vec<_> = (0..5)
+        .map(|_retry| {
+            let scene = Arc::clone(&scene);
+            let record = record.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    scene.subscriptions.change_items(
+                        &Context::system(),
+                        scene.organization_id,
+                        &record,
+                        &[ItemChange::set(LOGS, 1)],
+                    ),
+                )
+                .await
+            })
+        })
+        .collect();
+    for retry in retries {
+        let answered = retry
+            .await
+            .expect("the task must join")
+            .expect("each retry is answered at once rather than queued");
+        let refused = answered.expect_err("the subscription is held");
+        assert!(refused.is_conflict(), "{refused}");
+    }
+    assert_eq!(
+        scene.mock.subscription_writes().len(),
+        1,
+        "no refused retry reached Stripe",
+    );
+
+    release.notify_one();
+    slow.await
         .expect("the task must join")
-        .expect("the change applies once the row is free");
-    assert_eq!(scene.mock.subscription_writes().len(), 1);
+        .expect("the held change still applies");
 }
 
 /// A webhook arriving while a change holds the subscription waits, then applies.
@@ -2189,18 +2467,30 @@ async fn a_change_whose_caller_goes_away_still_finishes_and_frees_the_row() {
     let _aborted = abandoned.await;
     release.notify_one();
 
-    let next = tokio::time::timeout(
-        Duration::from_secs(5),
-        scene.subscriptions.change_items(
+    // Nobody awaits the abandoned change any more, so its own write is what
+    // says it finished: it lands, and with it the row's lock is released.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while scene
+            .live(&record)
+            .await
+            .is_none_or(|held| !stored(&held).contains(&(BACKUPS.to_owned(), 1)))
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the abandoned change finishes and writes Stripe's answer back");
+
+    let next = scene
+        .subscriptions
+        .change_items(
             &Context::system(),
             scene.organization_id,
             &record,
             &[ItemChange::set(LOGS, 1)],
-        ),
-    )
-    .await
-    .expect("the next change is not left waiting on the abandoned one's lock")
-    .expect("the next change applies");
+        )
+        .await
+        .expect("the next change finds the row free, and applies");
     assert_eq!(
         stored(&next),
         pairs(&[(SMALL, 1), (BACKUPS, 1), (LOGS, 1)]),
@@ -2258,5 +2548,234 @@ async fn a_member_without_billing_authority_reads_the_plan_but_not_each_record()
         body["subscriptions"][0]["subject_id"],
         json!(record.id().to_string()),
         "the owner is: {body}",
+    );
+}
+
+/// A change whose answer is lost is read back, and recorded when Stripe applied it.
+///
+/// Stripe applies the add-on and the answer never arrives intact. The change is
+/// still the caller's act, and the money moved, so a read-back finding it in
+/// place writes it and records it in the audit log rather than failing.
+#[tokio::test]
+async fn a_change_whose_answer_is_lost_is_read_back_and_recorded() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    scene.mock.hold(
+        "sub_lost",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_lost", Utc::now().timestamp() - 600)
+        .await;
+    scene.mock.lose_next_answer(false);
+
+    let held = scene
+        .subscriptions
+        .change_items(
+            &Context::system(),
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect("Stripe applied the change, so the read-back finds it");
+    assert_eq!(stored(&held), pairs(&[(SMALL, 1), (BACKUPS, 1)]));
+    let recorded = scene
+        .audited(anubis::audit::SUBSCRIPTION_ITEMS_CHANGED)
+        .await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the change is in the audit log: {recorded:?}"
+    );
+}
+
+/// A replayed answer to an earlier attempt is read back rather than trusted.
+///
+/// An add-on's answer and the read after it are both lost; then the add-on is
+/// removed at Stripe directly. The retry sends the same request under the same
+/// key, and Stripe replays the first attempt's saved answer, which still bills
+/// the add-on. That answer describes the past: the subscription is read back,
+/// the add-on is not recorded as billed, and the caller is told to try again.
+#[tokio::test]
+async fn a_replayed_answer_is_read_back_rather_than_trusted() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    let context = Context::system();
+    scene.mock.hold(
+        "sub_replayed",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    scene
+        .announce("sub_replayed", Utc::now().timestamp() - 600)
+        .await;
+
+    scene.mock.lose_next_answer(true);
+    scene
+        .subscriptions
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect_err("neither the answer nor the read-back arrived");
+    scene.mock.stop_billing("sub_replayed", BACKUPS);
+
+    let retried = scene
+        .subscriptions
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect_err("Stripe only replayed an attempt that no longer holds");
+    assert!(retried.is_transport(), "worth retrying: {retried}");
+    let writes = scene.mock.subscription_writes();
+    assert_eq!(
+        writes[0].idempotency_key, writes[1].idempotency_key,
+        "the retry was the same request, which is why Stripe replayed it",
+    );
+    let held = scene.live(&record).await.expect("still paid for");
+    assert_eq!(
+        stored(&held),
+        pairs(&[(SMALL, 1)]),
+        "the replayed answer's add-on, gone at Stripe, is not recorded",
+    );
+
+    let held = scene
+        .subscriptions
+        .change_items(
+            &context,
+            scene.organization_id,
+            &record,
+            &[ItemChange::set(BACKUPS, 1)],
+        )
+        .await
+        .expect("keyed afresh, the next attempt is a new request and applies");
+    assert_eq!(stored(&held), pairs(&[(SMALL, 1), (BACKUPS, 1)]));
+}
+
+/// Two first purchases at once, by two people, end on one customer.
+///
+/// Both create the organization's customer under one key, with different
+/// emails, and Stripe refuses the second because its parameters differ. By the
+/// time it does, the first has stored the customer, which the second then
+/// uses rather than failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_purchases_at_once_share_one_customer() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Arc::new(Scene::new(&database).await);
+    let mut connection = scene.connection().await;
+    diesel::update(organizations::table.find(scene.organization_id))
+        .set(organizations::stripe_customer_id.eq(None::<String>))
+        .execute(&mut connection)
+        .await
+        .expect("the organization starts without a customer");
+    drop(connection);
+
+    let purchase = |email: &'static str| {
+        let scene = Arc::clone(&scene);
+        tokio::spawn(async move {
+            let record = server();
+            scene
+                .subscriptions
+                .checkout(
+                    scene.organization_id,
+                    NewSubscription {
+                        subject: &record,
+                        line_items: &[LineItem::new(SMALL, 1)],
+                        return_path: "/servers",
+                        email: Some(email),
+                    },
+                )
+                .await
+        })
+    };
+
+    let (first_arrived, first_release) = scene.mock.hold_next_customer();
+    let (second_arrived, second_release) = scene.mock.hold_next_customer();
+    let first = purchase("first@example.com");
+    first_arrived.notified().await;
+    let second = purchase("second@example.com");
+    second_arrived.notified().await;
+
+    first_release.notify_one();
+    first
+        .await
+        .expect("the task must join")
+        .expect("the first purchase opens a checkout");
+    second_release.notify_one();
+    second
+        .await
+        .expect("the task must join")
+        .expect("the second purchase uses the customer the first stored");
+
+    let mut connection = scene.connection().await;
+    let stored_customer: Option<String> = organizations::table
+        .find(scene.organization_id)
+        .select(organizations::stripe_customer_id)
+        .first(&mut connection)
+        .await
+        .expect("the organization reads");
+    assert_eq!(stored_customer.as_deref(), Some("cus_created"));
+}
+
+/// A subscription that is over is never written back to a live status.
+///
+/// Stripe never revives a cancelled subscription, so a live status arriving
+/// after the cancellation is an older read whatever its stamp says, here an
+/// event whose read-back saw Stripe before the cancellation reached it.
+#[tokio::test]
+async fn a_subscription_that_is_over_is_never_revived() {
+    let Some(database) = TestDatabase::create("billing_subscriptions_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let record = server();
+    scene.mock.hold(
+        "sub_over",
+        &scene.customer,
+        "active",
+        &scene.record_metadata(&record),
+        &[(SMALL, 1)],
+    );
+    let now = Utc::now().timestamp();
+    scene.announce("sub_over", now - 600).await;
+
+    let mut ended = scene.mock.snapshot("sub_over");
+    ended["status"] = json!("canceled");
+    scene
+        .deliver(
+            "evt_over",
+            "customer.subscription.deleted",
+            now - 60,
+            &ended,
+        )
+        .await;
+    scene.process().await;
+    assert!(scene.live(&record).await.is_none());
+
+    scene.announce("sub_over", now).await;
+    assert!(
+        scene.live(&record).await.is_none(),
+        "a later read still showing it active does not bring it back",
     );
 }

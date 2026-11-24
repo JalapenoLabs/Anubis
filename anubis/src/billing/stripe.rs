@@ -2,8 +2,8 @@
 //!
 //! Anubis talks to Stripe over its REST API directly, with [`Client`], rather
 //! than through a generated SDK. The reasoning is in `docs/billing.md`, and it
-//! comes down to surface area: the whole integration is eight calls, five
-//! writes and three reads, every one of them answering flat JSON. The
+//! comes down to surface area: the whole integration is nine calls, five
+//! writes and four reads, every one of them answering flat JSON. The
 //! framework already carries a `reqwest` client built on rustls for outgoing
 //! webhooks, so this module adds no dependency, no second TLS stack, and no
 //! compile time worth measuring.
@@ -20,6 +20,7 @@
 //! | [`Client::retrieve_subscription`] | `GET /v1/subscriptions/{id}` | Reading current state when an event arrives |
 //! | [`Client::list_subscriptions`] | `GET /v1/subscriptions` | Reconciling an organization against Stripe |
 //! | [`Client::complete_items`] | `GET /v1/subscription_items` | Reading the rest of a long item list |
+//! | [`Client::retrieve_price`] | `GET /v1/prices/{id}` | Checking a record's prices recur monthly or yearly before Checkout |
 //!
 //! The reads exist because an event's body is a snapshot of the moment it was
 //! created, and a job may process it minutes later. Stripe's own guidance is to
@@ -223,6 +224,19 @@ impl Client {
         self.complete_items(subscription).await
     }
 
+    /// Reads one price, which is how a purchase is checked before Stripe takes payment.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    /// A price Stripe has never heard of is an API refusal carrying the code
+    /// `resource_missing`.
+    pub async fn retrieve_price(&self, id: &str) -> Result<Price, Error> {
+        // Percent-encoded because the id is the application's to pass, and a
+        // path segment is never a place to paste unescaped input.
+        let path = format!("/v1/prices/{}", encode_path_segment(id));
+        self.get(&path, &[]).await
+    }
+
     /// Changes a subscription's line items, or sets it to cancel at period end.
     ///
     /// Every item change rides one request, so a swap (one price removed,
@@ -237,7 +251,10 @@ impl Client {
     /// request at Stripe together with the change itself; see the module docs.
     ///
     /// Answers with the subscription as it stands afterwards, which is what the
-    /// caller writes into the projection.
+    /// caller writes into the projection. When Stripe answers with the saved
+    /// answer to an earlier request under the same key, marked
+    /// `Idempotent-Replayed`, that answer describes the subscription as it was
+    /// then, so the subscription is read back and that is the answer instead.
     ///
     /// # Errors
     /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
@@ -275,7 +292,12 @@ impl Client {
         // the id reaches here from a stored row that an event body wrote.
         let path = format!("/v1/subscriptions/{}", encode_path_segment(subscription_id));
         let key = idempotency_key("POST", &path, &form.finish(), revision);
-        let subscription = self.post(&path, &form, Some(&key)).await?;
+        let (subscription, replayed) = self
+            .exchange(self.post_request(&path, &form, Some(&key)), &path)
+            .await?;
+        if replayed {
+            return self.retrieve_subscription(subscription_id).await;
+        }
         self.complete_items(subscription).await
     }
 
@@ -385,6 +407,17 @@ impl Client {
         form: &Form,
         idempotency_key: Option<&str>,
     ) -> Result<T, Error> {
+        self.send(self.post_request(path, form, idempotency_key), path)
+            .await
+    }
+
+    /// Prepares a form POST to one Stripe endpoint, keyed when `idempotency_key` is given.
+    fn post_request(
+        &self,
+        path: &str,
+        form: &Form,
+        idempotency_key: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}{path}", self.base_url);
         let mut request = self
             .http
@@ -398,8 +431,7 @@ impl Client {
         if let Some(key) = idempotency_key {
             request = request.header(IDEMPOTENCY_HEADER, key);
         }
-
-        self.send(request, path).await
+        request
     }
 
     /// GETs one Stripe endpoint with `query` and parses what comes back.
@@ -423,11 +455,25 @@ impl Client {
         request: reqwest::RequestBuilder,
         path: &str,
     ) -> Result<T, Error> {
+        let (value, _replayed) = self.exchange(request, path).await?;
+        Ok(value)
+    }
+
+    /// Sends one prepared request, and says whether Stripe replayed a saved answer.
+    async fn exchange<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<(T, bool), Error> {
         let response = request
             .send()
             .await
             .map_err(|source| Error::transport(&source))?;
         let status = response.status();
+        let replayed = response
+            .headers()
+            .get(REPLAYED_HEADER)
+            .is_some_and(|value| value == "true");
         let body = response
             .text()
             .await
@@ -436,7 +482,9 @@ impl Client {
         if !status.is_success() {
             return Err(Error::api(status.as_u16(), &body, path));
         }
-        serde_json::from_str(&body).map_err(|source| Error::decode(path, &source.to_string()))
+        let value = serde_json::from_str(&body)
+            .map_err(|source| Error::decode(path, &source.to_string()))?;
+        Ok((value, replayed))
     }
 }
 
@@ -475,6 +523,9 @@ pub(super) const SUBJECT_ID_METADATA: &str = "subject_id";
 
 /// The header Stripe deduplicates writes by.
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+
+/// The header marking an answer Stripe saved for an earlier request with the same key.
+const REPLAYED_HEADER: &str = "Idempotent-Replayed";
 
 /// One subscription purchase, about to be handed to Stripe Checkout.
 #[derive(Debug, Clone)]
@@ -753,7 +804,7 @@ pub struct SubscriptionItem {
     #[serde(default)]
     id: String,
     #[serde(default)]
-    price: Option<ItemPrice>,
+    price: Option<Price>,
     #[serde(default)]
     quantity: Option<i64>,
     #[serde(default)]
@@ -780,27 +831,53 @@ impl SubscriptionItem {
     }
 
     /// The price's recurrence as Stripe spells it, `month` or `year`.
+    ///
+    /// `None` for a price that recurs every several intervals; see
+    /// [`Price::recurring_interval`].
     #[must_use]
     pub fn recurring_interval(&self) -> Option<&str> {
-        self.price
-            .as_ref()
-            .and_then(|price| price.recurring.as_ref())
-            .map(|recurring| recurring.interval.as_str())
+        self.price.as_ref().and_then(Price::recurring_interval)
     }
 }
 
-/// A price on a line item, as much of one as the framework reads.
+/// A Stripe price, as much of one as the framework reads.
 #[derive(Debug, Clone, Deserialize)]
-struct ItemPrice {
-    id: String,
+pub struct Price {
+    /// Stripe's id for the price, e.g. `price_1Q...`.
+    pub id: String,
     #[serde(default)]
     recurring: Option<Recurring>,
+}
+
+impl Price {
+    /// How often the price bills, as Stripe spells it: `month` or `year`.
+    ///
+    /// `None` for a one-time price, and for one that recurs every several
+    /// intervals (quarterly is every three months), neither of which the
+    /// framework records a subscription on.
+    #[must_use]
+    pub fn recurring_interval(&self) -> Option<&str> {
+        self.recurring.as_ref().and_then(Recurring::single_interval)
+    }
 }
 
 /// How often a price recurs, in Stripe's own words.
 #[derive(Debug, Clone, Deserialize)]
 struct Recurring {
     interval: String,
+    /// How many intervals pass between bills: three months is quarterly.
+    #[serde(default)]
+    interval_count: Option<i64>,
+}
+
+impl Recurring {
+    /// The interval, when the price bills every single one of them.
+    ///
+    /// A price billing every three months is not monthly, and the framework
+    /// records only monthly and yearly subscriptions, so it reads as none.
+    fn single_interval(&self) -> Option<&str> {
+        (self.interval_count.unwrap_or(1) == 1).then_some(self.interval.as_str())
+    }
 }
 
 /// One page of a Stripe list response.
@@ -986,7 +1063,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::{
-        API_BASE, Client, Error, Form, Subscription, encode_path_segment, idempotency_key,
+        API_BASE, Client, Error, Form, Price, Subscription, encode_path_segment, idempotency_key,
     };
     use crate::config::AppConfig;
 
@@ -1099,6 +1176,28 @@ mod tests {
             !on_the_subscription.items_complete(),
             "a first page is not the whole list",
         );
+    }
+
+    #[test]
+    fn a_price_recurring_every_several_intervals_names_none() {
+        let monthly: Price = serde_json::from_str(
+            r#"{ "id": "price_m", "recurring": { "interval": "month", "interval_count": 1 } }"#,
+        )
+        .expect("a price must parse");
+        let quarterly: Price = serde_json::from_str(
+            r#"{ "id": "price_q", "recurring": { "interval": "month", "interval_count": 3 } }"#,
+        )
+        .expect("a price must parse");
+        let one_time: Price =
+            serde_json::from_str(r#"{ "id": "price_once" }"#).expect("a price must parse");
+
+        assert_eq!(monthly.recurring_interval(), Some("month"));
+        assert_eq!(
+            quarterly.recurring_interval(),
+            None,
+            "every three months is not monthly",
+        );
+        assert_eq!(one_time.recurring_interval(), None);
     }
 
     #[test]

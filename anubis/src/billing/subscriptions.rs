@@ -52,17 +52,21 @@
 //! # Changes are serialized, read back, and keyed
 //!
 //! A change takes a row lock on the subscription for its whole length, so two
-//! changes to one subscription run one after the other, each computed from
-//! what the previous one left. Under the lock it reads the subscription back
-//! from Stripe, works out the smallest request that reaches what was asked for
-//! ([`ItemChange::set`] of a price already at that quantity sends nothing), and
-//! sends it with an idempotency key naming the row's last write. A retry of a
-//! change whose answer was lost is therefore one change at Stripe, and the
-//! answer is written into the projection, with the change's audit event, before
-//! the lock is released. Stripe replays the first answer to a key for a day,
-//! refusals included, so a change Stripe refuses moves the row's revision: the
-//! next attempt is keyed afresh, which is safe because it reads Stripe back
-//! first. The change runs on a task of its own, so a caller that goes away
+//! changes to one subscription never interleave; one asked for while another
+//! holds the row is refused as a conflict to retry rather than queued, so
+//! waiters cannot pile up on pooled connections. Under the lock it reads the
+//! subscription back from Stripe, works out the smallest request that reaches
+//! what was asked for ([`ItemChange::set`] of a price already at that quantity
+//! sends nothing), and sends it with an idempotency key naming the row's last
+//! write. Stripe's answer is written into the projection, with the change's
+//! audit event, before the lock is released. An answer lost on the way back is
+//! not taken for a failed change: the subscription is read back, and a change
+//! Stripe shows in place is written and recorded like any other. Stripe
+//! replays the first answer to a key for a day, refusals included, so a change
+//! Stripe refuses moves the row's revision and the next attempt is keyed
+//! afresh, which is safe because it reads Stripe back first; a replayed answer
+//! is read back rather than trusted, since it describes the subscription as it
+//! was. The change runs on a task of its own, so a caller that goes away
 //! cannot leave the row locked.
 //!
 //! The write is stamped when the read began, so an event describing anything
@@ -78,13 +82,14 @@ use diesel::prelude::*;
 use diesel_async::pooled_connection::deadpool::Object;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::lifecycle::{self, Origin, Reconciler, move_revision, read_began};
 use super::model::{
     Subject, Subscription, SubscriptionStatus, SubscriptionWithItems, terminal_statuses,
 };
-use super::plans::PlanSet;
+use super::plans::{Interval, PlanSet};
 use super::stripe::{
     self, CheckoutSession, ItemUpdate, LineItem, NewCheckoutSession, NewCustomer, Purchase,
     SubscriptionUpdate,
@@ -255,7 +260,7 @@ impl Subscriptions {
         organization_id: Uuid,
         purchase: NewSubscription<'_>,
     ) -> Result<CheckoutSession, Error> {
-        self.configured()?;
+        let stripe = self.configured()?;
         validate_line_items(purchase.line_items)?;
         if !is_application_path(purchase.return_path) {
             return Err(Error::new(
@@ -286,6 +291,26 @@ impl Subscriptions {
             ));
         }
         drop(connection);
+
+        // Before Stripe takes payment, not after: a subscription on a price
+        // recurring any other way would be charged and then never recorded.
+        for item in purchase.line_items {
+            let price = stripe.retrieve_price(item.price_id()).await?;
+            if price
+                .recurring_interval()
+                .and_then(Interval::parse)
+                .is_none()
+            {
+                return Err(Error::new(
+                    ErrorKind::Invalid,
+                    format!(
+                        "{} does not bill monthly or yearly, and subscriptions are recorded \
+                         monthly or yearly",
+                        item.price_id(),
+                    ),
+                ));
+            }
+        }
 
         let landing = format!("{}{}", self.app_url, purchase.return_path);
         self.open_checkout(
@@ -422,11 +447,16 @@ impl Subscriptions {
         let service = self.clone();
         let context = context.clone();
         let subject = subject.clone();
-        let change = tokio::spawn(async move {
-            service
-                .locked_change(&context, organization_id, &subject, &intent)
-                .await
-        });
+        // The caller's span travels with the task, so the change's log lines
+        // keep the request id they belong to.
+        let change = tokio::spawn(
+            async move {
+                service
+                    .locked_change(&context, organization_id, &subject, &intent)
+                    .await
+            }
+            .instrument(tracing::Span::current()),
+        );
 
         change.await.map_err(|source| {
             Error::new(
@@ -449,28 +479,7 @@ impl Subscriptions {
 
         let outcome = connection
             .transaction::<_, Error, _>(async |connection| {
-                // The lock serializes every change to this subscription, and a
-                // webhook writing the same row waits for it too, then applies or
-                // not by its own timestamp.
-                let held: Subscription = subscriptions::table
-                    .filter(subscriptions::organization_id.eq(organization_id))
-                    .filter(subscriptions::subject_type.eq(subject.kind()))
-                    .filter(subscriptions::subject_id.eq(subject.id()))
-                    .filter(subscriptions::status.ne_all(terminal_statuses()))
-                    .select(Subscription::as_select())
-                    .for_update()
-                    .first(connection)
-                    .await
-                    .optional()?
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::NotFound,
-                            format!(
-                                "organization {organization_id} holds no live subscription for \
-                                 {subject}",
-                            ),
-                        )
-                    })?;
+                let held = lock_live(connection, organization_id, subject).await?;
 
                 let read_at = read_began();
                 let current = stripe
@@ -487,31 +496,23 @@ impl Subscriptions {
                     (Intent::Cancel(when), false) => cancel_request(*when, &current),
                 };
 
-                let answered = match &request {
-                    Request::Nothing => current.clone(),
-                    // The row's last write is the revision: a retry of this
-                    // change before anything is written sends the same key, and
-                    // the same change asked for again after the projection has
-                    // moved on sends a new one.
-                    Request::Update(update) => match stripe
-                        .update_subscription(
-                            &held.stripe_subscription_id,
-                            update,
-                            &held.updated_at.to_rfc3339(),
-                        )
-                        .await
-                    {
-                        Ok(answered) => answered,
-                        Err(refused) if refused.is_api() => {
-                            move_revision(connection, held.id).await?;
-                            return Ok(Outcome::Refused(refused.into()));
+                let answered = match send_request(stripe, &held, &request, &current).await {
+                    Ok(answered) => answered,
+                    Err(refused) if refused.is_api() => {
+                        move_revision(connection, held.id).await?;
+                        return Ok(Outcome::Refused(refused.into()));
+                    }
+                    // The answer was lost, not necessarily the change: Stripe
+                    // may have applied it. Reading back says which, and a change
+                    // Stripe shows in place is written and recorded as made.
+                    Err(unanswered) => {
+                        match stripe
+                            .retrieve_subscription(&held.stripe_subscription_id)
+                            .await
+                        {
+                            Ok(after) if reached(intent, &after) => after,
+                            _unknown => return Err(unanswered.into()),
                         }
-                        Err(unanswered) => return Err(unanswered.into()),
-                    },
-                    Request::Delete => {
-                        stripe
-                            .cancel_subscription(&held.stripe_subscription_id)
-                            .await?
                     }
                 };
 
@@ -525,6 +526,20 @@ impl Subscriptions {
 
                 if ended && matches!(intent, Intent::Items(_)) {
                     return Ok(Outcome::Ended);
+                }
+                if !reached(intent, &answered) {
+                    // Stripe answered an earlier attempt of this change, saved
+                    // under the same key, and the subscription has moved since;
+                    // what holds now is written above. Moving the revision keys
+                    // the next attempt afresh.
+                    move_revision(connection, held.id).await?;
+                    return Ok(Outcome::Refused(Error::new(
+                        ErrorKind::Unavailable,
+                        format!(
+                            "Stripe answered an earlier attempt of the change to {subject}, which \
+                             no longer holds; try again"
+                        ),
+                    )));
                 }
                 if !matches!(request, Request::Nothing) {
                     record(
@@ -589,6 +604,50 @@ impl Debug for Subscriptions {
             .field("stripe", &self.stripe.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// Locks the subject's live subscription row, refusing rather than waiting.
+///
+/// The lock serializes every change to this subscription, and a webhook
+/// writing the same row waits for it too, then applies or not by its own
+/// timestamp. A change does not wait for another: one holds the row across its
+/// calls to Stripe, and a queue of waiters would each hold a pooled connection,
+/// which a caller retrying a slow change could pile up until the pool ran dry
+/// for every tenant. So a row another change holds answers as a conflict to
+/// retry, and only a row that is not there answers as not found.
+async fn lock_live(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    subject: &Subject,
+) -> Result<Subscription, Error> {
+    let live = subscriptions::table
+        .filter(subscriptions::organization_id.eq(organization_id))
+        .filter(subscriptions::subject_type.eq(subject.kind()))
+        .filter(subscriptions::subject_id.eq(subject.id()))
+        .filter(subscriptions::status.ne_all(terminal_statuses()));
+    let locked: Option<Subscription> = live
+        .clone()
+        .select(Subscription::as_select())
+        .for_update()
+        .skip_locked()
+        .first(connection)
+        .await
+        .optional()?;
+    if let Some(held) = locked {
+        return Ok(held);
+    }
+
+    let busy: i64 = live.count().get_result(connection).await?;
+    if busy > 0 {
+        return Err(Error::new(
+            ErrorKind::Conflict,
+            format!("another change to the subscription for {subject} is in progress; try again"),
+        ));
+    }
+    Err(Error::new(
+        ErrorKind::NotFound,
+        format!("organization {organization_id} holds no live subscription for {subject}"),
+    ))
 }
 
 /// The smallest item update that puts `current` where `changes` ask.
@@ -656,6 +715,48 @@ fn cancel_request(when: Cancellation, current: &stripe::Subscription) -> Request
             cancel_at_period_end: Some(true),
         }),
         Cancellation::Now => Request::Delete,
+    }
+}
+
+/// Sends what a change comes down to; asking for nothing answers with `current`.
+async fn send_request(
+    stripe: &stripe::Client,
+    held: &Subscription,
+    request: &Request<'_>,
+    current: &stripe::Subscription,
+) -> Result<stripe::Subscription, stripe::Error> {
+    match request {
+        Request::Nothing => Ok(current.clone()),
+        // The row's last write is the revision: a retry of this change before
+        // anything is written sends the same key, and the same change asked for
+        // again after the projection has moved on sends a new one.
+        Request::Update(update) => {
+            stripe
+                .update_subscription(
+                    &held.stripe_subscription_id,
+                    update,
+                    &held.updated_at.to_rfc3339(),
+                )
+                .await
+        }
+        Request::Delete => {
+            stripe
+                .cancel_subscription(&held.stripe_subscription_id)
+                .await
+        }
+    }
+}
+
+/// Whether `subscription` is where `intent` asked it to be.
+fn reached(intent: &Intent, subscription: &stripe::Subscription) -> bool {
+    let ended = SubscriptionStatus::parse(&subscription.status)
+        .is_some_and(SubscriptionStatus::is_terminal);
+    match intent {
+        Intent::Items(changes) => {
+            matches!(item_request(changes, subscription), Ok(Request::Nothing))
+        }
+        Intent::Cancel(Cancellation::AtPeriodEnd) => ended || subscription.cancel_at_period_end,
+        Intent::Cancel(Cancellation::Now) => ended,
     }
 }
 
@@ -758,6 +859,12 @@ fn validate_line_items(line_items: &[LineItem]) -> Result<(), Error> {
 
 /// Refuses item changes Stripe would refuse, before anything is locked.
 fn validate_changes(changes: &[ItemChange]) -> Result<(), Error> {
+    if changes.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Invalid,
+            "the change names no line items",
+        ));
+    }
     let mut seen = BTreeSet::new();
     for change in changes {
         if change.price_id().trim().is_empty() {
@@ -820,13 +927,25 @@ async fn ensure_customer(
         .select(organizations::name)
         .first(connection)
         .await?;
-    let customer = stripe
+    let created = stripe
         .create_customer(NewCustomer {
             organization_id,
             name: &name,
             email,
         })
-        .await?;
+        .await;
+    let customer = match created {
+        Ok(customer) => customer,
+        Err(refused) => {
+            // Two first purchases at once share the organization's key, and
+            // Stripe refuses the second when its email differs. By the time it
+            // does, the first has usually stored the customer both are for.
+            if let Some(existing) = stored_customer_id(connection, organization_id).await? {
+                return Ok(existing);
+            }
+            return Err(refused.into());
+        }
+    };
 
     diesel::update(
         organizations::table
@@ -1157,6 +1276,8 @@ mod tests {
     #[test]
     fn changes_stripe_would_refuse_are_refused_first() {
         let refused_changes = [
+            // Nothing to change would still take the lock and read Stripe.
+            Vec::new(),
             vec![ItemChange::set("price_a", 0)],
             vec![ItemChange::set(" ", 1)],
             // One price changed twice in one request is ambiguous.

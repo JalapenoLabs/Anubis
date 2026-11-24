@@ -51,14 +51,19 @@
 //! whole seconds; see [`read_began`]. Anything Stripe recorded before then is
 //! in what it read, so an older event is rightly ignored, and anything later
 //! may not be, so a newer event is free to apply. Letting an event win is
-//! always safe, because processing one reads Stripe back.
+//! always safe, because processing one reads Stripe back. A write that did not
+//! hold the subscription's row lock (reconciliation, seat synchronization) is
+//! stamped a second earlier still, so it loses a tie with an event created in
+//! the same second; see [`unlocked_read_began`]. And whatever the stamps say,
+//! a subscription that is over is never written back to a live status, because
+//! Stripe never revives one.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use diesel::prelude::*;
 use diesel::upsert::excluded;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -67,7 +72,7 @@ use uuid::Uuid;
 
 use super::event::StripeBillingEvent;
 use super::limits;
-use super::model::{Subject, Subscription, SubscriptionStatus};
+use super::model::{Subject, Subscription, SubscriptionStatus, terminal_statuses};
 use super::plans::{Interval, PlanSet};
 use super::stripe::{
     self, CompletedCheckout, ItemUpdate, ORGANIZATION_METADATA, PLAN_METADATA, SUBJECT_ID_METADATA,
@@ -257,10 +262,29 @@ impl Reconciler {
             return Ok(());
         }
 
-        let read_at = read_began();
+        let read_at = unlocked_read_began();
         let current = stripe
             .retrieve_subscription(&held.stripe_subscription_id)
             .await?;
+        let ended =
+            SubscriptionStatus::parse(&current.status).is_some_and(SubscriptionStatus::is_terminal);
+        let billed = current
+            .item_for_price(per_seat_price)
+            .and_then(stripe::SubscriptionItem::quantity);
+        if ended || billed == Some(seats) {
+            // Stripe already bills these seats, or bills nothing any more: an
+            // earlier attempt whose answer was lost got there, or a
+            // cancellation did. Sending the update again would only fetch that
+            // attempt's saved answer, stale by now, so what Stripe holds is
+            // written instead.
+            let origin = Origin {
+                organization_id: Some(job.organization_id),
+                metadata: None,
+            };
+            self.converge(&mut connection, &current, &origin, read_at)
+                .await?;
+            return Ok(());
+        }
         let item = current.item_for_price(per_seat_price).ok_or_else(|| {
             Error::new(
                 ErrorKind::Data,
@@ -372,7 +396,7 @@ impl Reconciler {
             );
         };
 
-        let read_at = read_began();
+        let read_at = unlocked_read_began();
         let mut held = stripe.list_subscriptions(&customer_id).await?;
         // Finished subscriptions first: a row this application still believes is
         // live has to be corrected before the live one can take its place, or
@@ -463,9 +487,8 @@ impl Reconciler {
                 let subscription = stripe.retrieve_subscription(subscription_id).await?;
                 let origin = Origin {
                     organization_id: None,
-                    // The session carries the same two values as the
-                    // subscription, and is the fallback for the day Stripe
-                    // drops one of them.
+                    // The session carries the subscription's organization, and
+                    // is the fallback for resolving it the day Stripe drops it.
                     metadata: Some(&session.metadata),
                 };
                 self.converge(connection, &subscription, &origin, event_at)
@@ -584,6 +607,15 @@ impl Reconciler {
                     .filter(subscriptions::stripe_event_at.is_null().or(
                         subscriptions::stripe_event_at.le(excluded(subscriptions::stripe_event_at)),
                     ))
+                    // And a subscription that is over stays over: Stripe never
+                    // revives a cancelled or expired one, so a live status
+                    // arriving after a terminal one is an older read, whatever
+                    // its stamp says.
+                    .filter(
+                        subscriptions::status
+                            .ne_all(terminal_statuses())
+                            .or(excluded(subscriptions::status).eq_any(terminal_statuses())),
+                    )
                     .returning(subscriptions::id)
                     .get_result(connection)
                     .await
@@ -601,8 +633,8 @@ impl Reconciler {
             tracing::info!(
                 billing.subscription.id = subscription.id,
                 organization.id = %organization_id,
-                "a Stripe event older than the one already applied left \
-                 {{billing.subscription.id}} alone",
+                "a Stripe read older than the one already applied, or one reviving a \
+                 subscription that is over, left {{billing.subscription.id}} alone",
             );
         } else {
             tracing::info!(
@@ -913,6 +945,19 @@ pub(super) fn read_began() -> DateTime<Utc> {
     DateTime::from_timestamp(now.timestamp(), 0).unwrap_or(now)
 }
 
+/// The stamp for a write that read Stripe without holding the subscription's row:
+/// one second before [`read_began`], so it loses every tie.
+///
+/// Reconciliation and seat synchronization read and write without the lock a
+/// change holds, so an event created in the second their read began can be
+/// processed before their write lands. An event written first carries that
+/// same second, and a tie would let the older read overwrite it, reviving a
+/// cancellation that nothing would repair. Losing ties to events is always
+/// safe: processing an event reads Stripe back.
+pub(super) fn unlocked_read_began() -> DateTime<Utc> {
+    read_began() - TimeDelta::seconds(1)
+}
+
 /// Explains a refused write in the terms of what it was trying to do.
 fn write_failed(
     subscription: &stripe::Subscription,
@@ -926,15 +971,17 @@ fn write_failed(
         // The unique indexes this write can trip are the two live-subscription
         // ones, and hitting either means Stripe holds two subscriptions for
         // one slot. A person has to decide which one the customer keeps.
-        let slot = read_subject(subscription).ok().flatten().map_or_else(
-            || "a live plan subscription".to_owned(),
-            |subject| format!("a live subscription for {subject}"),
+        // The plan slot is one organization's; a record's slot spans every
+        // organization, so the subscription holding it may be another's.
+        let holder = read_subject(subscription).ok().flatten().map_or_else(
+            || format!("organization {organization_id} already holds a live plan subscription"),
+            |subject| format!("{subject} already has a live subscription"),
         );
         return Error::new(
             ErrorKind::Data,
             format!(
-                "organization {organization_id} already holds {slot}, so Stripe subscription {} \
-                 could not be recorded; cancel one of them at Stripe",
+                "{holder}, so Stripe subscription {} for organization {organization_id} could not \
+                 be recorded; cancel one of them at Stripe",
                 subscription.id,
             ),
         );

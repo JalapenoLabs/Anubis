@@ -163,16 +163,26 @@ async fn show(
     member: OrganizationMember,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let live = Subscription::live_for_organization(&mut connection, member.organization.id)
-        .await
-        .map_err(log_internal)?;
+    // Only what the caller may see is loaded: an organization paying per
+    // record can hold hundreds of subscriptions, which a member without billing
+    // authority is never shown.
+    let list_all = holds_billing_authority(&member);
+    let live = if list_all {
+        Subscription::live_for_organization(&mut connection, member.organization.id).await
+    } else {
+        Subscription::current_for_organization(&mut connection, member.organization.id)
+            .await
+            .map(Option::into_iter)
+            .map(Iterator::collect)
+    }
+    .map_err(log_internal)?;
 
     let body = overview(
         &mut connection,
         &state,
         member.organization.id,
         live,
-        holds_billing_authority(&member),
+        list_all,
     )
     .await?;
     Ok(Json(body))
