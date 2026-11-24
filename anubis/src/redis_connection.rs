@@ -1,12 +1,13 @@
 //! The one recipe for connecting to the optional Redis.
 //!
 //! [`open`] is the recipe for a Redis connection that serves requests: the
-//! timeouts and the reconnection policy that bound a request waiting on Redis,
-//! decided once. The session store opens through it today; the realtime
-//! fanout still opens its own. The session store sits on the path of every
-//! authenticated request, so a Redis that stops answering must turn into a
-//! prompt error, not a request that hangs until the server's own timeout gives
-//! up on it.
+//! connection timeout and the reconnection policy that bound a request waiting
+//! on Redis, decided once. The session store and realtime's command connection
+//! both open through it, each naming how long its own commands may take to
+//! answer; realtime's subscriber connection is its own, because a connection
+//! in pub/sub mode carries nothing else. Both sit on the path of requests, so
+//! a Redis that stops answering must turn into a prompt error, not a request
+//! that hangs until the server's own timeout gives up on it.
 //!
 //! The connection is a [`ConnectionManager`]: one multiplexed connection,
 //! cheap to clone and safe to share across tasks, that reconnects on its own
@@ -27,13 +28,6 @@ use redis::{Client, RedisError};
 /// one fails a request quickly instead of holding it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How long one command may wait for its answer.
-///
-/// The commands sent are single-key reads and small atomic writes, which a
-/// healthy Redis answers in well under a millisecond, so a second only ever
-/// expires on a Redis that is stalled or gone.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// How many times a lost connection is retried before a command fails.
 ///
 /// The client library's default is six, with a delay that doubles each time,
@@ -47,6 +41,9 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_millis(500);
 
 /// Opens a lazily connected, self-reconnecting connection to Redis at `url`.
 ///
+/// `response_timeout` is how long one command may wait for its answer, which
+/// only the caller can size, because it depends on what its commands do.
+///
 /// Performs no I/O: the connection is established by the first command sent
 /// on it. Must be called inside a tokio runtime, because the connection's
 /// supervision task is spawned here.
@@ -55,11 +52,11 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_millis(500);
 /// Returns the Redis error when `url` is not a Redis connection URL. A URL
 /// from [`crate::config::RedisConfig`] was parsed when the configuration
 /// loaded, so it never fails here.
-pub(crate) fn open(url: &str) -> Result<ConnectionManager, RedisError> {
+pub(crate) fn open(url: &str, response_timeout: Duration) -> Result<ConnectionManager, RedisError> {
     let client = Client::open(url)?;
     let config = ConnectionManagerConfig::new()
         .set_connection_timeout(Some(CONNECT_TIMEOUT))
-        .set_response_timeout(Some(RESPONSE_TIMEOUT))
+        .set_response_timeout(Some(response_timeout))
         .set_number_of_retries(RECONNECT_ATTEMPTS)
         .set_max_delay(RECONNECT_MAX_DELAY);
     ConnectionManager::new_lazy_with_config(client, config)

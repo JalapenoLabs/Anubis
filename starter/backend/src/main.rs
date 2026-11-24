@@ -77,8 +77,11 @@ async fn main() {
     // and their action links to the console.
     let mailer = anubis::mail::Mailer::from_config(&config).expect("invalid mail configuration");
 
-    // Realtime channels: Redis pub/sub when REDIS_URL is set, in-process
-    // otherwise. Clone this into handlers and jobs that publish events.
+    // Realtime channels: the event sequence, the replay buffers, and the
+    // fanout live in Redis when REDIS_URL is set and in process otherwise.
+    // Clone this into handlers and jobs that publish events. To keep more
+    // events for a topic than the default 64 per channel, build it with
+    // `Channels::builder().retain(..)`; see docs/realtime.md.
     let channels = anubis::realtime::Channels::from_config(&config)
         .await
         .expect("REDIS_URL must name a reachable Redis");
@@ -91,7 +94,7 @@ async fn main() {
     let app = Router::new()
         // Public profile pictures at /users/{user_id}/avatar.
         .merge(anubis::auth::avatar_router(pool.clone()))
-        // The realtime channel socket at /realtime.
+        // The realtime event stream at /realtime.
         .merge(anubis::realtime::router(pool.clone(), channels.clone()))
         // The signed-in user's notification inbox at /account/notifications,
         // beside the application's own account routes below.

@@ -133,16 +133,19 @@
 //! # Realtime fanout
 //!
 //! `REDIS_URL` is the switch between the two realtime backends. Unset, the
-//! default, realtime channels are served inside the process: a publish reaches
-//! the browsers connected to this instance, which is everything a
-//! single-instance deployment needs. Set, publishes travel through Redis
-//! pub/sub, so every instance's subscribers hear them. Both `redis://` and
-//! `rediss://` (TLS) are understood, credentials ride in the URL, and the URL
-//! is a secret, so it is never echoed in errors or logs.
+//! default, realtime channels are served inside the process: the event
+//! sequence and the replay buffers live in memory, and a publish reaches the
+//! browsers connected to this instance, which is everything a single-instance
+//! deployment needs. Set, all three move into Redis, so every instance's
+//! streams hear every publish and a client resumes on whichever instance it
+//! reaches. Both `redis://` and `rediss://` (TLS) are understood, credentials
+//! ride in the URL, and the URL is a secret, so it is never echoed in errors
+//! or logs.
 //!
-//! For realtime, Redis is a fanout and nothing else. Nothing durable is stored
-//! for it, and losing it costs live delivery until it returns, never data. See
-//! [`crate::realtime`] and `docs/realtime.md`.
+//! For realtime, nothing durable is stored in Redis. Losing it costs live
+//! delivery until it returns and the replay buffers it held, so clients that
+//! resume afterwards refetch; it never costs data. See [`crate::realtime`] and
+//! `docs/realtime.md`.
 //!
 //! # Session store
 //!

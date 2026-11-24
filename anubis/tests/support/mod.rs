@@ -26,7 +26,7 @@ mod database;
 mod harness;
 pub mod oauth;
 mod passkey;
-pub mod socket;
+pub mod stream;
 
 pub use database::TestDatabase;
 pub use harness::{Harness, PASSWORD, invitation_token, register, send, serve, session_token};

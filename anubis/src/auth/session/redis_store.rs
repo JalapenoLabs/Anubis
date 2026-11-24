@@ -53,6 +53,13 @@ use crate::auth::token;
 use crate::db::DbPool;
 use crate::schema::users;
 
+/// How long one session command may wait for its answer.
+///
+/// The commands sent are single-key reads and small atomic writes, which a
+/// healthy Redis answers in well under a millisecond, so a second only ever
+/// expires on a Redis that is stalled or gone.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Prefixes a token hash to name the key holding that session.
 const TOKEN_KEY_PREFIX: &str = "anubis:sessions:token:";
 
@@ -87,7 +94,7 @@ impl RedisSessions {
     /// [`crate::config::RedisConfig`] never is: the configuration parsed it
     /// when it loaded.
     pub(super) fn new(url: &str) -> Self {
-        let connection = crate::redis_connection::open(url)
+        let connection = crate::redis_connection::open(url, RESPONSE_TIMEOUT)
             .expect("REDIS_URL was parsed when the configuration loaded");
         Self { connection }
     }

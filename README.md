@@ -75,7 +75,7 @@ and rehearsed, ready for a screencast.
 ## The stack
 
 - **Backend**: Rust on tokio, Axum, tower, Diesel with diesel-async, PostgreSQL,
-  optional Redis for realtime fanout and, when chosen, sessions.
+  optional Redis for realtime fanout and replay, and, when chosen, sessions.
 - **Frontend**: React SPA with Vite, TypeScript, HeroUI, TailwindCSS, Redux
   Toolkit, React Router, ky with SWR, react-hook-form with zod, i18next.
 - **Contract**: OpenAPI 3.1 generated from the Rust handlers, driving a
@@ -105,7 +105,7 @@ feature categories are on the left.
 | **Outgoing webhooks** | Ships | Per-team subscriptions, HMAC-SHA256 signatures, at-least-once delivery on the job queue, a delivery log with redelivery, and a debugging screen |
 | **Incoming webhooks** | Ships | `anubis scaffold webhook <Provider>` generates the table, the store-then-process endpoint, the signature check, the job, and the test |
 | **Background jobs** | Ships | A durable Postgres queue. Enqueue rides the caller's transaction, at-least-once delivery, widening retry backoff, then a `dead_jobs` table |
-| **Realtime** | Ships | One session-authenticated websocket, team- and user-scoped channels, in-process fanout by default and Redis across instances |
+| **Realtime** | Ships | Server-Sent Events: one session-authenticated stream, team- and user-scoped channels with payloads and ids, resume from a bounded replay log, application streams of your own, in process by default and Redis across instances |
 | **Notifications** | Ships | A framework-owned inbox, one `notify` call that commits with the write that caused it, a realtime bell with an unread badge, and the framework's own notices for invitations, roles, and failing endpoints |
 | **Billing** | Ships | Plans in `config/billing.yml`, Stripe Checkout and the customer portal, the subscription projection kept current by Stripe's events, reconciliation, hard and soft limits, per-seat pricing, and the billing screen |
 | **Audit log** | Ships | An append-only record that commits with the write that caused it, framework surfaces recording themselves, every scaffolded model audited with no per-model code, and an admin-gated team screen |

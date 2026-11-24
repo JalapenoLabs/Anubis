@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
-//! img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss://app.example.com;
+//! img-src 'self' data: blob:; font-src 'self'; connect-src 'self';
 //! base-uri 'self'; form-action 'self'; frame-ancestors 'none'
 //! ```
 //!
@@ -32,7 +32,7 @@
 //! | `style-src` | `'self' 'unsafe-inline'` | See below |
 //! | `img-src` | `'self' data: blob:` | Avatars and the TOTP QR code are served by this binary. The avatar picker previews the chosen file through `URL.createObjectURL`, which is a `blob:` URL. `data:` rides along because it is how a canvas or an inline SVG hands a browser an image, and because it names no origin, so configuration could not add it later |
 //! | `font-src` | `'self'` | The build self-hosts every face; nothing reaches a font CDN |
-//! | `connect-src` | `'self'` and the websocket origin | Every fetch goes to this server's own API, and the realtime channel is a websocket to it. CSP level 3 has `'self'` cover `ws:` on the same host, but browsers implemented that late and a realtime channel that dies silently in one of them is the worst kind of bug, so the origin of `APP_URL` is spelled out beside it |
+//! | `connect-src` | `'self'` | Every fetch goes to this server's own API, the realtime event stream included: it is an ordinary same-origin `fetch`, so it needs no origin of its own |
 //! | `base-uri` | `'self'` | An injected `<base>` repoints every relative URL on the page, the ones the SPA fetches with included |
 //! | `form-action` | `'self'` | A form may only post back here. The directive does not fall back to `default-src`, so leaving it out would allow every destination |
 //! | `frame-ancestors` | `'none'` | The modern spelling of `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
@@ -120,7 +120,6 @@ use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use url::Url;
 
 use crate::config::AppConfig;
 
@@ -155,9 +154,6 @@ const POLICY: &[(&str, &str)] = &[
     ("form-action", "'self'"),
     ("frame-ancestors", "'none'"),
 ];
-
-/// The directive the realtime websocket origin joins.
-const CONNECT_SRC: &str = "connect-src";
 
 /// The policy the API reference page carries instead of the framework's.
 ///
@@ -309,16 +305,10 @@ async fn apply(State(policy): State<Policy>, request: Request, next: Next) -> Re
 /// Called once at startup: the policy depends only on configuration, and a
 /// header value assembled per request would be the same string every time.
 fn content_security_policy(config: &AppConfig) -> HeaderValue {
-    let websocket_origin = websocket_origin(&config.app_url);
     let mut rendered = String::new();
 
     for (directive, base) in POLICY {
         let mut sources: Vec<&str> = base.split_whitespace().collect();
-        if *directive == CONNECT_SRC
-            && let Some(origin) = websocket_origin.as_deref()
-        {
-            sources.push(origin);
-        }
         if let Some(additional) = config.csp.additional_sources.get(directive) {
             sources.extend(additional.iter().map(String::as_str));
         }
@@ -338,27 +328,6 @@ fn content_security_policy(config: &AppConfig) -> HeaderValue {
 
     HeaderValue::from_str(&rendered)
         .expect("configuration accepts only sources that are valid header values")
-}
-
-/// Returns the websocket origin of the application's public URL.
-///
-/// `http` becomes `ws` and `https` becomes `wss`, which is the origin the
-/// browser opens the realtime channel on. `None` when `APP_URL` is neither, in
-/// which case `connect-src 'self'` is the whole answer; see the module docs on
-/// why the origin is named at all.
-fn websocket_origin(app_url: &str) -> Option<String> {
-    let url = Url::parse(app_url).ok()?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => return None,
-    };
-    let host = url.host_str()?;
-
-    match url.port() {
-        Some(port) => Some(format!("{scheme}://{host}:{port}")),
-        None => Some(format!("{scheme}://{host}")),
-    }
 }
 
 /// Returns whether the request reached the deployment over https.
@@ -425,9 +394,7 @@ mod tests {
     use axum::extract::Request;
     use axum::http::HeaderValue;
 
-    use super::{
-        CorsConfig, Policy, arrived_over_https, cors_layer, extendable_directive, websocket_origin,
-    };
+    use super::{CorsConfig, Policy, arrived_over_https, cors_layer, extendable_directive};
     use crate::config::AppConfig;
 
     fn request(forwarded_proto: Option<&str>) -> Request {
@@ -513,11 +480,8 @@ mod tests {
             policy.contains("img-src 'self' data: blob:;"),
             "got: {policy}"
         );
-        // The realtime channel, named rather than left to `'self'` matching.
-        assert!(
-            policy.contains("connect-src 'self' wss://app.example.com;"),
-            "got: {policy}",
-        );
+        // The realtime stream is a same-origin fetch, so `'self'` covers it.
+        assert!(policy.contains("connect-src 'self';"), "got: {policy}");
         assert!(policy.contains("base-uri 'self';"), "got: {policy}");
         assert!(policy.contains("form-action 'self';"), "got: {policy}");
         assert!(policy.ends_with("frame-ancestors 'none'"), "got: {policy}");
@@ -544,7 +508,7 @@ mod tests {
         );
         // Beside the framework's own sources, never instead of them.
         assert!(
-            policy.contains("connect-src 'self' ws://localhost:3000 https://plausible.io;"),
+            policy.contains("connect-src 'self' https://plausible.io;"),
             "got: {policy}",
         );
         // A directive with no framework sources renders exactly what was asked.
@@ -552,24 +516,6 @@ mod tests {
             policy.contains("frame-src https://js.stripe.com;"),
             "got: {policy}",
         );
-    }
-
-    #[test]
-    fn the_websocket_origin_follows_the_public_url() {
-        assert_eq!(
-            websocket_origin("https://app.example.com").as_deref(),
-            Some("wss://app.example.com"),
-        );
-        assert_eq!(
-            websocket_origin("http://localhost:5173").as_deref(),
-            Some("ws://localhost:5173"),
-        );
-        // A default port is not part of an origin, and CSP compares origins.
-        assert_eq!(
-            websocket_origin("https://app.example.com:443").as_deref(),
-            Some("wss://app.example.com"),
-        );
-        assert_eq!(websocket_origin("not a url"), None);
     }
 
     /// The guard against a directive configuration accepts and rendering drops.

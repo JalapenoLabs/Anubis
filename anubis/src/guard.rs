@@ -223,32 +223,8 @@ where
 
         let mut connection = pool.get().await.map_err(log_internal)?;
 
-        let found: Option<(Team, TeamMembership)> = teams::table
-            .inner_join(
-                team_memberships::table.on(team_memberships::team_id
-                    .eq(teams::id)
-                    .and(team_memberships::user_id.eq(user.id))),
-            )
-            // A suspension is a deny, so it closes the team route too: the
-            // organization's cuts every team in it, and a sub-tenant's cuts
-            // the teams scoped to that sub-tenant. Both joins are left joins
-            // filtered on a null timestamp, so a member with no membership at
-            // the tier above passes exactly as they did before the tier
-            // existed.
-            .left_join(
-                organization_memberships::table.on(organization_memberships::organization_id
-                    .eq(teams::organization_id)
-                    .and(organization_memberships::user_id.eq(user.id))),
-            )
-            .left_join(
-                sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
-                    .nullable()
-                    .eq(teams::sub_tenant_id)
-                    .and(sub_tenant_memberships::user_id.eq(user.id))),
-            )
+        let found: Option<(Team, TeamMembership)> = admitted_teams(user.id)
             .filter(teams::id.eq(team_id))
-            .filter(organization_memberships::suspended_at.is_null())
-            .filter(sub_tenant_memberships::suspended_at.is_null())
             .select((Team::as_select(), TeamMembership::as_select()))
             .first(&mut connection)
             .await
@@ -265,6 +241,38 @@ where
             roles,
         })
     }
+}
+
+/// The teams `user_id` is admitted to, joined to the membership that admits them.
+///
+/// The one statement of who reaches a team, shared by [`TeamMember`] and the
+/// realtime stream's team channels, so a route and a channel can never
+/// disagree about it. A claimed membership admits, and a suspension denies:
+/// the organization's cuts every team in it, and a sub-tenant's cuts the
+/// teams scoped to that sub-tenant. Both are left joins filtered on a null
+/// timestamp, so a member with no membership at the tier above passes exactly
+/// as they did before the tier existed.
+#[diesel::dsl::auto_type(no_type_alias)]
+pub(crate) fn admitted_teams(user_id: Uuid) -> _ {
+    teams::table
+        .inner_join(
+            team_memberships::table.on(team_memberships::team_id
+                .eq(teams::id)
+                .and(team_memberships::user_id.eq(user_id))),
+        )
+        .left_join(
+            organization_memberships::table.on(organization_memberships::organization_id
+                .eq(teams::organization_id)
+                .and(organization_memberships::user_id.eq(user_id))),
+        )
+        .left_join(
+            sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
+                .nullable()
+                .eq(teams::sub_tenant_id)
+                .and(sub_tenant_memberships::user_id.eq(user_id))),
+        )
+        .filter(organization_memberships::suspended_at.is_null())
+        .filter(sub_tenant_memberships::suspended_at.is_null())
 }
 
 /// The signed-in user's standing in the route's `{sub_tenant_id}` sub-tenant.
