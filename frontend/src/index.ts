@@ -3,6 +3,7 @@
 export type {
   AppNotification,
   AuthSession,
+  AuthorizationDelivery,
   AuthorizationRequest,
   BillingCheckoutRequest,
   BillingEnforcement,

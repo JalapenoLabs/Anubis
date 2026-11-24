@@ -191,14 +191,30 @@ export type OauthClient = {
   clientUri: string | null
 }
 
+/**
+ * Where an approval goes, which decides what the consent screen warns about.
+ *
+ * A `redirect` request sends a code back to the program's address, which the
+ * screen must name. A `device` request was started by a program that showed
+ * the person a code to enter here, and the approval goes to that device
+ * wherever it is: the screen says so, because a code somebody else sent is
+ * how this flow is abused.
+ */
+export type AuthorizationDelivery =
+  | {
+    kind: 'redirect'
+    /** The host the code is delivered to. */
+    host: string
+    /** True when the code goes to a program on this device, worth a warning. */
+    isLoopback: boolean
+  }
+  | { kind: 'device' }
+
 /** What the consent screen asks the person to approve. */
 export type AuthorizationRequest = {
   id: string
   client: OauthClient
-  /** Where the code goes, which the screen must show. */
-  redirectHost: string
-  /** True when the code goes to a program on this device, worth a warning. */
-  redirectIsLoopback: boolean
+  delivery: AuthorizationDelivery
   scopes: OauthScope[]
   expiresAt: string
 }
