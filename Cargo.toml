@@ -105,6 +105,9 @@ serde_json = "1"
 serde_norway = "0.9"
 sha1 = "0.11"
 sha2 = "0.11"
+# Socket options the standard library does not reach: the serve path bounds how
+# long a connection's writes may stall with TCP_USER_TIMEOUT.
+socket2 = { version = "0.6", features = ["all"] }
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

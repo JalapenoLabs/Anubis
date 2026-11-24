@@ -11,10 +11,13 @@ use std::fmt::{self, Display, Formatter};
 /// and receives every event after it on the channels it listens to.
 ///
 /// The epoch names one run of the sequence. In process it is minted when the
-/// [`super::Channels`] service starts; under Redis it is stored beside the
-/// sequence and changes only when Redis loses both. An id from another epoch
-/// cannot be resumed from, so it is answered with a reset rather than with a
-/// guess.
+/// [`super::Channels`] service starts. Under Redis it is stored beside the
+/// sequence and the `run_id` of the Redis server holding them, and changes
+/// whenever that server is a different run: a restart, whether it comes back
+/// empty or from any snapshot or append-only file, or a replica promoted in
+/// its place. So a planned Redis restart resets every client that resumes
+/// across it, even one that kept every byte. An id from another epoch cannot
+/// be resumed from, so it is answered with a reset rather than with a guess.
 ///
 /// Ids render as `{epoch}-{sequence}`, the epoch in sixteen hex digits, such
 /// as `3f2b9c0d1e4a5b6c-42`. Clients treat the text as opaque.

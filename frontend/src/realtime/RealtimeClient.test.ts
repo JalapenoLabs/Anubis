@@ -26,11 +26,17 @@ type Connection = {
 
 type Context = {
   connections: Connection[]
+  /** The status the fake server refuses every request with, or none. */
+  refusal: number | null
   client: RealtimeClient
 }
 
-/** A fetch that answers every request with a stream the test drives. */
-function createFetch(connections: Connection[]) {
+/**
+ * A fetch that answers every request with a stream the test drives, unless
+ * the test has the server refusing them. Every request is recorded either way.
+ */
+function createFetch(context: Context) {
+  const connections = context.connections
   return async (input: Request | string | URL, init?: RequestInit): Promise<Response> => {
     const request = input instanceof Request
       ? input
@@ -58,6 +64,12 @@ function createFetch(connections: Connection[]) {
       controller?.error(new DOMException('aborted', 'AbortError'))
     })
     connections.push(connection)
+    if (context.refusal) {
+      return new Response('{"message":"refused"}', {
+        status: context.refusal,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
 
     return new Response(body, {
       status: 200,
@@ -92,9 +104,10 @@ describe('RealtimeClient', () => {
   beforeEach<Context>((context) => {
     vi.useFakeTimers()
     context.connections = []
+    context.refusal = null
     context.client = new RealtimeClient({
       url: 'http://localhost/realtime',
-      fetch: createFetch(context.connections),
+      fetch: createFetch(context),
     })
   })
 
@@ -244,6 +257,75 @@ describe('RealtimeClient', () => {
     // The reconnect asks for it fresh: it never went live on this cursor.
     expect(current(context).lastEventId).toBe('e-1')
     expect(current(context).fresh).toEqual([ PROJECTS ])
+  })
+
+  it<Context>('should reset a listener that joins a channel already live, and only that one', async (context) => {
+    const first: RealtimeMessage[] = []
+    context.client.subscribe(PROJECTS, (message) => first.push(message))
+    await settle()
+    current(context).push(frame({ type: 'reset', channel: PROJECTS }))
+    current(context).push(frame({ type: 'live' }, 'e-1'))
+    await settle()
+
+    const late: RealtimeMessage[] = []
+    context.client.subscribe(PROJECTS, (message) => late.push(message))
+    const gone: RealtimeMessage[] = []
+    const leave = context.client.subscribe(PROJECTS, (message) => gone.push(message))
+    leave()
+    await settle()
+
+    expect(late).toEqual([{ type: 'reset', channel: PROJECTS }])
+    expect(first).toEqual([{ type: 'reset', channel: PROJECTS }])
+    expect(gone).toEqual([])
+    expect(context.connections).toHaveLength(1)
+  })
+
+  it<Context>('should not ask again for a stream refused for good on unchanged channels', async (context) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    context.refusal = 401
+    context.client.subscribe(PROJECTS, () => {})
+    await settle()
+    expect(context.connections).toHaveLength(1)
+    expect(context.client.state).toBe('closed')
+
+    // Components mounting and unmounting on the channel already refused.
+    const leave = context.client.subscribe(PROJECTS, () => {})
+    leave()
+    await settle(60_000)
+    expect(context.connections).toHaveLength(1)
+
+    // A different set of channels is a different request, and is asked.
+    context.refusal = null
+    context.client.subscribe(INBOX, () => {})
+    await settle()
+    expect(context.connections).toHaveLength(2)
+    expect(context.client.state).toBe('open')
+  })
+
+  it<Context>('should forget what an earlier connection refused once a new one opens', async (context) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    context.client.subscribe(PROJECTS, () => {})
+    context.client.subscribe(INBOX, () => {})
+    await settle()
+
+    // Refused, and then the connection drops before it went live.
+    current(context).push(frame({
+      type: 'error',
+      channel: PROJECTS,
+      code: 'not_found',
+      message: 'No such channel.',
+    }))
+    current(context).end()
+    await settle(500)
+
+    // The stream reconnects on its own, and this time admits both.
+    current(context).push(frame({ type: 'live' }, 'e-1'))
+    current(context).end()
+    await settle(1000)
+
+    expect(context.connections).toHaveLength(3)
+    expect(current(context).lastEventId).toBe('e-1')
+    expect(current(context).fresh).toEqual([])
   })
 
   it<Context>('should warn about a channel the server refused', async (context) => {

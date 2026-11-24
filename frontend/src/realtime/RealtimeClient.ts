@@ -35,9 +35,14 @@ export type RealtimeClientOptions = {
  * their channel until they call it.
  *
  * A listener hears every event on its channel, and a `reset` whenever what it
- * holds may be stale: once when its channel goes live, since anything it
- * fetched before then may already be behind, and again whenever a reconnect
- * spanned more than the server keeps. Refetching on a reset is always right.
+ * holds may be stale: once as it starts listening, when its channel goes live
+ * or, on a channel already live, on the next tick, since anything it fetched
+ * before then may already be behind; and again whenever a reconnect spanned
+ * more than the server keeps. Refetching on a reset is always right.
+ *
+ * A stream the server refuses for good, with a `4xx` such as `401`, stays
+ * refused until the set of channels changes: listeners coming and going on
+ * the same channels do not ask again for what was just refused.
  *
  * ```ts
  * const client = new RealtimeClient()
@@ -102,6 +107,23 @@ export class RealtimeClient {
     this.scheduleRebuild()
 
     let released = false
+    // A channel already live has had its reset, and no other is coming, so a
+    // listener joining it gets one of its own: it holds nothing yet.
+    if (this.live.has(channel)) {
+      setTimeout(() => {
+        if (released) {
+          console.debug('RealtimeClient listener left before its reset', channel)
+          return
+        }
+        try {
+          listener({ type: 'reset', channel })
+        }
+        catch (error) {
+          console.error('A realtime listener threw', { channel, error })
+        }
+      }, 0)
+    }
+
     return () => {
       if (released) {
         console.debug('RealtimeClient disposer called twice', channel)
@@ -147,18 +169,21 @@ export class RealtimeClient {
     }, 0)
   }
 
-  /** Opens a stream for the channels listened to now, unless one already carries them. */
+  /**
+   * Opens a stream for the channels listened to now, unless one already
+   * carries them, or was refused them for good.
+   */
   private rebuild(): void {
     const channels = this.listeners.channels().sort()
-    const running = this.stream && this.stream.state !== 'closed'
     const unchanged = channels.length === this.carried.length
       && channels.every((channel, index) => channel === this.carried[index])
-    if (running && unchanged) {
+    // The stream for exactly these channels stays: open, it carries them, and
+    // refused, it would be refused again.
+    if (this.stream && unchanged) {
       return
     }
 
     this.retire()
-    this.refused.clear()
     // A channel nobody listens to any more stops being live, so one that
     // comes back later joins at the head rather than on an old cursor.
     for (const channel of [ ...this.live ]) {
@@ -183,9 +208,15 @@ export class RealtimeClient {
         }
       },
       onStateChange: (state) => {
-        if (generation === this.generation) {
-          this.setState(state)
+        if (generation !== this.generation) {
+          return
         }
+        // Each connection sends its own refusals, so what an earlier one
+        // refused says nothing about this one.
+        if (state === 'open') {
+          this.refused.clear()
+        }
+        this.setState(state)
       },
       fetch: this.options.fetch,
     })
@@ -236,7 +267,6 @@ export class RealtimeClient {
           this.live.add(channel)
         }
       }
-      this.refused.clear()
       return
     }
 
@@ -253,6 +283,11 @@ export class RealtimeClient {
     }
 
     this.connectionState = state
-    this.options.onStateChange?.(state)
+    try {
+      this.options.onStateChange?.(state)
+    }
+    catch (error) {
+      console.error('A realtime state listener threw', { state, error })
+    }
   }
 }

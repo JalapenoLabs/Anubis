@@ -186,39 +186,53 @@ export class EventStream {
     this.controller = controller
     this.setState('connecting')
 
-    void this.read(controller.signal).then((ending) => {
-      if (controller.signal.aborted) {
-        // Closed on purpose; the caller has moved on.
-        return
-      }
-      this.controller = null
+    void this.read(controller.signal)
+      .catch((error: unknown): Ending => {
+        // `read` turns every failure of the network into an ending of its
+        // own, so a throw here is a bug, such as a `url` callback that threw.
+        // The connection is abandoned like a broken one: aborting its request
+        // also releases a body it had begun to read, and the stream
+        // reconnects on the backoff rather than sitting open and deaf.
+        console.error('An event stream connection failed unexpectedly; it will reconnect', error)
+        controller.abort()
+        return { kind: 'failed', steady: false, waitAtLeast: 0 }
+      })
+      .then((ending) => this.settle(controller, ending))
+  }
 
-      if (ending.kind === 'refused') {
-        this.setState('closed')
-        return
-      }
+  /** Decides what follows a connection that ended. */
+  private settle(controller: AbortController, ending: Ending): void {
+    if (this.controller !== controller) {
+      // Closed on purpose; the caller has moved on.
+      return
+    }
+    this.controller = null
 
-      // Only a connection that proved itself resets the backoff. A steady
-      // stream the server ended resumes at once; anything else waits on the
-      // doubling schedule, however it ended.
-      let backoff = 0
-      if (ending.steady) {
-        this.attempt = 0
-        if (ending.kind === 'failed') {
-          backoff = reconnectDelay(0)
-        }
-      }
-      else {
-        backoff = reconnectDelay(this.attempt)
-        this.attempt += 1
-      }
+    if (ending.kind === 'refused') {
+      this.setState('closed')
+      return
+    }
 
-      this.setState('connecting')
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null
-        this.connect()
-      }, Math.max(backoff, ending.waitAtLeast))
-    })
+    // Only a connection that proved itself resets the backoff. A steady
+    // stream the server ended resumes at once; anything else waits on the
+    // doubling schedule, however it ended.
+    let backoff = 0
+    if (ending.steady) {
+      this.attempt = 0
+      if (ending.kind === 'failed') {
+        backoff = reconnectDelay(0)
+      }
+    }
+    else {
+      backoff = reconnectDelay(this.attempt)
+      this.attempt += 1
+    }
+
+    this.setState('connecting')
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, Math.max(backoff, ending.waitAtLeast))
   }
 
   /** Reads one connection from its request to its end. */
@@ -393,7 +407,14 @@ export class EventStream {
     }
 
     this.connectionState = state
-    this.options.onStateChange?.(state)
+    // A state listener that throws is the caller's problem, as a frame
+    // listener that throws is: the stream carries on regardless.
+    try {
+      this.options.onStateChange?.(state)
+    }
+    catch (error) {
+      console.error('An event stream state listener threw', { state, error })
+    }
   }
 }
 

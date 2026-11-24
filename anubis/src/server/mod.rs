@@ -132,8 +132,9 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, Response};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::serve::ListenerExt as _;
 use axum::{Extension, Router};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
@@ -183,6 +184,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// traffic gate has already stopped sending work, and a deploy that waits on
 /// one straggler is a deploy that hangs.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(25);
+
+/// How long a connection's writes may make no progress before it is closed.
+///
+/// A client that stops reading, or vanishes without closing, leaves the
+/// server's writes waiting on it. An ordinary response ends within the
+/// request timeout regardless, but an event stream is never finished: once its
+/// client stops taking bytes, hyper stops polling its body, so nothing in the
+/// process can end it, and it would keep its socket and whatever it had queued
+/// for as long as the client stayed connected. The kernel can end it: with
+/// data unacknowledged, or unsent because the client's window is shut, for
+/// this long, it closes the connection, the pending write fails, and the
+/// stream is dropped. Sixty seconds is nginx's `send_timeout`, the bound a
+/// proxied deployment already lives under, and far past any client that is
+/// reading at all.
+const WRITE_STALL_LIMIT: Duration = Duration::from_mins(1);
 
 /// The header carrying a request's id back to the caller.
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -297,7 +313,7 @@ pub async fn serve_with_shutdown(
     // each request to the address it arrived from, which only the accept loop
     // knows. See `crate::rate_limit`.
     let serving = axum::serve(
-        listener,
+        listener.tap_io(limit_write_stalls),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
@@ -335,6 +351,24 @@ pub async fn serve_with_shutdown(
     }
 }
 
+/// Closes a connection whose writes stall past [`WRITE_STALL_LIMIT`].
+///
+/// Through `TCP_USER_TIMEOUT`, so on Linux, where deployments run. Elsewhere,
+/// which is development, a stalled connection lasts until its client leaves.
+fn limit_write_stalls(stream: &mut TcpStream) {
+    #[cfg(target_os = "linux")]
+    if let Err(error) =
+        socket2::SockRef::from(&*stream).set_tcp_user_timeout(Some(WRITE_STALL_LIMIT))
+    {
+        tracing::warn!(
+            error.message = %error,
+            "a connection's stalled writes could not be bounded: {{error.message}}",
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = stream;
+}
+
 /// The server's word that it has started to drain.
 ///
 /// [`serve_with_shutdown`] puts one on every request it serves. A response
@@ -354,6 +388,8 @@ impl Drain {
 
     /// Whether the drain has started, without waiting for it.
     pub(crate) fn has_started(&self) -> bool {
+        // `has_changed` fails only once the sender is gone, and a sender that
+        // is gone is a server that is gone, which is a drain too.
         *self.0.borrow() || self.0.has_changed().is_err()
     }
 }
@@ -679,6 +715,8 @@ mod tests {
         Drain, Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with,
         serve_with_shutdown,
     };
+    #[cfg(target_os = "linux")]
+    use super::{WRITE_STALL_LIMIT, limit_write_stalls};
     use crate::config::AppConfig;
     use crate::db::DbPool;
 
@@ -694,6 +732,29 @@ mod tests {
 
     fn config() -> AppConfig {
         AppConfig::from_lookup(|_name| None).expect("the defaults parse")
+    }
+
+    /// The kernel is told to close a connection whose writes stall.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_accepted_connection_bounds_how_long_its_writes_may_stall() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port must be free");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        let _client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the listener accepts");
+        let (mut accepted, _peer) = listener.accept().await.expect("a connection arrives");
+
+        limit_write_stalls(&mut accepted);
+
+        let limit = socket2::SockRef::from(&accepted)
+            .tcp_user_timeout()
+            .expect("the option reads back");
+        assert_eq!(limit, Some(WRITE_STALL_LIMIT));
     }
 
     /// A handler that takes longer than the test's timeout.

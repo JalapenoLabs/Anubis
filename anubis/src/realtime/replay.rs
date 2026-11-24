@@ -13,10 +13,12 @@
 //! whole. A resume from before either is answered with a reset, because the
 //! events in between may be gone, and a resume after both replays exactly.
 //!
-//! The rules live here once. The in-process backend keeps its buffers in a
-//! [`MemoryLog`]; the Redis backend keeps them in Redis, under a script that
-//! applies the same arithmetic, and both answer a [`Snapshot`] that
-//! [`Snapshot::opening`] reads the same way.
+//! The in-process backend keeps its buffers in a [`MemoryLog`], whose methods
+//! state the rules. The Redis backend keeps them in Redis, under two scripts
+//! kept in step with those methods: one appends with the same arithmetic, and
+//! one decides each opening by the same rules. Both answer a [`Snapshot`], and
+//! both decide how a channel opens before reading any of it, so a stream reads
+//! only what it sends.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -115,22 +117,6 @@ pub(crate) enum Cursor {
     Unknown,
 }
 
-impl Start {
-    /// The sequence a snapshot replays after, or `None` to replay nothing.
-    ///
-    /// A backfill stream reads everything a channel keeps, because whatever
-    /// its cursor says, the opening may have to fall back to all of it.
-    pub(crate) fn since(self) -> Option<u64> {
-        if self.backfill {
-            return Some(0);
-        }
-        match self.cursor {
-            Cursor::Fresh | Cursor::Unknown => None,
-            Cursor::After(cursor) => Some(cursor.sequence()),
-        }
-    }
-}
-
 /// One kept event: its place in the sequence and its rendered frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -138,28 +124,15 @@ pub(crate) struct Entry {
     pub(crate) data: Arc<str>,
 }
 
-/// What the log holds for some channels at one instant.
+/// How some channels' streams open, decided at one instant.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     /// The run of the sequence the log is on.
     pub(crate) epoch: u64,
     /// The newest sequence minted so far; a stream is live from here.
     pub(crate) head: u64,
-    /// The newest event of any channel the budget let go of whole.
-    pub(crate) watermark: u64,
-    /// One view per channel asked for, in the order they were asked for.
-    pub(crate) buffers: Vec<BufferView>,
-}
-
-/// What the log holds for one channel.
-#[derive(Debug, Default)]
-pub(crate) struct BufferView {
-    /// Whether the channel has a buffer at all.
-    pub(crate) exists: bool,
-    /// The newest event the buffer dropped, or the watermark it was born under.
-    pub(crate) floor: u64,
-    /// The kept events after the sequence the request named, oldest first.
-    pub(crate) entries: Vec<Entry>,
+    /// One per channel asked for, in the order they were asked for.
+    pub(crate) openings: Vec<Opening>,
 }
 
 /// How one channel of a new stream opens.
@@ -170,63 +143,6 @@ pub(crate) struct Opening {
     pub(crate) reset: bool,
     /// The events it replays after that, oldest first, which may be none.
     pub(crate) entries: Vec<Entry>,
-}
-
-impl Snapshot {
-    /// Decides how a channel that begins at `start` opens, given its buffer.
-    ///
-    /// The one statement of the resume rules. A cursor from another epoch, or
-    /// from past the head, is not one this log minted; past that, a resume is
-    /// exact unless the channel's floor or, for a channel with no buffer, the
-    /// watermark shows that something after the cursor was let go. Wherever a
-    /// resume is not exact the channel opens with a reset, followed, for a
-    /// backfill stream, by everything the channel still keeps.
-    pub(crate) fn opening(&self, start: Start, buffer: BufferView) -> Opening {
-        let cursor = match start.cursor {
-            Cursor::After(cursor) if self.vouches_for(cursor, &buffer) => cursor,
-            // A first connection to a backfill stream opens with what is
-            // kept, and needs no reset: there was nothing before it to clear.
-            Cursor::Fresh if start.backfill => {
-                return Opening {
-                    reset: false,
-                    entries: buffer.entries,
-                };
-            }
-            Cursor::Fresh | Cursor::After(_) | Cursor::Unknown => {
-                let entries = if start.backfill {
-                    buffer.entries
-                } else {
-                    Vec::new()
-                };
-                return Opening {
-                    reset: true,
-                    entries,
-                };
-            }
-        };
-
-        // A backfill stream read the whole buffer; a resume wants only what
-        // came after its cursor.
-        let mut entries = buffer.entries;
-        entries.retain(|entry| entry.sequence > cursor.sequence());
-        Opening {
-            reset: false,
-            entries,
-        }
-    }
-
-    /// Whether every event on this channel after `cursor` is still kept.
-    fn vouches_for(&self, cursor: EventId, buffer: &BufferView) -> bool {
-        if cursor.epoch() != self.epoch || cursor.sequence() > self.head {
-            return false;
-        }
-        let dropped_after_cursor = if buffer.exists {
-            buffer.floor > cursor.sequence()
-        } else {
-            self.watermark > cursor.sequence()
-        };
-        !dropped_after_cursor
-    }
 }
 
 /// The in-process backend's replay log: the sequence and every channel's buffer.
@@ -342,50 +258,87 @@ impl MemoryLog {
         }
     }
 
-    /// What the log holds for each `(channel, since)` asked for.
-    ///
-    /// A view carries the channel's kept events after `since`, or none when
-    /// `since` is `None`.
+    /// How each `(channel, start)` asked for opens, at this instant.
     pub(crate) fn snapshot<'name>(
         &self,
-        requests: impl IntoIterator<Item = (&'name str, Option<u64>)>,
+        requests: impl IntoIterator<Item = (&'name str, Start)>,
     ) -> Snapshot {
-        let buffers = requests
+        let openings = requests
             .into_iter()
-            .map(|(channel, since)| {
-                let Some(buffer) = self.buffers.get(channel) else {
-                    return BufferView::default();
-                };
-                let entries = since.map_or_else(Vec::new, |since| {
-                    // Entries are in sequence order, so everything after
-                    // `since` is one contiguous run at the back.
-                    let first = buffer
-                        .entries
-                        .partition_point(|entry| entry.sequence <= since);
-                    buffer.entries.range(first..).cloned().collect()
-                });
-                BufferView {
-                    exists: true,
-                    floor: buffer.floor,
-                    entries,
-                }
-            })
+            .map(|(channel, start)| self.opening(channel, start))
             .collect();
 
         Snapshot {
             epoch: self.epoch,
             head: self.sequence,
-            watermark: self.watermark,
-            buffers,
+            openings,
         }
     }
+
+    /// How a channel that begins at `start` opens.
+    ///
+    /// The resume rules, which `snapshot.lua` applies the same way under
+    /// Redis. A resume the log can vouch for replays exactly what came after
+    /// its cursor. Anything else opens with a reset, followed, for a backfill
+    /// stream, by everything the channel keeps; a backfill stream's first
+    /// connection opens with what is kept and no reset, since it has nothing
+    /// before it to clear. Only the entries the opening sends are read.
+    fn opening(&self, channel: &str, start: Start) -> Opening {
+        let buffer = self.buffers.get(channel);
+        if let Cursor::After(cursor) = start.cursor
+            && self.vouches_for(cursor, buffer)
+        {
+            return Opening {
+                reset: false,
+                entries: kept_after(buffer, cursor.sequence()),
+            };
+        }
+        if start.backfill {
+            return Opening {
+                reset: start.cursor != Cursor::Fresh,
+                entries: kept_after(buffer, 0),
+            };
+        }
+        Opening {
+            reset: true,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Whether every event on a channel after `cursor` is still kept.
+    ///
+    /// A cursor from another epoch, or from past the head, is not one this
+    /// log minted. Past that, it is vouched for unless something after it was
+    /// let go: by the channel's capacity, which its buffer's floor records,
+    /// or, for a channel with no buffer, by the budget, which the watermark
+    /// records.
+    fn vouches_for(&self, cursor: EventId, buffer: Option<&Buffer>) -> bool {
+        if cursor.epoch() != self.epoch || cursor.sequence() > self.sequence {
+            return false;
+        }
+        let floor = buffer.map_or(self.watermark, |buffer| buffer.floor);
+        floor <= cursor.sequence()
+    }
+}
+
+/// The events a buffer keeps after `since`, oldest first; none for no buffer.
+fn kept_after(buffer: Option<&Buffer>, since: u64) -> Vec<Entry> {
+    let Some(buffer) = buffer else {
+        return Vec::new();
+    };
+    // Entries are in sequence order, so everything after `since` is one
+    // contiguous run at the back.
+    let first = buffer
+        .entries
+        .partition_point(|entry| entry.sequence <= since);
+    buffer.entries.range(first..).cloned().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{BUFFER_OVERHEAD, Cursor, ENTRY_OVERHEAD, MemoryLog, Opening, Snapshot, Start};
+    use super::{BUFFER_OVERHEAD, Cursor, ENTRY_OVERHEAD, MemoryLog, Opening, Start};
     use crate::realtime::id::EventId;
 
     const EPOCH: u64 = 0xfeed;
@@ -423,9 +376,7 @@ mod tests {
 
     /// How `channel` opens for a stream beginning at `start`.
     fn open(log: &MemoryLog, channel: &str, start: Start) -> Opening {
-        let mut snapshot: Snapshot = log.snapshot([(channel, start.since())]);
-        let buffer = snapshot.buffers.remove(0);
-        snapshot.opening(start, buffer)
+        log.snapshot([(channel, start)]).openings.remove(0)
     }
 
     /// The sequences a replay carries, or `None` for a reset.
@@ -622,8 +573,7 @@ mod tests {
             (true, vec![3, 4]),
         );
 
-        // An exact resume replays only what came after the cursor, even
-        // though a backfill stream read the whole buffer to decide.
+        // An exact resume replays only what came after the cursor.
         let recent = EventId::new(EPOCH, 3);
         assert_eq!(
             opened(open(
@@ -641,14 +591,10 @@ mod tests {
         log.append("team:a:projects", data("1"), 8, usize::MAX);
         log.append("team:b:projects", data("2"), 8, usize::MAX);
 
-        let snapshot = log.snapshot([("team:a:projects", None)]);
+        let snapshot = log.snapshot([("team:a:projects", start(Cursor::Fresh))]);
 
         assert_eq!(snapshot.epoch, EPOCH);
         assert_eq!(snapshot.head, 2);
-        assert!(snapshot.buffers[0].exists);
-        assert!(
-            snapshot.buffers[0].entries.is_empty(),
-            "nothing was asked for"
-        );
+        assert_eq!(snapshot.openings, vec![RESET]);
     }
 }

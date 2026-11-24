@@ -106,12 +106,11 @@ struct Slot {
     ready: watch::Sender<bool>,
 }
 
-/// One stream's queue, the channels it holds, and whose it is.
+/// One stream's queue, and the channels it holds.
 #[derive(Debug)]
 struct Entry {
     sender: mpsc::Sender<Delivery>,
     channels: Vec<String>,
-    account: Uuid,
 }
 
 /// The account already holds as many streams or channels as it may.
@@ -145,6 +144,10 @@ impl Registry {
         let mut guard = self.lock();
         let state = &mut *guard;
 
+        // Checked against every channel asked for, because which of them the
+        // process has room for is only known below; charged further down for
+        // the ones it holds. A request at the edge is refused rather than
+        // admitted on the strength of refusals it has not had yet.
         let holding = state.holdings.get(&account).copied().unwrap_or_default();
         if holding.streams >= MAX_STREAMS_PER_ACCOUNT
             || holding.channels + channels.len() > MAX_CHANNELS_PER_ACCOUNT
@@ -210,12 +213,12 @@ impl Registry {
         let holding = state.holdings.entry(account).or_default();
         holding.streams += 1;
         holding.channels += held.len();
+        let charged = held.len();
         state.listeners.insert(
             id,
             Entry {
                 sender,
                 channels: held,
-                account,
             },
         );
         drop(guard);
@@ -223,6 +226,8 @@ impl Registry {
         let listener = Listener {
             registry: Arc::clone(self),
             id,
+            account,
+            charged,
             receiver,
             ready,
         };
@@ -294,21 +299,37 @@ impl Registry {
         self.cut(&mut guard, id);
     }
 
-    /// Removes one stream, closing each channel it was the last to hold.
+    /// Removes a stream for good: releases what it still holds, and hands its
+    /// account back the share it was charged.
+    fn leave(&self, id: u64, account: Uuid, charged: usize) {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        self.cut(state, id);
+
+        let Some(holding) = state.holdings.get_mut(&account) else {
+            tracing::debug!(
+                user.id = %account,
+                "a realtime stream left without a share held for {{user.id}}",
+            );
+            return;
+        };
+        holding.streams -= 1;
+        holding.channels -= charged;
+        if holding.streams == 0 {
+            state.holdings.remove(&account);
+        }
+    }
+
+    /// Removes one stream's queue, closing each channel it was the last to hold.
+    ///
+    /// The account's share is not handed back here but when the stream itself
+    /// is gone; see [`Listener::release_at`].
     fn cut(&self, state: &mut State, id: u64) {
         // Dropping the entry drops the only sender, which is what ends the
         // stream's queue once it has drained.
         let Some(entry) = state.listeners.remove(&id) else {
             return;
         };
-
-        if let Some(holding) = state.holdings.get_mut(&entry.account) {
-            holding.streams -= 1;
-            holding.channels -= entry.channels.len();
-            if holding.streams == 0 {
-                state.holdings.remove(&entry.account);
-            }
-        }
 
         for channel in entry.channels {
             let Some(slot) = state.slots.get_mut(&channel) else {
@@ -367,6 +388,9 @@ impl Registry {
 pub(crate) struct Listener {
     registry: Arc<Registry>,
     id: u64,
+    /// Whose stream this is, and how many channels it is charged for.
+    account: Uuid,
+    charged: usize,
     receiver: mpsc::Receiver<Delivery>,
     ready: Vec<watch::Receiver<bool>>,
 }
@@ -396,10 +420,19 @@ impl Listener {
     /// starts, whether or not anything is still reading from it.
     ///
     /// A stream's body is polled only while its client takes bytes, so a
-    /// client that stops reading would otherwise keep its channels, its share
-    /// of the account bounds, and under Redis its subscriptions, for as long
-    /// as it liked. The task holds the registry weakly, and ending it early
-    /// (the stream closing on its own) is harmless.
+    /// client that stops reading would otherwise keep its channels, and under
+    /// Redis its subscriptions, for as long as it liked. The task holds the
+    /// registry weakly, and ending it early (the stream closing on its own) is
+    /// harmless.
+    ///
+    /// The account's share is another matter: it stays charged until this
+    /// listener is dropped, which is when the stream itself is gone. A stream
+    /// whose client stopped reading outlives its release, holding its socket
+    /// and whatever it had queued until the connection closes, so handing its
+    /// share back at the release would let one account open stream after
+    /// stream and keep every stalled one. Charged until it is gone, an
+    /// account that stalls its streams reaches its bound and stalls only
+    /// itself.
     pub(crate) fn release_at(&self, deadline: Instant, drain: Option<Drain>) -> JoinHandle<()> {
         let registry: Weak<Registry> = Arc::downgrade(&self.registry);
         let id = self.id;
@@ -423,7 +456,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.registry.release(self.id);
+        self.registry.leave(self.id, self.account, self.charged);
     }
 }
 
@@ -657,17 +690,45 @@ mod tests {
         registry.dispatch("team:a:x", &delivery(1));
         tokio::time::sleep(std::time::Duration::from_secs(61)).await;
 
-        // The channel, and the account's share, are free without a single read.
+        // The channel is free without a single read.
         assert_eq!(registry.len(), 0);
-        let full: Vec<String> = (0..MAX_CHANNELS_PER_ACCOUNT)
-            .map(|index| format!("user:{account}:t{index}"))
-            .collect();
-        let _whole_share = registry
-            .listen(account, &full)
-            .expect("the released stream's share is free again");
         // What was queued before the release still drains, then the queue ends.
         assert!(listener.recv().await.is_some());
         assert!(listener.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stream_counts_against_its_account_until_it_is_gone() {
+        let registry = Registry::new(None);
+        let account = Uuid::new_v4();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+
+        // Streams whose clients never read: released on schedule, but still
+        // open, as a stream is when its body is no longer polled.
+        let mut stalled = Vec::new();
+        for index in 0..MAX_STREAMS_PER_ACCOUNT {
+            let channel = names(&[&format!("user:{account}:t{index}")]);
+            let (listener, _refused) = registry
+                .listen(account, &channel)
+                .expect("within the bound");
+            let release = listener.release_at(deadline, None);
+            stalled.push((listener, release));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        assert_eq!(registry.len(), 0, "every channel was released on schedule");
+
+        let one_more = names(&["user:x:extra"]);
+        assert_eq!(
+            registry.listen(account, &one_more).err(),
+            Some(OverQuota),
+            "an account cannot replace stalled streams with new ones",
+        );
+
+        // Once a stalled stream is gone, its share is free again.
+        stalled.pop();
+        let _room_again = registry
+            .listen(account, &one_more)
+            .expect("a stream that is gone frees its share");
     }
 
     #[tokio::test]

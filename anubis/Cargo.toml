@@ -83,6 +83,10 @@ uuid = { workspace = true }
 webauthn-rs = { workspace = true }
 zeroize = { workspace = true }
 
+# TCP_USER_TIMEOUT, which bounds a stalled connection, is a Linux socket option.
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { workspace = true }
+
 [dev-dependencies]
 # Integration tests are their own crates, so the stream tests need their own
 # entries for what the library already depends on.

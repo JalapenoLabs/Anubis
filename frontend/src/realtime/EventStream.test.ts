@@ -366,6 +366,59 @@ describe('EventStream', () => {
     stream.close()
   })
 
+  it<Context>('should carry on when its state listener throws', async (context) => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const stream = new EventStream({
+      url: 'http://localhost/stream',
+      onFrame: (frame) => context.frames.push(frame),
+      onStateChange: (state) => {
+        if (state === 'open') {
+          throw new Error('a bug in the caller')
+        }
+      },
+      fetch: context.fetch,
+    })
+    await settle()
+
+    context.connections[0].push(event('e-1', { type: 'live' }))
+    context.connections[0].end()
+    await settle(500)
+
+    expect(context.frames).toEqual([{ type: 'live', id: 'e-1' }])
+    expect(context.connections).toHaveLength(2)
+    expect(context.connections[1].lastEventId).toBe('e-1')
+    expect(error).toHaveBeenCalledWith(
+      'An event stream state listener threw',
+      expect.objectContaining({ state: 'open' }),
+    )
+    stream.close()
+  })
+
+  it<Context>('should reconnect on its backoff when its URL callback throws', async (context) => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let attempt = 0
+    const stream = new EventStream({
+      url: () => {
+        attempt += 1
+        if (attempt === 1) {
+          throw new Error('a bug in the caller')
+        }
+        return 'http://localhost/stream'
+      },
+      onFrame: () => {},
+      fetch: context.fetch,
+    })
+    await settle()
+
+    expect(context.connections).toHaveLength(0)
+    expect(stream.state).toBe('connecting')
+    expect(error).toHaveBeenCalled()
+
+    await settle(500)
+    expect(context.connections).toHaveLength(1)
+    stream.close()
+  })
+
   it<Context>('should not reconnect once closed', async (context) => {
     const stream = open(context)
     await settle()

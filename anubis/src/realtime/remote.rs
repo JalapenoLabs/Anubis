@@ -4,39 +4,50 @@
 //! script ([`PUBLISH_SCRIPT`]) that mints the next id, keeps the event in its
 //! channel's buffer, keeps the deployment within its byte budget, and
 //! publishes it, all atomically, so the order Redis delivers events in is the
-//! order of the sequence. A stream opening reads what it missed with a second
-//! script ([`SNAPSHOT_SCRIPT`]) that sees the head, the watermark, and every
-//! buffer it asks for at one instant.
+//! order of the sequence. A stream opening decides how each channel opens,
+//! and reads what that opening sends, with a second script
+//! ([`SNAPSHOT_SCRIPT`]) that sees the head, the watermark, and every channel
+//! it asks about at one instant. Each script's work is bounded by what it
+//! sends or keeps, never by how much the log holds.
 //!
 //! Delivery is one background pump per process. It holds the subscriber
 //! connection, follows the channels this process carries, and dispatches
 //! everything it receives into the registry, so a publish reaches the
 //! publishing instance the same way it reaches every other one, through
-//! Redis, and no stream ever hears an event twice or out of order.
+//! Redis, and no stream ever hears an event twice or out of order. It names
+//! one channel per `SUBSCRIBE`, so each confirmation answers its own command,
+//! and it bounds every answer it waits on, so a connection that went dark is
+//! rebuilt within a minute.
 //!
 //! Nothing here is durable. The buffers live as long as Redis keeps its data,
 //! and the epoch beside the sequence is what tells a client when it has not:
-//! a Redis that comes back empty starts a new epoch, and every cursor from
-//! the old one resumes as a reset.
+//! whenever the Redis server is on a different run from the one the log was
+//! written under (a restart from any snapshot or file, or nothing at all, or a
+//! replica promoted in its place), the log starts a new epoch, and every cursor
+//! from the old one resumes as a reset.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use redis::aio::{ConnectionManager, PubSubSink};
-use redis::{Client, ErrorKind, RedisError, Script};
+use futures_util::future::try_join_all;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSubSink};
+use redis::{Client, ErrorKind, RedisError, RedisResult, Script};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::id::EventId;
 use super::registry::{Delivery, Registry};
-use super::replay::{BUFFER_OVERHEAD, BufferView, ENTRY_OVERHEAD, Entry, Snapshot};
+use super::replay::{BUFFER_OVERHEAD, Cursor, ENTRY_OVERHEAD, Entry, Opening, Snapshot, Start};
 
-/// The publish script; see the comment at its head.
-const PUBLISH_SCRIPT: &str = include_str!("lua/publish.lua");
+/// The publish script, after what both scripts share; see their heads.
+const PUBLISH_SCRIPT: &str = concat!(include_str!("lua/log.lua"), include_str!("lua/publish.lua"),);
 
-/// The snapshot script; see the comment at its head.
-const SNAPSHOT_SCRIPT: &str = include_str!("lua/snapshot.lua");
+/// The snapshot script, after what both scripts share; see their heads.
+const SNAPSHOT_SCRIPT: &str = concat!(
+    include_str!("lua/log.lua"),
+    include_str!("lua/snapshot.lua"),
+);
 
 /// What every Anubis pub/sub channel is prefixed with.
 ///
@@ -51,26 +62,44 @@ const PUBSUB_PREFIX: &str = "anubis:realtime:";
 /// key that lives beside the ones it was handed.
 const KEY_PREFIX: &str = "{anubis:realtime}:";
 
+/// How long a publish or a snapshot may wait on Redis before it fails.
+///
+/// Both scripts are bounded per call, so a healthy Redis answers in a few
+/// milliseconds; the slowest honest call is a stream opening that reads every
+/// kept event of a few dozen backfill channels. Ten seconds is past that by
+/// far, and matches how long a stream waits to open, so a call that runs out
+/// of it means Redis is gone rather than busy.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long the pump waits before its first reconnection attempt.
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 
-/// How often the pump checks that its subscriber connection still answers.
+/// How often the pump checks that an idle subscriber connection still answers.
 ///
 /// A connection a network black-holed never errors and never delivers, so
 /// without a check it would look idle forever while every stream on the
-/// instance heard nothing. Thirty seconds bounds that to under a minute.
+/// instance heard nothing. Thirty seconds, plus [`ANSWER_TIMEOUT`] for the
+/// `PING` itself, bounds that to under a minute.
 const KEEPALIVE: Duration = Duration::from_secs(30);
 
-/// How long a keepalive `PING` may go unanswered before the connection is
-/// taken for dead and rebuilt.
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The most channels one `SUBSCRIBE` or `UNSUBSCRIBE` names.
+/// How long Redis may take to answer the subscriber connection before the
+/// connection is taken for dead and rebuilt.
 ///
-/// Large enough that the burst of every tab reconnecting after a deploy is a
-/// handful of round trips, small enough that one command stays a few tens of
-/// kilobytes.
-const SUBSCRIBE_BATCH: usize = 512;
+/// Bounds every wait the pump has on that connection: the keepalive `PING`,
+/// and each `SUBSCRIBE` and `UNSUBSCRIBE`. Without it, an interest change sent
+/// down a connection that went dark would park the pump, and delivery to every
+/// stream on the instance, until the kernel gave up on the connection, which
+/// on Linux's defaults is a quarter of an hour. A healthy Redis answers even
+/// thousands of subscriptions in milliseconds.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most interest changes the pump applies in one go.
+///
+/// Every change waiting is sent together, so a burst of streams opening, every
+/// tab after a deploy, costs a round trip per batch rather than one per
+/// channel. The bound keeps the pump coming back to deliver events between
+/// batches.
+const INTEREST_BATCH: usize = 512;
 
 /// The longest the pump waits between reconnection attempts.
 ///
@@ -107,28 +136,33 @@ impl Remote {
     /// what it carries on; the pump follows it to decide what Redis should
     /// deliver here.
     ///
-    /// The connection is made here rather than lazily: a deployment that names
-    /// a Redis it cannot reach has a configuration problem, and finding out at
-    /// the first publish would mean losing events to discover it.
+    /// The connection is made, and one empty snapshot read, here rather than
+    /// lazily: a deployment that names a Redis it cannot reach, or one whose
+    /// user may not run what the scripts run, has a configuration problem, and
+    /// finding out at the first publish would mean losing events to discover
+    /// it. The scripts ask Redis which run it is on with `INFO`, which a user
+    /// restricted with `-@dangerous` may not run, so this is where that shows.
     ///
     /// # Errors
-    /// Returns the Redis error when the URL does not parse or the server
-    /// cannot be reached.
+    /// Returns the Redis error when the URL does not parse, the server cannot
+    /// be reached, or the scripts cannot run.
     pub(crate) async fn connect(
         url: &str,
         interest: UnboundedReceiver<Interest>,
         registry: Weak<Registry>,
     ) -> Result<Self, RedisError> {
         let client = Client::open(url)?;
-        let connection = ConnectionManager::new(client.clone()).await?;
-
-        tokio::spawn(pump(client, interest, registry));
-
-        Ok(Self {
+        let config = ConnectionManagerConfig::new().set_response_timeout(Some(COMMAND_TIMEOUT));
+        let connection = ConnectionManager::new_with_config(client.clone(), config).await?;
+        let remote = Self {
             connection,
             publish: Script::new(PUBLISH_SCRIPT),
             snapshot: Script::new(SNAPSHOT_SCRIPT),
-        })
+        };
+        remote.snapshot(&[]).await?;
+
+        tokio::spawn(pump(client, interest, registry));
+        Ok(remote)
     }
 
     /// Mints the next id for `data` on `channel`, keeps it, and fans it out.
@@ -155,14 +189,14 @@ impl Remote {
             .key(key("recent"))
             .key(key("floors"))
             .key(key("sizes"))
-            .key(buffer_key(channel))
+            .key(key("retired"))
             .arg(candidate_epoch())
             .arg(channel)
             .arg(data)
             .arg(capacity)
             .arg(budget)
             .arg(format!("{PUBSUB_PREFIX}{channel}"))
-            .arg(key("buffer:"))
+            .arg(KEY_PREFIX)
             .arg(ENTRY_OVERHEAD)
             .arg(BUFFER_OVERHEAD)
             .invoke_async(&mut connection)
@@ -171,44 +205,57 @@ impl Remote {
         Ok(EventId::new(stored_epoch(&epoch)?, sequence))
     }
 
-    /// Reads what the log holds for each `(channel, since)`, at one instant.
+    /// Decides how each `(channel, start)` opens, and reads what it sends, at
+    /// one instant.
     ///
     /// # Errors
     /// Returns the Redis error when the script cannot run, or answers with
     /// something Anubis did not write.
     pub(crate) async fn snapshot(
         &self,
-        requests: &[(&str, Option<u64>)],
+        requests: &[(&str, Start)],
     ) -> Result<Snapshot, RedisError> {
         let mut invocation = self.snapshot.key(key("log"));
         invocation
             .key(key("recent"))
             .key(key("floors"))
-            .key(key("sizes"));
-        for (channel, _since) in requests {
-            invocation.key(buffer_key(channel));
-        }
-        invocation.arg(candidate_epoch()).arg(key("buffer:"));
-        for (channel, since) in requests {
-            // -1 asks for no entries; every real sequence is positive.
-            let since = since.map_or_else(|| "-1".to_owned(), |since| since.to_string());
-            invocation.arg(*channel).arg(since);
+            .key(key("sizes"))
+            .key(key("retired"))
+            .arg(candidate_epoch())
+            .arg(KEY_PREFIX);
+        for (channel, start) in requests {
+            let (begins, epoch, sequence) = match start.cursor {
+                Cursor::Fresh => ("fresh", String::new(), 0),
+                Cursor::Unknown => ("unknown", String::new(), 0),
+                // Rendered as the log stores its own, so the script compares
+                // epochs as text, exactly.
+                Cursor::After(cursor) => (
+                    "after",
+                    EventId::render_epoch(cursor.epoch()),
+                    cursor.sequence(),
+                ),
+            };
+            invocation
+                .arg(*channel)
+                .arg(begins)
+                .arg(epoch)
+                .arg(sequence)
+                .arg(u8::from(start.backfill));
         }
 
         let mut connection = self.connection.clone();
-        let ((epoch, head, watermark), views): ((String, u64, u64), SnapshotViews) =
+        let ((epoch, head), openings): SnapshotReply =
             invocation.invoke_async(&mut connection).await?;
 
-        let buffers = views
+        let openings = openings
             .into_iter()
-            .map(|(exists, floor, entries)| {
+            .map(|(reset, entries)| {
                 let entries = entries
                     .iter()
                     .map(|entry| parse_entry(entry))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(BufferView {
-                    exists: exists == 1,
-                    floor,
+                Ok(Opening {
+                    reset: reset == 1,
                     entries,
                 })
             })
@@ -217,8 +264,7 @@ impl Remote {
         Ok(Snapshot {
             epoch: stored_epoch(&epoch)?,
             head,
-            watermark,
-            buffers,
+            openings,
         })
     }
 }
@@ -230,18 +276,9 @@ impl std::fmt::Debug for Remote {
     }
 }
 
-/// What the snapshot script answers per channel: whether its buffer exists,
-/// its floor, and the entries after the sequence asked for.
-type SnapshotViews = Vec<(u8, u64, Vec<String>)>;
-
 /// One of the framework's keys.
 fn key(name: &str) -> String {
     format!("{KEY_PREFIX}{name}")
-}
-
-/// The key holding one channel's buffer.
-fn buffer_key(channel: &str) -> String {
-    format!("{KEY_PREFIX}buffer:{channel}")
 }
 
 /// An epoch for the log to adopt if it has none yet.
@@ -258,6 +295,10 @@ fn candidate_epoch() -> String {
 fn stored_epoch(text: &str) -> Result<u64, RedisError> {
     EventId::parse_epoch(text).ok_or_else(|| foreign("the realtime epoch in Redis"))
 }
+
+/// What the snapshot script answers: the epoch and head, then each channel's
+/// opening as whether it resets, `1` or `0`, and the entries it replays.
+type SnapshotReply = ((String, u64), Vec<(u8, Vec<String>)>);
 
 /// Reads one kept entry, `"<sequence> <frame>"`.
 fn parse_entry(text: &str) -> Result<Entry, RedisError> {
@@ -327,7 +368,7 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
             .iter()
             .map(|(channel, generation)| (channel.clone(), *generation))
             .collect();
-        let mut healthy = subscribe(&mut commands, &registry, &everything).await;
+        let mut healthy = subscribe(&commands, &registry, &everything).await;
 
         let mut keepalive =
             tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
@@ -336,20 +377,18 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
         while healthy {
             tokio::select! {
                 _tick = keepalive.tick() => {
-                    healthy = still_answers(&mut commands).await;
+                    healthy = answered("PING", commands.ping::<redis::Value>()).await;
                 }
                 announced = interest.recv() => {
                     let Some(first) = announced else { return };
-                    // Every change already waiting goes in the same round
-                    // trip, so a burst of streams opening (every tab after a
-                    // deploy) costs one SUBSCRIBE rather than one per channel,
-                    // and delivery is held up for that one round trip only.
                     let mut batch = vec![first];
-                    while batch.len() < SUBSCRIBE_BATCH {
+                    while batch.len() < INTEREST_BATCH {
                         let Ok(next) = interest.try_recv() else { break };
                         batch.push(next);
                     }
-                    healthy = apply(&mut commands, &mut wanted, &registry, batch).await;
+                    let (opened, closed) = net_changes(&mut wanted, batch);
+                    healthy = unsubscribe(&commands, &closed).await
+                        && subscribe(&commands, &registry, &opened).await;
                 }
                 message = messages.next() => {
                     let Some(message) = message else {
@@ -377,21 +416,32 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
     }
 }
 
-/// Whether the subscriber connection still answers a `PING` in time.
-async fn still_answers(commands: &mut PubSubSink) -> bool {
-    match tokio::time::timeout(KEEPALIVE_TIMEOUT, commands.ping::<redis::Value>()).await {
-        Ok(Ok(_pong)) => true,
+/// Waits for Redis to answer on the subscriber connection, for at most
+/// [`ANSWER_TIMEOUT`].
+///
+/// Returns whether it answered in time and without an error. Either failure
+/// means the connection has to be rebuilt, and is logged here, naming the
+/// `command` that went unanswered.
+async fn answered<Reply>(
+    command: &'static str,
+    answer: impl Future<Output = RedisResult<Reply>>,
+) -> bool {
+    match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
+        Ok(Ok(_reply)) => true,
         Ok(Err(error)) => {
             tracing::warn!(
                 error.message = %error,
-                "realtime fanout's Redis subscriber connection failed a keepalive: \
+                redis.command = command,
+                "realtime fanout's Redis subscriber connection failed a {{redis.command}}: \
                  {{error.message}}",
             );
             false
         }
         Err(_elapsed) => {
             tracing::warn!(
-                "realtime fanout's Redis subscriber connection stopped answering; rebuilding it",
+                redis.command = command,
+                "realtime fanout's Redis subscriber connection did not answer a \
+                 {{redis.command}} in time; rebuilding it",
             );
             false
         }
@@ -400,56 +450,74 @@ async fn still_answers(commands: &mut PubSubSink) -> bool {
 
 /// Subscribes to `channels` and, once Redis confirms them, marks each live.
 ///
-/// Sent [`SUBSCRIBE_BATCH`] channels to a command. Returns `false` when the
-/// connection failed and has to be rebuilt.
+/// One `SUBSCRIBE` per channel, sent together. Redis answers a command naming
+/// several channels with one confirmation per channel, while the client pairs
+/// each reply with one command in the order they were sent, so the spare
+/// confirmations of a wide command would answer whichever command came next,
+/// before Redis had run it. One channel per command keeps every confirmation
+/// paired with its own command, and sending them together still costs a
+/// single round trip.
+///
+/// Returns `false` when the connection failed or stopped answering, and has
+/// to be rebuilt.
 async fn subscribe(
-    commands: &mut PubSubSink,
+    commands: &PubSubSink,
     registry: &Weak<Registry>,
     channels: &[(String, u64)],
 ) -> bool {
-    for batch in channels.chunks(SUBSCRIBE_BATCH) {
-        let names: Vec<String> = batch
-            .iter()
-            .map(|(channel, _generation)| format!("{PUBSUB_PREFIX}{channel}"))
-            .collect();
-        // The reply arrives once Redis has registered every subscription, so
-        // every publish it executes from here on is delivered on this
-        // connection.
-        if let Err(error) = commands.subscribe(names).await {
-            tracing::warn!(
-                error.message = %error,
-                realtime.channels = batch.len(),
-                "realtime fanout could not subscribe to {{realtime.channels}} channels: \
-                 {{error.message}}",
-            );
-            return false;
-        }
+    let sent: Vec<_> = channels
+        .iter()
+        .map(|(channel, _generation)| {
+            let mut sink = commands.clone();
+            let name = format!("{PUBSUB_PREFIX}{channel}");
+            async move { sink.subscribe(name).await }
+        })
+        .collect();
+    if !answered("SUBSCRIBE", try_join_all(sent)).await {
+        return false;
+    }
 
-        let Some(registry) = registry.upgrade() else {
-            return true;
-        };
-        for (channel, generation) in batch {
+    // Every channel's own confirmation is in, so every publish Redis executes
+    // from here on is delivered on this connection.
+    if let Some(registry) = registry.upgrade() {
+        for (channel, generation) in channels {
             registry.mark_ready(channel, *generation);
         }
     }
     true
 }
 
-/// Applies a batch of interest changes to the live connection and the wanted set.
+/// Unsubscribes from `channels`, one `UNSUBSCRIBE` each, sent together.
+///
+/// One channel per command for the reason [`subscribe`] gives. Returns `false`
+/// when the connection failed or stopped answering.
+async fn unsubscribe(commands: &PubSubSink, channels: &[String]) -> bool {
+    let sent: Vec<_> = channels
+        .iter()
+        .map(|channel| {
+            let mut sink = commands.clone();
+            let name = format!("{PUBSUB_PREFIX}{channel}");
+            async move { sink.unsubscribe(name).await }
+        })
+        .collect();
+    answered("UNSUBSCRIBE", try_join_all(sent)).await
+}
+
+/// Folds a batch of interest changes into the wanted set, and into what Redis
+/// has to be told.
 ///
 /// Changes apply in order, so the last one for a channel decides it: a
 /// channel closed and opened again in one batch stays subscribed under its
-/// new generation, and one opened and closed again is let go. Returns `false`
-/// when the connection failed and has to be rebuilt. The wanted set is
-/// updated either way, so the reconnection declares the truth.
-async fn apply(
-    commands: &mut PubSubSink,
+/// new generation, and one opened and closed again is let go. Returns the
+/// channels to subscribe to, each with its generation, and the channels to
+/// let go of. The wanted set is updated here, before anything is sent, so a
+/// connection that fails while applying them reconnects declaring the truth.
+fn net_changes(
     wanted: &mut HashMap<String, u64>,
-    registry: &Weak<Registry>,
     batch: Vec<Interest>,
-) -> bool {
-    // Each channel's net change: `Some(generation)` to subscribe, `None` to let go.
-    let mut changes: HashMap<String, Option<u64>> = HashMap::new();
+) -> (Vec<(String, u64)>, Vec<String>) {
+    // Each channel's last word: `Some(generation)` to subscribe, `None` to let go.
+    let mut last: HashMap<String, Option<u64>> = HashMap::new();
     for interest in batch {
         match interest {
             Interest::Opened {
@@ -457,34 +525,24 @@ async fn apply(
                 generation,
             } => {
                 wanted.insert(channel.clone(), generation);
-                changes.insert(channel, Some(generation));
+                last.insert(channel, Some(generation));
             }
             Interest::Closed { channel, .. } => {
                 wanted.remove(&channel);
-                changes.insert(channel, None);
+                last.insert(channel, None);
             }
         }
     }
 
     let mut opened = Vec::new();
     let mut closed = Vec::new();
-    for (channel, change) in changes {
+    for (channel, change) in last {
         match change {
             Some(generation) => opened.push((channel, generation)),
-            None => closed.push(format!("{PUBSUB_PREFIX}{channel}")),
+            None => closed.push(channel),
         }
     }
-
-    for batch in closed.chunks(SUBSCRIBE_BATCH) {
-        if let Err(error) = commands.unsubscribe(batch).await {
-            tracing::warn!(
-                error.message = %error,
-                "realtime fanout could not update its Redis subscriptions: {{error.message}}",
-            );
-            return false;
-        }
-    }
-    subscribe(commands, registry, &opened).await
+    (opened, closed)
 }
 
 /// Hands one message from Redis to the local streams carrying its channel.
@@ -548,39 +606,4 @@ async fn wait_before_retry(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{parse_entry, parse_message};
-    use crate::realtime::id::EventId;
-
-    #[test]
-    fn a_published_message_reads_back_as_its_id_and_frame() {
-        let delivery = parse_message(r#"00000000000000ab 42 {"type":"event","payload":"a b"}"#)
-            .expect("a message Anubis published");
-
-        assert_eq!(delivery.id, EventId::new(0xab, 42));
-        assert_eq!(&*delivery.data, r#"{"type":"event","payload":"a b"}"#);
-    }
-
-    #[test]
-    fn a_message_anubis_did_not_publish_is_discarded() {
-        for text in [
-            "",
-            "no spaces",
-            "00000000000000ab 42",
-            "nothex 42 {}",
-            "00000000000000ab x {}",
-        ] {
-            assert!(parse_message(text).is_none(), "{text:?} must be discarded");
-        }
-    }
-
-    #[test]
-    fn a_kept_entry_reads_back_as_its_sequence_and_frame() {
-        let entry = parse_entry(r#"7 {"type":"event"}"#).expect("an entry Anubis kept");
-        assert_eq!(entry.sequence, 7);
-        assert_eq!(&*entry.data, r#"{"type":"event"}"#);
-
-        let _refused = parse_entry("seven {}").expect_err("a sequence is a number");
-        let _refused = parse_entry("7").expect_err("an entry carries a frame");
-    }
-}
+mod tests;

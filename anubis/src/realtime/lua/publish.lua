@@ -4,24 +4,30 @@
 -- the sequence order, and what keeps the floors and the watermark true.
 --
 -- The arithmetic is `anubis::realtime::replay::MemoryLog::append`'s, kept in
--- step with it; `docs/realtime.md` states the rules both follow.
+-- step with it; `docs/realtime.md` states the rules both follow. Sent after
+-- log.lua.
 --
 -- KEYS: 1 the log hash (epoch, run_id, sequence, bytes, watermark), 2 the
 --       recency sorted set (channel by newest sequence), 3 the floors hash,
---       4 the sizes hash, 5 this channel's buffer list.
+--       4 the sizes hash, 5 the list of retired epochs, oldest first.
 -- ARGV: 1 a candidate epoch, used only when the log starts a new one, 2 the
 --       channel, 3 the rendered frame, 4 the channel's capacity, 5 the byte
---       budget, 6 the pub/sub channel, 7 the prefix of every buffer key, 8 what
+--       budget, 6 the pub/sub channel, 7 the prefix every key shares, 8 what
 --       one entry costs beyond its text, 9 what one buffer costs before it
 --       holds anything.
 --
 -- Returns { epoch, sequence }.
 
-local log, recent, floors, sizes, buffer = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local log, recent, floors, sizes, retired = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
 local channel, data = ARGV[2], ARGV[3]
 local capacity, budget = tonumber(ARGV[4]), tonumber(ARGV[5])
-local topic, buffer_prefix = ARGV[6], ARGV[7]
+local topic, prefix = ARGV[6], ARGV[7]
 local entry_overhead, buffer_overhead = tonumber(ARGV[8]), tonumber(ARGV[9])
+
+-- How many of a retired epoch's buffers one publish lets go of. Few enough
+-- that it adds well under a millisecond to the publish; enough that a budget
+-- full of single-event channels is let go of within a thousand publishes.
+local SWEEP = 256
 
 -- Numbers cross into Redis as text, and Lua renders a large one in exponent
 -- form unless it is formatted as an integer.
@@ -29,36 +35,34 @@ local function integer(value)
   return string.format('%d', value)
 end
 
--- An entry is "<sequence> <frame>"; a frame is JSON on one line.
-local function sequence_of(entry)
-  return tonumber(string.match(entry, '^%d+'))
-end
-
 local function cost_of(entry)
   return #entry - string.find(entry, ' ', 1, true) + entry_overhead
 end
 
--- The log belongs to one run of one Redis server. A server that restarted,
--- from an older snapshot or append-only file than the last publish, or a
--- replica promoted in its place, may hold a sequence behind ids clients
--- already have, and would mint those ids again for other events. Its run_id
--- is new in every one of those cases, so a new run_id starts a new epoch and
--- lets go of everything kept: no cursor from before can be vouched for, and
--- every client resuming on one opens with a reset. snapshot.lua does the same.
-local run_id = string.match(redis.call('INFO', 'server'), 'run_id:(%x+)')
-if not run_id then
-  return redis.error_reply('anubis realtime: INFO server reported no run_id')
-end
-if redis.call('HGET', log, 'run_id') ~= run_id then
-  for _, kept in ipairs(redis.call('ZRANGE', recent, 0, -1)) do
-    redis.call('DEL', buffer_prefix .. kept)
+-- Lets go of up to SWEEP buffers of the oldest retired epoch, and of the
+-- epoch itself once nothing of it is left. Until then its buffers are memory
+-- outside the budget, which is why every publish takes a share of the work.
+local function sweep()
+  local oldest = redis.call('LINDEX', retired, 0)
+  if not oldest then
+    return
   end
-  redis.call('DEL', log, recent, floors, sizes)
-  redis.call('HSET', log, 'epoch', ARGV[1], 'run_id', run_id,
-    'sequence', '0', 'bytes', '0', 'watermark', '0')
+  local popped = redis.call('ZPOPMIN', prefix .. 'retired:' .. oldest, SWEEP)
+  for index = 1, #popped, 2 do
+    redis.call('UNLINK', buffer_key(prefix, oldest, popped[index]))
+  end
+  if #popped < SWEEP * 2 then
+    redis.call('LPOP', retired)
+  end
 end
 
-local epoch = redis.call('HGET', log, 'epoch')
+local epoch = current_epoch(log, recent, floors, sizes, retired, prefix, ARGV[1])
+if not epoch then
+  return redis.error_reply('anubis realtime: INFO server reported no run_id')
+end
+sweep()
+
+local buffer = buffer_key(prefix, epoch, channel)
 local sequence = redis.call('HINCRBY', log, 'sequence', 1)
 local watermark = tonumber(redis.call('HGET', log, 'watermark'))
 
@@ -95,7 +99,7 @@ while tonumber(redis.call('HGET', log, 'bytes')) > budget do
   end
   local victim, newest = oldest[1], tonumber(oldest[2])
   local size = tonumber(redis.call('HGET', sizes, victim) or '0')
-  redis.call('DEL', buffer_prefix .. victim)
+  redis.call('UNLINK', buffer_key(prefix, epoch, victim))
   redis.call('HDEL', sizes, victim)
   redis.call('HDEL', floors, victim)
   redis.call('HINCRBY', log, 'bytes', integer(-size))

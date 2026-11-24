@@ -76,7 +76,10 @@
 //! the per-account share is what keeps one account from filling the process's
 //! table for everyone else. A stream's channels are released when its lifetime
 //! ends or the server drains whether or not its client is still reading, so a
-//! client that stops reading cannot keep them.
+//! client that stops reading cannot keep them. The stream itself counts
+//! against its account until its connection closes, which the server forces
+//! once the connection's writes stall for a minute, so an account whose
+//! streams stall holds its own share and nothing more.
 
 mod channel;
 mod endpoint;
@@ -129,9 +132,12 @@ pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 
 /// How long a stream refused for its account's bounds is asked to wait.
 ///
-/// The account's other streams free their share as their tabs close or their
-/// lifetimes end, which is minutes at most; ten seconds keeps a person who
-/// closed a tab from waiting long without inviting a retry storm.
+/// Deliberately far shorter than the worst case. The account's other streams
+/// free their share as their tabs close, which is usually what a person just
+/// did, or as their lifetimes end, which can take six minutes, or seven for a
+/// stream whose client stopped reading. Asking for that much would leave the
+/// common case waiting minutes; ten seconds answers it promptly, and a retry
+/// every ten seconds costs the server one cheap refusal.
 const OVER_QUOTA_RETRY: Duration = Duration::from_secs(10);
 
 /// How long opening a stream may wait on Redis before answering `503`.
@@ -372,11 +378,8 @@ impl Channels {
                     .listen(account, &names)
                     .map_err(over_quota)?;
                 let granted = without(requests, &full);
-                let snapshot = log.snapshot(
-                    granted
-                        .iter()
-                        .map(|(name, start)| (name.as_str(), start.since())),
-                );
+                let snapshot =
+                    log.snapshot(granted.iter().map(|(name, start)| (name.as_str(), *start)));
                 drop(log);
                 Ok(Registered {
                     listener,
@@ -402,9 +405,9 @@ impl Channels {
                     return Err(Error::new(ErrorKind::Transport(None)));
                 }
 
-                let reads: Vec<(&str, Option<u64>)> = granted
+                let reads: Vec<(&str, Start)> = granted
                     .iter()
-                    .map(|(name, start)| (name.as_str(), start.since()))
+                    .map(|(name, start)| (name.as_str(), *start))
                     .collect();
                 let snapshot = tokio::time::timeout_at(deadline, remote.snapshot(&reads))
                     .await
@@ -453,10 +456,9 @@ impl Registered {
             opening.push_back(refusal.event());
         }
 
-        let buffers = std::mem::take(&mut snapshot.buffers);
+        let openings = std::mem::take(&mut snapshot.openings);
         let mut replay = Vec::new();
-        for ((channel, start), buffer) in granted.iter().zip(buffers) {
-            let Opening { reset, entries } = snapshot.opening(*start, buffer);
+        for ((channel, _start), Opening { reset, entries }) in granted.iter().zip(openings) {
             if reset {
                 opening.push_back(Event::default().data(Frame::Reset { channel }.render()));
             }
@@ -736,7 +738,9 @@ impl Error {
     ///
     /// A share of the process's table per account, so no single account can
     /// fill it for everyone else. The client backs off and tries again; a
-    /// stream ending, after at most six minutes, frees its share.
+    /// stream frees its share when its connection closes, which its lifetime
+    /// brings about within six minutes, or seven for a stream whose client
+    /// stopped reading.
     #[must_use]
     pub fn is_over_quota(&self) -> bool {
         matches!(self.kind, ErrorKind::OverQuota)
