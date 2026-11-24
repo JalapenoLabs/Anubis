@@ -13,9 +13,10 @@ Everything Bullet Train does at runtime through Rails reflection, Anubis does at
 | Web framework | Axum | Maintained by the tokio team; sits on hyper + tower |
 | Middleware | tower / tower-http | Sessions, auth guards, per-client rate limits, request ids, tracing, security headers, opt-in CORS. See [server.md](server.md) |
 | ORM | Diesel + diesel-async | Fully compile-time typed queries against a generated `schema.rs`; no SQL strings, no runtime query surprises |
-| Database | PostgreSQL (required, pinned version) | System of record for everything, including sessions and jobs |
-| Realtime channels | One websocket at `/realtime`, session-authenticated | Team- and user-scoped channels, published from handlers and jobs, subscribed by the SPA. See [realtime.md](realtime.md) |
-| Cache + realtime fanout | Redis (optional) | Set `REDIS_URL` and a publish reaches every instance's subscribers; unset, channels are served in process. Never the system of record |
+| Database | PostgreSQL (required, pinned version) | System of record for everything, including jobs, and sessions by default |
+| Sessions | Postgres by default, Redis with `SESSION_STORE=redis` | An opaque token in a cookie, only its hash at rest, behaving identically in either store. See [sessions.md](sessions.md) |
+| Realtime channels | Server-Sent Events at `/realtime`, session-authenticated | Team- and user-scoped channels carrying payloads and ids, published from handlers and jobs, resumed with `Last-Event-ID` from a bounded replay log; applications serve streams of their own with `Channels::stream`. See [realtime.md](realtime.md) |
+| Realtime + sessions | Redis (optional) | Set `REDIS_URL` and the event sequence, the replay buffers, and the fanout move into Redis, so a publish reaches every instance's streams and a client resumes on any instance; unset, all three live in process. `SESSION_STORE=redis` keeps sessions there too, which is when it must persist. Never the system of record |
 | Background jobs | Postgres-backed queue | Enqueue commits in the same transaction as the domain write that caused it. At-least-once, retried on a widening backoff, then dead-lettered. See [jobs.md](jobs.md) |
 | Notifications | Postgres rows, plus a realtime ping | One row per person told about one thing, written on the caller's connection so it commits with the change it announces. The bell refetches on the ping. See [notifications.md](notifications.md) |
 | Audit log | Append-only Postgres rows | One row per recorded act, written on the caller's connection so it commits with the write that caused it. Framework surfaces record themselves, and scaffolded models ride the seams webhooks emit from. See [audit.md](audit.md) |
@@ -85,7 +86,7 @@ Scaffolding a model or field changes the document, so the export and the generat
 
 ## Deployment
 
-A production deployment is one Rust binary serving the API and the built SPA, PostgreSQL, and optionally Redis, with small Docker images and versions pinned everywhere.
+A production deployment is one Rust binary serving the API and the built SPA, PostgreSQL, and optionally Redis (for realtime fanout across instances, and for sessions when `SESSION_STORE=redis`), with small Docker images and versions pinned everywhere.
 
 The binary boots through `anubis::server::serve`, which is where production behavior lives: liveness at `/healthz` and readiness at `/readyz`, a request id on every response, one log event per request, a per-request timeout, security headers, opt-in CORS, and a bounded drain on `SIGTERM`. An application's `main` composes routers and calls it once. See [server.md](server.md).
 

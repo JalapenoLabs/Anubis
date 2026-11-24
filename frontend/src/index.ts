@@ -12,6 +12,7 @@ export type {
   BillingPlanLimit,
   BillingPlanPrice,
   BillingSubscription,
+  BillingSubscriptionItem,
   ChangePasswordRequest,
   ClaimedInvitation,
   ConnectedClient,
@@ -69,18 +70,18 @@ export type {
   UploadLabels,
 } from './fields/types'
 export type { UploadProps } from './fields/internal/UploadField'
+export type { ConnectionState, EventStreamOptions } from './realtime/EventStream'
 export type { RealtimeListener } from './realtime/listeners'
 export type {
-  ClientFrame,
   RealtimeErrorCode,
   RealtimeEvent,
-  ServerFrame,
+  RealtimeLive,
+  RealtimeMessage,
+  RealtimeRefusal,
+  RealtimeReset,
+  StreamFrame,
 } from './realtime/protocol'
-export type {
-  ConnectionState,
-  RealtimeClientOptions,
-  WebSocketLike,
-} from './realtime/RealtimeClient'
+export type { RealtimeClientOptions } from './realtime/RealtimeClient'
 
 // Fields
 export { BooleanField } from './fields/BooleanField'
@@ -117,9 +118,11 @@ export {
 } from './webauthn/ceremony'
 
 // Realtime
+export { EventStream } from './realtime/EventStream'
 export { REALTIME_PATH, RealtimeClient } from './realtime/RealtimeClient'
 export { RealtimeProvider, useOptionalRealtime, useRealtime } from './react/RealtimeProvider'
 export { useChannel } from './react/useChannel'
+export { useEventStream } from './react/useEventStream'
 
 // Notifications
 export { NotificationBell } from './react/NotificationBell'

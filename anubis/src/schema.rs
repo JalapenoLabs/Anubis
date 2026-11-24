@@ -20,6 +20,7 @@ diesel::table! {
         locale -> Text,
         platform_roles -> Array<Text>,
         password_change_required -> Bool,
+        session_generation -> Int8,
     }
 }
 
@@ -65,6 +66,7 @@ diesel::table! {
         token_hash -> Text,
         created_at -> Timestamptz,
         expires_at -> Timestamptz,
+        generation -> Int8,
     }
 }
 
@@ -354,12 +356,15 @@ diesel::table! {
 diesel::table! {
     /// An organization's subscription, mirroring Stripe's. See `docs/billing.md`.
     ///
-    /// The free plan is the absence of a row, and `plan_key` names a plan in
-    /// `config/billing.yml` rather than a row in another table.
+    /// The free plan is the absence of a plan subscription, which is the one
+    /// whose `subject_type` is null; `plan_key` names a plan in
+    /// `config/billing.yml` rather than a row in another table. A subscription
+    /// with a subject pays for one of the application's records and buys no
+    /// plan.
     subscriptions (id) {
         id -> Uuid,
         organization_id -> Uuid,
-        plan_key -> Text,
+        plan_key -> Nullable<Text>,
         stripe_subscription_id -> Text,
         status -> Text,
         billing_interval -> Text,
@@ -369,6 +374,24 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         stripe_event_at -> Nullable<Timestamptz>,
+        subject_type -> Nullable<Text>,
+        subject_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    /// A subscription's line items, one per Stripe price. See `docs/billing.md`.
+    ///
+    /// Written only beside their subscription, in the same guarded write, so
+    /// they are exactly as current as the row they belong to.
+    subscription_items (id) {
+        id -> Uuid,
+        subscription_id -> Uuid,
+        stripe_item_id -> Text,
+        stripe_price_id -> Text,
+        quantity -> Nullable<Int4>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -495,6 +518,8 @@ diesel::allow_tables_to_appear_in_same_query!(
 );
 diesel::joinable!(subscriptions -> organizations (organization_id));
 diesel::allow_tables_to_appear_in_same_query!(subscriptions, organizations);
+diesel::joinable!(subscription_items -> subscriptions (subscription_id));
+diesel::allow_tables_to_appear_in_same_query!(subscription_items, subscriptions);
 diesel::joinable!(webhook_endpoints -> teams (team_id));
 diesel::joinable!(webhook_deliveries -> webhook_endpoints (webhook_endpoint_id));
 diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);

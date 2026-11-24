@@ -95,6 +95,7 @@ describe('BillingPage', () => {
     stubBilling({
       plan: FREE_PLAN,
       subscription: null,
+      subscriptions: [],
       billing_enabled: false,
       seats_used: 1,
     })
@@ -112,6 +113,7 @@ describe('BillingPage', () => {
     stubBilling({
       plan: FREE_PLAN,
       subscription: null,
+      subscriptions: [],
       billing_enabled: true,
       seats_used: 2,
     })
@@ -142,21 +144,36 @@ describe('BillingPage', () => {
   })
 
   it('should mark a live subscription that is set to end, and offer the portal', async () => {
+    const planSubscription = {
+      id: '3f1a2b3c-0000-4000-8000-0000000000bb',
+      organization_id: ORGANIZATION_ID,
+      plan_key: 'pro',
+      subject_type: null,
+      subject_id: null,
+      stripe_subscription_id: 'sub_test',
+      status: 'active',
+      billing_interval: 'monthly',
+      quantity: 2,
+      current_period_end: '2026-09-13T00:00:00Z',
+      cancel_at_period_end: true,
+      items: [
+        {
+          id: '3f1a2b3c-0000-4000-8000-0000000000cc',
+          subscription_id: '3f1a2b3c-0000-4000-8000-0000000000bb',
+          stripe_item_id: 'si_test',
+          stripe_price_id: 'price_replace_me_pro_monthly',
+          quantity: 2,
+          created_at: '2026-08-13T00:00:00Z',
+          updated_at: '2026-08-13T00:00:00Z',
+        },
+      ],
+      created_at: '2026-08-13T00:00:00Z',
+      updated_at: '2026-08-13T00:00:00Z',
+    }
     stubBilling({
       plan: PRO_PLAN,
-      subscription: {
-        id: '3f1a2b3c-0000-4000-8000-0000000000bb',
-        organization_id: ORGANIZATION_ID,
-        plan_key: 'pro',
-        stripe_subscription_id: 'sub_test',
-        status: 'active',
-        billing_interval: 'monthly',
-        quantity: 2,
-        current_period_end: '2026-09-13T00:00:00Z',
-        cancel_at_period_end: true,
-        created_at: '2026-08-13T00:00:00Z',
-        updated_at: '2026-08-13T00:00:00Z',
-      },
+      subscription: planSubscription,
+      subscriptions: [ planSubscription ],
       billing_enabled: true,
       seats_used: 2,
     })

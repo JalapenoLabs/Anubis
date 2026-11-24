@@ -68,6 +68,8 @@ The framework implements the convention once: handlers take `anubis::http::ListP
 
 Every response, on every route, carries an `x-request-id` and the framework's security headers, and every request runs under a timeout. Cross-origin access is off until `CORS_ALLOWED_ORIGINS` names exact origins; the `/api/v1` bearer-token surface is what that exists for, since session cookies stay same-origin. [The server](server.md) covers the whole serve path, the headers, and the liveness and readiness probes.
 
+A route may also answer with a Server-Sent Events stream of its own, such as a record's log tail under `/api/v1`, through `anubis::realtime::Channels::stream` and the `Subscriber` extractor. Such a stream is session-authenticated, because a browser is what reads it, and it resumes, heartbeats, and drains exactly as `/realtime` does; [realtime.md](realtime.md#serving-a-stream-of-your-own) has the handler.
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.
@@ -80,7 +82,7 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 
 ## Authentication
 
-- **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor.
+- **Browser**: cookie sessions, kept in Postgres by default or in Redis with `SESSION_STORE=redis`, behaving identically in either. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the store keeps only the token's SHA-256, so a leaked database or Redis snapshot yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor. See [sessions.md](sessions.md).
 - **Sign-in methods**: password; passwordless emailed 6-digit codes (10-minute life, attempt-limited, enumeration-safe); and passkeys (WebAuthn discoverable credentials, password-manager-first, cross-platform authenticators welcome).
 - **Second factor**: TOTP (authenticator apps) with QR enrollment and single-use recovery codes. When confirmed, password and email-code login answer a 5-minute challenge instead of a session; a passkey is multi-factor by construction and bypasses the challenge.
 - **OAuth**: OpenID Connect providers, one line of setup each. See [OAuth sign-in](#oauth-sign-in) below.

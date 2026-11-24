@@ -14,7 +14,11 @@ The framework's tests are unit tests beside the code they cover, and integration
 
 A narrative is one linear story with a caller, a sequence, and assertions on what each step answered. It reads top to bottom and needs no shared fixtures beyond `tests/support/`.
 
-Every suite that needs a database gates on `DATABASE_URL` and logs a skip when it is unset, so `cargo test` works on a machine without one. CI always provides it. See [ci.md](ci.md).
+Every suite that needs a database gates on `DATABASE_URL` and logs a skip when it is unset, so `cargo test` works on a machine without one. A test that needs Redis, the realtime fanout and the Redis half of the session store narrative, gates on `REDIS_URL` the same way. CI always provides both. See [ci.md](ci.md).
+
+### One narrative, two stores
+
+When a feature runs on more than one backend, its narrative is written once and run once per backend: `session_store_flow.rs` walks every session act against Postgres and again against Redis, through `anubis::server::harden` and the real `SESSION_STORE` setting. Asserting what the browser sees is not enough on its own, because Postgres is the default and a Redis store that was never wired in would pass as Postgres; so each step also reads the store directly and asserts where the session lives. Where the design says a store's housekeeping is not what keeps a property, the narrative defeats that housekeeping on purpose, evicting an index or restoring a session as an old snapshot would, so the test fails if the property ever comes to rest on it. Against a Redis other suites share, a narrative isolates itself with fresh accounts and never flushes or reconfigures it. See [sessions.md](sessions.md#testing).
 
 The starter's narratives are templates as well as tests: one is stamped for every scaffolded model, and CI runs the stamped copies on every push through the [scaffold proof](ci.md#the-scaffold-proof).
 
@@ -50,6 +54,8 @@ Three specs are the proving set, and they are chosen the way the Rust narratives
 - `creative-concepts.spec.ts` is the golden path: register, create a creative concept, open it, add a tangible thing, see it listed. It is the scaffolder's own output, driven the way a person drives it.
 - `auth.spec.ts` is the auth round trip: sign out, ask for a guarded URL, land on `/sign-in?next=…`, sign in, arrive at the page originally asked for. The guards and `sanitizeDestination` have unit coverage; only a browser proves the session cookie and the redirect chain agree.
 - `settings.spec.ts` is a write that survives a reload, which is the cheapest way to tell a form that saved from one that only updated its own state.
+
+Every spec also proves the realtime stream opens, because `signUp` waits for the notification bell's `GET /realtime` to answer `200` as `text/event-stream`. A stream that never opens costs nothing visible, since every view still loads over REST, so only an assertion catches it, and only a browser exercises the session cookie, the client's request, and the dev server's proxy together.
 
 ### Running them
 

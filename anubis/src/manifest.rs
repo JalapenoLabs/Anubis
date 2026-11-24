@@ -60,8 +60,7 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/users/{user_id}/avatar",
         area: "auth",
     },
-    // The realtime channel socket. A plain GET is answered `426 Upgrade
-    // Required` by axum once the session is accepted.
+    // The realtime event stream, carrying the channels its query names.
     RouteEntry {
         method: "GET",
         path: "/realtime",

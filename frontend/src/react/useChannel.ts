@@ -16,16 +16,21 @@ import { useRealtime } from './RealtimeProvider'
  * may be a new function on every render without resubscribing, so it can close
  * over fresh props.
  *
+ * The handler hears each event, and a `reset` whenever what the view holds may
+ * be stale: once when the channel goes live, and again if a reconnect spanned
+ * more than the server keeps. Events missed during a short drop are replayed
+ * in order, so a view may write payloads straight into its cache as long as it
+ * revalidates on a reset:
+ *
  * ```tsx
- * useChannel(`team:${teamId}:projects`, (event) => {
- *   if (event.event === 'created') {
- *     void mutate('projects')
+ * useChannel(`team:${teamId}:projects`, (message) => {
+ *   if (message.type === 'reset') {
+ *     void mutate()
+ *     return
  *   }
+ *   void mutate((page) => applyProjectEvent(page, message), { revalidate: false })
  * })
  * ```
- *
- * Events published while the socket was down are not replayed, so a view that
- * must be exact should refetch rather than apply events to local state alone.
  */
 export function useChannel(channel: string | null, onEvent: RealtimeListener): void {
   const client = useRealtime()

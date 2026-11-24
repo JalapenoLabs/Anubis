@@ -169,7 +169,9 @@ fn subscription(id: &str, customer: &str, status: &str, price: &str) -> Value {
         "cancel_at_period_end": false,
         "current_period_end": (Utc::now() + chrono::Duration::days(30)).timestamp(),
         "items": { "object": "list", "data": [{
-            "id": "si_test",
+            // Stripe's item ids are unique across the account, as the
+            // projection's own index on them insists.
+            "id": format!("si_{id}"),
             "quantity": 1,
             "price": { "id": price, "recurring": { "interval": "month" } },
         }] },
@@ -345,7 +347,7 @@ async fn rows_for(connection: &mut AsyncPgConnection, organization_id: Uuid) -> 
             subscriptions::status,
             subscriptions::billing_interval,
         ))
-        .load::<(String, String, String, String)>(connection)
+        .load::<(String, Option<String>, String, String)>(connection)
         .await
         .expect("the subscriptions must be readable")
         .into_iter()
@@ -355,7 +357,7 @@ async fn rows_for(connection: &mut AsyncPgConnection, organization_id: Uuid) -> 
         .collect()
 }
 
-/// The organization's one live subscription, as the endpoints resolve it.
+/// The organization's live plan subscription, as the endpoints resolve it.
 async fn live_subscription(
     connection: &mut AsyncPgConnection,
     organization_id: Uuid,
@@ -444,7 +446,7 @@ async fn stripes_events_write_the_subscription_and_keep_it_current() {
         .await
         .expect("the completed checkout must write a subscription");
     assert_eq!(live.stripe_subscription_id, "sub_lifecycle");
-    assert_eq!(live.plan_key, "pro");
+    assert_eq!(live.plan_key.as_deref(), Some("pro"));
     assert_eq!(live.status, "active");
     assert_eq!(live.billing_interval, "monthly");
 
@@ -495,7 +497,8 @@ async fn stripes_events_write_the_subscription_and_keep_it_current() {
         .await
         .expect("a past_due subscription is still live");
     assert_eq!(
-        live.plan_key, "scale",
+        live.plan_key.as_deref(),
+        Some("scale"),
         "the price Stripe reports names the plan, not the event's metadata",
     );
     assert_eq!(
@@ -603,7 +606,7 @@ async fn stripes_events_write_the_subscription_and_keep_it_current() {
         .expect("the new subscription is live");
     assert_eq!(live.stripe_subscription_id, "sub_second");
     assert_eq!(live.billing_interval, "yearly");
-    assert_eq!(live.plan_key, "pro");
+    assert_eq!(live.plan_key.as_deref(), Some("pro"));
 }
 
 #[tokio::test]
@@ -926,7 +929,7 @@ async fn reconciling_corrects_a_row_that_drifted_from_stripe() {
             .reconcile(organization_id)
             .await
             .expect("reconciliation must run")
-            .is_none(),
+            .is_empty(),
     );
     let rows = rows_for(&mut connection, organization_id).await;
     assert_eq!(rows.len(), 1, "converging twice writes one row: {rows:?}");

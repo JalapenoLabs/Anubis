@@ -39,7 +39,7 @@ use uuid::Uuid;
 use support::oauth::{MetadataDocument, device_codes, mcp, poll, request_for_code};
 use support::{
     Harness, PASSWORD, TestDatabase, invitation_token, register, send, session_token, sign_in,
-    socket,
+    stream,
 };
 
 /// How many racers a test fires at once.
@@ -603,87 +603,88 @@ fn demote_member(
 // Realtime channels
 // ---------------------------------------------------------------------------
 
-/// Two sockets churning their subscriptions while events publish underneath
-/// them. Neither may deadlock, and neither may ever see a frame for a channel
-/// it is not entitled to: the socket that unsubscribed stops receiving, and
-/// the socket that never subscribed never started.
+/// Streams opening and closing while events publish underneath them. Nothing
+/// may deadlock, a stream that stays open hears every event on its channel in
+/// order, and no stream ever hears a channel it was not given: the churning
+/// streams carry only their own, and the steady one only its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sockets_churn_without_deadlocking_or_leaking_across_channels() {
+async fn streams_churn_without_deadlocking_or_leaking_across_channels() {
     let Some(database) = TestDatabase::create("concurrency_flow").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
-    let address = harness.serve();
 
     let listener = register(&harness.router, "listener@example.com").await;
     let bystander = register(&harness.router, "bystander@example.com").await;
     let listener_id = signed_in_user(&harness, &listener).await;
     let bystander_id = signed_in_user(&harness, &bystander).await;
 
-    let mut attentive = socket::connect(address, &listener).await;
-    let mut standing_by = socket::connect(address, &bystander).await;
+    let mine = ChannelName::user(listener_id, "inbox").to_string();
+    let theirs = ChannelName::user(bystander_id, "inbox").to_string();
 
-    let mine = ChannelName::user(listener_id, "inbox");
-    let theirs = ChannelName::user(bystander_id, "inbox");
-
-    let reply = socket::subscribe(&mut attentive, &mine.to_string()).await;
-    assert_eq!(reply["type"], json!("subscribed"), "reply: {reply}");
-
-    // The bystander subscribes and immediately drops it again, while events
-    // publish the whole time.
-    let reply = socket::subscribe(&mut standing_by, &theirs.to_string()).await;
-    assert_eq!(reply["type"], json!("subscribed"), "reply: {reply}");
-    socket::send(
-        &mut standing_by,
-        &json!({ "type": "unsubscribe", "channel": theirs.to_string() }),
+    let mut attentive = stream::connect(
+        &harness.router,
+        &stream::path(&[&mine], &[]),
+        &listener,
+        None,
     )
     .await;
-    let reply = socket::next_frame(&mut standing_by).await;
-    assert_eq!(reply["type"], json!("unsubscribed"), "reply: {reply}");
+    let _live = attentive.opening().await;
 
-    for round in 0..RACERS {
+    // The bystander's streams open, read a little, and close again, over and
+    // over, on other tasks, while events publish to both channels.
+    let mut churners = Vec::with_capacity(RACERS);
+    for _churner in 0..RACERS {
+        let router = harness.router.clone();
+        let cookie = bystander.clone();
+        let path = stream::path(&[&theirs], &[]);
+        let theirs = theirs.clone();
+        churners.push(tokio::spawn(async move {
+            for _round in 0..RACERS {
+                let mut churning = stream::connect(&router, &path, &cookie, None).await;
+                let opening = churning.opening().await;
+                for frame in &opening.frames {
+                    assert_eq!(frame.channel(), theirs, "a stream heard another channel");
+                }
+            }
+        }));
+    }
+
+    for round in 0..RACERS * RACERS {
         harness
             .channels
-            .publish(&mine, "tick", json!({ "round": round }))
+            .publish(
+                &mine.parse().expect("a channel"),
+                "tick",
+                json!({ "round": round }),
+            )
             .await
             .expect("publishing must succeed");
         harness
             .channels
-            .publish(&theirs, "tick", json!({ "round": round }))
+            .publish(
+                &theirs.parse().expect("a channel"),
+                "tick",
+                json!({ "round": round }),
+            )
             .await
             .expect("publishing must succeed");
     }
-
-    // The listener receives its own channel's rounds, in order and complete.
-    for round in 0..RACERS {
-        let frame = socket::next_frame(&mut attentive).await;
-        assert_eq!(frame["type"], json!("event"), "frame: {frame}");
-        assert_eq!(frame["channel"], json!(mine.to_string()), "frame: {frame}");
-        assert_eq!(frame["payload"]["round"], json!(round), "frame: {frame}");
+    for churner in churners {
+        churner.await.expect("a churning stream must not panic");
     }
 
-    // A channel it never held cannot reach it, so the next thing this socket
-    // hears is its own subscription again rather than the bystander's.
-    harness
-        .channels
-        .publish(&mine, "last", json!({}))
-        .await
-        .expect("publishing must succeed");
-    let frame = socket::next_frame(&mut attentive).await;
-    assert_eq!(frame["event"], json!("last"), "frame: {frame}");
-
-    // The unsubscribed socket heard nothing at all, which it proves by
-    // answering the next request it is given rather than a queued event.
-    socket::send(
-        &mut standing_by,
-        &json!({ "type": "unsubscribe", "channel": theirs.to_string() }),
-    )
-    .await;
-    let frame = socket::next_frame(&mut standing_by).await;
-    assert_eq!(
-        frame,
-        json!({ "type": "unsubscribed", "channel": theirs.to_string() }),
-        "an unsubscribed socket received an event it should never have seen",
+    // The steady stream heard its own channel's rounds, in order and complete,
+    // and nothing else.
+    for round in 0..RACERS * RACERS {
+        let event = attentive.next().await;
+        assert_eq!(event.kind(), "event", "{event:?}");
+        assert_eq!(event.channel(), mine, "{event:?}");
+        assert_eq!(event.frame["payload"]["round"], json!(round), "{event:?}");
+    }
+    assert!(
+        attentive.stays_quiet(Duration::from_millis(200)).await,
+        "the steady stream heard something that was never its own",
     );
 }
 

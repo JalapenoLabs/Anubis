@@ -26,8 +26,10 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      # Realtime channels run in process without this; the service exists so
-      # the Redis fanout is covered rather than skipped. See docs/realtime.md.
+      # Realtime channels run in process and sessions live in Postgres without
+      # this; the service exists so the Redis fanout and the Redis session
+      # store are covered rather than skipped. See docs/realtime.md and
+      # docs/sessions.md.
       redis:
         image: redis:7.4.10-alpine
         ports:

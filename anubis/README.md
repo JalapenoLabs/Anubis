@@ -20,7 +20,7 @@ anubis = { package = "anubis-framework", version = "0.1.0" }
 - **Billing**: plans as configuration, Stripe Checkout and the customer portal, hard and soft limits, per-seat pricing.
 - **Background jobs**: a durable Postgres queue that needs no Redis, enqueued on the caller's connection so a job commits with the write that caused it.
 - **Webhooks**: outgoing deliveries signed with HMAC-SHA256, and incoming receivers that store first and process afterwards.
-- **Realtime**: one session-authenticated websocket, in-process fanout by default, Redis pub/sub when `REDIS_URL` is set.
+- **Realtime**: Server-Sent Events with payloads, ids, and resume from a bounded replay log, in process by default and in Redis when `REDIS_URL` is set.
 - **Serving**: `anubis::server::serve`, which owns health checks, request ids, tracing, security headers, CORS, timeouts, and a bounded drain on `SIGTERM`.
 
 ## The CLI
@@ -36,7 +36,7 @@ anubis doctor              # check the environment a deployment needs
 
 ## Requirements
 
-PostgreSQL is required; Redis is optional and only ever a cache or a fanout, never durability. The crate builds with no native dependencies: no libpq, no OpenSSL.
+PostgreSQL is required; Redis is optional: realtime's fanout and replay buffers, and the session store when `SESSION_STORE=redis` chooses it, never the system of record. The crate builds with no native dependencies: no libpq, no OpenSSL.
 
 ## Documentation
 

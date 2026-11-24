@@ -8,7 +8,7 @@ anubis::server::serve(app, pool, &config).await?;
 
 `main` composes routers; the framework owns everything that turns a router into a server people can deploy. That split is deliberate: production behavior nobody has to remember to add is the only kind every application actually has.
 
-`serve` mounts the probes, applies the middleware stack, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal. `serve_with` and `harden_with` take a `Hardening` beside the router, which is where an application declares the routes the request timeout leaves alone (below).
+`serve` mounts the probes, applies the middleware stack, puts the configured session store on every request, binds `HOST:PORT`, and serves until the process is asked to stop. `anubis::server::harden` is the same stack without the accept loop, for tests and for applications that host the router elsewhere. `anubis::server::serve_with_shutdown` takes the listener and a shutdown future, which is how an application drives the server and a background [job worker](jobs.md) from one signal. `serve_with` and `harden_with` take a `Hardening` beside the router, which is where an application declares the routes the request timeout leaves alone (below).
 
 ## The middleware stack
 
@@ -25,6 +25,10 @@ Layers, outermost first. The order is the design:
 | Request timeout | 30 seconds, innermost; skipped for a route the application declared untimed |
 
 The request id is outermost so every later layer logs under it. The timeout is innermost so the response it produces still leaves with an id and the security headers on it.
+
+### The session store
+
+Beside the layers, the stack puts the session store `SESSION_STORE` chose on every request the application's routers answer, so the session cookie means the same thing on every route, the application's own included. Choosing Redis is therefore a setting and nothing more. A Redis store connects on first use, so `serve` asks it whether it can hold sessions before binding, and refuses to start, naming `SESSION_STORE` and `REDIS_URL`, when it gets no answer, a version older than 7.0, or a memory limit with a policy that evicts keys: a deployment that cannot check a session cannot serve anyone signed in. It logs a warning when Redis persists less than an append-only file. An application that pairs `harden` with `serve_with_shutdown` itself skips that check, and its Redis store connects on the first request that needs it. A router driven without `harden` reads sessions from Postgres, the default, except the authentication routes, which refuse a request whose store disagrees with `SESSION_STORE`. See [sessions.md](sessions.md).
 
 ### Request ids
 
@@ -56,8 +60,7 @@ What it leaves alone is as deliberate as what it compresses:
 |---|---|
 | Bodies under 32 bytes | The headers cost more than the body saves |
 | Images, and anything already encoded | Compressed twice is larger, not smaller |
-| `text/event-stream` | A stream must flush per event, not per buffer |
-| Websocket upgrades | A `101` carries no body at all, so the socket upgrades untouched |
+| `text/event-stream` | A stream must flush per event, not per buffer; see [realtime.md](realtime.md) |
 
 Compressed responses carry `vary: accept-encoding`, so a shared cache never hands brotli to a client that asked for none. `cache-control` is untouched: a hashed asset keeps its year.
 
@@ -85,9 +88,17 @@ serve_with(app, pool, &config, hardening).await?;
 
 The route is the path as the router matches it, parameters included and the full path under any nesting; only a request matched to exactly that route and method is untimed. Everything else in the stack still applies to it. What bounds such a route is everything but a clock: the size its handler accepts, the piece at a time it reads, and the [drain window](#graceful-shutdown) a stopping server gives it. That is why the declaration is per route and the timeout itself has no knob: a handler that reads a bounded body in bounded pieces is safe without a clock, and nothing else is. Declare only those.
 
+An event stream needs no declaration. The timeout clocks the handler, which for an upload includes reading the client's body and for a stream ends the moment the stream is open and its head is sent. The body that follows is never timed, so a [realtime stream](realtime.md) lives as long as its client listens, while its opening (the session check, the authorization, the replay read) stays bounded like any other request. A test pins that a streamed body outlives the timeout, so a change that made the timeout clock bodies would fail the build rather than cut every stream thirty seconds in.
+
+### Clients that stop reading
+
+The server does not time out a response whose body is still being sent. An event stream is never finished, and once its client stops taking bytes, hyper stops polling its body, so nothing in the process ends it: it keeps its socket, what it had queued, and its share of the account's [realtime bounds](realtime.md#limits) until the connection closes. That costs only the account the client belongs to, and production closes such a connection at the proxy in front of the server, which every deployment has for HTTP/2 and TLS: nginx's default `send_timeout` of sixty seconds closes a client that has taken nothing for that long. A deployment fronted by something without a send timeout should give it one.
+
+The server does not bound stalled writes itself, because only the proxy can tell a client that stopped reading from one reading slowly through it: a buffering proxy that has filled its temporary file stops reading the server for as long as its client takes to catch up, and a socket-level limit would cut a large download short while its client was still reading.
+
 ### Graceful shutdown
 
-`SIGTERM`, the signal an orchestrator sends before it kills a container, and ctrl-c both start a drain: the listener stops accepting immediately and in-flight requests get 25 seconds to finish, after which the process exits anyway. Twenty-five seconds fits inside Kubernetes' default 30-second `terminationGracePeriodSeconds`, so the process exits on its own terms instead of being killed mid-response. A request that started just before the signal and wants the full 30-second timeout is therefore cut short, which is the intended trade: by then the traffic gate has already stopped sending work, and a deploy that waits on one straggler is a deploy that hangs.
+`SIGTERM`, the signal an orchestrator sends before it kills a container, and ctrl-c both start a drain: the listener stops accepting immediately and in-flight requests get 25 seconds to finish, after which the process exits anyway. Requests can hear the drain start, and a realtime stream ends at that moment, because a stream is never finishing and would otherwise hold the drain for its whole window; its client resumes against whichever instance answers next. Twenty-five seconds fits inside Kubernetes' default 30-second `terminationGracePeriodSeconds`, so the process exits on its own terms instead of being killed mid-response. A request that started just before the signal and wants the full 30-second timeout is therefore cut short, which is the intended trade: by then the traffic gate has already stopped sending work, and a deploy that waits on one straggler is a deploy that hangs.
 
 Windows has no `SIGTERM`, so ctrl-c is the whole story there.
 
@@ -125,7 +136,7 @@ One policy, rendered once at startup and sent with every response:
 
 ```
 default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
-img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss://app.example.com;
+img-src 'self' data: blob:; font-src 'self'; connect-src 'self';
 base-uri 'self'; form-action 'self'; frame-ancestors 'none'
 ```
 
@@ -138,7 +149,7 @@ It is derived from what the Vite build emits and what the running application lo
 | `style-src` | `'self' 'unsafe-inline'` | See below |
 | `img-src` | `'self' data: blob:` | Avatars and the TOTP QR code are served by this binary. The avatar picker previews the chosen file through `URL.createObjectURL`, which is a `blob:` URL. `data:` rides along because it is how a canvas or an inline SVG hands a browser an image, and because it names no origin, so configuration could not add it later |
 | `font-src` | `'self'` | The build self-hosts every face; nothing reaches a font CDN |
-| `connect-src` | `'self'` and the websocket origin of `APP_URL` | Every fetch goes to this server's own API, and the realtime channel is a websocket to it. CSP level 3 has `'self'` cover `ws:` on the same host, but browsers implemented that late, and a realtime channel that dies silently in one of them is the worst kind of bug |
+| `connect-src` | `'self'` | Every fetch goes to this server's own API, the realtime event stream included: it is an ordinary same-origin `fetch`, so it needs no origin of its own |
 | `base-uri` | `'self'` | An injected `<base>` repoints every relative URL on the page, the ones the SPA fetches with included |
 | `form-action` | `'self'` | A form may only post back here. The directive does not fall back to `default-src`, so leaving it out would allow every destination |
 | `frame-ancestors` | `'none'` | The modern spelling of `X-Frame-Options`; both ship, because browsers still disagree about which they honor |
@@ -215,6 +226,7 @@ Allowed requests may carry `Authorization`, `Content-Type` and `X-Reported-Locat
 | `CSP_ALLOWED_SOURCES` | unset | Sources added to the content security policy, per directive |
 | `TRUSTED_PROXY_HEADER` | unset | Forwarding header naming the client address; see [rate limiting](api.md#rate-limiting) |
 | `SPA_DIR` | unset | Directory of built frontend assets; see [architecture](architecture.md#deployment) |
+| `SESSION_STORE` | `postgres` | Where sessions are kept, `postgres` or `redis`; `redis` requires `REDIS_URL`. See [sessions](sessions.md) |
 
 The timeout, the drain window, and the readiness timeout are constants rather than variables. They are properties of the deployment shape the framework targets, and a knob per timeout is a knob nobody tunes correctly and everybody has to understand. The one thing an application may say about the timeout is which routes it does not apply to, and only because an upload's duration is not the server's to bound.
 

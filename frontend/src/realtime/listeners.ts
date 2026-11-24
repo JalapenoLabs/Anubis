@@ -1,17 +1,24 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { RealtimeEvent } from './protocol'
-
-/** Called with every event published on a subscribed channel. */
-export type RealtimeListener = (event: RealtimeEvent) => void
+import type { RealtimeMessage } from './protocol'
 
 /**
- * Who is listening to what, for one connection.
+ * Called with everything a subscribed channel hears: each event, and each
+ * reset telling the listener to read the channel's state again.
+ *
+ * A listener that only refetches can treat both alike. One that writes an
+ * event's payload into a cache has to branch on `message.type`, and the
+ * compiler holds it to that: a reset carries no payload.
+ */
+export type RealtimeListener = (message: RealtimeMessage) => void
+
+/**
+ * Who is listening to what, for one client.
  *
  * Several components may watch the same channel, so listeners are grouped by
  * channel name and a channel exists exactly as long as somebody is listening
- * to it. `channels()` is therefore both the resubscribe list after a reconnect
- * and the answer to whether the last listener just left.
+ * to it. `channels()` is therefore both the list a stream is opened for and
+ * the answer to whether the last listener just left.
  */
 export function createListenerRegistry() {
   const listenersByChannel = new Map<string, Set<RealtimeListener>>()
@@ -45,25 +52,25 @@ export function createListenerRegistry() {
   }
 
   /**
-   * Delivers one event to the channel's listeners.
+   * Delivers one message to its channel's listeners.
    *
    * Listeners are copied before the walk so that one unsubscribing inside its
    * own callback cannot skip the next one, and a listener that throws does not
-   * rob the others of the event.
+   * rob the others of the message.
    */
-  function emit(event: RealtimeEvent): void {
-    const listeners = listenersByChannel.get(event.channel)
+  function emit(message: RealtimeMessage): void {
+    const listeners = listenersByChannel.get(message.channel)
     if (!listeners?.size) {
-      console.debug('createListenerRegistry received an event nobody is listening to', event)
+      console.debug('createListenerRegistry received a message nobody is listening to', message)
       return
     }
 
     for (const listener of [ ...listeners ]) {
       try {
-        listener(event)
+        listener(message)
       }
       catch (error) {
-        console.error('A realtime listener threw', { event, error })
+        console.error('A realtime listener threw', { message, error })
       }
     }
   }

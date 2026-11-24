@@ -360,8 +360,21 @@ export type BillingPlan = {
   limits: Record<string, BillingPlanLimit>
 }
 
+/** One line item of a subscription: a Stripe price, and how many of it. */
+export type BillingSubscriptionItem = {
+  id: string
+  stripeItemId: string
+  stripePriceId: string
+  /** Null for a metered price, which bills usage rather than a quantity. */
+  quantity: number | null
+}
+
 /**
- * The organization's subscription, mirroring Stripe's own record.
+ * One of the organization's subscriptions, mirroring Stripe's own record.
+ *
+ * The plan subscription names its plan and no subject; a subject subscription
+ * pays for one of the application's records, named by `subjectType` and
+ * `subjectId`, and names no plan.
  *
  * `status` is Stripe's vocabulary verbatim: `trialing`, `active`, `past_due`,
  * `canceled`, and the rest. `past_due` still grants access, because Stripe is
@@ -370,24 +383,36 @@ export type BillingPlan = {
 export type BillingSubscription = {
   id: string
   organizationId: string
-  planKey: string
+  /** The plan a plan subscription buys; null on a subject subscription. */
+  planKey: string | null
+  /** The model of the record a subject subscription pays for. */
+  subjectType: string | null
+  /** The id of that record. */
+  subjectId: string | null
   stripeSubscriptionId: string
   status: string
   /** `monthly` or `yearly`. */
   interval: string
-  /** Seats bought, which is the line item's quantity. */
+  /** Seats bought, which is the plan's line item's quantity. */
   quantity: number
   currentPeriodEnd: string | null
   cancelAtPeriodEnd: boolean
+  items: BillingSubscriptionItem[]
   createdAt: string
   updatedAt: string
 }
 
-/** What a billing screen renders: the plan, the subscription, and the seats. */
+/** What a billing screen renders: the plan, the subscriptions, and the seats. */
 export type BillingOverview = {
   plan: BillingPlan
-  /** Absent on the free plan, which is the absence of a subscription. */
+  /** The plan subscription; absent on the free plan, which is its absence. */
   subscription: BillingSubscription | null
+  /**
+   * Every live subscription: the plan subscription first, then subjects. Null
+   * for a member without the `admin` or `billing` role, who reads the plan but
+   * not what each record costs.
+   */
+  subscriptions: BillingSubscription[] | null
   /** False when this deployment has no Stripe key, so nothing can be bought. */
   billingEnabled: boolean
   /** People who can reach the organization, claimed and invited alike. */

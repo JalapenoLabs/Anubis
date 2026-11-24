@@ -1,6 +1,6 @@
 # Background jobs
 
-Durable background work lives in PostgreSQL, through `anubis::jobs`. Redis stays out of the durability path entirely: it is a cache and a fanout, never the record of what still has to happen.
+Durable background work lives in PostgreSQL, through `anubis::jobs`. Redis stays out of the durability path entirely: it is realtime's fanout and replay buffers, and the session store when an application chooses it, never the record of what still has to happen.
 
 The reason the queue is in Postgres is the transaction. `jobs::enqueue` writes through the caller's own connection, so a job enqueued inside a transaction commits with the domain write that caused it. A rolled-back write leaves no job behind, and a committed write never loses its follow-up work. A queue in another datastore can only approximate that with outbox tables and reconciliation.
 
@@ -86,7 +86,7 @@ Both tables are ordinary Postgres tables and are meant to be queried:
 | Job | Queue | What it does |
 |---|---|---|
 | `anubis::webhooks::DeliverWebhook` | `webhooks` | POSTs one signed outgoing webhook delivery, recording the answer on its row |
-| `anubis::billing::ProcessStripeEvent` | `billing` | Turns one stored Stripe event into the organization's subscription row |
+| `anubis::billing::ProcessStripeEvent` | `billing` | Turns one stored Stripe event into one of the organization's subscription rows and its line items |
 | `anubis::notifications::PingRecipient` | `notifications` | Publishes the realtime ping that tells one recipient's browsers to refetch their inbox, after the transaction that wrote the notification committed. See [notifications.md](notifications.md#realtime) |
 
 Registering each is three lines on the worker builder, and the starter's `main.rs` shows both. Each runs on its own queue so a customer endpoint that hangs for ten seconds, or Stripe replaying a day of events, cannot hold up an application's own work. An application's own jobs are registered beside it, through `register_jobs` in `backend/src/lib.rs`, which is where `anubis scaffold webhook` writes the job that processes a provider's events. [Webhooks](webhooks.md) covers the rest.

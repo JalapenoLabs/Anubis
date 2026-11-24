@@ -180,6 +180,18 @@ pub const OAUTH_CODE_REUSED: &str = "oauth.code_reused";
 /// copied; ending the family is what makes a stolen refresh token worth one
 /// race at most.
 pub const OAUTH_REFRESH_REUSED: &str = "oauth.refresh_reused";
+/// An application changed a subscription's line items through
+/// `billing::Subscriptions`: an add-on added or removed, a quantity moved.
+///
+/// Recorded on the organization; the subject is the subscription, labeled with
+/// the record it pays for, and the change set carries the items before and
+/// after as `{price, quantity}` pairs. See `docs/billing.md`.
+pub const SUBSCRIPTION_ITEMS_CHANGED: &str = "subscription.items_changed";
+/// An application cancelled a subscription through `billing::Subscriptions`.
+///
+/// The change set says which way: `cancel_at_period_end` moving to `true`, or
+/// `status` moving to `canceled` for a cancellation that took effect at once.
+pub const SUBSCRIPTION_CANCELED: &str = "subscription.canceled";
 /// A device code was presented again after it was exchanged, so its grant was
 /// revoked.
 ///
@@ -263,7 +275,7 @@ mod tests {
         ACCOUNT_DELETED, AVATAR_REFUSED, AVATAR_REMOVED, AVATAR_UPLOADED, INVITATION_RESENT,
         MEMBER_ROLE_CHANGED, OAUTH_CODE_REUSED, OAUTH_GRANTED, OAUTH_REFRESH_REUSED, OAUTH_REVOKED,
         ORGANIZATION_RENAMED, PASSWORD_CHANGED, PASSWORD_TEMPORARY_SET, SESSION_CREATED,
-        TEAM_RENAMED,
+        SUBSCRIPTION_CANCELED, SUBSCRIPTION_ITEMS_CHANGED, TEAM_RENAMED,
     };
 
     /// The framework's verbs are dotted, so a reader can tell one from the bare
@@ -286,6 +298,8 @@ mod tests {
             AVATAR_UPLOADED,
             AVATAR_REMOVED,
             AVATAR_REFUSED,
+            SUBSCRIPTION_ITEMS_CHANGED,
+            SUBSCRIPTION_CANCELED,
         ] {
             let (noun, verb) = action
                 .split_once('.')

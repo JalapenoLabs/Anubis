@@ -3,8 +3,8 @@
 //! Two narratives. The first follows a notice from the write that caused it to
 //! the recipient's inbox: an invitation, a claim, a role change, then the
 //! reads and the two ways of marking one read, including what another user's
-//! id answers. The second connects a real websocket and runs a real worker, so
-//! the path from `notify` to a bell that moves is covered end to end rather
+//! id answers. The second opens a real event stream and runs a real worker,
+//! so the path from `notify` to a bell that moves is covered end to end rather
 //! than asserted about.
 //!
 //! Requires `DATABASE_URL`; without it the tests log a skip and pass. CI
@@ -18,7 +18,7 @@ use anubis::jobs::Worker;
 use anubis::notifications::{self, PingRecipient, Pinger};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use support::{Harness, TestDatabase, invitation_token, register, send, socket};
+use support::{Harness, TestDatabase, invitation_token, register, send, stream};
 
 /// The address the person doing the inviting registers with.
 const OWNER: &str = "owner@notifications.test";
@@ -29,7 +29,7 @@ const MEMBER: &str = "member@notifications.test";
 /// How long the realtime narrative gives the worker to publish one ping.
 ///
 /// Generous, because the path is real: a job row, a worker claim, a publish,
-/// and a websocket frame. The test waits on the frame rather than the clock,
+/// and a streamed event. The test waits on the event rather than the clock,
 /// so a fast machine never waits this long.
 const PING_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -263,25 +263,30 @@ async fn a_notice_travels_from_the_write_that_caused_it_to_its_inbox() {
 }
 
 #[tokio::test]
-async fn a_written_notice_reaches_the_recipients_open_socket() {
+async fn a_written_notice_reaches_the_recipients_open_stream() {
     let Some(database) = TestDatabase::create("notifications_flow realtime").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
     let router = harness.router.clone();
-    let address = harness.serve();
 
     let owner_cookie = register(&router, OWNER).await;
     let member_cookie = register(&router, MEMBER).await;
     let team_id = harness.bootstrapped_team(&owner_cookie).await;
     let member_id = user_id(&router, &member_cookie).await;
 
-    // The bell's own subscription: the recipient's user channel, whose name is
+    // The bell's own channel: the recipient's user channel, whose name is
     // the authorization rule, so nobody else can listen in on this inbox.
-    let mut listening = socket::connect(address, &member_cookie).await;
     let channel = format!("user:{member_id}:notifications");
-    let subscribed = socket::subscribe(&mut listening, &channel).await;
-    assert_eq!(subscribed["type"], json!("subscribed"), "{subscribed}");
+    let mut listening = stream::connect(
+        &router,
+        &stream::path(&[&channel], &[]),
+        &member_cookie,
+        None,
+    )
+    .await;
+    let opening = listening.opening().await;
+    assert_eq!(opening.resets(), vec![channel.as_str()], "{opening:?}");
 
     // The worker is what publishes, once the transaction that wrote the row
     // has committed. Without one the notice is still delivered; the bell just
@@ -311,16 +316,15 @@ async fn a_written_notice_reaches_the_recipients_open_socket() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
 
-    let frame = tokio::time::timeout(PING_TIMEOUT, socket::next_frame(&mut listening))
-        .await
-        .expect("the worker must publish the ping within the timeout");
+    let ping = listening.next_within(PING_TIMEOUT).await;
+    let frame = &ping.frame;
     assert_eq!(frame["type"], json!("event"), "{frame}");
     assert_eq!(frame["channel"], json!(channel), "{frame}");
     assert_eq!(frame["event"], json!("created"), "{frame}");
     assert_eq!(
         frame["payload"],
         json!({}),
-        "nothing durable rides the socket; the client refetches: {frame}",
+        "nothing durable rides the stream; the client refetches: {frame}",
     );
 
     // And what it refetches is the row the ping was about.
