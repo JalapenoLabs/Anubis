@@ -28,8 +28,8 @@ use crate::schema::teams;
 
 /// Where the endpoint is mounted, and what `crate::spa` reserves for it.
 ///
-/// Public so an application can declare it untimed by name; see
-/// [`crate::server::Hardening::untimed`].
+/// Public so an application can name the route, in a proxy rule or a probe,
+/// without repeating the literal.
 pub const PATH: &str = "/realtime";
 
 /// What separates channel names in the query string.
@@ -42,8 +42,9 @@ const SEPARATOR: char = ',';
 ///
 /// Merge it into the application router alongside the framework's other
 /// routers. The extensions the endpoint needs travel with it, so nothing else
-/// has to be layered for it to work. Declare the route untimed when serving,
-/// as the starter does: a stream's duration is the client's.
+/// has to be layered for it to work, and the request timeout needs no
+/// exception for it: the timeout clocks the handler, which answers once the
+/// stream is open, never the body that follows.
 ///
 /// ```no_run
 /// # fn compose(pool: anubis::db::DbPool, channels: anubis::realtime::Channels) -> axum::Router {

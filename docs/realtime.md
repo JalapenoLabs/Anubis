@@ -48,6 +48,8 @@ A team the user does not belong to, a team that does not exist, a team the user 
 
 A stream authorizes its channels when it opens, and lives five minutes before the server ends it and the client resumes. So a session signed out elsewhere, or a member removed from a team, stops hearing within minutes, at the cost of one reconnect per tab per five minutes that the client makes invisibly.
 
+A replay is authorized with its stream: the channel is checked when the stream opens, and the replay is that channel's kept events after the cursor. A cursor is not bound to a session, and every `live` id shows its epoch, so a subscriber can name an early cursor and hear what the channel still keeps from before it could listen, at most the channel's capacity. That is accepted rather than guarded: it is what `backfill` does on purpose, and the rule that makes it safe is the one this namespace already rests on, that a channel's payloads are what any current member may see.
+
 Role permissions are deliberately not consulted. A team channel carries the fact that something changed and the payload the publisher chose, so membership is the right granularity, and a publisher that would send something only some members may see should split the topic, or serve it as a resource channel from an endpoint that checks the role.
 
 ### Extending the namespace

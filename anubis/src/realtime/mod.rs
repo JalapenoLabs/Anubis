@@ -272,9 +272,9 @@ impl Channels {
     /// reconnection replays what it missed, or opens with a reset when the
     /// replay log no longer holds all of it. Then events follow as they are
     /// published, with heartbeats in between, until the stream's lifetime is
-    /// up or the server starts to drain, and the client resumes. Declare the
-    /// route untimed with [`crate::server::Hardening::untimed`], as the
-    /// starter does for `/realtime`: the stream's duration is the client's.
+    /// up or the server starts to drain, and the client resumes. The route
+    /// needs no untimed declaration: the request timeout clocks the handler,
+    /// which answers once the stream is open, and never the body that follows.
     ///
     /// # Errors
     /// Returns an [`Error`] when `channels` names more than

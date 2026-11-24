@@ -51,6 +51,8 @@ Three specs are the proving set, and they are chosen the way the Rust narratives
 - `auth.spec.ts` is the auth round trip: sign out, ask for a guarded URL, land on `/sign-in?next=…`, sign in, arrive at the page originally asked for. The guards and `sanitizeDestination` have unit coverage; only a browser proves the session cookie and the redirect chain agree.
 - `settings.spec.ts` is a write that survives a reload, which is the cheapest way to tell a form that saved from one that only updated its own state.
 
+Every spec also proves the realtime stream opens, because `signUp` waits for the notification bell's `GET /realtime` to answer `200` as `text/event-stream`. A stream that never opens costs nothing visible, since every view still loads over REST, so only an assertion catches it, and only a browser exercises the session cookie, the client's request, and the dev server's proxy together.
+
 ### Running them
 
 The suite drives a real stack, so a stack has to be running:

@@ -52,7 +52,10 @@ export function uniqueEmail(purpose: string): string {
  * Registers a fresh account and leaves the browser on the dashboard.
  *
  * Registration signs the new user straight in, so this is also how a spec that
- * needs a session gets one.
+ * needs a session gets one. It also waits for the realtime stream the
+ * notification bell opens, so every spec proves the browser's stream connects:
+ * the session cookie, the client's request, and the dev server's proxy, which
+ * no component test exercises.
  */
 export async function signUp(page: Page, purpose: string): Promise<Account> {
   const account: Account = {
@@ -63,11 +66,29 @@ export async function signUp(page: Page, purpose: string): Promise<Account> {
   await page.goto(UrlTree.signUp)
   await fillCredentials(page, account)
   const registration = page.waitForResponse(byPath('/auth/register'))
+  // Registered before the click, because the bell mounts with the dashboard
+  // and opens its stream as soon as the signed-in user is known.
+  const stream = page.waitForResponse(byPath('/realtime'))
   await page.getByRole('button', { name: strings.auth.signUp.action }).click()
   expectAuthAccepted(await registration)
   await expectDashboard(page)
+  await expectEventStream(await stream)
 
   return account
+}
+
+/**
+ * Fails with what came back when the realtime stream did not open.
+ *
+ * A stream that never opens costs nothing visible on any page, since every
+ * view still loads over REST, which is exactly why it has to be asserted.
+ */
+async function expectEventStream(response: Response): Promise<void> {
+  const contentType = await response.headerValue('content-type')
+  expect(
+    { status: response.status(), contentType },
+    'the realtime stream must open as an event stream',
+  ).toEqual({ status: 200, contentType: 'text/event-stream' })
 }
 
 /** Signs `account` in from the sign-in page the browser is already on. */
