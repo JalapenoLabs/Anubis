@@ -51,6 +51,10 @@ pub struct User {
     /// the account chooses. While it holds, [`crate::auth::CurrentUser`]
     /// refuses the account everywhere but the routes that change a password.
     pub password_change_required: bool,
+    /// The generation of sessions the account accepts, read with every other
+    /// column, so a session is stamped with the generation its credentials
+    /// were checked under. See [`crate::auth::session`].
+    pub(crate) session_generation: i64,
 }
 
 impl fmt::Debug for User {
@@ -68,6 +72,7 @@ impl fmt::Debug for User {
             .field("locale", &self.locale)
             .field("platform_roles", &self.platform_roles)
             .field("password_change_required", &self.password_change_required)
+            .field("session_generation", &self.session_generation)
             .finish()
     }
 }
@@ -179,6 +184,7 @@ mod tests {
             locale: "en-US".to_owned(),
             platform_roles: Vec::new(),
             password_change_required: false,
+            session_generation: 0,
         }
     }
 

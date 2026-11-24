@@ -70,6 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::auth::routes::{AuthState, signed_in_jar};
+use crate::auth::session::Sessions;
 use crate::auth::token;
 use crate::schema::oauth_states;
 
@@ -328,11 +329,12 @@ struct CallbackQuery {
 
 async fn callback(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: crate::audit::Context,
     Path(provider_key): Path<String>,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    match finish_flow(&state, &context, &provider_key, query).await {
+    match finish_flow(&state, &sessions, &context, &provider_key, query).await {
         Ok((jar, destination)) => {
             let location = format!("{}{destination}", state.app_url);
             (jar, Redirect::to(&location)).into_response()
@@ -344,6 +346,7 @@ async fn callback(
 /// Verifies one callback and returns the session cookie and where to land.
 async fn finish_flow(
     state: &AuthState,
+    sessions: &Sessions,
     context: &crate::audit::Context,
     provider_key: &str,
     query: CallbackQuery,
@@ -440,6 +443,7 @@ async fn finish_flow(
 
     let jar = signed_in_jar(
         state,
+        sessions,
         &mut connection,
         context,
         &user,

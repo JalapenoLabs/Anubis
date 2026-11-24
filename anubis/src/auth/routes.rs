@@ -45,10 +45,10 @@ use crate::audit;
 use crate::auth::extract::{CurrentUser, SignedIn};
 use crate::auth::model::{NewUser, User, UserResponse};
 use crate::auth::secret_box::SecretKey;
-use crate::auth::session::SignInMethod;
+use crate::auth::session::{Sessions, SignInMethod};
 use crate::auth::user_token::TokenPurpose;
 use crate::auth::{password, policy, session, user_token};
-use crate::config::{AppConfig, AvatarConfig, Environment};
+use crate::config::{AppConfig, AvatarConfig, Environment, SessionStore};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::images::ImageScreen;
@@ -146,6 +146,7 @@ pub fn router_with(
         hasher: password::Hasher::new(config.password_hash_concurrency),
         avatar: config.avatar,
         image_screen: options.image_screen,
+        session_store: config.session_store,
     };
 
     Router::new()
@@ -199,6 +200,9 @@ pub(crate) struct AuthState {
     pub(crate) avatar: AvatarConfig,
     /// The application's look at an uploaded image before it is stored.
     pub(crate) image_screen: Option<Arc<dyn ImageScreen>>,
+    /// The store `SESSION_STORE` chose, which every request these routes
+    /// answer must carry; see [`crate::auth::session`].
+    pub(crate) session_store: SessionStore,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +253,7 @@ struct MessageBody {
 
 async fn register(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<RegisterBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -263,10 +268,11 @@ async fn register(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    // One transaction creates the user and their personal organization, so a
-    // half-bootstrapped account can never exist.
-    let created: User = connection
-        .transaction(async |transaction| {
+    // One transaction creates the user, their personal organization, and their
+    // session, so a half-bootstrapped account can never exist, and a session
+    // store that fails leaves no account behind to answer the retry with 409.
+    let (created, jar) = connection
+        .transaction::<_, ApiError, _>(async |transaction| {
             let user: User = diesel::insert_into(users::table)
                 .values(NewUser {
                     email: &credentials.email,
@@ -276,30 +282,33 @@ async fn register(
                 })
                 .returning(User::as_returning())
                 .get_result(transaction)
-                .await?;
+                .await
+                .map_err(|error| match error {
+                    diesel::result::Error::DatabaseError(
+                        DatabaseErrorKind::UniqueViolation,
+                        _details,
+                    ) => ApiError::conflict("That email address is already registered."),
+                    other => log_internal(other),
+                })?;
 
             crate::tenancy::create_personal_organization(transaction, &user).await?;
 
-            Ok::<User, diesel::result::Error>(user)
+            let jar = signed_in_jar(
+                &state,
+                &sessions,
+                transaction,
+                &context,
+                &user,
+                SignInMethod::Registration,
+            )
+            .await?;
+            Ok((user, jar))
         })
-        .await
-        .map_err(|error| match error {
-            diesel::result::Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _details) => {
-                ApiError::conflict("That email address is already registered.")
-            }
-            other => log_internal(other),
-        })?;
+        .await?;
 
+    // After the commit, so a sign-up that failed mails nobody.
     send_verification_email(&state, &mut connection, &created).await;
 
-    let jar = signed_in_jar(
-        &state,
-        &mut connection,
-        &context,
-        &created,
-        SignInMethod::Registration,
-    )
-    .await?;
     let body = UserBody {
         user: UserResponse::load(&mut connection, &created)
             .await
@@ -317,6 +326,7 @@ struct MfaChallengeBody {
 
 async fn login(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<CredentialsBody>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -378,9 +388,17 @@ async fn login(
         .map_err(log_internal)?
         .is_some()
     {
-        let mfa_token = user_token::issue(&mut connection, user.id, TokenPurpose::MfaChallenge)
-            .await
-            .map_err(log_internal)?;
+        // The challenge carries the generation the password was checked
+        // under, so a reset committing before the second factor answers ends
+        // this sign-in too; see `crate::auth::mfa`.
+        let mfa_token = user_token::issue_with_payload(
+            &mut connection,
+            user.id,
+            TokenPurpose::MfaChallenge,
+            Some(&user.session_generation.to_string()),
+        )
+        .await
+        .map_err(log_internal)?;
         return Ok((
             StatusCode::OK,
             Json(MfaChallengeBody {
@@ -393,6 +411,7 @@ async fn login(
 
     let jar = signed_in_jar(
         &state,
+        &sessions,
         &mut connection,
         &context,
         &user,
@@ -409,11 +428,12 @@ async fn login(
 
 async fn logout(
     State(state): State<AuthState>,
+    sessions: Sessions,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, ApiError> {
     if let Some(cookie) = jar.get(session::SESSION_COOKIE) {
-        let mut connection = state.pool.get().await.map_err(log_internal)?;
-        session::delete(&mut connection, cookie.value())
+        sessions
+            .revoke(&state.pool, cookie.value())
             .await
             .map_err(log_internal)?;
     }
@@ -606,6 +626,7 @@ async fn request_password_reset(
 
 async fn confirm_password_reset(
     State(state): State<AuthState>,
+    sessions: Sessions,
     context: audit::Context,
     Json(body): Json<ResetBody>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -613,16 +634,27 @@ async fn confirm_password_reset(
 
     let mut connection = state.pool.get().await.map_err(log_internal)?;
 
-    let (user_id, _payload) =
-        user_token::consume(&mut connection, &body.token, TokenPurpose::PasswordReset)
-            .await
-            .map_err(log_internal)?
-            .ok_or_else(expired_link)?;
+    // Looked at, not spent: a link that was never good costs no argon2 run,
+    // and a good one is spent below, inside the transaction that uses it, so
+    // a failure there leaves it usable for another try.
+    user_token::peek(&mut connection, &body.token, TokenPurpose::PasswordReset)
+        .await
+        .map_err(log_internal)?
+        .ok_or_else(expired_link)?;
 
     let password_hash = state.hasher.hash(body.password).await?;
 
-    connection
-        .transaction::<(), diesel::result::Error, _>(async |transaction| {
+    // The session store's error type, because ending the sessions is one of
+    // its operations; it converts from every Diesel error the rest raises.
+    let revocation = connection
+        .transaction::<_, session::Error, _>(async |transaction| {
+            let Some((user_id, _payload)) =
+                user_token::consume(transaction, &body.token, TokenPurpose::PasswordReset).await?
+            else {
+                // Spent by a request that raced this one since the look above.
+                return Ok(None);
+            };
+
             // A password the account chose through its own inbox replaces any
             // temporary one an operator set, so the flag goes with it.
             let user: User = diesel::update(users::table.find(user_id))
@@ -635,16 +667,22 @@ async fn confirm_password_reset(
                 .await?;
 
             // A reset proves the old credentials may be compromised: no
-            // session created under them survives, and neither does any
-            // program connected under them. The account is the actor, since
-            // it proved itself through its inbox.
-            session::delete_all_for_user(transaction, user_id).await?;
+            // program connected under them survives, and no session created
+            // under them does either. The account is the actor, since it
+            // proved itself through its inbox. Ending the sessions is the last
+            // statement, so they end exactly when the new password commits.
             crate::oauth_server::revoke_every_grant(transaction, &context.by(&user), user_id)
                 .await?;
-            Ok(())
+            Ok(Some(sessions.revoke_all(transaction, user_id).await?))
         })
         .await
         .map_err(log_internal)?;
+    let revocation = revocation.ok_or_else(expired_link)?;
+
+    // After the commit and with the connection back in the pool, so a slow
+    // store never holds either; see `crate::auth::session`.
+    drop(connection);
+    sessions.sweep(revocation).await;
 
     Ok(Json(MessageBody {
         message: "Your password has been reset. Sign in with your new password.",
@@ -712,13 +750,14 @@ async fn deliver(mailer: &Mailer, email: Email) {
 ///
 /// Every path that signs somebody in comes through here, which is what makes
 /// the [`audit::SESSION_CREATED`] record complete rather than a convention
-/// each path has to remember. The session and its record commit together, so
-/// a browser never holds a session the log does not know about. `context` is
-/// the request's, so the record carries the address and browser the sign-in
-/// came from, and the location the browser reported; see
-/// [`crate::server::origin`].
+/// each path has to remember. The record and the session are written in one
+/// transaction and the cookie is issued only after it commits, so a browser
+/// never holds a session the log does not know about. `context` is the
+/// request's, so the record carries the address and browser the sign-in came
+/// from, and the location the browser reported; see [`crate::server::origin`].
 pub(crate) async fn signed_in_jar(
     state: &AuthState,
+    sessions: &Sessions,
     connection: &mut diesel_async::AsyncPgConnection,
     context: &audit::Context,
     user: &User,
@@ -732,8 +771,7 @@ pub(crate) async fn signed_in_jar(
     );
 
     let token = connection
-        .transaction::<_, diesel::result::Error, _>(async |transaction| {
-            let token = session::create(transaction, user.id).await?;
+        .transaction::<_, session::Error, _>(async |transaction| {
             audit::record(
                 transaction,
                 &actor,
@@ -747,10 +785,20 @@ pub(crate) async fn signed_in_jar(
                     )),
             )
             .await?;
-            Ok(token)
+            // Last, because a Redis store cannot roll back: a session written
+            // before a step that then failed would outlive its sign-in.
+            sessions.create(transaction, user).await
         })
         .await
-        .map_err(log_internal)?;
+        .map_err(|error| {
+            if error.is_stale() {
+                ApiError::unauthorized(
+                    "Your password changed while you were signing in. Sign in again.",
+                )
+            } else {
+                log_internal(error)
+            }
+        })?;
 
     let cookie = Cookie::build((session::SESSION_COOKIE, token))
         .http_only(true)

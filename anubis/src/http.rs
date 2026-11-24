@@ -188,6 +188,22 @@ impl From<diesel::result::Error> for ApiError {
     }
 }
 
+impl From<crate::auth::session::Error> for ApiError {
+    /// Renders a failed session read or write as a `500`, logging the cause.
+    ///
+    /// The session store's counterpart of the Diesel conversion above, for a
+    /// transaction that also signs an account out. A store that cannot answer
+    /// is the server's fault, never a reason to treat the caller as signed
+    /// out.
+    fn from(source: crate::auth::session::Error) -> Self {
+        tracing::error!(
+            error.message = %source,
+            "the session store failed: {{error.message}}",
+        );
+        Self::internal()
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     message: &'a str,

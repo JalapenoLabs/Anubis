@@ -1,6 +1,6 @@
 # Background jobs
 
-Durable background work lives in PostgreSQL, through `anubis::jobs`. Redis stays out of the durability path entirely: it is a cache and a fanout, never the record of what still has to happen.
+Durable background work lives in PostgreSQL, through `anubis::jobs`. Redis stays out of the durability path entirely: it is realtime's fanout and replay buffers, and the session store when an application chooses it, never the record of what still has to happen.
 
 The reason the queue is in Postgres is the transaction. `jobs::enqueue` writes through the caller's own connection, so a job enqueued inside a transaction commits with the domain write that caused it. A rolled-back write leaves no job behind, and a committed write never loses its follow-up work. A queue in another datastore can only approximate that with outbox tables and reconciliation.
 

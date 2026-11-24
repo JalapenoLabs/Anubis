@@ -25,8 +25,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::audit;
+use crate::auth::User;
 use crate::auth::password::Hasher;
-use crate::auth::{User, session};
 use crate::config::AppConfig;
 use crate::guard::PlatformMember;
 use crate::http::ApiError;
@@ -98,11 +98,11 @@ impl Accounts {
     /// Gives an account a generated password it must replace at its next sign-in.
     ///
     /// In one transaction, holding the account: sets the password, marks the
-    /// account as required to change it, deletes every session it has, revokes
-    /// every OAuth grant it gave a connected client (each recorded as
-    /// `oauth.revoked` by the operator), and records
-    /// [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
-    /// because the fact is the whole of what an auditor needs. The account
+    /// account as required to change it, revokes every OAuth grant it gave a
+    /// connected client (each recorded as `oauth.revoked` by the operator),
+    /// records [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
+    /// because the fact is the whole of what an auditor needs, and ends every
+    /// session it has. The account
     /// signs in with the returned password by any path a password reaches,
     /// and a confirmed second factor is still asked for.
     ///
@@ -120,8 +120,8 @@ impl Accounts {
         let password = TemporaryPassword::generate();
         let password_hash = self.hasher.hash(password.reveal().to_owned()).await?;
 
-        connection
-            .transaction::<(), ApiError, _>(async |transaction| {
+        let revocation = connection
+            .transaction::<_, ApiError, _>(async |transaction| {
                 let user: User = users::table
                     .find(user_id)
                     .select(User::as_select())
@@ -141,8 +141,7 @@ impl Accounts {
 
                 // Whoever holds a session for this account now may be the
                 // reason it needed rescuing, and so may a program somebody
-                // connected in its name.
-                session::delete_all_for_user(transaction, user.id).await?;
+                // connected in its name. The sessions end last, below.
                 crate::oauth_server::revoke_every_grant(
                     transaction,
                     &context.by(&operator.user),
@@ -163,9 +162,17 @@ impl Accounts {
                         .label(&label),
                 )
                 .await?;
-                Ok(())
+
+                // The last statement, so the sessions end exactly when the
+                // temporary password commits. The store is the one the
+                // operator's own request was authenticated against, which is
+                // the one the configuration chose.
+                Ok(operator.sessions().revoke_all(transaction, user.id).await?)
             })
             .await?;
+
+        // After the commit, so a slow store never holds the account's row.
+        operator.sessions().sweep(revocation).await;
 
         Ok(password)
     }

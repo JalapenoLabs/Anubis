@@ -12,7 +12,7 @@ const CHANNEL = 'team:11111111-1111-1111-1111-111111111111:projects'
 const OTHER_CHANNEL = 'user:22222222-2222-2222-2222-222222222222:inbox'
 
 function eventOn(channel: string): RealtimeEvent {
-  return { channel, event: 'created', payload: { id: 7 }}
+  return { type: 'event', id: '00000000000000ab-1', channel, event: 'created', payload: { id: 7 }}
 }
 
 describe('createListenerRegistry', () => {
@@ -47,7 +47,7 @@ describe('createListenerRegistry', () => {
     expect(registry.has(CHANNEL)).toBe(true)
   })
 
-  it('should list every channel with a listener, for resubscribing', () => {
+  it('should list every channel with a listener, for the stream to carry', () => {
     const registry = createListenerRegistry()
     const leaving = () => {}
     registry.add(CHANNEL, () => {})
@@ -98,6 +98,17 @@ describe('createListenerRegistry', () => {
     registry.emit(eventOn(CHANNEL))
 
     expect(received).toEqual([ 'once', 'after', 'after' ])
+  })
+
+  it('should deliver a reset to the listeners of its channel, as it delivers an event', () => {
+    const registry = createListenerRegistry()
+    const received: string[] = []
+    registry.add(CHANNEL, (message) => received.push(message.type))
+    registry.add(OTHER_CHANNEL, (message) => received.push(`elsewhere ${message.type}`))
+
+    registry.emit({ type: 'reset', channel: CHANNEL })
+
+    expect(received).toEqual([ 'reset' ])
   })
 
   it('should drop an event nobody is listening to', () => {
