@@ -58,7 +58,7 @@ Adding an audience means adding the authorization rule that goes with it, in `Ch
 
 ## Ids and replay
 
-Every publish takes the next number of one sequence shared by every channel, so ids order events across channels as well as within one. That is what lets a stream carrying several channels resume from a single id. An id renders as `{epoch}-{sequence}`, such as `3f2b9c0d1e4a5b6c-42`, and clients treat it as opaque. The epoch names one run of the sequence: in process it is minted when the service starts, and under Redis it is stored beside the sequence and changes only when Redis loses both.
+Every publish takes the next number of one sequence shared by every channel, so ids order events across channels as well as within one. That is what lets a stream carrying several channels resume from a single id. An id renders as `{epoch}-{sequence}`, such as `3f2b9c0d1e4a5b6c-42`, and clients treat it as opaque. The epoch names one run of the sequence: in process it is minted when the service starts, and under Redis it is stored beside the sequence and the `run_id` of the Redis server that holds them, and changes whenever that server is a different run. A Redis that restarts, whether it comes back empty or from an older snapshot or append-only file, and a replica promoted in its place, all have a new `run_id`, so a sequence that went backwards never mints again an id a client already holds.
 
 Every event is kept in its channel's buffer, whether or not anyone is listening. A channel keeps its last 64 events, and the deployment keeps 64 MiB of events across every channel, letting go of whole channels, least recently published first, past that. A topic whose events are the data itself usually wants more of its own:
 
@@ -85,6 +85,8 @@ A reconnecting client sends the id of the last event it heard as `Last-Event-ID`
 | After an id, its whole buffer was let go since | `reset` |
 | After an id from another epoch, from past the head, or unreadable | `reset` |
 
+A stream served with `backfill()` (below) follows every `reset` with everything the channel still keeps, and opens a first connection with that and no reset at all, because its events are the data itself.
+
 The first row is not a failure: a channel that starts listening opens with a reset because anything the client fetched before the stream was live may already be behind, and refetching once the stream is live is the only way not to miss what happened in between. A view that loads with a REST fetch and listens with `useChannel` therefore revalidates once when its channel goes live.
 
 `fresh` exists because one cursor cannot speak for a channel that was not on the connection it came from: events on that channel before the cursor may never have reached the client, and events after it may predate what the view just fetched. When a page starts listening to a new channel, the client opens a new stream that resumes the channels it already had and names the new one in `fresh`.
@@ -98,7 +100,7 @@ GET /realtime?channels=team:{id}:projects,user:{id}:notifications&fresh=user:{id
 Last-Event-ID: 3f2b9c0d1e4a5b6c-42
 ```
 
-The session cookie authenticates the request. `channels` names every channel the stream should carry, comma-separated, at most 64. `fresh` names those among them that do not continue `Last-Event-ID`; without a `Last-Event-ID` every channel is fresh and `fresh` changes nothing. A name given twice is carried once.
+The session cookie authenticates the request. `channels` names every channel the stream should carry, comma-separated, at most 64, each in the spelling the server renders: lowercase, UUIDs included, since every frame names its channel that way and a listener is found by that name. `fresh` names those among them that do not continue `Last-Event-ID`; without a `Last-Event-ID` every channel is fresh and `fresh` changes nothing. A name given twice is carried once.
 
 | Answer | When |
 |---|---|
@@ -106,6 +108,7 @@ The session cookie authenticates the request. `channels` names every channel the
 | `401` | No session |
 | `403` `password_change_required` | The account must replace its temporary password first |
 | `400` | No channels, or more than 64 |
+| `429`, with `Retry-After` | The account already holds 32 streams, or 512 channels across them, on this instance; the client waits and asks again |
 | `503`, or `500` | The stream could not open right now (the database or Redis was unreachable, or a query failed); the client retries on its backoff |
 
 ### Frames
@@ -125,13 +128,13 @@ Refusal codes:
 
 | Code | Meaning |
 |---|---|
-| `invalid_channel` | Not a channel name |
+| `invalid_channel` | Not a channel name in the spelling the server renders |
 | `not_found` | The channel does not exist, or is not the subscriber's to hear |
 | `too_many_channels` | The process is holding as many channels as it may |
 
 ### How a stream ends
 
-A stream ends with a clean close, and the client reconnects at once with its cursor, missing nothing. It ends after its lifetime, five minutes plus up to a minute chosen at random so the tabs a deploy reconnected together do not keep reconnecting together; when the server starts to drain; when it falls 256 events behind, because a stalled connection is cut rather than buffered without limit; and when the delivery path under it broke, such as a lost Redis subscriber connection. In every case the replay log is what makes the end invisible.
+A stream ends with a clean close, and the client reconnects at once with its cursor, missing nothing. It ends after its lifetime, five minutes plus up to a minute chosen at random so the tabs a deploy reconnected together do not keep reconnecting together; when the server starts to drain; when it falls 256 events behind, because a stalled connection is cut rather than buffered without limit; and when the delivery path under it broke, such as a lost Redis subscriber connection. In every case the replay log is what makes the end invisible. An expired or draining stream never sends again, even if events are queued for it, and its channels are released on schedule even when its client has stopped reading, so a stalled connection cannot keep hearing, or keep holding, past its lifetime.
 
 While nothing happens, the stream sends a heartbeat comment every twenty seconds, inside every idle timeout a stream is likely to cross: nginx closes a quiet proxied connection after sixty seconds by default and Cloudflare after a hundred.
 
@@ -179,7 +182,7 @@ One client is one stream however many channels the page listens to. It opens wit
 
 A listener hears a `RealtimeMessage`, an event or a reset. A listener that only refetches treats both alike. One that writes payloads into its cache has to branch, and the compiler holds it to that, because a reset carries no payload. Since a replay is exact or a reset, writing payloads is safe: the cache is never left behind by an event it did not hear.
 
-A stream the server ends reconnects at once; one that fails reconnects on a capped backoff, half a second doubling to ten. A `4xx` answer is final until the set of channels changes, because the server will refuse the same request again.
+A stream the server ends reconnects at once; one that fails reconnects on a capped backoff, half a second doubling to ten. One that says nothing at all for 45 seconds, past two heartbeats, is taken for a connection that vanished without closing and reconnects the same way. A `4xx` answer is final until the set of channels changes, because the server will refuse the same request again, except `408`, `425`, `426`, and `429`, which wait and ask again, honoring `Retry-After`; `426` is what an instance still running a release from before event streams answers during a rolling deploy. A channel the server refused never counts as live on the cursor, so if it is admitted on a later connection it opens fresh, with the reset that covers whatever it missed. A listener that throws is logged and the stream carries on.
 
 ### Application streams
 
@@ -222,7 +225,7 @@ async fn logs(
 
 `Subscriber` is where the session check lives: it requires a signed-in session exactly as `CurrentUser` does, so a stream can never be mounted without one, and it reads `Last-Event-ID` and the server's drain signal. Authorizing the channels is the handler's, against `subscriber.user()`, which is why any audience may be passed to `stream`, and resource channels above all. The stream then carries everything a `/realtime` stream does: the replay, the reset, heartbeats, its lifetime, and its end on a drain.
 
-`backfill()` changes what a first connection opens with: instead of a reset, every event the channel still keeps, so a log tail opens with its recent lines and a live graph opens full instead of blank. A reconnection resumes from its cursor either way.
+`backfill()` changes what a first connection opens with: instead of a reset, every event the channel still keeps, so a log tail opens with its recent lines and a live graph opens full instead of blank. A reconnection resumes from its cursor, and when the buffer can no longer vouch for the cursor it opens with a reset followed by everything still kept, so the tail clears and fills again rather than going blank.
 
 Publishing to the stream is publishing to its channel, from wherever the data arrives:
 
@@ -251,13 +254,13 @@ The backend is chosen by configuration, never by code. The API, the frames, and 
 
 **In process** is one lock over the sequence, the buffers, and the registry of open streams. A publish mints its id, keeps the event, and queues it for every stream carrying its channel, all under the lock, and a stream opening registers its queue and reads its replay under the same lock, so every event lands in its replay or on its queue and never in neither. This is the whole implementation for a single-instance deployment, which is the shape the framework targets out of the box: no Redis, no extra process, no configuration.
 
-**Redis** moves the sequence and the buffers into Redis and fans events out through pub/sub. A publish is one Lua script that mints the next id, keeps the event in its channel's buffer, trims and evicts exactly as the in-process log does, and publishes it, all atomically, so the order Redis delivers events in is the order of the sequence. A single background pump per process holds the subscriber connection, follows the channels this process's streams carry, and dispatches what arrives into the same registry. The pump subscribes per channel rather than to a pattern, so an instance receives only the channels its own streams carry. A stream opening waits for Redis to confirm its subscriptions before it reads its replay with a second script, so an event published in between is on its queue, where the stream skips it if the replay already carried it.
+**Redis** moves the sequence and the buffers into Redis and fans events out through pub/sub. A publish is one Lua script that mints the next id, keeps the event in its channel's buffer, trims and evicts exactly as the in-process log does, and publishes it, all atomically, so the order Redis delivers events in is the order of the sequence. A single background pump per process holds the subscriber connection, follows the channels this process's streams carry, and dispatches what arrives into the same registry. The pump subscribes per channel rather than to a pattern, so an instance receives only the channels its own streams carry, and it gathers every subscription change already waiting into one `SUBSCRIBE` and one `UNSUBSCRIBE`, so a burst of tabs reconnecting after a deploy costs a round trip or two rather than one per channel. A stream opening waits for Redis to confirm its subscriptions before it reads its replay with a second script, so an event published in between is on its queue, where the stream skips it if the replay already carried it. That script reads each buffer from its tail, a page at a time, and stops at the first event the client already heard, so a resume near the head reads a page rather than the whole buffer.
 
 A publish therefore reaches the publishing instance the same way it reaches every other one, through Redis. Each stream hears each event exactly once and in sequence order, which a local shortcut would quietly break.
 
-Every key lives under `{anubis:realtime}:`: the log hash (`epoch`, `sequence`, `bytes`, `watermark`), the recency sorted set, the floors and sizes hashes, and one list per channel's buffer. The braces are a Redis Cluster hash tag, so the keys a script touches share one slot. Nothing expires on its own: the byte budget bounds the buffers, and evicting through it is what keeps the watermark true. Run Redis with a `maxmemory-policy` that never evicts keys without a TTL (`noeviction`, or any `volatile-*` policy), because a key Redis evicted behind the framework's back is an event it can no longer vouch for.
+Every key lives under `{anubis:realtime}:`: the log hash (`epoch`, `run_id`, `sequence`, `bytes`, `watermark`), the recency sorted set, the floors and sizes hashes, and one list per channel's buffer. The braces are a Redis Cluster hash tag, so the keys a script touches share one slot. Nothing expires on its own: the byte budget bounds the buffers, and evicting through it is what keeps the watermark true. Run Redis with a `maxmemory-policy` that never evicts keys without a TTL (`noeviction`, or any `volatile-*` policy), because a key Redis evicted behind the framework's back is an event it can no longer vouch for.
 
-Losing Redis costs live delivery until it returns, never data. When the subscriber connection drops, every stream on that instance ends, because whatever was published while it was down never reached their queues, and their clients resume from the replay log once Redis answers. A Redis that comes back empty starts a new epoch, and every client that resumes afterwards opens with resets and refetches. Publishes attempted while Redis is away fail and are not queued for retry.
+Losing Redis costs live delivery until it returns, never data. When the subscriber connection drops, every stream on that instance ends, because whatever was published while it was down never reached their queues, and their clients resume from the replay log once Redis answers. A Redis that restarts, empty or from an older point, starts a new epoch and lets go of everything kept, because both scripts compare the server's `run_id` with the one the log was written under; every client that resumes afterwards opens with resets and refetches. Publishes attempted while Redis is away fail and are not queued for retry.
 
 ### Running Redis locally
 
@@ -272,11 +275,13 @@ There is no volume behind it. The replay buffers are a convenience for clients t
 
 ## Limits
 
-Everything a stream holds is bounded, because channel names arrive from browsers.
+Everything a stream holds is bounded, because channel names arrive from browsers. The per-account share is what keeps one account from filling the process's table for everyone else: it would take thirty-two accounts holding their whole share to do it, and accounts are themselves bounded by the registration limits.
 
 | Limit | Value | What happens at it |
 |---|---|---|
 | Channels per stream | 64 | The request is refused with `400` |
+| Streams per account, per process | 32 | The request is refused with `429` and `Retry-After` |
+| Channels per account, per process | 512, counted across its streams | The request is refused with `429` and `Retry-After` |
 | Channels per process | 16,384 | The channel is refused with `too_many_channels` |
 | Events queued for one stream | 256 | The stream ends, and its client resumes from replay |
 | Events kept per channel | 64, or the topic's own | The oldest go, and a resume from before them resets |

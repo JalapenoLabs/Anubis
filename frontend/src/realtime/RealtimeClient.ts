@@ -63,6 +63,15 @@ export class RealtimeClient {
    * connection the cursor came from, so it opens at the head instead.
    */
   private readonly live = new Set<string>()
+  /**
+   * The channels the current connection refused, so far.
+   *
+   * A connection sends its refusals before its `live` frame, and a refused
+   * channel must not go live on the cursor: if it is admitted later, it was
+   * never heard in between, and only a fresh start gives it the reset it
+   * needs.
+   */
+  private readonly refused = new Set<string>()
   /** The cursor a replacement stream resumes from. */
   private cursor: string | null = null
   /**
@@ -149,6 +158,7 @@ export class RealtimeClient {
     }
 
     this.retire()
+    this.refused.clear()
     // A channel nobody listens to any more stops being live, so one that
     // comes back later joins at the head rather than on an old cursor.
     for (const channel of [ ...this.live ]) {
@@ -219,13 +229,21 @@ export class RealtimeClient {
     }
 
     if (frame.type === 'live') {
-      // Everything the stream was opened for is now on this cursor.
+      // Everything the stream was opened for and not refused is now on this
+      // cursor.
       for (const channel of this.carried) {
-        this.live.add(channel)
+        if (!this.refused.has(channel)) {
+          this.live.add(channel)
+        }
       }
+      this.refused.clear()
       return
     }
 
+    // Refused, so not live: should it be admitted on a later connection, it
+    // opens fresh, with the reset that covers whatever it missed meanwhile.
+    this.refused.add(frame.channel)
+    this.live.delete(frame.channel)
     console.warn('The realtime server refused a channel', frame)
   }
 

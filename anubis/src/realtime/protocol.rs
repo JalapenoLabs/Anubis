@@ -55,7 +55,7 @@ impl Frame<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ErrorCode {
-    /// The name is not a channel name.
+    /// The name is not a channel name in the spelling the server renders.
     InvalidChannel,
     /// The channel does not exist, or the subscriber may not listen to it.
     ///

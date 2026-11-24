@@ -17,11 +17,12 @@ use axum::http::request::Parts;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::id::EventId;
 use super::registry::{Delivery, Listener};
-use super::replay::Start;
+use super::replay::{Cursor, Start};
 use crate::auth::{CurrentUser, User};
 use crate::http::ApiError;
 use crate::server::Drain;
@@ -105,14 +106,14 @@ const LIFETIME_SPREAD_MILLIS: u64 = 60_000;
 /// ```
 pub struct Subscriber {
     user: User,
-    cursor: Cursor,
+    cursor: LastEventId,
     backfill: bool,
     drain: Option<Drain>,
 }
 
 /// What a request's `Last-Event-ID` said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cursor {
+enum LastEventId {
     /// No header: a first connection.
     Absent,
     /// An id this server renders.
@@ -136,7 +137,10 @@ impl Subscriber {
     /// change to it: a log tail that should open with its recent lines, or a
     /// graph that should open full instead of blank. Without it a first
     /// connection opens with a reset, telling the client to read the current
-    /// state itself. A reconnection resumes from its cursor either way.
+    /// state itself. A reconnection resumes from its cursor either way, and
+    /// when the buffer can no longer vouch for that cursor, opens with a reset
+    /// followed by everything still kept, so the tail clears and fills again
+    /// rather than going blank.
     #[must_use]
     pub fn backfill(mut self) -> Self {
         self.backfill = true;
@@ -149,11 +153,14 @@ impl Subscriber {
     /// resume from it: events on it before the cursor may never have reached
     /// the client, and events after it may predate what the client fetched.
     pub(crate) fn start(&self, continues: bool) -> Start {
-        match self.cursor {
-            Cursor::Read(cursor) if continues => Start::After(cursor),
-            Cursor::Unreadable if continues => Start::Unknown,
-            _ if self.backfill => Start::Backfill,
-            _ => Start::Head,
+        let cursor = match self.cursor {
+            LastEventId::Read(id) if continues => Cursor::After(id),
+            LastEventId::Unreadable if continues => Cursor::Unknown,
+            LastEventId::Absent | LastEventId::Read(_) | LastEventId::Unreadable => Cursor::Fresh,
+        };
+        Start {
+            cursor,
+            backfill: self.backfill,
         }
     }
 
@@ -183,16 +190,16 @@ where
         let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
 
         let cursor = match parts.headers.get(LAST_EVENT_ID) {
-            None => Cursor::Absent,
+            None => LastEventId::Absent,
             Some(value) => match value.to_str() {
                 // The standard has a client send nothing rather than an empty
                 // id, so an empty one is a first connection all the same.
-                Ok("") => Cursor::Absent,
-                Ok(text) => EventId::parse(text).map_or(Cursor::Unreadable, Cursor::Read),
-                Err(_not_text) => Cursor::Unreadable,
+                Ok("") => LastEventId::Absent,
+                Ok(text) => EventId::parse(text).map_or(LastEventId::Unreadable, LastEventId::Read),
+                Err(_not_text) => LastEventId::Unreadable,
             },
         };
-        if cursor == Cursor::Unreadable {
+        if cursor == LastEventId::Unreadable {
             tracing::debug!(
                 user.id = %user.id,
                 "a stream for {{user.id}} named a Last-Event-ID this server never sent; \
@@ -219,7 +226,9 @@ where
 ///
 /// It ends itself, and the client resumes from its cursor, when its five
 /// minute lifetime is up, when the server starts to drain, when it falls too
-/// far behind, or when the delivery path under it broke.
+/// far behind, or when the delivery path under it broke. An expired or
+/// draining stream never sends again, and its channels are released on
+/// schedule even when its client has stopped reading.
 pub struct EventStream {
     opening: VecDeque<Event>,
     feed: Feed,
@@ -234,6 +243,17 @@ struct Feed {
     head: u64,
     ends_at: Instant,
     drain: Option<Drain>,
+    /// Releases the listener at `ends_at` or on the drain even when nothing
+    /// polls this stream; see [`Listener::release_at`].
+    release: JoinHandle<()>,
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        // The listener releases itself as it drops, so the scheduled release
+        // has nothing left to do.
+        self.release.abort();
+    }
 }
 
 impl EventStream {
@@ -247,27 +267,42 @@ impl EventStream {
     ) -> Self {
         let spread = getrandom::u64().expect("the OS random source must be available")
             % LIFETIME_SPREAD_MILLIS;
+        let ends_at = Instant::now() + LIFETIME + Duration::from_millis(spread);
+        let release = listener.release_at(ends_at, drain.clone());
         Self {
             opening,
             feed: Feed {
                 listener,
                 epoch,
                 head,
-                ends_at: Instant::now() + LIFETIME + Duration::from_millis(spread),
+                ends_at,
                 drain,
+                release,
             },
         }
     }
 
     /// The next event to send, or `None` when the stream ends.
+    ///
+    /// An expired or draining stream never sends again, however much it has
+    /// queued: its lifetime is what bounds how long a revoked session or a
+    /// removed member keeps hearing, so it is checked before anything is sent,
+    /// and first among the branches below.
     async fn next(&mut self) -> Option<Event> {
+        let feed = &mut self.feed;
+        let draining_now = feed.drain.as_ref().is_some_and(Drain::has_started);
+        if Instant::now() >= feed.ends_at || draining_now {
+            return None;
+        }
         if let Some(event) = self.opening.pop_front() {
             return Some(event);
         }
 
-        let feed = &mut self.feed;
         loop {
             tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(feed.ends_at) => return None,
+                () = draining(feed.drain.as_mut()) => return None,
                 delivery = feed.listener.recv() => {
                     // A queue that ended was cut, and the client resumes.
                     let delivery = delivery?;
@@ -284,8 +319,6 @@ impl EventStream {
                     }
                     return Some(event_for(&delivery));
                 }
-                () = tokio::time::sleep_until(feed.ends_at) => return None,
-                () = draining(feed.drain.as_mut()) => return None,
             }
         }
     }

@@ -12,6 +12,8 @@ import { EventStream, reconnectDelay } from './EventStream'
 type Connection = {
   url: string
   lastEventId: string | null
+  /** Whether the client cancelled the body, which closes the connection. */
+  cancelled: boolean
   /** Sends raw event-stream text down the connection. */
   push: (text: string) => void
   /** Ends the stream cleanly, as the server does every few minutes. */
@@ -21,7 +23,7 @@ type Connection = {
 }
 
 /** How the fake server answers the next connection. */
-type Answer = 'stream' | 'network-error' | number
+type Answer = 'stream' | 'network-error' | number | { status: number, retryAfter: string }
 
 type Context = {
   connections: Connection[]
@@ -52,25 +54,35 @@ function createFetch(context: Context) {
         headers: { 'content-type': 'application/json' },
       })
     }
+    if (typeof answer === 'object') {
+      return new Response('{"message":"wait"}', {
+        status: answer.status,
+        headers: { 'content-type': 'application/json', 'retry-after': answer.retryAfter },
+      })
+    }
 
     const encoder = new TextEncoder()
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null
+    const connection: Connection = {
+      url: request.url,
+      lastEventId: request.headers.get('last-event-id'),
+      cancelled: false,
+      push: (text) => controller?.enqueue(encoder.encode(text)),
+      end: () => controller?.close(),
+      drop: () => controller?.error(new TypeError('network error')),
+    }
     const body = new ReadableStream<Uint8Array>({
       start(start) {
         controller = start
+      },
+      cancel() {
+        connection.cancelled = true
       },
     })
     request.signal.addEventListener('abort', () => {
       controller?.error(new DOMException('aborted', 'AbortError'))
     })
-
-    context.connections.push({
-      url: request.url,
-      lastEventId: request.headers.get('last-event-id'),
-      push: (text) => controller?.enqueue(encoder.encode(text)),
-      end: () => controller?.close(),
-      drop: () => controller?.error(new TypeError('network error')),
-    })
+    context.connections.push(connection)
 
     return new Response(body, {
       status: 200,
@@ -215,6 +227,86 @@ describe('EventStream', () => {
 
     expect(context.connections).toHaveLength(2)
     expect(context.connections[1].lastEventId).toBe('e-9')
+    stream.close()
+  })
+
+  it<Context>('should keep delivering after a listener throws, without leaking the connection', async (context) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const heard: string[] = []
+    const stream = new EventStream({
+      url: 'http://localhost/stream',
+      onFrame: (frame) => {
+        if (frame.type === 'event' && frame.event === 'poison') {
+          throw new Error('this listener cannot handle it')
+        }
+        heard.push(frame.type)
+      },
+      fetch: context.fetch,
+    })
+    await settle()
+
+    context.connections[0].push(event('e-1', { type: 'event', channel: 'c', event: 'poison', payload: 1 }))
+    context.connections[0].push(event('e-2', { type: 'event', channel: 'c', event: 'fine', payload: 2 }))
+    await settle()
+
+    expect(heard).toEqual([ 'event' ])
+    expect(errors).toHaveBeenCalled()
+    expect(context.connections).toHaveLength(1)
+    expect(context.connections[0].cancelled).toBe(false)
+    expect(stream.lastEventId).toBe('e-2')
+    stream.close()
+  })
+
+  it<Context>('should close the connection and back off when an event overflows the parser', async (context) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const stream = open(context)
+    await settle()
+
+    context.connections[0].push(`data: ${'x'.repeat(200 * 1024)}`)
+    await settle()
+
+    expect(context.connections[0].cancelled).toBe(true)
+    expect(context.connections).toHaveLength(1)
+    await settle(500)
+    expect(context.connections).toHaveLength(2)
+    stream.close()
+  })
+
+  it<Context>('should take a stream that falls silent past two heartbeats for dead', async (context) => {
+    const stream = open(context)
+    await settle()
+    context.connections[0].push(event('e-1', { type: 'live' }))
+    await settle()
+
+    // A heartbeat keeps it alive.
+    await settle(40_000)
+    context.connections[0].push(': heartbeat\n\n')
+    await settle(40_000)
+    expect(context.connections).toHaveLength(1)
+
+    // Then nothing at all, as a connection that vanished without a FIN.
+    await settle(5_000)
+    expect(context.connections[0].cancelled).toBe(true)
+    await settle(500)
+    expect(context.connections).toHaveLength(2)
+    expect(context.connections[1].lastEventId).toBe('e-1')
+    stream.close()
+  })
+
+  it<Context>('should wait and ask again when it is told to, honoring Retry-After', async (context) => {
+    context.answers.push(426, { status: 429, retryAfter: '3' })
+    const stream = open(context)
+    await settle()
+
+    // A rolling deploy's older instance: not final, retried on the backoff.
+    expect(stream.state).toBe('connecting')
+    await settle(500)
+    // Asked to wait three seconds, which outweighs the one-second backoff.
+    await settle(2_999)
+    expect(context.connections).toHaveLength(0)
+    await settle(1)
+    expect(context.connections).toHaveLength(1)
+    expect(stream.state).toBe('open')
     stream.close()
   })
 

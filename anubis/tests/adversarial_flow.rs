@@ -216,6 +216,10 @@ async fn fetch(app: &Router, path: &str) -> (StatusCode, String) {
 /// malformed shape has to end in a refusal or a reset, never in a stream that
 /// carries more than it should or a cursor the server trusts.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one probe after another against the same stream endpoint"
+)]
 async fn the_realtime_stream_refuses_what_no_client_would_send() {
     let Some(database) = TestDatabase::create("adversarial_flow").await else {
         return;
@@ -257,6 +261,22 @@ async fn the_realtime_stream_refuses_what_no_client_would_send() {
         .refusal(&stranger)
         .expect("a stranger's inbox is refused");
     assert_eq!(refused.frame["code"], json!("not_found"));
+    assert!(opening.resets().is_empty());
+    drop(probe);
+
+    // A name that parses in a spelling the server never renders, such as an
+    // uppercase UUID, is refused: every frame would name it the other way, and
+    // the listener that asked for it would never hear a thing.
+    let shouted = mine
+        .to_uppercase()
+        .replacen("USER", "user", 1)
+        .replace("INBOX", "inbox");
+    let mut probe = stream::connect(&router, &stream::path(&[&shouted], &[]), &cookie, None).await;
+    let opening = probe.opening().await;
+    let refused = opening
+        .refusal(&shouted)
+        .expect("a non-canonical spelling is refused");
+    assert_eq!(refused.frame["code"], json!("invalid_channel"));
     assert!(opening.resets().is_empty());
     drop(probe);
 
@@ -303,6 +323,33 @@ async fn the_realtime_stream_refuses_what_no_client_would_send() {
         .await
         .expect("the router must answer");
     assert_eq!(response.status(), StatusCode::OK);
+    // Closing the stream frees its share of the account's bounds.
+    drop(response);
+
+    // One account holds a share of the process's channel table, not the
+    // whole of it: past its streams, it is asked to wait rather than allowed
+    // to crowd out everybody else on the instance.
+    let mut held = Vec::new();
+    for index in 0..32 {
+        let topic = format!("{mine}{index}");
+        held.push(stream::connect(&router, &stream::path(&[&topic], &[]), &cookie, None).await);
+    }
+    let (status, _body) = stream::open(&router, &stream::path(&[&mine], &[]), Some(&cookie), None)
+        .await
+        .expect_err("an account past its share must be refused");
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let stranger_cookie = register(&router, "bystander@example.com").await;
+    let (_status, _headers, them) =
+        send(&router, "GET", "/auth/me", None, Some(&stranger_cookie)).await;
+    let theirs = format!("user:{}:inbox", them["user"]["id"].as_str().expect("an id"));
+    let _unaffected = stream::connect(
+        &router,
+        &stream::path(&[&theirs], &[]),
+        &stranger_cookie,
+        None,
+    )
+    .await;
+    drop(held);
 
     // A channel list past the limit is refused before any stream exists,
     // and so is one that names nothing at all.

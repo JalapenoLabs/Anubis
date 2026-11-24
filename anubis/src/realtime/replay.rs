@@ -95,29 +95,38 @@ impl Retention {
 
 /// Where one channel of a new stream begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Start {
-    /// At the head of the sequence: nothing is replayed, and the channel opens
-    /// with a reset so the client reads its current state once the stream is
-    /// live, which is the only way not to miss what happened while it was
-    /// fetching.
-    Head,
-    /// At the oldest event the channel still keeps, for a stream whose events
-    /// are the data itself, such as a log tail.
-    Backfill,
-    /// Just after this id: every later event the channel keeps, or a reset
-    /// when the log can no longer vouch for all of them.
+pub(crate) struct Start {
+    /// What the client says it already heard.
+    pub(crate) cursor: Cursor,
+    /// Whether the stream's events are the data itself, such as a log tail,
+    /// so that a channel opening without an exact replay opens with whatever
+    /// it still keeps rather than with nothing.
+    pub(crate) backfill: bool,
+}
+
+/// What a client says it already heard on one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cursor {
+    /// Nothing: the channel starts at the head of the sequence.
+    Fresh,
+    /// Everything up to and including this id.
     After(EventId),
-    /// After an id this server cannot read: a reset.
+    /// An id this server cannot read.
     Unknown,
 }
 
 impl Start {
     /// The sequence a snapshot replays after, or `None` to replay nothing.
+    ///
+    /// A backfill stream reads everything a channel keeps, because whatever
+    /// its cursor says, the opening may have to fall back to all of it.
     pub(crate) fn since(self) -> Option<u64> {
-        match self {
-            Self::Head | Self::Unknown => None,
-            Self::Backfill => Some(0),
-            Self::After(cursor) => Some(cursor.sequence()),
+        if self.backfill {
+            return Some(0);
+        }
+        match self.cursor {
+            Cursor::Fresh | Cursor::Unknown => None,
+            Cursor::After(cursor) => Some(cursor.sequence()),
         }
     }
 }
@@ -155,11 +164,12 @@ pub(crate) struct BufferView {
 
 /// How one channel of a new stream opens.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Opening {
-    /// With a reset frame: the client reads the channel's state again.
-    Reset,
-    /// With these events, oldest first, which may be none at all.
-    Replay(Vec<Entry>),
+pub(crate) struct Opening {
+    /// Whether it opens with a reset frame: the client reads the channel's
+    /// state again, or clears it, before anything that follows.
+    pub(crate) reset: bool,
+    /// The events it replays after that, oldest first, which may be none.
+    pub(crate) entries: Vec<Entry>,
 }
 
 impl Snapshot {
@@ -168,28 +178,54 @@ impl Snapshot {
     /// The one statement of the resume rules. A cursor from another epoch, or
     /// from past the head, is not one this log minted; past that, a resume is
     /// exact unless the channel's floor or, for a channel with no buffer, the
-    /// watermark shows that something after the cursor was let go.
+    /// watermark shows that something after the cursor was let go. Wherever a
+    /// resume is not exact the channel opens with a reset, followed, for a
+    /// backfill stream, by everything the channel still keeps.
     pub(crate) fn opening(&self, start: Start, buffer: BufferView) -> Opening {
-        let cursor = match start {
-            Start::Head | Start::Unknown => return Opening::Reset,
-            Start::Backfill => return Opening::Replay(buffer.entries),
-            Start::After(cursor) => cursor,
+        let cursor = match start.cursor {
+            Cursor::After(cursor) if self.vouches_for(cursor, &buffer) => cursor,
+            // A first connection to a backfill stream opens with what is
+            // kept, and needs no reset: there was nothing before it to clear.
+            Cursor::Fresh if start.backfill => {
+                return Opening {
+                    reset: false,
+                    entries: buffer.entries,
+                };
+            }
+            Cursor::Fresh | Cursor::After(_) | Cursor::Unknown => {
+                let entries = if start.backfill {
+                    buffer.entries
+                } else {
+                    Vec::new()
+                };
+                return Opening {
+                    reset: true,
+                    entries,
+                };
+            }
         };
 
-        if cursor.epoch() != self.epoch || cursor.sequence() > self.head {
-            return Opening::Reset;
+        // A backfill stream read the whole buffer; a resume wants only what
+        // came after its cursor.
+        let mut entries = buffer.entries;
+        entries.retain(|entry| entry.sequence > cursor.sequence());
+        Opening {
+            reset: false,
+            entries,
         }
+    }
 
+    /// Whether every event on this channel after `cursor` is still kept.
+    fn vouches_for(&self, cursor: EventId, buffer: &BufferView) -> bool {
+        if cursor.epoch() != self.epoch || cursor.sequence() > self.head {
+            return false;
+        }
         let dropped_after_cursor = if buffer.exists {
             buffer.floor > cursor.sequence()
         } else {
             self.watermark > cursor.sequence()
         };
-        if dropped_after_cursor {
-            return Opening::Reset;
-        }
-
-        Opening::Replay(buffer.entries)
+        !dropped_after_cursor
     }
 }
 
@@ -349,13 +385,40 @@ impl MemoryLog {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BUFFER_OVERHEAD, ENTRY_OVERHEAD, MemoryLog, Opening, Snapshot, Start};
+    use super::{BUFFER_OVERHEAD, Cursor, ENTRY_OVERHEAD, MemoryLog, Opening, Snapshot, Start};
     use crate::realtime::id::EventId;
 
     const EPOCH: u64 = 0xfeed;
 
+    /// The reset a stream that is not a backfill opens with: no entries.
+    const RESET: Opening = Opening {
+        reset: true,
+        entries: Vec::new(),
+    };
+
     fn data(text: &str) -> Arc<str> {
         Arc::from(text)
+    }
+
+    /// Where a channel begins, for a stream that is not a backfill.
+    fn start(cursor: Cursor) -> Start {
+        Start {
+            cursor,
+            backfill: false,
+        }
+    }
+
+    /// Where a channel begins, for a backfill stream.
+    fn backfill(cursor: Cursor) -> Start {
+        Start {
+            cursor,
+            backfill: true,
+        }
+    }
+
+    /// Resuming after `id`, for a stream that is not a backfill.
+    fn after(id: EventId) -> Start {
+        start(Cursor::After(id))
     }
 
     /// How `channel` opens for a stream beginning at `start`.
@@ -367,10 +430,26 @@ mod tests {
 
     /// The sequences a replay carries, or `None` for a reset.
     fn replayed(opening: Opening) -> Option<Vec<u64>> {
-        match opening {
-            Opening::Reset => None,
-            Opening::Replay(entries) => Some(entries.iter().map(|entry| entry.sequence).collect()),
+        if opening.reset {
+            return None;
         }
+        Some(
+            opening
+                .entries
+                .into_iter()
+                .map(|entry| entry.sequence)
+                .collect(),
+        )
+    }
+
+    /// The sequences an opening carries, and whether it reset first.
+    fn opened(opening: Opening) -> (bool, Vec<u64>) {
+        let sequences = opening
+            .entries
+            .into_iter()
+            .map(|entry| entry.sequence)
+            .collect();
+        (opening.reset, sequences)
     }
 
     #[test]
@@ -394,7 +473,7 @@ mod tests {
         log.append("team:a:projects", data("3"), 8, usize::MAX);
         log.append("team:a:projects", data("4"), 8, usize::MAX);
 
-        let opening = open(&log, "team:a:projects", Start::After(cursor));
+        let opening = open(&log, "team:a:projects", after(cursor));
 
         assert_eq!(replayed(opening), Some(vec![3, 4]));
     }
@@ -404,7 +483,7 @@ mod tests {
         let mut log = MemoryLog::new(EPOCH);
         let cursor = log.append("team:a:projects", data("1"), 8, usize::MAX);
 
-        let opening = open(&log, "user:never:published", Start::After(cursor));
+        let opening = open(&log, "user:never:published", after(cursor));
 
         assert_eq!(replayed(opening), Some(vec![]));
     }
@@ -419,15 +498,12 @@ mod tests {
 
         // Event 2 was dropped to keep the buffer at two, and the client never
         // heard it, so nothing short of a reset is honest.
-        assert_eq!(
-            open(&log, "team:a:projects", Start::After(cursor)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:a:projects", after(cursor)), RESET);
 
         // A cursor at the floor itself lost nothing the buffer does not hold.
         let at_floor = EventId::new(EPOCH, 2);
         assert_eq!(
-            replayed(open(&log, "team:a:projects", Start::After(at_floor))),
+            replayed(open(&log, "team:a:projects", after(at_floor))),
             Some(vec![3, 4]),
         );
     }
@@ -447,38 +523,20 @@ mod tests {
         log.append("team:new:projects", data(&"n".repeat(entry)), 8, budget);
 
         // The oldest channel is gone, and so its events cannot be vouched for.
-        assert_eq!(
-            open(&log, "team:old:projects", Start::After(cursor)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:old:projects", after(cursor)), RESET);
         // Any other channel without a buffer is in the same position.
-        assert_eq!(
-            open(&log, "user:quiet:inbox", Start::After(cursor)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "user:quiet:inbox", after(cursor)), RESET);
         // A cursor at or past everything that was let go resumes exactly.
         assert_eq!(
-            replayed(open(
-                &log,
-                "team:old:projects",
-                Start::After(heard_the_first)
-            )),
+            replayed(open(&log, "team:old:projects", after(heard_the_first))),
             Some(vec![]),
         );
         assert_eq!(
-            replayed(open(
-                &log,
-                "team:new:projects",
-                Start::After(heard_the_first)
-            )),
+            replayed(open(&log, "team:new:projects", after(heard_the_first))),
             Some(vec![3]),
         );
         assert_eq!(
-            replayed(open(
-                &log,
-                "user:quiet:inbox",
-                Start::After(heard_the_first)
-            )),
+            replayed(open(&log, "user:quiet:inbox", after(heard_the_first))),
             Some(vec![]),
         );
     }
@@ -497,10 +555,7 @@ mod tests {
         log.append("team:a:projects", data("3"), 8, budget);
 
         // Event 1 is gone even though the channel has a buffer again.
-        assert_eq!(
-            open(&log, "team:a:projects", Start::After(cursor)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:a:projects", after(cursor)), RESET);
     }
 
     #[test]
@@ -509,21 +564,12 @@ mod tests {
         log.append("team:a:projects", data("1"), 8, usize::MAX);
 
         let other_epoch = EventId::new(EPOCH + 1, 1);
-        assert_eq!(
-            open(&log, "team:a:projects", Start::After(other_epoch)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:a:projects", after(other_epoch)), RESET);
 
         let from_the_future = EventId::new(EPOCH, 99);
-        assert_eq!(
-            open(&log, "team:a:projects", Start::After(from_the_future)),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:a:projects", after(from_the_future)), RESET);
 
-        assert_eq!(
-            open(&log, "team:a:projects", Start::Unknown),
-            Opening::Reset
-        );
+        assert_eq!(open(&log, "team:a:projects", start(Cursor::Unknown)), RESET);
     }
 
     #[test]
@@ -533,14 +579,59 @@ mod tests {
             log.append("resource:r:logs", data(text), 2, usize::MAX);
         }
 
-        assert_eq!(open(&log, "resource:r:logs", Start::Head), Opening::Reset);
+        assert_eq!(open(&log, "resource:r:logs", start(Cursor::Fresh)), RESET);
         assert_eq!(
-            replayed(open(&log, "resource:r:logs", Start::Backfill)),
-            Some(vec![2, 3]),
+            opened(open(&log, "resource:r:logs", backfill(Cursor::Fresh))),
+            (false, vec![2, 3]),
         );
         assert_eq!(
-            replayed(open(&log, "resource:none:logs", Start::Backfill)),
-            Some(vec![]),
+            opened(open(&log, "resource:none:logs", backfill(Cursor::Fresh))),
+            (false, vec![]),
+        );
+    }
+
+    #[test]
+    fn a_backfill_that_cannot_resume_exactly_resets_then_refills() {
+        let mut log = MemoryLog::new(EPOCH);
+        let cursor = log.append("resource:r:logs", data("1"), 2, usize::MAX);
+        for text in ["2", "3", "4"] {
+            log.append("resource:r:logs", data(text), 2, usize::MAX);
+        }
+
+        // The cursor is below the floor: the tail clears what it shows, then
+        // fills again from the lines still kept, rather than going blank.
+        assert_eq!(
+            opened(open(
+                &log,
+                "resource:r:logs",
+                backfill(Cursor::After(cursor))
+            )),
+            (true, vec![3, 4]),
+        );
+        assert_eq!(
+            opened(open(&log, "resource:r:logs", backfill(Cursor::Unknown))),
+            (true, vec![3, 4]),
+        );
+        let foreign = EventId::new(EPOCH + 1, 1);
+        assert_eq!(
+            opened(open(
+                &log,
+                "resource:r:logs",
+                backfill(Cursor::After(foreign))
+            )),
+            (true, vec![3, 4]),
+        );
+
+        // An exact resume replays only what came after the cursor, even
+        // though a backfill stream read the whole buffer to decide.
+        let recent = EventId::new(EPOCH, 3);
+        assert_eq!(
+            opened(open(
+                &log,
+                "resource:r:logs",
+                backfill(Cursor::After(recent))
+            )),
+            (false, vec![4]),
         );
     }
 

@@ -18,10 +18,14 @@ mod support;
 
 use std::time::Duration;
 
-use anubis::realtime::{ChannelName, Channels, ChannelsBuilder};
+use anubis::http::ApiError;
+use anubis::realtime::{ChannelName, Channels, ChannelsBuilder, EventStream, Subscriber};
 use anubis::schema::organization_memberships;
+use axum::extract::Path;
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderValue, StatusCode};
+use axum::routing::get;
+use axum::{Extension, Router};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde_json::json;
@@ -475,6 +479,175 @@ async fn narrative(deployment: Deployment) {
         no_such_team["message"],
         "a suspension reads exactly like a team that does not exist",
     );
+}
+
+/// An application's own stream, through `Subscriber` and `Channels::stream`:
+/// the session check is part of the extractor, a first connection backfills
+/// what the channel keeps, a resume is exact, and a resume the buffer cannot
+/// vouch for resets and then refills from what is kept.
+#[tokio::test]
+async fn an_application_stream_backfills_resumes_and_refills_after_a_reset() {
+    let Some(database) = TestDatabase::create("realtime_flow application stream").await else {
+        return;
+    };
+    let channels = Channels::builder().retain("logs", 3).build_in_process();
+    let harness = Harness::boot_with_channels(&database, channels.clone()).await;
+    let member = register(&harness.router, "logs@realtime.test").await;
+    let server_id = Uuid::new_v4();
+    let logs = ChannelName::resource(server_id, "logs");
+
+    let router = Router::new()
+        .route("/servers/{server_id}/logs", get(tail))
+        .layer(Extension(channels.clone()))
+        .layer(Extension(harness.pool.clone()));
+    let path = format!("/servers/{server_id}/logs");
+
+    // The session check is the extractor's, so no handler can forget it.
+    let (status, _body) = stream::open(&router, &path, None, None)
+        .await
+        .expect_err("a stream without a session must be refused");
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    for line in ["booting", "ready"] {
+        channels
+            .publish(&logs, "line", json!({ "text": line }))
+            .await
+            .expect("publishing must succeed");
+    }
+
+    // A first connection opens with what the channel keeps, and no reset.
+    let mut tailing = stream::connect(&router, &path, &member, None).await;
+    let opening = tailing.opening().await;
+    assert!(opening.resets().is_empty(), "{opening:?}");
+    assert_eq!(texts(&opening), vec!["booting", "ready"]);
+    let cursor = opening.cursor.clone();
+    drop(tailing);
+
+    // A resume within what is kept replays exactly what was missed.
+    channels
+        .publish(&logs, "line", json!({ "text": "player joined" }))
+        .await
+        .expect("publishing must succeed");
+    let mut resumed = stream::connect(&router, &path, &member, Some(&cursor)).await;
+    let opening = resumed.opening().await;
+    assert!(opening.resets().is_empty(), "{opening:?}");
+    assert_eq!(texts(&opening), vec!["player joined"]);
+    let cursor = opening.cursor.clone();
+    drop(resumed);
+
+    // Five more lines through a buffer of three: the tail clears what it
+    // shows, then fills again from what is still kept, rather than going blank.
+    for index in 0..5 {
+        channels
+            .publish(&logs, "line", json!({ "text": format!("tick {index}") }))
+            .await
+            .expect("publishing must succeed");
+    }
+    let mut refilled = stream::connect(&router, &path, &member, Some(&cursor)).await;
+    let opening = refilled.opening().await;
+    assert_eq!(opening.resets(), vec![logs.to_string().as_str()]);
+    assert_eq!(texts(&opening), vec!["tick 2", "tick 3", "tick 4"]);
+}
+
+/// `GET /servers/{server_id}/logs`, as an application would write it.
+async fn tail(
+    subscriber: Subscriber,
+    Path(server_id): Path<Uuid>,
+    Extension(channels): Extension<Channels>,
+) -> Result<EventStream, ApiError> {
+    // The application's own authorization, against `subscriber.user()`,
+    // goes here; this test lets every signed-in account read every log.
+    let stream = channels
+        .stream(
+            subscriber.backfill(),
+            [ChannelName::resource(server_id, "logs")],
+        )
+        .await?;
+    Ok(stream)
+}
+
+/// The text of every log line an opening replayed, in order.
+fn texts(opening: &Opening) -> Vec<String> {
+    opening
+        .of_kind("event")
+        .into_iter()
+        .map(|event| {
+            event.frame["payload"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A Redis that restarted from an older point, or a replica promoted in its
+/// place, has a new `run_id`; the log starts a new epoch rather than mint ids
+/// clients already hold for other events.
+#[tokio::test]
+async fn a_redis_that_came_back_from_an_older_point_starts_a_new_epoch() {
+    let Some(redis_url) = redis_url("realtime_flow rewind") else {
+        return;
+    };
+    let Some(database) = TestDatabase::create("realtime_flow rewind").await else {
+        return;
+    };
+    let isolated = redis_database(&redis_url, 13);
+    flush(&isolated).await;
+
+    let channels = Channels::redis(&isolated)
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    let harness = Harness::boot_with_channels(&database, channels.clone()).await;
+    let member = register(&harness.router, "rewind@realtime.test").await;
+    let inbox = ChannelName::user(user_id(&harness.router, &member).await, "inbox");
+    let path = stream::path(&[&inbox.to_string()], &[]);
+
+    let mut listening = stream::connect(&harness.router, &path, &member, None).await;
+    let _opened = listening.opening().await;
+    let mut cursor = String::new();
+    for round in 0..3 {
+        channels
+            .publish(&inbox, "created", json!({ "round": round }))
+            .await
+            .expect("publishing must succeed");
+        cursor = listening.next().await.id.expect("an event carries its id");
+    }
+
+    // What a restore from an older snapshot leaves behind: the same epoch, a
+    // sequence that went backwards, and a server that is not the one that
+    // wrote it. Only the last is visible to a script, so it is the one that
+    // has to decide.
+    let client = redis::Client::open(isolated.as_str()).expect("the Redis URL must parse");
+    let mut connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Redis must be reachable");
+    redis::cmd("HSET")
+        .arg("{anubis:realtime}:log")
+        .arg("sequence")
+        .arg(1)
+        .arg("run_id")
+        .arg("0000000000000000000000000000000000000000")
+        .query_async::<()>(&mut connection)
+        .await
+        .expect("the log must accept the rewind");
+
+    let reissued = channels
+        .publish(&inbox, "created", json!({ "round": "after" }))
+        .await
+        .expect("publishing must succeed")
+        .to_string();
+    assert_ne!(
+        epoch_of(&reissued),
+        epoch_of(&cursor),
+        "a rewound sequence must not mint ids under the old epoch",
+    );
+    // The open stream hears an epoch it did not start in, and ends.
+    assert!(listening.until_end().await.is_empty());
+
+    let mut resumed = stream::connect(&harness.router, &path, &member, Some(&cursor)).await;
+    let opening = resumed.opening().await;
+    assert_eq!(opening.resets(), vec![inbox.to_string().as_str()]);
+    assert!(opening.of_kind("event").is_empty(), "{opening:?}");
 }
 
 /// A Redis that lost its data starts a new epoch, and every stream and cursor

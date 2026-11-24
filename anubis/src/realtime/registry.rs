@@ -13,13 +13,17 @@
 //! replay log instead of silently missing what was dropped.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use uuid::Uuid;
 
 use super::id::EventId;
 use super::remote::Interest;
+use crate::server::Drain;
 
 /// How many channels one process will hold streams for.
 ///
@@ -30,6 +34,23 @@ use super::remote::Interest;
 /// deployments sit far below it, since a channel exists here only while a
 /// stream carries it.
 pub(crate) const MAX_CHANNELS: usize = 16_384;
+
+/// How many streams one account may hold open on one process.
+///
+/// Every open tab holds one stream for `/realtime` and one for each of the
+/// application's own streams it shows, so thirty-two is a person with a great
+/// many tabs open. The bound exists because the per-process table is shared by
+/// every account: without a share of its own, one account could fill it and
+/// refuse everybody else's channels.
+pub(crate) const MAX_STREAMS_PER_ACCOUNT: usize = 32;
+
+/// How many channels one account's open streams may carry between them.
+///
+/// Counted per stream, so two tabs on the same channel count it twice. Five
+/// hundred and twelve is far past what a person's tabs listen to, and is a
+/// thirty-second of the per-process table, so filling it takes that many
+/// accounts rather than one.
+pub(crate) const MAX_CHANNELS_PER_ACCOUNT: usize = 512;
 
 /// How many events may queue for one stream before it is cut.
 ///
@@ -61,8 +82,17 @@ pub(crate) struct Registry {
 struct State {
     slots: HashMap<String, Slot>,
     listeners: HashMap<u64, Entry>,
+    /// What each account's open streams hold, for the per-account bounds.
+    holdings: HashMap<Uuid, Holding>,
     next_listener: u64,
     next_generation: u64,
+}
+
+/// What one account's open streams hold between them.
+#[derive(Debug, Default, Clone, Copy)]
+struct Holding {
+    streams: usize,
+    channels: usize,
 }
 
 /// One channel: the streams carrying it, and whether it is being delivered.
@@ -76,12 +106,17 @@ struct Slot {
     ready: watch::Sender<bool>,
 }
 
-/// One stream's queue, and the channels it holds.
+/// One stream's queue, the channels it holds, and whose it is.
 #[derive(Debug)]
 struct Entry {
     sender: mpsc::Sender<Delivery>,
     channels: Vec<String>,
+    account: Uuid,
 }
+
+/// The account already holds as many streams or channels as it may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverQuota;
 
 impl Registry {
     /// Builds a registry, announcing what it carries to `interest`.
@@ -92,15 +127,38 @@ impl Registry {
         })
     }
 
-    /// Opens one stream's queue on `channels`.
+    /// Opens one stream's queue on `channels`, for `account`.
     ///
     /// Returns the [`Listener`], and the channels it was refused because the
     /// process already holds [`MAX_CHANNELS`] and each would have opened one
     /// more. A channel already open costs nothing and is never refused.
-    pub(crate) fn listen(self: &Arc<Self>, channels: &[String]) -> (Listener, Vec<String>) {
+    ///
+    /// # Errors
+    /// Returns [`OverQuota`] when the stream would take `account` past
+    /// [`MAX_STREAMS_PER_ACCOUNT`] or [`MAX_CHANNELS_PER_ACCOUNT`].
+    pub(crate) fn listen(
+        self: &Arc<Self>,
+        account: Uuid,
+        channels: &[String],
+    ) -> Result<(Listener, Vec<String>), OverQuota> {
         let (sender, receiver) = mpsc::channel(BACKLOG);
         let mut guard = self.lock();
         let state = &mut *guard;
+
+        let holding = state.holdings.get(&account).copied().unwrap_or_default();
+        if holding.streams >= MAX_STREAMS_PER_ACCOUNT
+            || holding.channels + channels.len() > MAX_CHANNELS_PER_ACCOUNT
+        {
+            tracing::warn!(
+                user.id = %account,
+                realtime.streams = holding.streams,
+                realtime.channels = holding.channels,
+                "refusing a stream: {{user.id}} already holds {{realtime.streams}} streams \
+                 carrying {{realtime.channels}} channels",
+            );
+            return Err(OverQuota);
+        }
+
         let id = state.next_listener;
         state.next_listener += 1;
 
@@ -149,11 +207,15 @@ impl Registry {
             });
         }
 
+        let holding = state.holdings.entry(account).or_default();
+        holding.streams += 1;
+        holding.channels += held.len();
         state.listeners.insert(
             id,
             Entry {
                 sender,
                 channels: held,
+                account,
             },
         );
         drop(guard);
@@ -164,7 +226,7 @@ impl Registry {
             receiver,
             ready,
         };
-        (listener, refused)
+        Ok((listener, refused))
     }
 
     /// Queues one event for every stream carrying `channel`.
@@ -239,6 +301,14 @@ impl Registry {
         let Some(entry) = state.listeners.remove(&id) else {
             return;
         };
+
+        if let Some(holding) = state.holdings.get_mut(&entry.account) {
+            holding.streams -= 1;
+            holding.channels -= entry.channels.len();
+            if holding.streams == 0 {
+                state.holdings.remove(&entry.account);
+            }
+        }
 
         for channel in entry.channels {
             let Some(slot) = state.slots.get_mut(&channel) else {
@@ -321,6 +391,34 @@ impl Listener {
     pub(crate) async fn recv(&mut self) -> Option<Delivery> {
         self.receiver.recv().await
     }
+
+    /// Releases this listener's channels at `deadline`, or when `drain`
+    /// starts, whether or not anything is still reading from it.
+    ///
+    /// A stream's body is polled only while its client takes bytes, so a
+    /// client that stops reading would otherwise keep its channels, its share
+    /// of the account bounds, and under Redis its subscriptions, for as long
+    /// as it liked. The task holds the registry weakly, and ending it early
+    /// (the stream closing on its own) is harmless.
+    pub(crate) fn release_at(&self, deadline: Instant, drain: Option<Drain>) -> JoinHandle<()> {
+        let registry: Weak<Registry> = Arc::downgrade(&self.registry);
+        let id = self.id;
+        tokio::spawn(async move {
+            let mut drain = drain;
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = async {
+                    match drain.as_mut() {
+                        Some(drain) => drain.started().await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+            if let Some(registry) = registry.upgrade() {
+                registry.release(id);
+            }
+        })
+    }
 }
 
 impl Drop for Listener {
@@ -333,7 +431,12 @@ impl Drop for Listener {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BACKLOG, Delivery, Registry};
+    use uuid::Uuid;
+
+    use super::{
+        BACKLOG, Delivery, Listener, MAX_CHANNELS_PER_ACCOUNT, MAX_STREAMS_PER_ACCOUNT, OverQuota,
+        Registry,
+    };
     use crate::realtime::id::EventId;
     use crate::realtime::remote::Interest;
 
@@ -351,10 +454,17 @@ mod tests {
             .collect()
     }
 
+    /// Opens a stream on `channels` for an account of its own.
+    fn listen(registry: &Arc<Registry>, channels: &[String]) -> (Listener, Vec<String>) {
+        registry
+            .listen(Uuid::new_v4(), channels)
+            .expect("a fresh account is within its bounds")
+    }
+
     #[tokio::test]
     async fn one_queue_carries_every_channel_in_dispatch_order() {
         let registry = Registry::new(None);
-        let (mut listener, refused) = registry.listen(&names(&["team:a:x", "user:b:y"]));
+        let (mut listener, refused) = listen(&registry, &names(&["team:a:x", "user:b:y"]));
         assert!(refused.is_empty());
 
         registry.dispatch("team:a:x", &delivery(1));
@@ -370,8 +480,8 @@ mod tests {
     #[tokio::test]
     async fn every_stream_on_a_channel_receives_a_dispatch() {
         let registry = Registry::new(None);
-        let (mut first, _refused) = registry.listen(&names(&["team:a:x"]));
-        let (mut second, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (mut first, _refused) = listen(&registry, &names(&["team:a:x"]));
+        let (mut second, _refused) = listen(&registry, &names(&["team:a:x"]));
 
         registry.dispatch("team:a:x", &delivery(1));
 
@@ -384,8 +494,8 @@ mod tests {
     #[tokio::test]
     async fn a_channel_lives_exactly_as_long_as_its_streams() {
         let registry = Registry::new(None);
-        let (first, _refused) = registry.listen(&names(&["user:a:inbox"]));
-        let (second, _refused) = registry.listen(&names(&["user:a:inbox"]));
+        let (first, _refused) = listen(&registry, &names(&["user:a:inbox"]));
+        let (second, _refused) = listen(&registry, &names(&["user:a:inbox"]));
         assert_eq!(registry.len(), 1);
 
         drop(first);
@@ -400,8 +510,8 @@ mod tests {
         let (sender, mut interest) = tokio::sync::mpsc::unbounded_channel();
         let registry = Registry::new(Some(sender));
 
-        let (first, _refused) = registry.listen(&names(&["team:a:x"]));
-        let (second, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (first, _refused) = listen(&registry, &names(&["team:a:x"]));
+        let (second, _refused) = listen(&registry, &names(&["team:a:x"]));
         let opened = interest
             .try_recv()
             .expect("the first stream opens the channel");
@@ -430,7 +540,7 @@ mod tests {
         );
 
         // Opening it again is a new generation.
-        let (_third, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (_third, _refused) = listen(&registry, &names(&["team:a:x"]));
         let reopened = interest.try_recv().expect("the channel opens again");
         assert!(
             matches!(reopened, Interest::Opened { generation: next, .. } if next != generation),
@@ -443,7 +553,7 @@ mod tests {
         let (sender, mut interest) = tokio::sync::mpsc::unbounded_channel();
         let registry = Registry::new(Some(sender));
 
-        let (old, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (old, _refused) = listen(&registry, &names(&["team:a:x"]));
         let Some(Interest::Opened {
             generation: stale, ..
         }) = interest.try_recv().ok()
@@ -452,7 +562,7 @@ mod tests {
         };
         drop(old);
 
-        let (mut listener, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (mut listener, _refused) = listen(&registry, &names(&["team:a:x"]));
         let _closed = interest.try_recv();
         let Some(Interest::Opened { generation, .. }) = interest.try_recv().ok() else {
             panic!("the channel must open again");
@@ -474,8 +584,8 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_falls_behind_is_cut_after_draining_what_it_holds() {
         let registry = Registry::new(None);
-        let (mut slow, _refused) = registry.listen(&names(&["team:a:x"]));
-        let (mut keeping_up, _refused) = registry.listen(&names(&["team:a:x"]));
+        let (mut slow, _refused) = listen(&registry, &names(&["team:a:x"]));
+        let (mut keeping_up, _refused) = listen(&registry, &names(&["team:a:x"]));
 
         let total = u64::try_from(BACKLOG).expect("the backlog fits") + 1;
         for sequence in 1..=total {
@@ -499,10 +609,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_account_holds_a_share_of_the_table_and_no_more() {
+        let registry = Registry::new(None);
+        let account = Uuid::new_v4();
+
+        // Streams: up to the bound, then refused, then room again once one
+        // closes.
+        let mut held = Vec::new();
+        for index in 0..MAX_STREAMS_PER_ACCOUNT {
+            let channel = names(&[&format!("user:{account}:t{index}")]);
+            held.push(
+                registry
+                    .listen(account, &channel)
+                    .expect("within the bound"),
+            );
+        }
+        let one_more = names(&["user:x:extra"]);
+        assert_eq!(registry.listen(account, &one_more).err(), Some(OverQuota));
+        let _another = registry
+            .listen(Uuid::new_v4(), &one_more)
+            .expect("another account is untouched");
+        held.pop();
+        let _room_again = registry
+            .listen(account, &one_more)
+            .expect("a closed stream frees its share");
+        drop(held);
+
+        // Channels: counted across the account's streams.
+        let other = Uuid::new_v4();
+        let wide: Vec<String> = (0..MAX_CHANNELS_PER_ACCOUNT)
+            .map(|index| format!("user:{other}:t{index}"))
+            .collect();
+        let (_wide, _refused) = registry.listen(other, &wide).expect("exactly at the bound");
+        assert_eq!(registry.listen(other, &one_more).err(), Some(OverQuota));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_is_released_on_schedule_even_when_nothing_reads_it() {
+        let registry = Registry::new(None);
+        let account = Uuid::new_v4();
+        let (mut listener, _refused) = registry
+            .listen(account, &names(&["team:a:x"]))
+            .expect("within the bound");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+        let _release = listener.release_at(deadline, None);
+
+        registry.dispatch("team:a:x", &delivery(1));
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+
+        // The channel, and the account's share, are free without a single read.
+        assert_eq!(registry.len(), 0);
+        let full: Vec<String> = (0..MAX_CHANNELS_PER_ACCOUNT)
+            .map(|index| format!("user:{account}:t{index}"))
+            .collect();
+        let _whole_share = registry
+            .listen(account, &full)
+            .expect("the released stream's share is free again");
+        // What was queued before the release still drains, then the queue ends.
+        assert!(listener.recv().await.is_some());
+        assert!(listener.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn an_interruption_ends_every_stream() {
         let registry = Registry::new(None);
-        let (mut first, _refused) = registry.listen(&names(&["team:a:x"]));
-        let (mut second, _refused) = registry.listen(&names(&["user:b:y"]));
+        let (mut first, _refused) = listen(&registry, &names(&["team:a:x"]));
+        let (mut second, _refused) = listen(&registry, &names(&["user:b:y"]));
 
         registry.interrupt();
 

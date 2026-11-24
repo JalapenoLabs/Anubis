@@ -60,15 +60,23 @@
 //! the same [`Channels`] API, the same frames, the same authorization.
 //!
 //! Redis holds no durable state. The buffers are a convenience for clients
-//! that reconnect; a Redis that loses them starts a new epoch, and every
-//! client that resumes afterwards opens with a reset and refetches.
+//! that reconnect. A Redis that restarts, whether it comes back empty or from
+//! an older snapshot, or a replica promoted in its place, has a new `run_id`,
+//! and the log starts a new epoch on it and lets go of everything kept, so a
+//! rewound sequence can never mint an id a client already holds; every client
+//! that resumes afterwards opens with a reset and refetches.
 //!
 //! # Bounded everywhere
 //!
-//! A stream carries at most 64 channels, a process holds at most 16,384, an
-//! event renders to at most 64 KiB, and a stream that falls 256 events behind
-//! is closed and resumes. Channel names arrive from browsers, so every one of
-//! those is a bound on what a client can make the server hold.
+//! A stream carries at most 64 channels, an account holds at most 32 streams
+//! and 512 channels across them on one process, a process holds at most
+//! 16,384 channels, an event renders to at most 64 KiB, and a stream that
+//! falls 256 events behind is closed and resumes. Channel names arrive from
+//! browsers, so each is a bound on what a client can make the server hold, and
+//! the per-account share is what keeps one account from filling the process's
+//! table for everyone else. A stream's channels are released when its lifetime
+//! ends or the server drains whether or not its client is still reading, so a
+//! client that stops reading cannot keep them.
 
 mod channel;
 mod endpoint;
@@ -117,6 +125,13 @@ pub const MAX_CHANNELS_PER_STREAM: usize = 64;
 /// for a while. Sixty-four kilobytes is far past a changed record or a log
 /// line; anything larger belongs behind a REST read the event points at.
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+
+/// How long a stream refused for its account's bounds is asked to wait.
+///
+/// The account's other streams free their share as their tabs close or their
+/// lifetimes end, which is minutes at most; ten seconds keeps a person who
+/// closed a tab from waiting long without inviting a retry storm.
+const OVER_QUOTA_RETRY: Duration = Duration::from_secs(10);
 
 /// How long opening a stream may wait on Redis before answering `503`.
 ///
@@ -315,13 +330,19 @@ impl Channels {
             .filter(|(name, _start)| seen.insert(name.clone()))
             .collect();
         let names: Vec<String> = requests.iter().map(|(name, _start)| name.clone()).collect();
+        let account = subscriber.user().id;
+        let over_quota = |_over: registry::OverQuota| Error::new(ErrorKind::OverQuota);
 
         let (listener, full, mut snapshot, granted) = match &self.inner.backend {
             Backend::InProcess(log) => {
                 // Registering and reading under the publish lock: every event
                 // is in the snapshot or on the queue, and never in neither.
                 let log = lock(log);
-                let (listener, full) = self.inner.registry.listen(&names);
+                let (listener, full) = self
+                    .inner
+                    .registry
+                    .listen(account, &names)
+                    .map_err(over_quota)?;
                 let granted = without(&requests, &full);
                 let snapshot = log.snapshot(
                     granted
@@ -332,7 +353,11 @@ impl Channels {
                 (listener, full, snapshot, granted)
             }
             Backend::Redis(remote) => {
-                let (mut listener, full) = self.inner.registry.listen(&names);
+                let (mut listener, full) = self
+                    .inner
+                    .registry
+                    .listen(account, &names)
+                    .map_err(over_quota)?;
                 let granted = without(&requests, &full);
                 let deadline = tokio::time::Instant::now() + OPEN_TIMEOUT;
 
@@ -367,12 +392,11 @@ impl Channels {
         let buffers = std::mem::take(&mut snapshot.buffers);
         let mut replay = Vec::new();
         for ((channel, start), buffer) in granted.iter().zip(buffers) {
-            match snapshot.opening(*start, buffer) {
-                Opening::Reset => {
-                    opening.push_back(Event::default().data(Frame::Reset { channel }.render()));
-                }
-                Opening::Replay(entries) => replay.extend(entries),
+            let Opening { reset, entries } = snapshot.opening(*start, buffer);
+            if reset {
+                opening.push_back(Event::default().data(Frame::Reset { channel }.render()));
             }
+            replay.extend(entries);
         }
 
         // One channel's events are in order already; across channels, the
@@ -597,6 +621,8 @@ enum ErrorKind {
     Payload(serde_json::Error),
     TooLarge(usize),
     TooManyChannels(usize),
+    /// The account already holds as many streams or channels as it may.
+    OverQuota,
 }
 
 impl Error {
@@ -645,6 +671,17 @@ impl Error {
     pub fn is_too_many_channels(&self) -> bool {
         matches!(self.kind, ErrorKind::TooManyChannels(_))
     }
+
+    /// Returns `true` when the account already holds as many streams, or as
+    /// many channels across its streams, as one account may on one process.
+    ///
+    /// A share of the process's table per account, so no single account can
+    /// fill it for everyone else. The client backs off and tries again; a
+    /// stream ending, after at most six minutes, frees its share.
+    #[must_use]
+    pub fn is_over_quota(&self) -> bool {
+        matches!(self.kind, ErrorKind::OverQuota)
+    }
 }
 
 impl Display for Error {
@@ -677,6 +714,12 @@ impl Display for Error {
                      {MAX_CHANNELS_PER_STREAM}",
                 )?;
             }
+            ErrorKind::OverQuota => {
+                write!(
+                    f,
+                    "the account already holds as many realtime streams or channels as it may",
+                )?;
+            }
         }
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
@@ -690,9 +733,10 @@ impl std::error::Error for Error {
         match &self.kind {
             ErrorKind::Configuration(source) | ErrorKind::Transport(Some(source)) => Some(source),
             ErrorKind::Payload(source) => Some(source),
-            ErrorKind::Transport(None) | ErrorKind::TooLarge(_) | ErrorKind::TooManyChannels(_) => {
-                None
-            }
+            ErrorKind::Transport(None)
+            | ErrorKind::TooLarge(_)
+            | ErrorKind::TooManyChannels(_)
+            | ErrorKind::OverQuota => None,
         }
     }
 }
@@ -709,6 +753,9 @@ impl From<Error> for ApiError {
             ErrorKind::TooManyChannels(_) => Self::validation(format!(
                 "A stream may carry at most {MAX_CHANNELS_PER_STREAM} channels."
             )),
+            // The account's own streams are what has to end, so the answer is
+            // a wait rather than a refusal; the client backs off and retries.
+            ErrorKind::OverQuota => Self::too_many_requests(OVER_QUOTA_RETRY),
             ErrorKind::Configuration(_) | ErrorKind::Transport(_) => {
                 tracing::error!(
                     error.message = %error,

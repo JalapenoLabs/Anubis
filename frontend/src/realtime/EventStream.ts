@@ -17,6 +17,25 @@ const RECONNECT_BASE = 500
 const RECONNECT_CEILING = 10_000
 
 /**
+ * The longest a server's `Retry-After` is honored for, in milliseconds.
+ *
+ * A server asking for a minute is asking for patience; one asking for an hour
+ * is mistaken, and a tab that waits an hour looks broken.
+ */
+const RETRY_AFTER_CEILING = 60_000
+
+/**
+ * How long a stream may say nothing at all before it is taken for dead, in
+ * milliseconds.
+ *
+ * The server sends a heartbeat comment whenever it has been quiet for twenty
+ * seconds, so silence past two of them means the connection is gone without
+ * having closed: a server killed without a FIN, or a NAT that forgot it. The
+ * stream then reconnects rather than stay open and deaf.
+ */
+const IDLE_LIMIT = 45_000
+
+/**
  * The most text one event may buffer before the stream is abandoned.
  *
  * The server never renders an event past 64 KiB, so twice that is room to
@@ -24,6 +43,16 @@ const RECONNECT_CEILING = 10_000
  * the parser hold.
  */
 const MAX_EVENT_CHARACTERS = 128 * 1024
+
+/**
+ * The refusals worth asking again after a wait.
+ *
+ * `408` and `429` say "not now"; `425` says "too early"; `426` is what an
+ * instance still running a release that predates event streams answers during
+ * a rolling deploy. Every other `4xx` will be answered the same way next time,
+ * so it is final.
+ */
+const RETRYABLE_REFUSALS: ReadonlySet<number> = new Set([ 408, 425, 426, 429 ])
 
 /** What a stream is doing about its connection. */
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed'
@@ -46,14 +75,18 @@ export type EventStreamOptions = {
   fetch?: Options['fetch']
 }
 
-/** How one connection ended. */
-type Ending =
-  /** The server closed it after sending something: reconnect at once and resume. */
-  | 'ended'
-  /** It failed, broke, or ended having said nothing: reconnect on the backoff. */
-  | 'failed'
-  /** The server refused it: it will refuse it again, so stop. */
-  | 'refused'
+/** How one connection ended, and how long the server asked to be left. */
+type Ending = {
+  kind:
+    /** The server closed it after sending something: reconnect at once and resume. */
+    | 'ended'
+    /** It failed, broke, or ended having said nothing: reconnect on the backoff. */
+    | 'failed'
+    /** The server refused it, and will refuse it again: stop. */
+    | 'refused'
+  /** The least the next attempt waits, in milliseconds, from `Retry-After`. */
+  waitAtLeast: number
+}
 
 /**
  * How long to wait before the reconnection attempt numbered `attempt`.
@@ -74,11 +107,13 @@ export function reconnectDelay(attempt: number): number {
  *
  * Connects as soon as it is built and stays connected: a stream the server
  * ends, which it does every few minutes and whenever it restarts, reconnects
- * at once, and one that fails reconnects on a capped backoff. Every
- * reconnection sends the id of the last event or `live` frame it heard as
- * `Last-Event-ID`, so the server replays what was missed, or resets the
- * channels it can no longer replay. A `4xx` answer is final: the stream
- * closes rather than ask again for what it was refused.
+ * at once, and one that fails, or falls silent past two heartbeats, reconnects
+ * on a capped backoff. Every reconnection sends the id of the last event or
+ * `live` frame it heard as `Last-Event-ID`, so the server replays what was
+ * missed, or resets the channels it can no longer replay. A refusal that will
+ * not change, such as `401`, is final: the stream closes rather than ask again
+ * for what it was refused. One that may (`408`, `425`, `426`, `429`) waits and
+ * asks again, honoring `Retry-After`.
  *
  * Built on `fetch` rather than the browser's `EventSource`, which can send
  * `Last-Event-ID` only on its own reconnects and never says why a connection
@@ -144,22 +179,22 @@ export class EventStream {
       }
       this.controller = null
 
-      if (ending === 'refused') {
+      if (ending.kind === 'refused') {
         this.setState('closed')
         return
       }
 
-      const delay = ending === 'ended'
+      const backoff = ending.kind === 'ended'
         ? 0
         : reconnectDelay(this.attempt)
-      if (ending === 'failed') {
+      if (ending.kind === 'failed') {
         this.attempt += 1
       }
       this.setState('connecting')
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null
         this.connect()
-      }, delay)
+      }, Math.max(backoff, ending.waitAtLeast))
     })
   }
 
@@ -193,28 +228,63 @@ export class EventStream {
       if (!signal.aborted) {
         console.debug('EventStream could not connect; it will retry', error)
       }
-      return 'failed'
+      return { kind: 'failed', waitAtLeast: 0 }
     }
 
+    const waitAtLeast = retryAfter(response)
     if (response.status >= 400 && response.status < 500) {
+      if (RETRYABLE_REFUSALS.has(response.status)) {
+        console.debug('The event stream was asked to wait; it will retry', response.status)
+        return { kind: 'failed', waitAtLeast }
+      }
       console.warn('The server refused the event stream, so it will not reconnect', response.status)
-      return 'refused'
+      return { kind: 'refused', waitAtLeast }
     }
     if (!response.ok || !response.body) {
       console.debug('The event stream could not open; it will retry', response.status)
-      return 'failed'
+      return { kind: 'failed', waitAtLeast }
     }
     if (!response.headers.get('content-type')?.startsWith('text/event-stream')) {
       console.warn('The server answered the event stream with something else, so it will not reconnect')
-      return 'refused'
+      await response.body.cancel().catch((error: unknown) => {
+        console.debug('EventStream could not cancel an answer it will not read', error)
+      })
+      return { kind: 'refused', waitAtLeast }
     }
 
     this.attempt = 0
     this.setState('open')
+    return this.consume(response.body, signal)
+  }
+
+  /**
+   * Reads an open stream's body until it ends, breaks, or falls silent.
+   *
+   * Whatever ends it, the body is cancelled on the way out, so a stream this
+   * client stopped reading never stays open on the server.
+   */
+  private async consume(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<Ending> {
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
 
     // A server that ends a stream before sending a thing is one to back off
     // from, not one to reconnect to in a tight loop.
     let heardAnything = false
+    let overflowed = false
+    let stalled = false
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const restartWatchdog = () => {
+      if (watchdog) {
+        clearTimeout(watchdog)
+      }
+      watchdog = setTimeout(() => {
+        stalled = true
+        void reader.cancel().catch((error: unknown) => {
+          console.debug('EventStream could not cancel a silent stream', error)
+        })
+      }, IDLE_LIMIT)
+    }
+
     const parser = createParser({
       maxBufferSize: MAX_EVENT_CHARACTERS,
       onEvent: (message) => {
@@ -225,34 +295,66 @@ export class EventStream {
           this.cursor = message.id
         }
         const frame = parseStreamFrame(message.data, message.id)
-        if (frame) {
+        if (!frame) {
+          return
+        }
+        // A listener that throws is the listener's problem: the event was
+        // delivered, and the stream carries on to the next one.
+        try {
           this.options.onFrame(frame)
+        }
+        catch (error) {
+          console.error('An event stream listener threw', { frame, error })
         }
       },
       onError: (error) => {
+        if (error.type === 'max-buffer-size-exceeded') {
+          overflowed = true
+        }
         console.warn('The event stream sent something that is not an event', error)
       },
     })
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
+    restartWatchdog()
     try {
       for (;;) {
         const { done, value } = await reader.read()
+        if (stalled) {
+          console.debug('The event stream fell silent past its heartbeats; it will reconnect')
+          return { kind: 'failed', waitAtLeast: 0 }
+        }
         if (done) {
           parser.feed(decoder.decode())
-          return heardAnything
-            ? 'ended'
-            : 'failed'
+          return {
+            kind: heardAnything
+              ? 'ended'
+              : 'failed',
+            waitAtLeast: 0,
+          }
         }
+
+        restartWatchdog()
         parser.feed(decoder.decode(value, { stream: true }))
+        if (overflowed) {
+          return { kind: 'failed', waitAtLeast: 0 }
+        }
       }
     }
     catch (error) {
       if (!signal.aborted) {
         console.debug('The event stream broke; it will reconnect', error)
       }
-      return 'failed'
+      return { kind: 'failed', waitAtLeast: 0 }
+    }
+    finally {
+      if (watchdog) {
+        clearTimeout(watchdog)
+      }
+      // Cancelling a body that already ended or broke does nothing; one that
+      // is still open is closed here rather than left to the server.
+      void reader.cancel().catch((error: unknown) => {
+        console.debug('EventStream could not cancel a stream it stopped reading', error)
+      })
     }
   }
 
@@ -264,4 +366,13 @@ export class EventStream {
     this.connectionState = state
     this.options.onStateChange?.(state)
   }
+}
+
+/** The wait a response's `Retry-After` asks for, in milliseconds, or none. */
+function retryAfter(response: Response): number {
+  const seconds = Number(response.headers.get('retry-after'))
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0
+  }
+  return Math.min(seconds * 1000, RETRY_AFTER_CEILING)
 }

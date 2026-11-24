@@ -224,6 +224,28 @@ describe('RealtimeClient', () => {
     stop()
   })
 
+  it<Context>('should not resume a refused channel on the cursor once it is admitted', async (context) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    context.client.subscribe(PROJECTS, () => {})
+    context.client.subscribe(INBOX, () => {})
+    await settle()
+
+    // The membership commit is not visible yet, so the team channel is refused.
+    current(context).push(frame({
+      type: 'error',
+      channel: PROJECTS,
+      code: 'not_found',
+      message: 'No such channel.',
+    }))
+    current(context).push(frame({ type: 'live' }, 'e-1'))
+    current(context).end()
+    await settle()
+
+    // The reconnect asks for it fresh: it never went live on this cursor.
+    expect(current(context).lastEventId).toBe('e-1')
+    expect(current(context).fresh).toEqual([ PROJECTS ])
+  })
+
   it<Context>('should warn about a channel the server refused', async (context) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     context.client.subscribe(PROJECTS, () => {})

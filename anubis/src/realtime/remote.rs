@@ -54,6 +54,13 @@ const KEY_PREFIX: &str = "{anubis:realtime}:";
 /// How long the pump waits before its first reconnection attempt.
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 
+/// The most channels one `SUBSCRIBE` or `UNSUBSCRIBE` names.
+///
+/// Large enough that the burst of every tab reconnecting after a deploy is a
+/// handful of round trips, small enough that one command stays a few tens of
+/// kilobytes.
+const SUBSCRIBE_BATCH: usize = 512;
+
 /// The longest the pump waits between reconnection attempts.
 ///
 /// Five seconds keeps a recovered Redis picked up promptly while a Redis that
@@ -163,11 +170,14 @@ impl Remote {
         requests: &[(&str, Option<u64>)],
     ) -> Result<Snapshot, RedisError> {
         let mut invocation = self.snapshot.key(key("log"));
-        invocation.key(key("floors"));
+        invocation
+            .key(key("recent"))
+            .key(key("floors"))
+            .key(key("sizes"));
         for (channel, _since) in requests {
             invocation.key(buffer_key(channel));
         }
-        invocation.arg(candidate_epoch());
+        invocation.arg(candidate_epoch()).arg(key("buffer:"));
         for (channel, since) in requests {
             // -1 asks for no entries; every real sequence is positive.
             let since = since.map_or_else(|| "-1".to_owned(), |since| since.to_string());
@@ -302,19 +312,26 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
 
         // A reconnection has to declare everything again, because the server
         // that held the old subscriptions is not the one answering now.
-        let mut healthy = true;
-        for (channel, generation) in &wanted {
-            if !subscribe(&mut commands, &registry, channel, *generation).await {
-                healthy = false;
-                break;
-            }
-        }
+        let everything: Vec<(String, u64)> = wanted
+            .iter()
+            .map(|(channel, generation)| (channel.clone(), *generation))
+            .collect();
+        let mut healthy = subscribe(&mut commands, &registry, &everything).await;
 
         while healthy {
             tokio::select! {
                 announced = interest.recv() => {
-                    let Some(announced) = announced else { return };
-                    healthy = apply(&mut commands, &mut wanted, &registry, announced).await;
+                    let Some(first) = announced else { return };
+                    // Every change already waiting goes in the same round
+                    // trip, so a burst of streams opening (every tab after a
+                    // deploy) costs one SUBSCRIBE rather than one per channel,
+                    // and delivery is held up for that one round trip only.
+                    let mut batch = vec![first];
+                    while batch.len() < SUBSCRIBE_BATCH {
+                        let Ok(next) = interest.try_recv() else { break };
+                        batch.push(next);
+                    }
+                    healthy = apply(&mut commands, &mut wanted, &registry, batch).await;
                 }
                 message = messages.next() => {
                     let Some(message) = message else {
@@ -342,68 +359,93 @@ async fn pump(client: Client, mut interest: UnboundedReceiver<Interest>, registr
     }
 }
 
-/// Subscribes to one channel and, once Redis confirms it, marks it live.
+/// Subscribes to `channels` and, once Redis confirms them, marks each live.
 ///
-/// Returns `false` when the connection failed and has to be rebuilt.
+/// Sent [`SUBSCRIBE_BATCH`] channels to a command. Returns `false` when the
+/// connection failed and has to be rebuilt.
 async fn subscribe(
     commands: &mut PubSubSink,
     registry: &Weak<Registry>,
-    channel: &str,
-    generation: u64,
+    channels: &[(String, u64)],
 ) -> bool {
-    // The reply arrives once Redis has registered the subscription, so every
-    // publish it executes from here on is delivered on this connection.
-    if let Err(error) = commands
-        .subscribe(format!("{PUBSUB_PREFIX}{channel}"))
-        .await
-    {
-        tracing::warn!(
-            error.message = %error,
-            realtime.channel = channel,
-            "realtime fanout could not subscribe to {{realtime.channel}}: {{error.message}}",
-        );
-        return false;
-    }
+    for batch in channels.chunks(SUBSCRIBE_BATCH) {
+        let names: Vec<String> = batch
+            .iter()
+            .map(|(channel, _generation)| format!("{PUBSUB_PREFIX}{channel}"))
+            .collect();
+        // The reply arrives once Redis has registered every subscription, so
+        // every publish it executes from here on is delivered on this
+        // connection.
+        if let Err(error) = commands.subscribe(names).await {
+            tracing::warn!(
+                error.message = %error,
+                realtime.channels = batch.len(),
+                "realtime fanout could not subscribe to {{realtime.channels}} channels: \
+                 {{error.message}}",
+            );
+            return false;
+        }
 
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_ready(channel, generation);
+        let Some(registry) = registry.upgrade() else {
+            return true;
+        };
+        for (channel, generation) in batch {
+            registry.mark_ready(channel, *generation);
+        }
     }
     true
 }
 
-/// Applies one interest change to the live connection and the wanted set.
+/// Applies a batch of interest changes to the live connection and the wanted set.
 ///
-/// Returns `false` when the connection failed and has to be rebuilt. The
-/// wanted set is updated either way, so the reconnection declares the truth.
+/// Changes apply in order, so the last one for a channel decides it: a
+/// channel closed and opened again in one batch stays subscribed under its
+/// new generation, and one opened and closed again is let go. Returns `false`
+/// when the connection failed and has to be rebuilt. The wanted set is
+/// updated either way, so the reconnection declares the truth.
 async fn apply(
     commands: &mut PubSubSink,
     wanted: &mut HashMap<String, u64>,
     registry: &Weak<Registry>,
-    interest: Interest,
+    batch: Vec<Interest>,
 ) -> bool {
-    match interest {
-        Interest::Opened {
-            channel,
-            generation,
-        } => {
-            wanted.insert(channel.clone(), generation);
-            subscribe(commands, registry, &channel, generation).await
-        }
-        Interest::Closed { channel, .. } => {
-            wanted.remove(&channel);
-            if let Err(error) = commands
-                .unsubscribe(format!("{PUBSUB_PREFIX}{channel}"))
-                .await
-            {
-                tracing::warn!(
-                    error.message = %error,
-                    "realtime fanout could not update its Redis subscriptions: {{error.message}}",
-                );
-                return false;
+    // Each channel's net change: `Some(generation)` to subscribe, `None` to let go.
+    let mut changes: HashMap<String, Option<u64>> = HashMap::new();
+    for interest in batch {
+        match interest {
+            Interest::Opened {
+                channel,
+                generation,
+            } => {
+                wanted.insert(channel.clone(), generation);
+                changes.insert(channel, Some(generation));
             }
-            true
+            Interest::Closed { channel, .. } => {
+                wanted.remove(&channel);
+                changes.insert(channel, None);
+            }
         }
     }
+
+    let mut opened = Vec::new();
+    let mut closed = Vec::new();
+    for (channel, change) in changes {
+        match change {
+            Some(generation) => opened.push((channel, generation)),
+            None => closed.push(format!("{PUBSUB_PREFIX}{channel}")),
+        }
+    }
+
+    for batch in closed.chunks(SUBSCRIBE_BATCH) {
+        if let Err(error) = commands.unsubscribe(batch).await {
+            tracing::warn!(
+                error.message = %error,
+                "realtime fanout could not update its Redis subscriptions: {{error.message}}",
+            );
+            return false;
+        }
+    }
+    subscribe(commands, registry, &opened).await
 }
 
 /// Hands one message from Redis to the local streams carrying its channel.

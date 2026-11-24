@@ -351,6 +351,11 @@ impl Drain {
         // A sender that is gone is a server that is gone, which is a drain too.
         let _started = self.0.wait_for(|started| *started).await;
     }
+
+    /// Whether the drain has started, without waiting for it.
+    pub(crate) fn has_started(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
 }
 
 /// What an application tells [`harden_with`] beyond its router.

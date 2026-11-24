@@ -6,14 +6,14 @@
 -- The arithmetic is `anubis::realtime::replay::MemoryLog::append`'s, kept in
 -- step with it; `docs/realtime.md` states the rules both follow.
 --
--- KEYS: 1 the log hash (epoch, sequence, bytes, watermark), 2 the recency
---       sorted set (channel by newest sequence), 3 the floors hash, 4 the
---       sizes hash, 5 this channel's buffer list.
--- ARGV: 1 a candidate epoch, used only if the log has none yet, 2 the channel,
---       3 the rendered frame, 4 the channel's capacity, 5 the byte budget,
---       6 the pub/sub channel, 7 the prefix of every buffer key, 8 what one
---       entry costs beyond its text, 9 what one buffer costs before it holds
---       anything.
+-- KEYS: 1 the log hash (epoch, run_id, sequence, bytes, watermark), 2 the
+--       recency sorted set (channel by newest sequence), 3 the floors hash,
+--       4 the sizes hash, 5 this channel's buffer list.
+-- ARGV: 1 a candidate epoch, used only when the log starts a new one, 2 the
+--       channel, 3 the rendered frame, 4 the channel's capacity, 5 the byte
+--       budget, 6 the pub/sub channel, 7 the prefix of every buffer key, 8 what
+--       one entry costs beyond its text, 9 what one buffer costs before it
+--       holds anything.
 --
 -- Returns { epoch, sequence }.
 
@@ -38,10 +38,29 @@ local function cost_of(entry)
   return #entry - string.find(entry, ' ', 1, true) + entry_overhead
 end
 
-redis.call('HSETNX', log, 'epoch', ARGV[1])
+-- The log belongs to one run of one Redis server. A server that restarted,
+-- from an older snapshot or append-only file than the last publish, or a
+-- replica promoted in its place, may hold a sequence behind ids clients
+-- already have, and would mint those ids again for other events. Its run_id
+-- is new in every one of those cases, so a new run_id starts a new epoch and
+-- lets go of everything kept: no cursor from before can be vouched for, and
+-- every client resuming on one opens with a reset. snapshot.lua does the same.
+local run_id = string.match(redis.call('INFO', 'server'), 'run_id:(%x+)')
+if not run_id then
+  return redis.error_reply('anubis realtime: INFO server reported no run_id')
+end
+if redis.call('HGET', log, 'run_id') ~= run_id then
+  for _, kept in ipairs(redis.call('ZRANGE', recent, 0, -1)) do
+    redis.call('DEL', buffer_prefix .. kept)
+  end
+  redis.call('DEL', log, recent, floors, sizes)
+  redis.call('HSET', log, 'epoch', ARGV[1], 'run_id', run_id,
+    'sequence', '0', 'bytes', '0', 'watermark', '0')
+end
+
 local epoch = redis.call('HGET', log, 'epoch')
 local sequence = redis.call('HINCRBY', log, 'sequence', 1)
-local watermark = tonumber(redis.call('HGET', log, 'watermark') or '0')
+local watermark = tonumber(redis.call('HGET', log, 'watermark'))
 
 if redis.call('EXISTS', buffer) == 0 then
   -- A buffer born now cannot vouch for anything let go before it, so it

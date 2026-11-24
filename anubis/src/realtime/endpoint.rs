@@ -103,9 +103,14 @@ async fn open(
     let mut refusals = Vec::new();
     let mut named = Vec::with_capacity(requested.len());
     for name in requested {
+        // Only the spelling the server renders is accepted. Every frame names
+        // its channel that way, so a name that parses in another spelling (an
+        // uppercase UUID, say) would be carried but never reach the listener
+        // that asked for it, and `fresh` would match one spelling and not the
+        // other.
         match name.parse::<ChannelName>() {
-            Ok(channel) => named.push((name, channel)),
-            Err(_error) => refusals.push(Refusal::new(name, ErrorCode::InvalidChannel)),
+            Ok(channel) if channel.to_string() == name => named.push((name, channel)),
+            Ok(_) | Err(_) => refusals.push(Refusal::new(name, ErrorCode::InvalidChannel)),
         }
     }
 
