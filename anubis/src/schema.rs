@@ -522,21 +522,24 @@ diesel::table! {
         redirect_uris -> Array<Text>,
         created_at -> Timestamptz,
         refresh_after -> Nullable<Timestamptz>,
+        grant_types -> Array<Text>,
     }
 }
 
 diesel::table! {
-    /// Authorization requests waiting on the person's consent.
+    /// Authorization requests waiting on the person's consent, delivered to a
+    /// redirect URI or, for the device grant, to a device that polls.
     oauth_authorization_requests (id) {
         id -> Uuid,
         client_id -> Uuid,
-        redirect_uri -> Text,
+        redirect_uri -> Nullable<Text>,
         scopes -> Array<Text>,
         state -> Nullable<Text>,
-        code_challenge -> Text,
+        code_challenge -> Nullable<Text>,
         resource -> Text,
         created_at -> Timestamptz,
         expires_at -> Timestamptz,
+        device_code_id -> Nullable<Uuid>,
     }
 }
 
@@ -591,7 +594,27 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// Device authorizations (RFC 8628). Rows hold hashes of both codes.
+    oauth_device_codes (id) {
+        id -> Uuid,
+        client_id -> Uuid,
+        device_code_hash -> Text,
+        user_code_hash -> Text,
+        interval_seconds -> Int4,
+        last_polled_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        grant_id -> Nullable<Uuid>,
+        denied_at -> Nullable<Timestamptz>,
+        used_at -> Nullable<Timestamptz>,
+    }
+}
+
 diesel::joinable!(oauth_authorization_requests -> oauth_clients (client_id));
+diesel::joinable!(oauth_authorization_requests -> oauth_device_codes (device_code_id));
+diesel::joinable!(oauth_device_codes -> oauth_clients (client_id));
+diesel::joinable!(oauth_device_codes -> oauth_grants (grant_id));
 diesel::joinable!(oauth_grants -> oauth_clients (client_id));
 diesel::joinable!(oauth_grants -> users (user_id));
 diesel::joinable!(oauth_authorization_codes -> oauth_grants (grant_id));
@@ -604,5 +627,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     oauth_authorization_codes,
     oauth_refresh_tokens,
     oauth_access_tokens,
+    oauth_device_codes,
     users,
 );

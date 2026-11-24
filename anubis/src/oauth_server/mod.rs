@@ -6,7 +6,9 @@
 //! Claude Desktop, and Codex discover this server from the MCP endpoint's
 //! `401`, register or present a Client ID Metadata Document, send the person
 //! through a consent screen, and come back with tokens bound to the endpoint.
-//! [`crate::mcp`] is that endpoint.
+//! [`crate::mcp`] is that endpoint. A program on a machine with no browser
+//! takes the device grant instead ([`device`]): it shows a short code, and the
+//! person enters it and consents from any browser.
 //!
 //! # Routes
 //!
@@ -20,18 +22,22 @@
 //! | `GET /.well-known/oauth-protected-resource/mcp` | The same, at the path MCP clients try first |
 //! | `POST /oauth/register` | Dynamic Client Registration, bounded; see [`client`] |
 //! | `GET /oauth/authorize` | Start the authorization code flow |
+//! | `POST /oauth/device_authorization` | Start the device grant; see [`device`] |
+//! | `POST /oauth/device_verification` | The request a device's user code names (session) |
 //! | `GET /oauth/requests/{id}` | What the consent screen asks (session) |
 //! | `POST /oauth/requests/{id}` | The person's decision (session) |
-//! | `POST /oauth/token` | Exchange a code, or rotate a refresh token |
+//! | `POST /oauth/token` | Exchange a code or a device code, or rotate a refresh token |
 //! | `POST /oauth/revoke` | RFC 7009 revocation |
 //! | `GET /oauth/connections` | The account's connected clients (session) |
 //! | `DELETE /oauth/connections/{id}` | Revoke one (session) |
 //!
 //! # What is fixed, and why
 //!
-//! - **PKCE `S256` only, authorization code only, public clients only.** OAuth
-//!   2.1 and the MCP specification together leave nothing else for these
-//!   clients, and every option not offered is one nobody can misuse.
+//! - **Public clients only, and two ways to start.** The authorization code
+//!   flow with PKCE `S256` for a program that can receive a redirect, which is
+//!   all OAuth 2.1 and the MCP specification leave for one, and the device
+//!   grant for a program that cannot. Each client declares which it uses.
+//!   Every option not offered is one nobody can misuse.
 //! - **One resource**, `<APP_URL>/mcp`. The Protected Resource Metadata path,
 //!   the challenge's URL, the `resource` every token is bound to, and the
 //!   development proxy all name it, so it is one constant rather than a
@@ -48,6 +54,7 @@ mod authorize;
 mod bearer;
 mod client;
 mod connections;
+mod device;
 mod document;
 mod error;
 mod grant;
@@ -71,6 +78,8 @@ use crate::rate_limit::{Budget, RateLimiter};
 pub use authorize::CONSENT_PATH;
 #[doc(inline)]
 pub use bearer::{Bearer, Challenge};
+#[doc(inline)]
+pub use device::{DEVICE_PATH, DEVICE_RESULT_PARAM, USER_CODE_PARAM};
 #[doc(inline)]
 pub use scope::{Scope, Scopes};
 
@@ -185,11 +194,13 @@ impl Server {
 
 /// Returns the authorization server's routes, to merge at the root.
 ///
-/// The limiter is the application's one [`RateLimiter`]: registration and
-/// authorization are charged per client address, because both are open to
-/// strangers and authorization may fetch a URL the request names.
-/// Session routes resolve [`crate::auth::CurrentUser`] through the pool this
-/// router layers on itself.
+/// The limiter is the application's one [`RateLimiter`]: registration,
+/// authorization, and device authorization are charged per client address,
+/// because all three are open to strangers and the last two may fetch a URL
+/// the request names. Entering a device's user code is charged per client
+/// address and per account, because a short code is what a guesser would
+/// try. Session routes resolve [`crate::auth::CurrentUser`] through the pool
+/// this router layers on itself.
 pub fn router(server: &Server, rate_limit: &RateLimiter) -> Router {
     Router::new()
         .route(
@@ -213,6 +224,14 @@ pub fn router(server: &Server, rate_limit: &RateLimiter) -> Router {
             get(authorize::authorize).layer(rate_limit.layer(Budget::Authorization)),
         )
         .route(
+            "/oauth/device_authorization",
+            post(device::authorize).layer(rate_limit.layer(Budget::Authorization)),
+        )
+        .route(
+            "/oauth/device_verification",
+            post(device::verify).layer(rate_limit.layer(Budget::UserCodePerClient)),
+        )
+        .route(
             "/oauth/requests/{request_id}",
             get(authorize::show).post(authorize::decide),
         )
@@ -225,6 +244,9 @@ pub fn router(server: &Server, rate_limit: &RateLimiter) -> Router {
         )
         .with_state(server.clone())
         .layer(Extension(server.pool().clone()))
+        // Code entry charges the signed-in account as well as the address,
+        // which only the handler can do once it knows who is signed in.
+        .layer(Extension(rate_limit.clone()))
 }
 
 #[cfg(test)]
@@ -268,6 +290,29 @@ mod tests {
             "starter/frontend/src/urls.ts must route UrlTree.consent at {}",
             super::CONSENT_PATH,
         );
+    }
+
+    /// The device grant's verification URI is the starter's code-entry page,
+    /// and the page reads the two parameters the backend sends it with, so
+    /// all three are one contract checked the same way.
+    #[test]
+    fn the_starter_routes_the_code_entry_page_where_the_backend_sends_it() {
+        let urls = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../starter/frontend/src/urls.ts"
+        ))
+        .expect("the starter's urls are readable");
+
+        for expected in [
+            format!("device: '{}'", super::DEVICE_PATH),
+            format!("DEVICE_USER_CODE_PARAM = '{}'", super::USER_CODE_PARAM),
+            format!("DEVICE_RESULT_PARAM = '{}'", super::DEVICE_RESULT_PARAM),
+        ] {
+            assert!(
+                urls.contains(&expected),
+                "starter/frontend/src/urls.ts must declare {expected}",
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //!   (`/.well-known/oauth-protected-resource/mcp`) and at the root one it
 //!   falls back to, with the same body at both.
 //! - **Authorization Server Metadata** (RFC 8414) says where to authorize,
-//!   exchange, register, and revoke, and what this server supports.
+//!   exchange, register, revoke, and start a device authorization (RFC 8628
+//!   section 4), and what this server supports.
 //!
 //! Four of its fields decide how Claude and Codex register, and all four have
 //! to be present or both fall back to Dynamic Client Registration:
@@ -22,6 +23,7 @@ use axum::http::header::CACHE_CONTROL;
 use axum::response::IntoResponse;
 use serde_json::json;
 
+use crate::oauth_server::client::GrantType;
 use crate::oauth_server::{Server, pkce};
 
 /// How long a client may cache either document.
@@ -54,10 +56,11 @@ pub(crate) async fn authorization_server(State(server): State<Server>) -> impl I
             "token_endpoint": format!("{issuer}/oauth/token"),
             "registration_endpoint": format!("{issuer}/oauth/register"),
             "revocation_endpoint": format!("{issuer}/oauth/revoke"),
+            "device_authorization_endpoint": format!("{issuer}/oauth/device_authorization"),
             "scopes_supported": server.scopes().names(),
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "grant_types_supported": GrantType::ALL.map(GrantType::as_str),
             "token_endpoint_auth_methods_supported": ["none"],
             "revocation_endpoint_auth_methods_supported": ["none"],
             "code_challenge_methods_supported": [pkce::METHOD],

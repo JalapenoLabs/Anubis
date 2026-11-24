@@ -14,6 +14,11 @@
 //! action. Nothing the client sent rides through the browser twice: the stored
 //! request is what the decision acts on.
 //!
+//! A request is delivered one of two ways ([`Delivery`]): back to the client's
+//! redirect URI with a code, or, for the device grant, to a device that polls
+//! for it ([`super::device`]). The screen and the decision are the same for
+//! both; only where the answer goes differs.
+//!
 //! # Errors before and after the redirect URI is trusted
 //!
 //! RFC 6749 section 4.1.2.1 splits failures in two. Until the client and its
@@ -37,7 +42,8 @@ use uuid::Uuid;
 use crate::audit;
 use crate::auth::{CurrentUser, token};
 use crate::http::ApiError;
-use crate::oauth_server::client::{self, ClientFailure, ClientKind, ClientRow};
+use crate::oauth_server::client::{self, ClientFailure, ClientKind, ClientRow, GrantType};
+use crate::oauth_server::device::{self, Decision};
 use crate::oauth_server::{Server, grant, pkce, redirect};
 use crate::schema::{oauth_authorization_codes, oauth_authorization_requests, oauth_clients};
 
@@ -130,6 +136,9 @@ pub(crate) async fn authorize(
         state: query.state.as_deref(),
         issuer: server.issuer(),
     };
+    if !client.allows(GrantType::AuthorizationCode) {
+        return back.error("unauthorized_client");
+    }
     if query.response_type.as_deref() != Some("code") {
         return back.error("unsupported_response_type");
     }
@@ -284,14 +293,28 @@ impl ClientView {
 struct RequestView {
     id: Uuid,
     client: ClientView,
-    /// The host the code will be delivered to, which the MCP specification
-    /// requires the screen to show.
-    redirect_host: String,
-    /// True when the code goes to a program on this device, which the screen
-    /// warns about: any program on the device could have asked.
-    redirect_is_loopback: bool,
+    delivery: DeliveryView,
     scopes: Vec<crate::oauth_server::Scope>,
     expires_at: DateTime<Utc>,
+}
+
+/// Where an approval goes, as the consent screen explains it.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DeliveryView {
+    /// Back to the client's redirect URI.
+    Redirect {
+        /// The host the code will be delivered to, which the MCP
+        /// specification requires the screen to show.
+        host: String,
+        /// True when the code goes to a program on this device, which the
+        /// screen warns about: any program on the device could have asked.
+        is_loopback: bool,
+    },
+    /// To a device that showed the person a code, which the screen warns
+    /// about: RFC 8628 section 5.4's remote phishing, where somebody else's
+    /// device sends its code to a person to enter.
+    Device,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -299,12 +322,55 @@ struct RequestView {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 struct StoredRequest {
     id: Uuid,
-    redirect_uri: String,
+    redirect_uri: Option<String>,
     scopes: Vec<String>,
     state: Option<String>,
-    code_challenge: String,
+    code_challenge: Option<String>,
     resource: String,
     expires_at: DateTime<Utc>,
+    device_code_id: Option<Uuid>,
+}
+
+/// How a decision reaches the client that asked.
+enum Delivery<'a> {
+    /// Back to its redirect URI, with a code bound to its PKCE challenge.
+    Redirect {
+        back: Callback<'a>,
+        code_challenge: &'a str,
+    },
+    /// To the device authorization a device is polling for.
+    Device(Uuid),
+}
+
+impl StoredRequest {
+    /// How this request is delivered.
+    ///
+    /// The table's `oauth_authorization_requests_delivery` constraint makes a
+    /// row exactly one of the two, so the refusal is a row the database should
+    /// never have stored, logged for the operator rather than shown to anyone.
+    fn delivery<'a>(&'a self, issuer: &'a str) -> Result<Delivery<'a>, ApiError> {
+        if let Some(device_code_id) = self.device_code_id {
+            return Ok(Delivery::Device(device_code_id));
+        }
+
+        let (Some(redirect_uri), Some(code_challenge)) =
+            (self.redirect_uri.as_deref(), self.code_challenge.as_deref())
+        else {
+            tracing::error!(
+                oauth.request_id = %self.id,
+                "authorization request {{oauth.request_id}} names neither a redirect nor a device",
+            );
+            return Err(ApiError::internal());
+        };
+        Ok(Delivery::Redirect {
+            back: Callback {
+                redirect_uri,
+                state: self.state.as_deref(),
+                issuer,
+            },
+            code_challenge,
+        })
+    }
 }
 
 /// `GET /oauth/requests/{id}`: the request a person is about to decide.
@@ -331,13 +397,20 @@ pub(crate) async fn show(
         .optional()?
         .ok_or_else(ApiError::not_found)?;
 
-    let redirect = Url::parse(&request.redirect_uri).ok();
-    let redirect_host = redirect
-        .as_ref()
-        .and_then(|url| url.host_str())
-        .unwrap_or_default()
-        .to_owned();
-    let redirect_is_loopback = redirect.as_ref().is_some_and(redirect::is_loopback);
+    let delivery = match request.delivery(server.issuer())? {
+        Delivery::Redirect { back, .. } => {
+            let redirect = Url::parse(back.redirect_uri).ok();
+            DeliveryView::Redirect {
+                host: redirect
+                    .as_ref()
+                    .and_then(|url| url.host_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                is_loopback: redirect.as_ref().is_some_and(redirect::is_loopback),
+            }
+        }
+        Delivery::Device(_device_code_id) => DeliveryView::Device,
+    };
     let scopes = request
         .scopes
         .iter()
@@ -347,8 +420,7 @@ pub(crate) async fn show(
     Ok(Json(RequestView {
         id: request.id,
         client: ClientView::of(&client),
-        redirect_host,
-        redirect_is_loopback,
+        delivery,
         scopes,
         expires_at: request.expires_at,
     }))
@@ -370,8 +442,8 @@ struct DecisionResponse {
 ///
 /// The request is consumed by the first decision, deleted with `RETURNING`, so
 /// two decisions arriving together produce one code at most. Approving
-/// creates the grant and its code in the same transaction as the audit event
-/// that records it.
+/// creates the grant and its code, or lands it on the device authorization,
+/// in the same transaction as the audit event that records it.
 pub(crate) async fn decide(
     State(server): State<Server>,
     CurrentUser(user): CurrentUser,
@@ -405,13 +477,14 @@ pub(crate) async fn decide(
                 return Err(ApiError::not_found());
             };
 
-            let back = Callback {
-                redirect_uri: &request.redirect_uri,
-                state: request.state.as_deref(),
-                issuer: server.issuer(),
-            };
+            let delivery = request.delivery(server.issuer())?;
             if !body.approve {
-                return Ok(back.url(&[("error", "access_denied")]));
+                return match delivery {
+                    Delivery::Redirect { back, .. } => Ok(back.url(&[("error", "access_denied")])),
+                    Delivery::Device(device_code_id) => {
+                        device::decide(transaction, &server, device_code_id, Decision::Deny).await
+                    }
+                };
             }
 
             let client: ClientRow = oauth_clients::table
@@ -428,18 +501,35 @@ pub(crate) async fn decide(
             )
             .await?;
 
-            let code = token::generate();
-            diesel::insert_into(oauth_authorization_codes::table)
-                .values((
-                    oauth_authorization_codes::grant_id.eq(granted.id),
-                    oauth_authorization_codes::code_hash.eq(token::hash(&code)),
-                    oauth_authorization_codes::redirect_uri.eq(&request.redirect_uri),
-                    oauth_authorization_codes::code_challenge.eq(&request.code_challenge),
-                    oauth_authorization_codes::expires_at
-                        .eq(Utc::now() + Duration::minutes(CODE_TTL_MINUTES)),
-                ))
-                .execute(transaction)
-                .await?;
+            let destination = match delivery {
+                Delivery::Redirect {
+                    back,
+                    code_challenge,
+                } => {
+                    let code = token::generate();
+                    diesel::insert_into(oauth_authorization_codes::table)
+                        .values((
+                            oauth_authorization_codes::grant_id.eq(granted.id),
+                            oauth_authorization_codes::code_hash.eq(token::hash(&code)),
+                            oauth_authorization_codes::redirect_uri.eq(back.redirect_uri),
+                            oauth_authorization_codes::code_challenge.eq(code_challenge),
+                            oauth_authorization_codes::expires_at
+                                .eq(Utc::now() + Duration::minutes(CODE_TTL_MINUTES)),
+                        ))
+                        .execute(transaction)
+                        .await?;
+                    back.url(&[("code", code.as_str())])
+                }
+                Delivery::Device(device_code_id) => {
+                    device::decide(
+                        transaction,
+                        &server,
+                        device_code_id,
+                        Decision::Approve(granted.id),
+                    )
+                    .await?
+                }
+            };
 
             grant::record(
                 transaction,
@@ -450,7 +540,7 @@ pub(crate) async fn decide(
             )
             .await?;
 
-            Ok(back.url(&[("code", code.as_str())]))
+            Ok(destination)
         })
         .await?;
 

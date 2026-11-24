@@ -160,8 +160,10 @@ pub const AVATAR_REFUSED: &str = "avatar.refused";
 pub const SESSION_CREATED: &str = "session.created";
 /// A person approved a client on the consent screen, creating a grant.
 ///
-/// The subject is the grant, labeled with the client's name, and the change set
-/// carries the scopes approved. See `docs/oauth-server.md`.
+/// Recorded alike for a client that was redirected to the screen and for a
+/// device whose user code the person entered. The subject is the grant,
+/// labeled with the client's name, and the change set carries the scopes
+/// approved. See `docs/oauth-server.md`.
 pub const OAUTH_GRANTED: &str = "oauth.granted";
 /// A grant ended: the person revoked the connection, or the client revoked its
 /// own refresh token.
@@ -178,6 +180,13 @@ pub const OAUTH_CODE_REUSED: &str = "oauth.code_reused";
 /// copied; ending the family is what makes a stolen refresh token worth one
 /// race at most.
 pub const OAUTH_REFRESH_REUSED: &str = "oauth.refresh_reused";
+/// A device code was presented again after it was exchanged, so its grant was
+/// revoked.
+///
+/// The device code is the program's credential for the device grant (RFC 8628)
+/// and is exchanged once. Presented a second time it is held twice, which is
+/// treated exactly as a replayed authorization code is.
+pub const OAUTH_DEVICE_CODE_REUSED: &str = "oauth.device_code_reused";
 
 /// Writes one audit event through `connection`, returning its id.
 ///

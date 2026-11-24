@@ -4,7 +4,9 @@
 //! that is its `client_id`, so [`MetadataDocument`] serves one on a loopback
 //! port, which the server allows outside production. The rest are the
 //! requests a client and the person's browser make, in the order they make
-//! them, so a narrative reads as the ceremony it is.
+//! them, so a narrative reads as the ceremony it is. The device grant's are at
+//! the end: a headless program starting and polling, and the person entering
+//! its code.
 
 use std::net::SocketAddr;
 
@@ -19,6 +21,9 @@ use tower::ServiceExt;
 use url::Url;
 
 use super::harness::send;
+
+/// The device grant's `grant_type`, RFC 8628 section 3.4.
+pub const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// The RFC 7636 appendix B verifier, and the challenge it answers.
 pub const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -44,11 +49,34 @@ pub struct MetadataDocument {
 }
 
 impl MetadataDocument {
-    /// Serves a document naming `name` and the port-less loopback redirects.
+    /// Serves a document naming `name` and the port-less loopback redirects,
+    /// for the authorization code flow, the way Claude Code's reads.
     ///
     /// # Panics
     /// Panics when no loopback port is available.
     pub fn serve(name: &str) -> Self {
+        Self::serve_with(
+            name,
+            &["authorization_code", "refresh_token"],
+            &[REGISTERED_REDIRECT, "http://127.0.0.1/callback"],
+        )
+    }
+
+    /// Serves a document for a headless program: the device grant, and
+    /// nowhere to be redirected.
+    ///
+    /// # Panics
+    /// Panics when no loopback port is available.
+    pub fn serve_device(name: &str) -> Self {
+        Self::serve_with(name, &[DEVICE_CODE_GRANT, "refresh_token"], &[])
+    }
+
+    /// Serves a document naming `name`, declaring `grant_types`, and
+    /// registering `redirect_uris`.
+    ///
+    /// # Panics
+    /// Panics when no loopback port is available.
+    pub fn serve_with(name: &str, grant_types: &[&str], redirect_uris: &[&str]) -> Self {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port must be available");
         let address: SocketAddr = listener.local_addr().expect("the listener is bound");
@@ -58,9 +86,8 @@ impl MetadataDocument {
             "client_id": client_id,
             "client_name": name,
             "client_uri": "https://example.com",
-            "redirect_uris": [REGISTERED_REDIRECT, "http://127.0.0.1/callback"],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
+            "redirect_uris": redirect_uris,
+            "grant_types": grant_types,
             "token_endpoint_auth_method": "none",
         });
         let router = Router::new().route(
@@ -330,4 +357,91 @@ pub async fn mcp_with_cookie(router: &Router, cookie: &str, message: &Value) -> 
         .await
         .expect("the router answers");
     response.status()
+}
+
+/// The codes a device authorization hands a headless program.
+#[derive(Debug, Clone)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    /// The whole response, for a test that reads the rest of it.
+    pub response: Value,
+}
+
+/// Starts a device authorization, as a headless program does.
+pub async fn start_device(router: &Router, client_id: &str, scope: &str) -> (StatusCode, Value) {
+    post_form(
+        router,
+        "/oauth/device_authorization",
+        &[
+            ("client_id", client_id),
+            ("scope", scope),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await
+}
+
+/// Starts a device authorization that must succeed.
+///
+/// # Panics
+/// Panics when the endpoint refuses.
+pub async fn device_codes(router: &Router, client_id: &str, scope: &str) -> DeviceAuthorization {
+    let (status, response) = start_device(router, client_id, scope).await;
+    assert_eq!(status, StatusCode::OK, "body: {response}");
+    DeviceAuthorization {
+        device_code: response["device_code"]
+            .as_str()
+            .expect("a device code")
+            .to_owned(),
+        user_code: response["user_code"]
+            .as_str()
+            .expect("a user code")
+            .to_owned(),
+        response,
+    }
+}
+
+/// Polls the token endpoint with a device code.
+pub async fn poll(router: &Router, client_id: &str, device_code: &str) -> (StatusCode, Value) {
+    post_form(
+        router,
+        "/oauth/token",
+        &[
+            ("grant_type", DEVICE_CODE_GRANT),
+            ("client_id", client_id),
+            ("device_code", device_code),
+        ],
+    )
+    .await
+}
+
+/// Enters a user code on the code-entry page as the signed-in person.
+pub async fn enter_code(
+    router: &Router,
+    cookie: Option<&str>,
+    user_code: &str,
+) -> (StatusCode, Value) {
+    let (status, _headers, body) = send(
+        router,
+        "POST",
+        "/oauth/device_verification",
+        Some(&json!({ "user_code": user_code })),
+        cookie,
+    )
+    .await;
+    (status, body)
+}
+
+/// Enters a user code that must name a waiting request, answering its id.
+///
+/// # Panics
+/// Panics when the entry is refused.
+pub async fn request_for_code(router: &Router, cookie: &str, user_code: &str) -> String {
+    let (status, body) = enter_code(router, Some(cookie), user_code).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["request_id"]
+        .as_str()
+        .expect("an entry names a request")
+        .to_owned()
 }
