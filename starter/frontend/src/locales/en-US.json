@@ -446,7 +446,7 @@
       "activityLink": "View activity",
       "addCredit": "Add credit",
       "autoRecharge": "Auto-recharge",
-      "autoRechargeOn": "Recharges {{amount}} below {{threshold}}",
+      "autoRechargeOn": "Recharges {{amount}} at or below {{threshold}}",
       "autoRechargeOff": "Auto-recharge is off",
       "recharging": "A recharge is on its way.",
       "rechargeFailed": "The recharge on {{date}} was declined, so auto-recharge turned off. Add credit, or turn it back on.",

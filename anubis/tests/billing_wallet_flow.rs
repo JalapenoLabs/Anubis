@@ -28,7 +28,7 @@ use anubis::config::AppConfig;
 use anubis::roles::RoleSet;
 use anubis::schema::{
     audit_events, jobs, notifications, organization_memberships, organizations,
-    stripe_billing_events, wallet_entries, wallets,
+    stripe_billing_events, subscriptions, wallet_entries, wallets,
 };
 use anubis::webhooks::signature;
 use axum::body::Body;
@@ -607,6 +607,51 @@ impl Scene {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    /// Turns auto-recharge on as the owner, at any settings.
+    async fn set_auto_recharge(
+        &self,
+        threshold_micros: i64,
+        amount_micros: i64,
+    ) -> (StatusCode, Value) {
+        self.request(
+            "PUT",
+            "/wallet/auto-recharge",
+            Some(json!({ "threshold_micros": threshold_micros, "amount_micros": amount_micros })),
+            &self.owner,
+        )
+        .await
+    }
+
+    /// Stands in for a recharge job that ran out of attempts: the queued job
+    /// is gone, and the armed attempt was last queued two hours ago.
+    async fn dead_letter_recharge(&self) {
+        let mut connection = self.connection().await;
+        diesel::delete(jobs::table.filter(jobs::kind.eq("anubis.billing.recharge_wallet")))
+            .execute(&mut connection)
+            .await
+            .expect("the job must delete");
+        let two_hours_ago = Utc::now() - chrono::TimeDelta::hours(2);
+        diesel::update(wallets::table.find(self.organization_id))
+            .set((
+                wallets::recharge_queued_at.eq(two_hours_ago),
+                wallets::recharge_armed_at.eq(two_hours_ago),
+            ))
+            .execute(&mut connection)
+            .await
+            .expect("the attempt must age");
+    }
+
+    /// The amounts, in cents, of every off-session charge Stripe was asked for.
+    fn recharge_amounts(&self) -> Vec<i64> {
+        self.mock
+            .ledger()
+            .payments
+            .values()
+            .filter(|payment| payment["metadata"]["wallet"] == "recharge")
+            .map(|payment| payment["amount"].as_i64().unwrap_or_default())
+            .collect()
     }
 
     /// A second account in the organization, holding only the default role.
@@ -1505,4 +1550,182 @@ async fn a_recharge_reaches_the_ledger_once_whichever_of_its_job_and_events_land
     let (_status, body) = scene.billing_body(&scene.owner).await;
     assert_eq!(body["wallet"]["auto_recharge"], Value::Null);
     assert_eq!(scene.balance().await, scene.ledger_sum().await);
+}
+
+#[tokio::test]
+async fn a_dead_lettered_recharge_is_queued_again_by_a_refused_spend_at_zero() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    scene.enable_auto_recharge().await;
+
+    // The dip arms a recharge whose job then runs out of attempts, and the
+    // meter drains the wallet to zero before an hour has passed.
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+    scene.spend(4 * DOLLAR, "drain").await.expect("covered");
+    assert_eq!(scene.balance().await, 0);
+    assert_eq!(
+        scene.recharges_queued().await,
+        1,
+        "the drain found the attempt fresh"
+    );
+    scene.dead_letter_recharge().await;
+
+    // Every later spend is refused, and the first of them queues the stuck
+    // attempt again, committed although the spend itself took nothing.
+    let refused = scene
+        .spend(DOLLAR, "refused")
+        .await
+        .expect_err("nothing left");
+    assert!(refused.is_insufficient());
+    assert_eq!(scene.recharges_queued().await, 1);
+    scene.recharge().await.expect("the recharge runs");
+    assert_eq!(scene.mock.ledger().charges, 1);
+    assert_eq!(scene.balance().await, 10 * DOLLAR);
+    scene
+        .spend(DOLLAR, "refused")
+        .await
+        .expect("credit arrived");
+}
+
+#[tokio::test]
+async fn a_threshold_of_zero_recharges_when_the_wallet_runs_dry() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    let (status, body) = scene.set_auto_recharge(0, 10 * DOLLAR).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    scene.spend(9 * DOLLAR, "most").await.expect("covered");
+    assert_eq!(
+        scene.recharges_queued().await,
+        0,
+        "$1 is above a threshold of zero"
+    );
+    let drained = scene.spend(3 * DOLLAR, "rest").await.expect("drains");
+    assert_eq!(drained.balance_micros(), 0);
+    assert_eq!(
+        scene.recharges_queued().await,
+        1,
+        "at the threshold is below enough"
+    );
+    scene.recharge().await.expect("the recharge runs");
+    assert_eq!(scene.balance().await, 10 * DOLLAR);
+}
+
+#[tokio::test]
+async fn a_recharge_queued_again_charges_what_the_settings_say_now() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.top_up("pi_card", 1_000, true).await;
+    let (status, body) = scene.set_auto_recharge(5 * DOLLAR, 50 * DOLLAR).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // A $50 attempt is armed and its job dead-lettered; the person then
+    // lowers the recharge to $10.
+    scene.spend(6 * DOLLAR, "dip").await.expect("covered");
+    scene.dead_letter_recharge().await;
+    let (status, body) = scene.set_auto_recharge(5 * DOLLAR, 10 * DOLLAR).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    scene.spend(DOLLAR, "requeue").await.expect("covered");
+    scene.recharge().await.expect("the recharge runs");
+    assert_eq!(
+        scene.recharge_amounts(),
+        [1_000],
+        "the $10 the setting says, not the $50 armed"
+    );
+    assert_eq!(scene.balance().await, 13 * DOLLAR);
+
+    // A recharge whose wallet was topped up over the threshold before it ran
+    // charges nothing at all.
+    let queued = scene.recharges_queued().await;
+    scene.spend(9 * DOLLAR, "dip-2").await.expect("covered");
+    assert_eq!(scene.recharges_queued().await, queued + 1);
+    scene.top_up("pi_manual", 2_000, false).await;
+    scene.recharge().await.expect("nothing needed");
+    assert_eq!(scene.recharge_amounts().len(), 1, "no second charge");
+    let (_status, body) = scene.billing_body(&scene.owner).await;
+    assert_eq!(body["wallet"]["recharging"], false, "the attempt ended");
+}
+
+#[tokio::test]
+async fn a_plan_subscription_naming_a_removed_plan_leaves_credit_deciding() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    let mut connection = scene.connection().await;
+    diesel::insert_into(subscriptions::table)
+        .values((
+            subscriptions::organization_id.eq(scene.organization_id),
+            subscriptions::plan_key.eq("legacy_gold"),
+            subscriptions::stripe_subscription_id.eq("sub_legacy"),
+            subscriptions::status.eq("active"),
+            subscriptions::billing_interval.eq("monthly"),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("the subscription must insert");
+    scene.top_up("pi_seed", 1_000, false).await;
+
+    let limits = anubis::billing::Limits::new(plans());
+    let plan = limits
+        .plan_for(&mut connection, scene.organization_id)
+        .await
+        .expect("the plan must resolve");
+    assert_eq!(
+        plan.key(),
+        "member",
+        "the subscription decides nothing, so the credit does"
+    );
+    let (_status, body) = scene.billing_body(&scene.owner).await;
+    assert_eq!(body["plan"]["key"], "member");
+    assert_eq!(body["plan_source"], "paid_status");
+}
+
+#[tokio::test]
+async fn reconciliation_credits_back_a_refund_that_failed_while_its_events_were_missed() {
+    let Some(database) = TestDatabase::create("billing_wallet_flow").await else {
+        return;
+    };
+    let scene = Scene::new(&database).await;
+    scene.mock.pay(
+        "pi_refunded",
+        &scene.customer,
+        &scene.wallet_metadata("top_up"),
+        2_000,
+        &json!({}),
+    );
+    scene.mock.refund("re_1", "pi_refunded", 500, "pending");
+    let charge =
+        json!({ "id": "ch_pi_refunded", "object": "charge", "payment_intent": "pi_refunded" });
+    scene
+        .deliver("evt_charge_refunded", "charge.refunded", &charge)
+        .await;
+    assert_eq!(scene.balance().await, 15 * DOLLAR);
+
+    // The refund fails, Stripe takes it off the charge, and the endpoint
+    // never hears of it.
+    scene.mock.refund("re_1", "pi_refunded", 500, "failed");
+    scene
+        .mock
+        .ledger()
+        .payments
+        .get_mut("pi_refunded")
+        .expect("the payment is held")["latest_charge"] =
+        json!({ "id": "ch_pi_refunded", "object": "charge", "amount_refunded": 0 });
+
+    let (status, body) = scene
+        .request("POST", "/reconcile", None, &scene.owner)
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(scene.balance().await, 20 * DOLLAR);
+    assert_eq!(scene.audited("wallet.refund_reversed").await, 1);
 }

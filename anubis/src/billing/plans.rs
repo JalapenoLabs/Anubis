@@ -746,6 +746,13 @@ fn validate_wallet(terms: &WalletTerms) -> Result<(), Error> {
             terms.currency,
         )));
     }
+    if !super::currency::is_supported(&terms.currency) {
+        return Err(Error::new(format!(
+            "the wallet cannot hold {:?}: Stripe charges three-decimal currencies by rules the \
+             wallet does not apply, so pick another currency",
+            terms.currency,
+        )));
+    }
     if super::currency::to_minor(terms.minimum_top_up_micros, &terms.currency)
         .is_none_or(|minor| minor < 1)
     {
@@ -755,7 +762,7 @@ fn validate_wallet(terms: &WalletTerms) -> Result<(), Error> {
              smallest unit",
             terms.minimum_top_up_micros,
             terms.currency,
-            super::currency::charge_step_micros(&terms.currency),
+            super::currency::charge_step_micros(&terms.currency).unwrap_or_default(),
             super::currency::MAX_CHARGE_MINOR,
         )));
     }
@@ -1156,5 +1163,36 @@ plans:
             let error = PlanSet::from_yaml(yaml).expect_err("must be rejected");
             assert!(error.to_string().contains("does not parse"), "got: {error}");
         }
+    }
+
+    #[test]
+    fn a_wallet_refuses_a_currency_whose_charging_rules_it_does_not_apply() {
+        let wallet = |currency: &str, minimum: i64| {
+            format!(
+                "
+plans:
+  - key: free
+    name: Free
+wallet:
+  name: Account credit
+  currency: {currency}
+  minimum_top_up_micros: {minimum}
+"
+            )
+        };
+
+        let refused = PlanSet::from_yaml(&wallet("kwd", 10_000_000)).expect_err("three decimals");
+        assert!(
+            refused.to_string().contains("three-decimal"),
+            "got: {refused}"
+        );
+        let refused =
+            PlanSet::from_yaml(&wallet("ugx", 10_500_000)).expect_err("a fraction of a shilling");
+        assert!(
+            refused.to_string().contains("minimum_top_up_micros"),
+            "got: {refused}"
+        );
+        PlanSet::from_yaml(&wallet("ugx", 5_000_000_000)).expect("whole shillings");
+        PlanSet::from_yaml(&wallet("usd", 10_000_000)).expect("whole cents");
     }
 }

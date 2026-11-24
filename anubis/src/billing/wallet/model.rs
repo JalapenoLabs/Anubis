@@ -24,7 +24,7 @@ pub enum EntryKind {
     /// Credit bought through Stripe Checkout.
     TopUp,
     /// Credit bought off-session with the saved card, when the balance fell
-    /// below the auto-recharge threshold.
+    /// to or below the auto-recharge threshold.
     Recharge,
     /// The application charged for usage.
     Spend,

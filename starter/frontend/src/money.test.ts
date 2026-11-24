@@ -49,11 +49,14 @@ describe('currencySymbol', () => {
 })
 
 describe('chargeStepMicros', () => {
-  it('should charge in cents, whole yen, and hundredths of a dinar', () => {
+  it('should charge in cents and in whole yen', () => {
     expect(chargeStepMicros('usd')).toBe(10_000)
     expect(chargeStepMicros('jpy')).toBe(MICROS_PER_UNIT)
-    // Stripe requires a three-decimal currency's last digit to be zero.
-    expect(chargeStepMicros('bhd')).toBe(10_000)
+  })
+
+  it('should charge whole krónur and shillings, which Stripe writes in hundredths', () => {
+    expect(chargeStepMicros('isk')).toBe(MICROS_PER_UNIT)
+    expect(chargeStepMicros('ugx')).toBe(MICROS_PER_UNIT)
   })
 })
 

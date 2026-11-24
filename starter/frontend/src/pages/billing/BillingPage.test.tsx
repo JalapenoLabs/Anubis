@@ -238,7 +238,7 @@ describe('BillingPage', () => {
 
     expect(await screen.findByRole('heading', { name: 'Credit' })).toBeDefined()
     expect(screen.getByText('$25.00')).toBeDefined()
-    expect(screen.getByText('Recharges $10.00 below $5.00')).toBeDefined()
+    expect(screen.getByText('Recharges $10.00 at or below $5.00')).toBeDefined()
     expect(screen.getByRole('button', { name: 'Add credit' })).toBeDefined()
     expect(screen.getByRole('button', { name: 'Auto-recharge' })).toBeDefined()
     // A real link, so it opens in a new tab like any other.
@@ -334,7 +334,7 @@ describe('BillingPage', () => {
 
     renderWithProviders(<App />, BILLING_PATH)
 
-    expect(await screen.findByText('Recharges $10.00 below $5.00')).toBeDefined()
+    expect(await screen.findByText('Recharges $10.00 at or below $5.00')).toBeDefined()
     expect(screen.queryByText(/was declined/)).toBeNull()
   })
 

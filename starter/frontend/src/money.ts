@@ -63,11 +63,11 @@ export function currencySymbol(currency: string): string {
 /**
  * The smallest step Stripe charges in, in micro-units: one cent for usd.
  *
- * A zero-decimal currency such as jpy charges whole units. Every other one
- * charges hundredths, the three-decimal currencies included, because Stripe
- * requires their last digit to be zero. That is the backend's own rule
- * (`anubis::billing::currency::charge_step_micros`), and checking it here only
- * spares the person a refusal.
+ * A currency read in whole units, jpy, or isk and ugx (which Stripe writes in
+ * hundredths but charges only whole units of), charges whole units. Every
+ * other one a wallet can hold charges hundredths. That is the backend's own
+ * rule (`anubis::billing::currency::charge_step_micros`), and checking it here
+ * only spares the person a refusal.
  */
 export function chargeStepMicros(currency: string): number {
   const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency: currency.toUpperCase() })

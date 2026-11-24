@@ -255,9 +255,7 @@ impl Standing {
     ) -> QueryResult<Self> {
         let plan_subscription =
             Subscription::current_for_organization(connection, organization_id).await?;
-        let decided = plan_subscription
-            .as_ref()
-            .is_some_and(Subscription::grants_access);
+        let decided = subscribed_plan(plans, plan_subscription.as_ref()).is_some();
         if decided || plans.paid().is_none() {
             return Ok(Self {
                 plan_subscription,
@@ -310,15 +308,15 @@ pub(super) fn plan_in_force<'plans>(
     plans: &'plans PlanSet,
     standing: &Standing,
 ) -> (&'plans Plan, PlanSource) {
+    if let Some(plan) = subscribed_plan(plans, standing.plan_subscription.as_ref()) {
+        return (plan, PlanSource::PlanSubscription);
+    }
     if let Some(subscription) = standing
         .plan_subscription
         .as_ref()
         .filter(|held| held.grants_access())
     {
         let plan_key = subscription.plan_key.as_deref().unwrap_or_default();
-        if let Some(plan) = plans.find(plan_key) {
-            return (plan, PlanSource::PlanSubscription);
-        }
         // The plan was renamed or removed while a subscription still named it.
         // Falling through keeps every page answering; the log is what tells an
         // operator to reconcile `config/billing.yml` with Stripe.
@@ -334,6 +332,19 @@ pub(super) fn plan_in_force<'plans>(
         Some(paid) if standing.pays_for_something() => (paid, PlanSource::PaidStatus),
         _unpaid => (plans.free(), PlanSource::Free),
     }
+}
+
+/// The plan a plan subscription puts in force: it grants access, and names a plan the file defines.
+///
+/// The first step of [`plan_in_force`], shared with [`Standing::load`], so the
+/// read that decides whether the records and the wallet matter and the rule
+/// that reads them never disagree about whether the subscription decided.
+fn subscribed_plan<'plans>(
+    plans: &'plans PlanSet,
+    plan_subscription: Option<&Subscription>,
+) -> Option<&'plans Plan> {
+    let subscription = plan_subscription.filter(|held| held.grants_access())?;
+    plans.find(subscription.plan_key.as_deref()?)
 }
 
 /// Answers whether `resulting` records are allowed on `plan`.

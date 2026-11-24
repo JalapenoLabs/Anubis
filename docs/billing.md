@@ -250,7 +250,7 @@ A usage-priced application sells credit up front and spends it as usage accrues:
 
 ### Amounts
 
-Every amount is an integer number of **micro-units** of the wallet's currency: 1,000,000 is $1.00, so an hour at $0.0875 is 87,500 and a minute never rounds to zero. The unit is in every name that carries one (`balance_micros`, `amount_micros`), in the tables, the Rust API, the JSON, and `billing.yml` alike, so no two amounts that meet are ever in different units. Stripe charges in the currency's smallest unit instead, and `anubis::billing::currency` is the one place the two meet, following Stripe's own list of zero-decimal and three-decimal currencies: a top-up or a recharge is a whole cent (a whole yen, ten fils), at most Stripe's eight digits.
+Every amount is an integer number of **micro-units** of the wallet's currency: 1,000,000 is $1.00, so an hour at $0.0875 is 87,500 and a minute never rounds to zero. The unit is in every name that carries one (`balance_micros`, `amount_micros`), in the tables, the Rust API, the JSON, and `billing.yml` alike, so no two amounts that meet are ever in different units. Stripe charges in the currency's smallest unit instead, and `anubis::billing::currency` is the one place the two meet, following Stripe's currency rules: a top-up or a recharge is a whole cent, or a whole unit of a zero-decimal currency such as `jpy`, at most Stripe's eight digits. `isk` and `ugx` are Stripe's special cases, charged in whole units but written in two-decimal form (5 ISK is an `amount` of `500`), and they are handled as such; `huf` and `twd` are two-decimal for charges. The three-decimal currencies (`bhd`, `jod`, `kwd`, `omr`, `tnd`) charge by rules the wallet does not apply, so `billing.yml` naming one for the wallet is refused at boot rather than guessed at.
 
 ### The ledger, and the balance it caches
 
@@ -302,9 +302,9 @@ Nothing is credited by the request. The payment arrives as events, `checkout.ses
 
 ### Auto-recharge
 
-`PUT .../wallet/auto-recharge` takes `{"threshold_micros": 5000000, "amount_micros": 10000000}`: when a spend leaves the balance below the threshold, the saved card is charged the amount. It needs a saved card (`409` until a top-up saves one), an amount at least the minimum top-up and at least the threshold, which is what guarantees one recharge lifts a spent-down wallet back over it, and is audited as `wallet.auto_recharge_changed`. `DELETE` turns it off. Turning it on below the threshold recharges at once.
+`PUT .../wallet/auto-recharge` takes `{"threshold_micros": 5000000, "amount_micros": 10000000}`: when a spend leaves the balance at or below the threshold, the saved card is charged the amount, so a threshold of zero recharges the moment the credit runs out. It needs a saved card (`409` until a top-up saves one), an amount at least the minimum top-up and at least the threshold, which is what guarantees one recharge lifts a spent-down wallet back over it, and is audited as `wallet.auto_recharge_changed`. `DELETE` turns it off. Turning it on at or below the threshold recharges at once.
 
-**One dip, one charge.** The spend that lands below the threshold arms an attempt on the wallet row, inside its own transaction under the wallet's lock, and queues `RechargeWallet`. Every spend landing there while the attempt is armed finds it armed and arms nothing, so ten spends crossing at once queue one job. The attempt's id travels in the payment's metadata and, with a revision, keys the request at Stripe. The job reads Stripe back before it charges: it lists the customer's payments since the attempt was armed and looks for one carrying its id, so a run whose answer was lost, or two workers running one attempt, find the charge rather than make another. Then it charges the card off-session (`off_session=true`, `confirm=true`, redirects refused), and the payment is credited exactly as a top-up is.
+**One dip, one charge.** The spend that lands at or below the threshold arms an attempt on the wallet row, inside its own transaction under the wallet's lock, and queues `RechargeWallet`. Every spend landing there while the attempt is armed finds it armed and arms nothing, so ten spends crossing at once queue one job. The attempt's id travels in the payment's metadata and, with a revision, keys the request at Stripe. The job reads Stripe back before it charges: it lists the customer's payments since the attempt was armed and looks for one carrying its id, so a run whose answer was lost, or two workers running one attempt, find the charge rather than make another. Finding none, it charges only what the wallet still needs: an attempt whose wallet was topped up over the threshold since it was armed ends without a charge, and one armed for an amount the person has since changed is replaced by an attempt, under a new id, for what the settings say now. Then it charges the card off-session (`off_session=true`, `confirm=true`, redirects refused), and the payment is credited exactly as a top-up is.
 
 | Stripe's answer | What happens |
 |---|---|
@@ -314,7 +314,7 @@ Nothing is credited by the request. The payment arrives as events, `checkout.ses
 | No answer, a key still in use | Read back; a charge found is credited, and otherwise the job fails and the queue retries under the same key |
 | A server error | Read back; Stripe saves that answer under the key and would replay it, so with nothing found the attempt's revision moves and the retry is a new request |
 
-An attempt left armed for an hour, because its job was dead-lettered or its payment is still processing, is queued again by the next spend below the threshold, under the same attempt, which reads Stripe back first. A refund never arms a recharge: charging a customer again for the credit they were just refunded is not what they asked for.
+An attempt left armed for an hour, because its job was dead-lettered or its payment is still processing, is queued again by the next spend at or below the threshold, or by the next spend refused at zero, since a drained wallet sees no other spend, under the same attempt, which reads Stripe back first. A refund never arms a recharge: charging a customer again for the credit they were just refunded is not what they asked for.
 
 ### Refunds
 
@@ -339,7 +339,7 @@ Credits, refunds, reversals, and auto-recharge changes and failures are audited 
 
 ### Reading the wallet
 
-The billing `GET` answers the wallet to `admin` and `billing` (see [the endpoints](#endpoints)), and `GET .../wallet/entries?page=&limit=` pages the ledger, newest first, by `position`, the order the balances chain in. Both are the billing roles' only: the balance says what the organization spends, and a spend names the record it paid for, which a member may not reach. Reconciliation converges the wallet's payments too: a top-up whose events never arrived is credited, and a refund whose events were missed is debited, reading each payment's refunds only when its charge says it was refunded.
+The billing `GET` answers the wallet to `admin` and `billing` (see [the endpoints](#endpoints)), and `GET .../wallet/entries?page=&limit=` pages the ledger, newest first, by `position`, the order the balances chain in. Both are the billing roles' only: the balance says what the organization spends, and a spend names the record it paid for, which a member may not reach. Reconciliation converges the wallet's payments too: a top-up whose events never arrived is credited, and a refund whose events were missed is debited, reading each payment's refunds when its charge says it was refunded or the ledger holds a refund of it, which is how a refund that failed while its events were missed is credited back.
 
 ### Without Stripe
 

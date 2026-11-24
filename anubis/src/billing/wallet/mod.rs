@@ -108,7 +108,8 @@ const RECHARGE_STALE_AFTER: TimeDelta = TimeDelta::hours(1);
 ///
 /// Queued by the spend that leaves the balance below the auto-recharge
 /// threshold, in that spend's transaction, which also arms the attempt it
-/// will run; and by turning auto-recharge on below the threshold. The payload
+/// will run; by turning auto-recharge on at or below the threshold; and by a
+/// spend refused at zero, which queues a stuck attempt again. The payload
 /// is the organization alone: the attempt, its amount, and its key are on the
 /// wallet row.
 #[derive(Debug, Serialize, Deserialize)]
@@ -212,7 +213,7 @@ impl Wallets {
     ///
     /// Drains to zero and never below: see the [module docs](self). When the
     /// spend leaves the balance below the low-balance mark it tells the billing
-    /// members, and when it leaves it below the auto-recharge threshold it arms
+    /// members, and when it leaves it at or below the auto-recharge threshold it arms
     /// a recharge, once per dip, both in the caller's transaction.
     ///
     /// # Errors
@@ -240,19 +241,33 @@ impl Wallets {
             )));
         }
 
+        // A refusal is an answer, not a failure, so it commits: the outer
+        // result is the database's, the inner one the spend's. That is what
+        // keeps a stuck recharge the refusal queued again from rolling back
+        // with it.
         connection
             .transaction::<_, Error, _>(async |connection| {
                 let Some(mut wallet) = ledger::lock(connection, organization_id).await? else {
-                    return Err(Error::insufficient(organization_id, 0));
+                    return Ok(Err(Error::insufficient(organization_id, 0)));
                 };
                 if let Some(entry) =
                     WalletEntry::find(connection, organization_id, EntryKind::Spend, spend.key)
                         .await?
                 {
-                    return replay(entry, &spend);
+                    return Ok(replay(entry, &spend));
                 }
                 if wallet.balance_micros <= 0 {
-                    return Err(Error::insufficient(organization_id, wallet.balance_micros));
+                    // Nothing is left to spend, so no later spend will land
+                    // below the threshold to re-queue a recharge whose job ran
+                    // out of attempts; the refusal does it instead. It never
+                    // arms a new one, which keeps a refund from charging again.
+                    if self.billing_enabled {
+                        requeue_stale(connection, &wallet).await?;
+                    }
+                    return Ok(Err(Error::insufficient(
+                        organization_id,
+                        wallet.balance_micros,
+                    )));
                 }
 
                 let before = wallet.balance_micros;
@@ -273,12 +288,12 @@ impl Wallets {
                 .await?;
 
                 self.after_debit(connection, &wallet, before, terms).await?;
-                Ok(Spent {
+                Ok(Ok(Spent {
                     entry,
                     replayed: false,
-                })
+                }))
             })
-            .await
+            .await?
     }
 
     /// The organization's balance in micro-units, zero when it has no wallet.
@@ -300,8 +315,9 @@ impl Wallets {
 
     /// What a debit owes the people and the recharge behind the wallet.
     ///
-    /// The balance fell from `before` to the wallet's. Landing below the
-    /// threshold arms a recharge unless one is already in flight. Without a
+    /// The balance fell from `before` to the wallet's. Landing at or below the
+    /// threshold arms a recharge unless one is already in flight, so a
+    /// threshold of zero recharges the moment the credit runs out. Without a
     /// recharge that can run, crossing the low mark tells the billing members
     /// instead; with one, the recharge is the answer, and a failed one says so
     /// itself.
@@ -315,7 +331,7 @@ impl Wallets {
         let after = wallet.balance_micros;
         match wallet.auto_recharge() {
             Some((threshold, _amount)) if self.billing_enabled => {
-                if after < threshold {
+                if after <= threshold {
                     arm_recharge(connection, wallet).await?;
                 }
             }
@@ -365,13 +381,12 @@ fn replay(entry: WalletEntry, spend: &Spend<'_>) -> Result<Spent, Error> {
     })
 }
 
-/// Arms a recharge on a wallet below its threshold, unless one is already in flight.
+/// Arms a recharge on a wallet at or below its threshold, unless one is already in flight.
 ///
 /// Runs under the wallet's lock, inside the transaction that took the balance
-/// below the threshold, so of every spend landing there at once exactly one
-/// finds the wallet unarmed: one dip, one charge. A recharge armed longer than
-/// [`RECHARGE_STALE_AFTER`] ago is queued again under the same attempt, which
-/// reads Stripe back before it charges anything.
+/// there, so of every spend landing there at once exactly one finds the wallet
+/// unarmed: one dip, one charge. An attempt already armed is only queued again
+/// once it is stale; see [`requeue_stale`].
 pub(super) async fn arm_recharge(
     connection: &mut AsyncPgConnection,
     wallet: &Wallet,
@@ -379,28 +394,49 @@ pub(super) async fn arm_recharge(
     let Some((_threshold, amount)) = wallet.auto_recharge() else {
         return Ok(());
     };
-    let now = Utc::now();
-    match wallet.recharge_queued_at {
-        Some(queued_at) if now - queued_at < RECHARGE_STALE_AFTER => return Ok(()),
-        Some(_stale) => {
-            diesel::update(wallets::table.find(wallet.organization_id))
-                .set(wallets::recharge_queued_at.eq(now))
-                .execute(connection)
-                .await?;
-        }
-        None => {
-            diesel::update(wallets::table.find(wallet.organization_id))
-                .set((
-                    wallets::recharge_attempt_id.eq(Uuid::new_v4()),
-                    wallets::recharge_attempt_amount_micros.eq(amount),
-                    wallets::recharge_armed_at.eq(now),
-                    wallets::recharge_queued_at.eq(now),
-                ))
-                .execute(connection)
-                .await?;
-        }
+    if wallet.recharge_attempt_id.is_some() {
+        return requeue_stale(connection, wallet).await;
     }
 
+    let now = Utc::now();
+    diesel::update(wallets::table.find(wallet.organization_id))
+        .set((
+            wallets::recharge_attempt_id.eq(Uuid::new_v4()),
+            wallets::recharge_attempt_amount_micros.eq(amount),
+            wallets::recharge_armed_at.eq(now),
+            wallets::recharge_queued_at.eq(now),
+        ))
+        .execute(connection)
+        .await?;
+    crate::jobs::enqueue_query(
+        connection,
+        &RechargeWallet {
+            organization_id: wallet.organization_id,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Queues an armed recharge's job again once it was queued [`RECHARGE_STALE_AFTER`] ago.
+///
+/// Its job was dead-lettered, or its payment is still processing. Running the
+/// same attempt again is safe: it reads Stripe back before it charges
+/// anything. Runs under the wallet's lock, so one caller re-queues it.
+async fn requeue_stale(connection: &mut AsyncPgConnection, wallet: &Wallet) -> Result<(), Error> {
+    let now = Utc::now();
+    let stale = wallet.auto_recharge().is_some()
+        && wallet
+            .recharge_queued_at
+            .is_some_and(|queued_at| now - queued_at >= RECHARGE_STALE_AFTER);
+    if !stale {
+        return Ok(());
+    }
+
+    diesel::update(wallets::table.find(wallet.organization_id))
+        .set(wallets::recharge_queued_at.eq(now))
+        .execute(connection)
+        .await?;
     crate::jobs::enqueue_query(
         connection,
         &RechargeWallet {
@@ -431,7 +467,7 @@ pub(super) async fn balance_of(
 /// Turns auto-recharge on or changes it (`Some((threshold, amount))`), or turns it off.
 ///
 /// Records the change in the audit log, attributed by `context`, and arms a
-/// recharge at once when the balance is already below the new threshold.
+/// recharge at once when the balance is already at or below the new threshold.
 ///
 /// # Errors
 /// Returns an [`Error`] that is [`Error::is_invalid`] for an amount Stripe
@@ -484,7 +520,7 @@ pub(super) async fn set_auto_recharge(
                 .await?;
             }
             if let Some((threshold, _amount)) = settings
-                && updated.balance_micros < threshold
+                && updated.balance_micros <= threshold
             {
                 arm_recharge(connection, &updated).await?;
             }

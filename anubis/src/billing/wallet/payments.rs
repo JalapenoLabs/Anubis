@@ -46,7 +46,7 @@ use crate::billing::stripe::{
 };
 use crate::billing::subscriptions::stored_customer_id;
 use crate::db::DbPool;
-use crate::schema::{organizations, wallets};
+use crate::schema::{organizations, wallet_entries, wallets};
 
 /// How far before an attempt was armed its payment may have been created.
 ///
@@ -84,7 +84,8 @@ impl Purpose {
 pub(in crate::billing) enum Refunds {
     /// A refund event named the payment: read every refund it has.
     Read,
-    /// Read them only when the payment's expanded charge says it was refunded.
+    /// Read them only when the payment's expanded charge says it was
+    /// refunded, or the ledger holds a refund of it.
     WhenRefunded,
     /// The payment's own event: nothing about refunds.
     Skip,
@@ -136,9 +137,22 @@ pub(in crate::billing) async fn converge_payment(
 
     let read_refunds = match refunds {
         Refunds::Read => true,
-        Refunds::WhenRefunded => payment
-            .amount_refunded()
-            .is_none_or(|refunded| refunded > 0),
+        // Stripe's charge says whether anything is refunded now, and the
+        // ledger whether anything was debited: a refund that failed after
+        // its debit shows nothing at Stripe, and still needs crediting back.
+        Refunds::WhenRefunded => {
+            payment
+                .amount_refunded()
+                .is_none_or(|refunded| refunded > 0)
+                || diesel::select(diesel::dsl::exists(
+                    wallet_entries::table
+                        .filter(wallet_entries::organization_id.eq(organization_id))
+                        .filter(wallet_entries::kind.eq(EntryKind::Refund.as_str()))
+                        .filter(wallet_entries::stripe_payment_intent_id.eq(&payment.id)),
+                ))
+                .get_result::<bool>(connection)
+                .await?
+        }
         Refunds::Skip => false,
     };
     if read_refunds {
@@ -257,10 +271,9 @@ async fn credit(
                 .await?;
             }
             if purpose == Purpose::Recharge
-                && attempt.is_some()
-                && attempt == wallet.recharge_attempt_id
+                && let Some(attempt) = attempt
             {
-                disarm(connection, organization_id).await?;
+                disarm(connection, organization_id, attempt).await?;
             }
             Ok(())
         })
@@ -374,45 +387,40 @@ pub(in crate::billing) async fn recharge(
     let Some(wallet) = Wallet::find(&mut connection, organization_id).await? else {
         return Ok(());
     };
-    let (Some(attempt), Some(amount), Some(armed_at)) = (
-        wallet.recharge_attempt_id,
-        wallet.recharge_attempt_amount_micros,
-        wallet.recharge_armed_at,
-    ) else {
+    let Some(armed) = Attempt::of(&wallet) else {
         // Nothing armed: an earlier run of this job, or the payment's own
         // event, settled the attempt already.
         return Ok(());
     };
     let Some(customer) = stored_customer_id(&mut connection, organization_id).await? else {
-        disarm(&mut connection, organization_id).await?;
+        disarm(&mut connection, organization_id, armed.id).await?;
         return Ok(());
     };
 
     // Look before charging: an earlier run of this attempt may have charged
     // already and lost the answer.
-    let search = Search {
-        customer: &customer,
-        attempt,
-        armed_at,
-    };
-    if let Some(found) = search.run(stripe).await? {
+    if let Some(found) = armed.search(stripe, &customer).await? {
         return converge_payment(&mut connection, plans, stripe, &found, Refunds::Skip).await;
     }
-    let Some(card) = wallet
-        .recharge_payment_method_id
-        .as_deref()
-        .filter(|_card| wallet.auto_recharge().is_some())
-    else {
+    let (Some(card), Some(settings)) = (
+        wallet.recharge_payment_method_id.as_deref(),
+        wallet.auto_recharge(),
+    ) else {
         // Auto-recharge was turned off after this attempt was armed, and the
         // attempt never charged: there is nothing to do.
-        disarm(&mut connection, organization_id).await?;
+        disarm(&mut connection, organization_id, armed.id).await?;
         return Ok(());
     };
-    let amount_minor = currency::to_minor(amount, terms.currency()).ok_or_else(|| {
-        Error::data(format!(
-            "the armed recharge of {amount} micro-units is not an amount Stripe can charge",
-        ))
-    })?;
+    let Some(armed) = still_wanted(&mut connection, &wallet, armed, settings).await? else {
+        return Ok(());
+    };
+    let amount_minor =
+        currency::to_minor(armed.amount_micros, terms.currency()).ok_or_else(|| {
+            Error::data(format!(
+                "the armed recharge of {} micro-units is not an amount Stripe can charge",
+                armed.amount_micros,
+            ))
+        })?;
 
     let charged = stripe
         .create_recharge(
@@ -423,9 +431,9 @@ pub(in crate::billing) async fn recharge(
                 currency: terms.currency(),
                 description: terms.name(),
                 organization_id,
-                attempt_id: attempt,
+                attempt_id: armed.id,
             },
-            wallet.recharge_attempt_revision,
+            armed.revision,
         )
         .await;
     let payment = match charged {
@@ -435,7 +443,7 @@ pub(in crate::billing) async fn recharge(
                 &mut connection,
                 terms,
                 organization_id,
-                attempt,
+                armed.id,
                 refused.message(),
             )
             .await?;
@@ -445,7 +453,7 @@ pub(in crate::billing) async fn recharge(
             // The answer never arrived, Stripe answered with a server error, or
             // another run holds the key. Stripe may have charged; reading back
             // says whether.
-            if let Some(found) = search.run(stripe).await? {
+            if let Some(found) = armed.search(stripe, &customer).await? {
                 found
             } else {
                 if unknown.is_indeterminate() {
@@ -454,7 +462,7 @@ pub(in crate::billing) async fn recharge(
                     diesel::update(
                         wallets::table
                             .find(organization_id)
-                            .filter(wallets::recharge_attempt_id.eq(attempt)),
+                            .filter(wallets::recharge_attempt_id.eq(armed.id)),
                     )
                     .set(
                         wallets::recharge_attempt_revision
@@ -471,25 +479,85 @@ pub(in crate::billing) async fn recharge(
     converge_payment(&mut connection, plans, stripe, &payment, Refunds::Skip).await
 }
 
-/// Where a recharge attempt's payment would be, if it made one.
-struct Search<'a> {
-    customer: &'a str,
-    attempt: Uuid,
+/// The recharge attempt armed on a wallet: what it charges, and how it is keyed.
+#[derive(Debug, Clone, Copy)]
+struct Attempt {
+    id: Uuid,
+    amount_micros: i64,
+    revision: i32,
+    /// When it was armed, which bounds the search for its payment.
     armed_at: DateTime<Utc>,
 }
 
-impl Search<'_> {
-    /// The payment the attempt made, read from the customer's recent payments.
-    async fn run(&self, stripe: &stripe::Client) -> Result<Option<PaymentIntent>, Error> {
+impl Attempt {
+    fn of(wallet: &Wallet) -> Option<Self> {
+        Some(Self {
+            id: wallet.recharge_attempt_id?,
+            amount_micros: wallet.recharge_attempt_amount_micros?,
+            revision: wallet.recharge_attempt_revision,
+            armed_at: wallet.recharge_armed_at?,
+        })
+    }
+
+    /// The payment this attempt made, read from the customer's recent payments.
+    async fn search(
+        &self,
+        stripe: &stripe::Client,
+        customer: &str,
+    ) -> Result<Option<PaymentIntent>, Error> {
         let since = (self.armed_at - READ_BACK_SLACK).timestamp();
-        let attempt = self.attempt.to_string();
-        let recent = stripe
-            .list_payment_intents(self.customer, Some(since))
-            .await?;
+        let attempt = self.id.to_string();
+        let recent = stripe.list_payment_intents(customer, Some(since)).await?;
         Ok(recent
             .into_iter()
             .find(|payment| payment.metadata(RECHARGE_ATTEMPT_METADATA) == Some(attempt.as_str())))
     }
+}
+
+/// The attempt to charge for what the wallet needs now, or `None` when it needs nothing.
+///
+/// Runs once a search shows the armed attempt never charged. Credit that
+/// arrived since the attempt was armed, lifting the balance over the
+/// threshold, ends it without a charge. An attempt armed for an amount the
+/// person has since changed is replaced by one for what the settings say now,
+/// under a new id, so it goes to Stripe as a new request; replacing it is
+/// conditional on its id, so an attempt another run or the payment's own
+/// event settled meanwhile is left alone.
+async fn still_wanted(
+    connection: &mut AsyncPgConnection,
+    wallet: &Wallet,
+    armed: Attempt,
+    (threshold, wanted): (i64, i64),
+) -> Result<Option<Attempt>, Error> {
+    let organization_id = wallet.organization_id;
+    if wallet.balance_micros > threshold {
+        disarm(connection, organization_id, armed.id).await?;
+        return Ok(None);
+    }
+    if wanted == armed.amount_micros {
+        return Ok(Some(armed));
+    }
+
+    let fresh = Attempt {
+        id: Uuid::new_v4(),
+        amount_micros: wanted,
+        revision: 0,
+        armed_at: Utc::now(),
+    };
+    let replaced = diesel::update(
+        wallets::table
+            .find(organization_id)
+            .filter(wallets::recharge_attempt_id.eq(armed.id)),
+    )
+    .set((
+        wallets::recharge_attempt_id.eq(fresh.id),
+        wallets::recharge_attempt_amount_micros.eq(fresh.amount_micros),
+        wallets::recharge_attempt_revision.eq(fresh.revision),
+        wallets::recharge_armed_at.eq(fresh.armed_at),
+    ))
+    .execute(connection)
+    .await?;
+    Ok((replaced > 0).then_some(fresh))
 }
 
 /// Ends a recharge payment that Stripe left unpaid, when it is still the armed attempt.
@@ -540,7 +608,7 @@ async fn fail_armed(
                 ))
                 .execute(connection)
                 .await?;
-            disarm(connection, organization_id).await?;
+            disarm(connection, organization_id, attempt).await?;
             notices::record_settings(
                 connection,
                 &audit::Context::system(),
@@ -562,17 +630,28 @@ async fn fail_armed(
         .await
 }
 
-/// Clears the armed attempt, so the next dip below the threshold arms a new one.
-async fn disarm(connection: &mut AsyncPgConnection, organization_id: Uuid) -> QueryResult<()> {
-    diesel::update(wallets::table.find(organization_id))
-        .set((
-            wallets::recharge_attempt_id.eq(None::<Uuid>),
-            wallets::recharge_attempt_amount_micros.eq(None::<i64>),
-            wallets::recharge_attempt_revision.eq(0),
-            wallets::recharge_armed_at.eq(None::<DateTime<Utc>>),
-            wallets::recharge_queued_at.eq(None::<DateTime<Utc>>),
-        ))
-        .execute(connection)
-        .await?;
+/// Clears the armed attempt, so the next dip to the threshold arms a new one.
+///
+/// Only when `attempt` is still the one armed: a caller that read the wallet
+/// without its lock never clears an attempt armed after its read.
+async fn disarm(
+    connection: &mut AsyncPgConnection,
+    organization_id: Uuid,
+    attempt: Uuid,
+) -> QueryResult<()> {
+    diesel::update(
+        wallets::table
+            .find(organization_id)
+            .filter(wallets::recharge_attempt_id.eq(attempt)),
+    )
+    .set((
+        wallets::recharge_attempt_id.eq(None::<Uuid>),
+        wallets::recharge_attempt_amount_micros.eq(None::<i64>),
+        wallets::recharge_attempt_revision.eq(0),
+        wallets::recharge_armed_at.eq(None::<DateTime<Utc>>),
+        wallets::recharge_queued_at.eq(None::<DateTime<Utc>>),
+    ))
+    .execute(connection)
+    .await?;
     Ok(())
 }
