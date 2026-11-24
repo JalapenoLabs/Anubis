@@ -63,12 +63,14 @@ CREATE INDEX oauth_device_codes_grant_id ON oauth_device_codes (grant_id);
 -- challenge, because the device code is what proves the program. It belongs
 -- to the account that last entered its user code (`entered_by`), and no other
 -- account may read or decide it, so passing the request's id to somebody is
--- no way around typing the code.
+-- no way around typing the code. Deleting that account leaves the request to
+-- nobody until the code is entered again, rather than taking it away from
+-- the device.
 ALTER TABLE oauth_authorization_requests
     ALTER COLUMN redirect_uri DROP NOT NULL,
     ALTER COLUMN code_challenge DROP NOT NULL,
     ADD COLUMN device_code_id UUID UNIQUE REFERENCES oauth_device_codes(id) ON DELETE CASCADE,
-    ADD COLUMN entered_by UUID REFERENCES users(id) ON DELETE CASCADE,
+    ADD COLUMN entered_by UUID REFERENCES users(id) ON DELETE SET NULL,
     ADD CONSTRAINT oauth_authorization_requests_delivery CHECK (
         (
             device_code_id IS NULL

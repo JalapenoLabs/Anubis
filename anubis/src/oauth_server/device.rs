@@ -194,14 +194,18 @@ pub(crate) async fn authorize(
     // A web page can have every visitor's browser post this form, each from
     // its own address and so on its own budget, and fill the table of waiting
     // codes. A browser marks such a write with `Origin`, and a current one
-    // with `Sec-Fetch-Site`; a program on a device sends neither.
+    // with `Sec-Fetch-Site`. A native program's own HTTP client usually sends
+    // neither, but one running in a webview shell may: Tauri's HTTP plugin
+    // sets `Origin` to the webview's. It is refused all the same, since the
+    // header is all this server sees, and told to send from native code.
     let sent_by_a_page = headers.contains_key(ORIGIN)
         || headers
             .get("sec-fetch-site")
             .is_some_and(|site| site == "cross-site" || site == "same-site");
     if sent_by_a_page {
         return Err(OauthError::invalid_request(
-            "Device authorization is for programs, not web pages.",
+            "Device authorization is for programs, not web pages: send this request \
+             from native code, without an Origin or Sec-Fetch-Site header.",
         ));
     }
 

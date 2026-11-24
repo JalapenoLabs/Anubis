@@ -671,6 +671,42 @@ async fn only_the_account_that_entered_a_code_may_decide_its_request() {
     decide(router, &recipient, &request_id, true).await;
 }
 
+/// The account that entered a code is deleted before deciding: the request
+/// goes back to nobody's, so whoever enters the code next can still decide it.
+#[tokio::test]
+async fn a_deleted_entrant_leaves_the_request_to_the_next_one() {
+    let Some(database) = TestDatabase::create("oauth_device_deleted_entrant").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let router = &harness.router;
+    let leaving = register(router, &format!("leaving-{}@example.com", Uuid::new_v4())).await;
+    let owner = register(router, &format!("owner-{}@example.com", Uuid::new_v4())).await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(router, &program.client_id, "").await;
+    let request_id = request_for_code(router, &leaving, &codes.user_code).await;
+
+    let (status, _headers, body) = send(
+        router,
+        "DELETE",
+        "/auth/account",
+        Some(&json!({ "password": support::PASSWORD })),
+        Some(&leaving),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
+
+    // Nobody owns it now, so nobody reads it until somebody enters the code.
+    let path = format!("/oauth/requests/{request_id}");
+    let (status, _headers, _body) = send(router, "GET", &path, None, Some(&owner)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let entered = request_for_code(router, &owner, &codes.user_code).await;
+    assert_eq!(entered, request_id);
+    decide(router, &owner, &request_id, true).await;
+    let (status, tokens) = poll(router, &program.client_id, &codes.device_code).await;
+    assert_eq!(status, StatusCode::OK, "body: {tokens}");
+}
+
 #[tokio::test]
 async fn a_denied_device_outlives_the_sweep_of_stale_documents() {
     let Some(database) = TestDatabase::create("oauth_device_sweep").await else {
@@ -701,8 +737,10 @@ async fn a_denied_device_outlives_the_sweep_of_stale_documents() {
 }
 
 /// A web page can make every visitor's browser post a form anywhere, so a
-/// device authorization a browser sent is refused before it stores anything:
-/// a program on a device sends neither header a browser adds.
+/// device authorization a browser sent is refused before it stores anything.
+/// A native program's own HTTP client usually sends neither header a browser
+/// adds; one that does (a webview shell's HTTP plugin may set `Origin`) is
+/// told what to change.
 #[tokio::test]
 async fn a_web_page_cannot_start_device_flows_through_its_visitors() {
     let Some(database) = TestDatabase::create("oauth_device_browsers").await else {
@@ -745,6 +783,12 @@ async fn a_web_page_cannot_start_device_flows_through_its_visitors() {
             .to_bytes();
         let body: Value = serde_json::from_slice(&bytes).expect("an OAuth error");
         assert_eq!(body["error"], "invalid_request", "{header}: {value}");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .is_some_and(|description| description.contains("without an Origin")),
+            "the refusal says what to change: {body}",
+        );
     }
 
     let mut connection = harness.pool.get().await.expect("a connection");
