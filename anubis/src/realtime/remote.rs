@@ -138,16 +138,21 @@ impl Remote {
     /// what it carries on; the pump follows it to decide what Redis should
     /// deliver here.
     ///
-    /// The connection is made, and one empty snapshot read, here rather than
-    /// lazily: a deployment that names a Redis it cannot reach, or one whose
-    /// user may not run what the scripts run, has a configuration problem, and
-    /// finding out at the first publish would mean losing events to discover
-    /// it. The scripts ask Redis which run it is on with `INFO`, which a user
-    /// restricted with `-@dangerous` may not run, so this is where that shows.
+    /// The connection is made, one empty snapshot read, and one message
+    /// published, here rather than lazily: a deployment that names a Redis it
+    /// cannot reach, or one whose user may not do what realtime does, has a
+    /// configuration problem, and finding out at the first publish would mean
+    /// losing events to discover it. The scripts ask Redis which run it is on
+    /// with `INFO`, which a user restricted with `-@dangerous` may not run, and
+    /// Redis 7 gives a new user no pub/sub channels at all, so this is where
+    /// either shows. The message goes to the bare prefix, a channel no stream
+    /// is ever named, and one channel permission covers publishing and
+    /// subscribing alike.
     ///
     /// # Errors
     /// Returns the Redis error when the URL does not parse, the server cannot
-    /// be reached, or the scripts cannot run.
+    /// be reached, the scripts cannot run, or the user may not publish on the
+    /// framework's channels.
     pub(crate) async fn connect(
         url: &str,
         interest: UnboundedReceiver<Interest>,
@@ -162,6 +167,12 @@ impl Remote {
             snapshot: Script::new(SNAPSHOT_SCRIPT),
         };
         remote.snapshot(&[]).await?;
+        let mut probe = remote.connection.clone();
+        redis::cmd("PUBLISH")
+            .arg(PUBSUB_PREFIX)
+            .arg("")
+            .query_async::<()>(&mut probe)
+            .await?;
 
         tokio::spawn(pump(client, interest, registry));
         Ok(remote)

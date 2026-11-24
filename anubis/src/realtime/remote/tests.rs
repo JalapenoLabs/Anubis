@@ -287,12 +287,15 @@ async fn a_new_run_sets_the_old_buffers_aside_and_lets_go_of_them_a_share_at_a_t
     );
 }
 
-/// A Redis user that may not run `INFO` is found out at startup.
+/// A Redis user without the documented grant is found out at startup.
 ///
-/// The scripts read the server's run with it, and `INFO` is in the
-/// `@dangerous` category a restricted user commonly lacks.
+/// The scripts read the server's run with `INFO`, which the `@dangerous`
+/// category a restricted user commonly lacks includes, and every publish and
+/// subscription is on an `anubis:realtime:` channel, which Redis 7 grants a new
+/// user none of. The user is built from the documented grant alone, with no
+/// channel permission beyond the one it names.
 #[tokio::test]
-async fn a_redis_user_that_may_not_run_info_is_refused_at_startup() {
+async fn a_redis_user_without_the_documented_grant_is_refused_at_startup() {
     let Some(redis_url) = redis_url("Redis ACL") else {
         return;
     };
@@ -312,7 +315,15 @@ async fn a_redis_user_that_may_not_run_info_is_refused_at_startup() {
 
     let () = query(
         &redis_url,
-        &acl(&["on", ">secret", "~*", "&*", "+@all", "-@dangerous"]),
+        &acl(&[
+            "on",
+            ">secret",
+            "~*",
+            "resetchannels",
+            "&anubis:realtime:*",
+            "+@all",
+            "-@dangerous",
+        ]),
     )
     .await;
     let refused = Channels::redis(restricted.as_str())
@@ -320,11 +331,17 @@ async fn a_redis_user_that_may_not_run_info_is_refused_at_startup() {
         .expect_err("a user that may not run INFO cannot run the scripts");
     assert!(refused.is_configuration(), "got: {refused}");
 
-    // The documented grant is enough.
-    let () = query(&redis_url, &acl(&["+info"])).await;
+    let () = query(&redis_url, &acl(&["+info", "resetchannels"])).await;
+    let refused = Channels::redis(restricted.as_str())
+        .await
+        .expect_err("a user without the framework's channels cannot publish");
+    assert!(refused.is_configuration(), "got: {refused}");
+
+    // The documented grant, +@all -@dangerous +info &anubis:realtime:*, is enough.
+    let () = query(&redis_url, &acl(&["&anubis:realtime:*"])).await;
     let channels = Channels::redis(restricted.as_str())
         .await
-        .expect("+@all -@dangerous +info runs everything the scripts need");
+        .expect("the documented grant runs everything realtime needs");
     channels
         .publish(&ChannelName::user(Uuid::new_v4(), "inbox"), "created", ())
         .await

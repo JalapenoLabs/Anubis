@@ -77,9 +77,9 @@
 //! table for everyone else. A stream's channels are released when its lifetime
 //! ends or the server drains whether or not its client is still reading, so a
 //! client that stops reading cannot keep them. The stream itself counts
-//! against its account until its connection closes, which the server forces
-//! once the connection's writes stall for a minute, so an account whose
-//! streams stall holds its own share and nothing more.
+//! against its account until its connection closes, so an account whose
+//! streams stall holds its own share and nothing more; a proxy's send timeout
+//! is what closes a client that stopped reading (see `docs/realtime.md`).
 
 mod channel;
 mod endpoint;
@@ -134,10 +134,10 @@ pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 ///
 /// Deliberately far shorter than the worst case. The account's other streams
 /// free their share as their tabs close, which is usually what a person just
-/// did, or as their lifetimes end, which can take six minutes, or seven for a
-/// stream whose client stopped reading. Asking for that much would leave the
-/// common case waiting minutes; ten seconds answers it promptly, and a retry
-/// every ten seconds costs the server one cheap refusal.
+/// did, or as their lifetimes end, which can take six minutes, and longer for
+/// a stream whose client stopped reading. Asking for that much would leave
+/// the common case waiting minutes; ten seconds answers it promptly, and a
+/// retry every ten seconds costs the server one cheap refusal.
 const OVER_QUOTA_RETRY: Duration = Duration::from_secs(10);
 
 /// How long opening a stream may wait on Redis before answering `503`.
@@ -743,8 +743,9 @@ impl Error {
     /// A share of the process's table per account, so no single account can
     /// fill it for everyone else. The client backs off and tries again; a
     /// stream frees its share when its connection closes, which its lifetime
-    /// brings about within six minutes, or seven for a stream whose client
-    /// stopped reading.
+    /// brings about within six minutes while its client reads. A stream whose
+    /// client stopped reading holds its share until the connection is closed
+    /// some other way, such as by a proxy's send timeout.
     #[must_use]
     pub fn is_over_quota(&self) -> bool {
         matches!(self.kind, ErrorKind::OverQuota)

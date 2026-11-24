@@ -86,9 +86,11 @@ The route is the path as the router matches it, parameters included and the full
 
 An event stream needs no declaration. The timeout clocks the handler, which for an upload includes reading the client's body and for a stream ends the moment the stream is open and its head is sent. The body that follows is never timed, so a [realtime stream](realtime.md) lives as long as its client listens, while its opening (the session check, the authorization, the replay read) stays bounded like any other request. A test pins that a streamed body outlives the timeout, so a change that made the timeout clock bodies would fail the build rather than cut every stream thirty seconds in.
 
-### Stalled connections
+### Clients that stop reading
 
-A connection whose writes make no progress for 60 seconds is closed, by the kernel, through `TCP_USER_TIMEOUT` on every accepted socket: data the client has not acknowledged, or that cannot be sent because the client's receive window is shut, for that long ends the connection, its pending write fails, and the response is dropped. The request timeout cannot do this for a response whose body is still being sent, and an event stream is never finished: once its client stops taking bytes, hyper stops polling the body, so nothing in the process could end the stream, and it would keep its socket and what it had queued for as long as the client stayed connected. Sixty seconds is nginx's `send_timeout`, the bound a proxied deployment already lives under, and far past any client that is reading at all. The option is Linux's; on other platforms, which serve development only, a stalled connection lasts until its client leaves.
+The server does not time out a response whose body is still being sent. An event stream is never finished, and once its client stops taking bytes, hyper stops polling its body, so nothing in the process ends it: it keeps its socket, what it had queued, and its share of the account's [realtime bounds](realtime.md#limits) until the connection closes. That costs only the account the client belongs to, and production closes such a connection at the proxy in front of the server, which every deployment has for HTTP/2 and TLS: nginx's default `send_timeout` of sixty seconds closes a client that has taken nothing for that long. A deployment fronted by something without a send timeout should give it one.
+
+The server does not bound stalled writes itself, because only the proxy can tell a client that stopped reading from one reading slowly through it: a buffering proxy that has filled its temporary file stops reading the server for as long as its client takes to catch up, and a socket-level limit would cut a large download short while its client was still reading.
 
 ### Graceful shutdown
 
