@@ -104,7 +104,7 @@ The session cookie authenticates the request. `channels` names every channel the
 | `401` | No session |
 | `403` `password_change_required` | The account must replace its temporary password first |
 | `400` | No channels, or more than 64 |
-| `503` | The database or Redis could not answer in time; retry |
+| `503`, or `500` | The stream could not open right now (the database or Redis was unreachable, or a query failed); the client retries on its backoff |
 
 ### Frames
 
