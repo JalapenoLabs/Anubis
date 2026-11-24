@@ -249,7 +249,7 @@ Holding a role-management permission lets somebody change what others may do, so
 | Removing the last holder of role management | The administrator role holds every framework permission, cannot be deleted, and always keeps a holder |
 | Raising organization-wide or sub-tenant rank through a team or record grant | Rank is measured where the change happens; a narrow grant never reaches wider, and a team's grants never rank in a sub-tenant |
 | Naming another organization's role, team, or membership | `404`, byte-identical to an id that does not exist |
-| Two managers editing one role, or reordering, at once | Every role and grant change locks the organization row first and reads the actor's standing again under it, so the second is judged against what the first left behind |
+| Two managers editing one role, or reordering, at once | Every role and grant change locks the organization row first and reads the actor's standing again under it, so the second is judged against what the first left behind. Claiming an invitation and deleting an account take the same lock (a departure locks every organization it touches, in id order), so a role deleted mid-claim lands wholly before or after it, and the administrator a departure promotes is chosen from the roster as it stands |
 
 **Deleting a role** revokes it from everybody holding it, at once, through the cascading foreign key: holders keep their other roles and the default role, and each is told with the "roles changed" notification. The roles above close the gap.
 
