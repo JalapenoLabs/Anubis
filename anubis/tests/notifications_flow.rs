@@ -18,7 +18,7 @@ use anubis::jobs::Worker;
 use anubis::notifications::{self, PingRecipient, Pinger};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use support::{Harness, TestDatabase, invitation_token, register, send, stream};
+use support::{Harness, TestDatabase, invitation_token, register, role_id, send, stream};
 
 /// The address the person doing the inviting registers with.
 const OWNER: &str = "owner@notifications.test";
@@ -52,7 +52,8 @@ async fn a_notice_travels_from_the_write_that_caused_it_to_its_inbox() {
     // ------------------------------------------------------------------
     // Inviting an address that already has an account writes it a notice.
     // ------------------------------------------------------------------
-    let invitation = json!({ "email": MEMBER, "team_id": team_id, "roles": [ "editor" ] });
+    let editor = role_id(&router, &owner_cookie, team_id, "editor").await;
+    let invitation = json!({ "email": MEMBER, "team_id": team_id, "role_ids": [ editor ] });
     let (status, _headers, body) = send(
         &router,
         "POST",
@@ -120,11 +121,12 @@ async fn a_notice_travels_from_the_write_that_caused_it_to_its_inbox() {
     // Changing somebody's roles tells that person, and nobody else.
     // ------------------------------------------------------------------
     let membership_id = membership_of(&router, &owner_cookie, team_id, MEMBER).await;
+    let administrator = role_id(&router, &owner_cookie, team_id, "admin").await;
     let (status, _headers, body) = send(
         &router,
         "PATCH",
         &format!("/tenancy/teams/{team_id}/members/{membership_id}"),
-        Some(&json!({ "roles": [ "admin" ] })),
+        Some(&json!({ "role_ids": [ administrator ] })),
         Some(&owner_cookie),
     )
     .await;

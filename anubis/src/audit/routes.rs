@@ -31,7 +31,6 @@ use crate::guard::TeamMember;
 use crate::http::{ApiError, ListParams, Pagination};
 use crate::roles::RoleSet;
 use crate::schema::audit_events;
-use crate::tenancy::ADMIN_ROLE;
 
 /// Returns the audit log's read routes.
 ///
@@ -159,21 +158,13 @@ async fn list_account_events(
     }))
 }
 
-/// The log shows every member's activity, so reading it is an administrative
-/// act, exactly as managing platform applications and webhook endpoints is.
+/// The log shows every member's activity, so reading it stays with the
+/// administrator role, exactly as managing platform applications and webhook
+/// endpoints does.
 fn require_team_admin(member: &TeamMember) -> Result<(), ApiError> {
-    if member
-        .membership
-        .roles
-        .iter()
-        .any(|role| role == ADMIN_ROLE)
-    {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You need the admin role to read the team's audit log.",
-        ))
-    }
+    member
+        .access
+        .require_administrator("read the team's audit log")
 }
 
 fn log_internal(error: impl std::fmt::Display) -> ApiError {

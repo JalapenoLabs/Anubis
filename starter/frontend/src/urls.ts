@@ -32,6 +32,12 @@ export const UrlTree = {
    * `/billing`: the backend reserves that prefix for the API itself.
    */
   organizationBilling: '/organizations/:organizationId/billing',
+  /** The organization's roles, highest first: the role editor's list. */
+  organizationRoles: '/organizations/:organizationId/roles',
+  /** One role's own page, where it is renamed, recoloured, and given permissions. */
+  organizationRole: '/organizations/:organizationId/roles/:roleId',
+  /** Making a role, on a page of its own. */
+  organizationRoleNew: '/organizations/:organizationId/roles/new',
   claimInvitation: '/claim-invitation',
   /**
    * Where a connecting program such as Claude Code sends the person to approve
@@ -189,6 +195,20 @@ export function getOrganizationSettingsUrl(organizationId: string): string {
 
 export function getOrganizationBillingUrl(organizationId: string): string {
   return UrlTree.organizationBilling.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationRolesUrl(organizationId: string): string {
+  return UrlTree.organizationRoles.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationRoleNewUrl(organizationId: string): string {
+  return UrlTree.organizationRoleNew.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationRoleUrl(organizationId: string, roleId: string): string {
+  return UrlTree.organizationRole
+    .replace(':organizationId', organizationId)
+    .replace(':roleId', roleId)
 }
 
 export function getCreativeConceptUrl(creativeConceptId: string): string {

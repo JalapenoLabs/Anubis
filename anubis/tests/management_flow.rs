@@ -15,7 +15,9 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use anubis::db::DbPool;
-use anubis::schema::{organization_memberships, organizations, team_memberships, teams, users};
+use anubis::schema::{
+    organization_memberships, organizations, role_grants, roles, team_memberships, teams, users,
+};
 
 const PASSWORD: &str = "correct horse battery staple";
 
@@ -193,6 +195,60 @@ async fn organization_roster(router: &Router, organization_id: Uuid, cookie: &st
     body
 }
 
+/// The id of the role seeded from `key` in the team's organization.
+async fn role_id(router: &Router, cookie: &str, team_id: Uuid, key: &str) -> Uuid {
+    let (status, _headers, body) = send(
+        router,
+        "GET",
+        &format!("/tenancy/teams/{team_id}/roles"),
+        None,
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let role = body["roles"]
+        .as_array()
+        .expect("the listing carries roles")
+        .iter()
+        .find(|role| role["key"] == key)
+        .unwrap_or_else(|| panic!("no role seeded from {key:?} in {body}"));
+    uuid(&role["id"])
+}
+
+/// The id of the organization's first team, as the overview lists it.
+async fn organization_team(router: &Router, cookie: &str, organization_id: Uuid) -> Value {
+    let (status, _headers, body) =
+        send(router, "GET", "/tenancy/memberships", None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    body["organizations"]
+        .as_array()
+        .expect("the overview lists organizations")
+        .iter()
+        .find(|organization| organization["id"] == json!(organization_id))
+        .expect("the caller belongs to the organization")["teams"][0]["id"]
+        .clone()
+}
+
+/// The keys of the roles granted through one membership, sorted.
+async fn granted_keys(
+    connection: &mut diesel_async::AsyncPgConnection,
+    granted_through: Uuid,
+) -> Vec<String> {
+    let mut keys: Vec<Option<String>> = role_grants::table
+        .inner_join(roles::table)
+        .filter(
+            role_grants::team_membership_id
+                .eq(granted_through)
+                .or(role_grants::organization_membership_id.eq(granted_through)),
+        )
+        .select(roles::key)
+        .load(connection)
+        .await
+        .expect("grants must load");
+    keys.sort();
+    keys.into_iter().flatten().collect()
+}
+
 fn uuid(value: &Value) -> Uuid {
     value
         .as_str()
@@ -281,14 +337,17 @@ async fn tenants_are_created_administered_and_dissolved() {
     assert_eq!(body["team"]["name"], json!("General"));
     let acme_id = uuid(&body["organization"]["id"]);
 
-    let organization_roles: Vec<String> = organization_memberships::table
+    let founder_in_acme: Uuid = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(acme_id))
         .filter(organization_memberships::user_id.eq(founder_id))
-        .select(organization_memberships::roles)
+        .select(organization_memberships::id)
         .first(&mut connection)
         .await
         .expect("the creator's organization membership must exist");
-    assert_eq!(organization_roles, vec!["admin".to_owned()]);
+    assert_eq!(
+        granted_keys(&mut connection, founder_in_acme).await,
+        ["admin"]
+    );
 
     let (status, _headers, _body) = send(
         &router,
@@ -347,11 +406,14 @@ async fn tenants_are_created_administered_and_dissolved() {
     // Roles: an admin sets them, a non-admin cannot, unknown keys are out.
     // ------------------------------------------------------------------
     let teammate_cookie = register(&router, &teammate_email).await;
+    let editor = role_id(&router, &founder_cookie, platform_id, "editor").await;
+    let billing = role_id(&router, &founder_cookie, platform_id, "billing").await;
+    let administrator = role_id(&router, &founder_cookie, platform_id, "admin").await;
     let (claimed_invitation, token) = invite(
         &router,
         &outbox,
         &founder_cookie,
-        &json!({ "email": teammate_email, "team_id": platform_id, "roles": ["editor"] }),
+        &json!({ "email": teammate_email, "team_id": platform_id, "role_ids": [editor] }),
         &teammate_email,
     )
     .await;
@@ -365,22 +427,32 @@ async fn tenants_are_created_administered_and_dissolved() {
         &router,
         "PATCH",
         &teammate_path,
-        Some(&json!({ "roles": ["editor", "billing"] })),
+        Some(&json!({ "role_ids": [editor, billing] })),
         Some(&founder_cookie),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["roles"], json!(["editor", "billing"]));
+    let held: Vec<&str> = body["roles"]
+        .as_array()
+        .expect("the answer lists the roles held")
+        .iter()
+        .filter_map(|role| role["name"].as_str())
+        .collect();
+    assert_eq!(held, ["Billing", "Editor"], "highest first");
 
     let (status, _headers, _body) = send(
         &router,
         "PATCH",
         &teammate_path,
-        Some(&json!({ "roles": ["emperor"] })),
+        Some(&json!({ "role_ids": [Uuid::new_v4()] })),
         Some(&founder_cookie),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown roles are refused");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an id naming no role here is answered as one of another organization's",
+    );
 
     let (status, _headers, _body) = send(
         &router,
@@ -396,7 +468,7 @@ async fn tenants_are_created_administered_and_dissolved() {
         &router,
         "PATCH",
         &teammate_path,
-        Some(&json!({ "roles": ["admin"] })),
+        Some(&json!({ "role_ids": [administrator] })),
         Some(&teammate_cookie),
     )
     .await;
@@ -430,7 +502,7 @@ async fn tenants_are_created_administered_and_dissolved() {
         &router,
         "PATCH",
         &founder_path,
-        Some(&json!({ "roles": ["editor"] })),
+        Some(&json!({ "role_ids": [editor] })),
         Some(&founder_cookie),
     )
     .await;
@@ -534,11 +606,13 @@ async fn tenants_are_created_administered_and_dissolved() {
     // Organization roles: a member without the admin key is refused.
     // ------------------------------------------------------------------
     let biller_cookie = register(&router, &biller_email).await;
+    let acme_team = uuid(&organization_team(&router, &founder_cookie, acme_id).await);
+    let acme_billing = role_id(&router, &founder_cookie, acme_team, "billing").await;
     let (_invitation, token) = invite(
         &router,
         &outbox,
         &founder_cookie,
-        &json!({ "email": biller_email, "organization_id": acme_id, "roles": ["billing"] }),
+        &json!({ "email": biller_email, "organization_id": acme_id, "role_ids": [acme_billing] }),
         &biller_email,
     )
     .await;
@@ -576,7 +650,7 @@ async fn tenants_are_created_administered_and_dissolved() {
         &router,
         &outbox,
         &founder_cookie,
-        &json!({ "email": advisor_email, "organization_id": acme_id, "roles": ["billing"] }),
+        &json!({ "email": advisor_email, "organization_id": acme_id, "role_ids": [acme_billing] }),
         &advisor_email,
     )
     .await;
@@ -817,11 +891,12 @@ async fn account_deletion_settles_the_organizations_left_behind() {
         .expect("the solo user's organization must exist");
 
     // The heir joins the owner's team, and holds no organization membership.
+    let editor = role_id(&router, &owner_cookie, shared_team, "editor").await;
     let (_invitation, token) = invite(
         &router,
         &outbox,
         &owner_cookie,
-        &json!({ "email": heir_email, "team_id": shared_team, "roles": ["editor"] }),
+        &json!({ "email": heir_email, "team_id": shared_team, "role_ids": [editor] }),
         &heir_email,
     )
     .await;
@@ -869,24 +944,28 @@ async fn account_deletion_settles_the_organizations_left_behind() {
         .expect("count must run");
     assert_eq!(survivors, 1, "the heir still works here");
 
-    let team_roles: Vec<String> = team_memberships::table
+    let heir_in_team: Uuid = team_memberships::table
         .filter(team_memberships::team_id.eq(shared_team))
         .filter(team_memberships::user_id.eq(heir_id))
-        .select(team_memberships::roles)
+        .select(team_memberships::id)
         .first(&mut connection)
         .await
         .expect("the heir's team membership must survive");
+    let team_roles = granted_keys(&mut connection, heir_in_team).await;
     assert!(
         team_roles.contains(&"admin".to_owned()),
         "the last admin's departure promotes the heir: {team_roles:?}",
     );
 
-    let organization_roles: Vec<String> = organization_memberships::table
+    let heir_in_organization: Uuid = organization_memberships::table
         .filter(organization_memberships::organization_id.eq(shared_organization))
         .filter(organization_memberships::user_id.eq(heir_id))
-        .select(organization_memberships::roles)
+        .select(organization_memberships::id)
         .first(&mut connection)
         .await
         .expect("the heir must inherit the organization membership");
-    assert_eq!(organization_roles, vec!["admin".to_owned()]);
+    assert_eq!(
+        granted_keys(&mut connection, heir_in_organization).await,
+        ["admin"]
+    );
 }

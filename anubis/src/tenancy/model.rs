@@ -131,7 +131,10 @@ impl FromSql<Text, Pg> for OrganizationAccess {
     }
 }
 
-/// Joins a user to an organization with org-level roles.
+/// Joins a user to an organization.
+///
+/// The organization's own role grants hang off this row, so removing it takes
+/// every organization-wide role the member held with it.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable)]
 #[diesel(table_name = organization_memberships)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -142,8 +145,6 @@ pub struct OrganizationMembership {
     pub organization_id: Uuid,
     /// The member.
     pub user_id: Uuid,
-    /// Role keys granted at the organization level.
-    pub roles: Vec<String>,
     /// When the membership was created.
     pub created_at: DateTime<Utc>,
     /// When the membership was last updated.
@@ -155,11 +156,12 @@ pub struct OrganizationMembership {
     pub suspended_at: Option<DateTime<Utc>>,
 }
 
-/// Joins a user to a sub-tenant with sub-tenant-level roles.
+/// Joins a user to a sub-tenant.
 ///
-/// This is the explicit grant a guest reaches a sub-tenant through, and the
-/// row an administrator suspends to cut somebody out of one sub-tenant without
-/// touching their standing anywhere else.
+/// This is the explicit grant a guest reaches a sub-tenant through, the row
+/// the sub-tenant's role grants hang off, and the row an administrator
+/// suspends to cut somebody out of one sub-tenant without touching their
+/// standing anywhere else.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable)]
 #[diesel(table_name = sub_tenant_memberships)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -170,8 +172,6 @@ pub struct SubTenantMembership {
     pub sub_tenant_id: Uuid,
     /// The member.
     pub user_id: Uuid,
-    /// Role keys granted at the sub-tenant level.
-    pub roles: Vec<String>,
     /// When the member was suspended from this sub-tenant, or `None` while
     /// they are in good standing.
     pub suspended_at: Option<DateTime<Utc>>,
@@ -181,10 +181,12 @@ pub struct SubTenantMembership {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Joins a user to a team with team-level roles.
+/// Joins a user to a team.
 ///
 /// Domain resources are assigned to team memberships, never directly to
-/// users; `user_id` stays null for invited people until they claim it.
+/// users; `user_id` stays null for invited people until they claim it. The
+/// team's role grants, and grants on single records of the team, hang off this
+/// row, so an invitation's roles are already in place when it is claimed.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable)]
 #[diesel(table_name = team_memberships)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -195,8 +197,6 @@ pub struct TeamMembership {
     pub team_id: Uuid,
     /// The member, once the membership is claimed.
     pub user_id: Option<Uuid>,
-    /// Role keys granted at the team level.
-    pub roles: Vec<String>,
     /// When the membership was created.
     pub created_at: DateTime<Utc>,
     /// When the membership was last updated.
@@ -377,16 +377,14 @@ pub(crate) struct NewTeam<'a> {
 
 #[derive(Insertable)]
 #[diesel(table_name = organization_memberships)]
-pub(crate) struct NewOrganizationMembership<'a> {
+pub(crate) struct NewOrganizationMembership {
     pub organization_id: Uuid,
     pub user_id: Uuid,
-    pub roles: &'a [String],
 }
 
 #[derive(Insertable)]
 #[diesel(table_name = team_memberships)]
-pub(crate) struct NewTeamMembership<'a> {
+pub(crate) struct NewTeamMembership {
     pub team_id: Uuid,
     pub user_id: Option<Uuid>,
-    pub roles: &'a [String],
 }

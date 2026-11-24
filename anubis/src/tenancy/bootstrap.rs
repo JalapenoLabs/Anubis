@@ -3,7 +3,8 @@
 //! Registration bootstraps a personal organization so solo use needs no
 //! tenancy ceremony; the management endpoints create further organizations
 //! and teams through the same functions, so every organization in the system
-//! looks alike and every creator ends up an admin of what they created.
+//! looks alike and every creator ends up holding the administrator role over
+//! what they created.
 
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -13,23 +14,12 @@ use crate::auth::User;
 use crate::schema::{
     organization_memberships, organizations, sub_tenants, team_memberships, teams,
 };
+use crate::tenancy::grants::{self, Holder};
 use crate::tenancy::model::{
     NewOrganization, NewOrganizationMembership, NewSubTenant, NewTeam, NewTeamMembership,
     Organization, SubTenant, Team,
 };
-
-/// Role key granted to the creator of an organization or team.
-///
-/// The roles.yml compiler formalizes role definitions; until then this is the
-/// one well-known key.
-pub const ADMIN_ROLE: &str = "admin";
-
-/// Role key granted when a caller asks for no roles at all.
-///
-/// The starter's `config/roles.yml` ships it as the read-only baseline; an
-/// application that removes the key makes role-less requests fail validation,
-/// which is the honest outcome.
-pub(crate) const DEFAULT_ROLE: &str = "default";
+use crate::tenancy::role;
 
 /// Name of the team every new organization starts with.
 const DEFAULT_TEAM_NAME: &str = "General";
@@ -40,11 +30,6 @@ const DEFAULT_TEAM_NAME: &str = "General";
 /// name is only ever read by one that does, where "Main" is what a first
 /// project is usually called before somebody renames it.
 const DEFAULT_SUB_TENANT_NAME: &str = "Main";
-
-/// Returns `true` when the held role keys include [`ADMIN_ROLE`].
-pub(crate) fn holds_admin(roles: &[String]) -> bool {
-    roles.iter().any(|role| role == ADMIN_ROLE)
-}
 
 /// Creates the personal organization, default team, and admin memberships.
 ///
@@ -61,11 +46,18 @@ pub(crate) async fn create_personal_organization(
     create_organization(connection, user.id, name).await
 }
 
-/// Creates an organization with its default sub-tenant and team.
+/// Creates an organization with its roles, its default sub-tenant, and team.
 ///
 /// The personal organization at signup and an organization created later are
 /// the same thing; nothing marks one as special. Run it in a transaction so an
-/// organization without its team, or without its admin, can never exist.
+/// organization without its team, or without its administrator, can never
+/// exist.
+///
+/// The organization starts with its two structural roles, and the owner holds
+/// the administrator role over it and over its team. The rest of the
+/// recommended roles are offered the first time the tenancy surface reads the
+/// organization's roles (see [`role`]), which is what lets registration create
+/// an organization without the application's `roles.yml` in hand.
 ///
 /// The default sub-tenant is what keeps the tier optional: an application that
 /// never surfaces it still has a complete ownership chain to point at, and one
@@ -77,22 +69,29 @@ pub(crate) async fn create_organization(
     owner: Uuid,
     name: &str,
 ) -> Result<(Organization, Team), diesel::result::Error> {
-    let admin_roles = vec![ADMIN_ROLE.to_owned()];
-
     let organization: Organization = diesel::insert_into(organizations::table)
         .values(NewOrganization { name })
         .returning(Organization::as_returning())
         .get_result(connection)
         .await?;
 
-    diesel::insert_into(organization_memberships::table)
+    let administrator = role::seed_structural(connection, organization.id).await?;
+    let membership_id: Uuid = diesel::insert_into(organization_memberships::table)
         .values(NewOrganizationMembership {
             organization_id: organization.id,
             user_id: owner,
-            roles: &admin_roles,
         })
-        .execute(connection)
+        .returning(organization_memberships::id)
+        .get_result(connection)
         .await?;
+    grants::grant(
+        connection,
+        organization.id,
+        administrator.id,
+        Holder::Organization { membership_id },
+        None,
+    )
+    .await?;
 
     create_sub_tenant(connection, organization.id, DEFAULT_SUB_TENANT_NAME).await?;
 
@@ -122,7 +121,7 @@ pub(crate) async fn create_sub_tenant(
         .await
 }
 
-/// Creates a team in an organization, with `owner` as its admin member.
+/// Creates a team in an organization, with `owner` as its administrator.
 ///
 /// `sub_tenant` scopes the team to one sub-tenant; `None` leaves it
 /// organization-level, which every sub-tenant inherits.
@@ -133,8 +132,6 @@ pub(crate) async fn create_team(
     sub_tenant: Option<Uuid>,
     owner: Uuid,
 ) -> Result<Team, diesel::result::Error> {
-    let admin_roles = vec![ADMIN_ROLE.to_owned()];
-
     let team: Team = diesel::insert_into(teams::table)
         .values(NewTeam {
             organization_id,
@@ -145,14 +142,27 @@ pub(crate) async fn create_team(
         .get_result(connection)
         .await?;
 
-    diesel::insert_into(team_memberships::table)
+    let membership_id: Uuid = diesel::insert_into(team_memberships::table)
         .values(NewTeamMembership {
             team_id: team.id,
             user_id: Some(owner),
-            roles: &admin_roles,
         })
-        .execute(connection)
+        .returning(team_memberships::id)
+        .get_result(connection)
         .await?;
+    let administrator = role::administrator_role(connection, organization_id).await?;
+    grants::grant(
+        connection,
+        organization_id,
+        administrator.id,
+        Holder::Team {
+            team_id: team.id,
+            membership_id,
+            resource_id: None,
+        },
+        None,
+    )
+    .await?;
 
     Ok(team)
 }

@@ -14,7 +14,7 @@ import { CurrentPlanCard } from '../../components/billing/CurrentPlanCard'
 import { PlansGrid } from '../../components/billing/PlansGrid'
 
 // Misc
-import { ADMIN_ROLE, BILLING_ROLE } from '../../permissions'
+import { SUBSCRIPTION_SUBJECT, allows } from '@jalapenolabs/anubis'
 import { getOrganizationSettingsUrl } from '../../urls'
 
 /**
@@ -47,10 +47,10 @@ export function BillingPage() {
     (candidate) => candidate.id === organizationId,
   )
 
-  // Somebody invited into a single team appears under its organization with no
-  // organization roles at all, and the billing surface is closed to them:
+  // Somebody invited into a single team appears under its organization without
+  // an organization membership, and the billing surface is closed to them:
   // asking for it would only earn a 404.
-  const isOrganizationMember = Boolean(organization?.roles.length)
+  const isOrganizationMember = Boolean(organization?.isMember)
 
   const billing = useSWR(
     isOrganizationMember ? `billing/${organizationId}` : null,
@@ -73,9 +73,7 @@ export function BillingPage() {
     </AppShell>
   }
 
-  const canManage = organization.roles.some(
-    (role) => role === ADMIN_ROLE || role === BILLING_ROLE,
-  )
+  const canManage = allows(organization.access, 'update', SUBSCRIPTION_SUBJECT)
   const checkoutOutcome = searchParams.get(CHECKOUT_PARAM)
 
   return <AppShell

@@ -31,7 +31,6 @@ use crate::http::{ApiError, ListParams, Pagination};
 use crate::jobs;
 use crate::roles::RoleSet;
 use crate::schema::{webhook_deliveries, webhook_endpoints};
-use crate::tenancy::ADMIN_ROLE;
 
 /// Returns the webhook subscription and debugging routes.
 ///
@@ -376,21 +375,14 @@ fn accepted_event_types(requested: Vec<String>) -> Result<Vec<String>, ApiError>
     Ok(accepted)
 }
 
-/// A subscription decides where a team's records are sent, so it needs the
-/// admin key, exactly as a platform application does.
+/// A subscription decides where a team's records are sent, every model's
+/// payload included, so it stays with the administrator role exactly as a
+/// platform application does: a role that could subscribe an endpoint could
+/// read through it what it may not read itself.
 fn require_team_admin(member: &TeamMember) -> Result<(), ApiError> {
-    if member
-        .membership
-        .roles
-        .iter()
-        .any(|role| role == ADMIN_ROLE)
-    {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You need the admin role to manage webhook endpoints.",
-        ))
-    }
+    member
+        .access
+        .require_administrator("manage webhook endpoints")
 }
 
 fn log_internal(error: impl std::fmt::Display) -> ApiError {

@@ -22,10 +22,13 @@
 //!
 //! [`anubis::tenancy::resolve_sub_tenant_access`]: crate::tenancy::resolve_sub_tenant_access
 //!
-//! Permissions come from the compiled role set: `member.require(action,
-//! model)` answers `403` unless one of the membership's roles grants the
-//! action. Scaffolded models resolve their parent chain to the owning team
-//! and ride the same primitives.
+//! Permissions come from the organization's runtime roles, drawn from the
+//! vocabulary `roles.yml` compiles: `member.require(action, model)` answers
+//! `403` unless a role that applies where the member stands grants the action.
+//! The tenant guards are thin: each asks one resolver in [`crate::tenancy`],
+//! the one place that decides reach and roles, and carries its answer.
+//! Scaffolded models resolve their parent chain to the owning team and ride
+//! the same resolver, narrowed to the records in hand.
 //!
 //! Routers using these extractors provide two request extensions, which
 //! [`layer`] bundles:
@@ -47,8 +50,6 @@ use std::sync::Arc;
 use axum::extract::{FromRequestParts, Path};
 use axum::http::request::Parts;
 use axum::{Extension, RequestPartsExt};
-use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
 use tower::layer::util::{Identity, Stack};
 use uuid::Uuid;
 
@@ -57,12 +58,9 @@ use crate::auth::{CurrentUser, User};
 use crate::db::DbPool;
 use crate::http::ApiError;
 use crate::roles::{Action, RoleSet, Scope};
-use crate::schema::{
-    organization_memberships, organizations, sub_tenant_memberships, team_memberships, teams,
-};
 use crate::tenancy::{
-    Organization, OrganizationMembership, SubTenant, SubTenantAccess, Team, TeamMembership,
-    resolve_sub_tenant_access,
+    Access, Organization, OrganizationMembership, SubTenant, SubTenantAccess, Team, TeamMembership,
+    resolve_organization_access, resolve_sub_tenant_access, resolve_team_access,
 };
 
 /// Bundles the request extensions the guard extractors need.
@@ -177,6 +175,11 @@ where
 }
 
 /// The signed-in user's standing in the route's `{team_id}` team.
+///
+/// The membership admits the caller and the [`Access`] says what they may
+/// do: the team-wide roles granted through the membership, and the default
+/// role everybody holds, resolved by
+/// [`anubis::tenancy::resolve_team_access`](crate::tenancy::resolve_team_access).
 #[derive(Debug, Clone)]
 pub struct TeamMember {
     /// The signed-in user.
@@ -185,14 +188,15 @@ pub struct TeamMember {
     pub team: Team,
     /// The user's membership in that team.
     pub membership: TeamMembership,
-    roles: Arc<RoleSet>,
+    /// What the roles that apply in the team allow.
+    pub access: Access,
 }
 
 impl TeamMember {
     /// Returns `true` when a held role grants the action on the model.
     #[must_use]
     pub fn can(&self, action: Action, model: &str) -> bool {
-        self.roles.can(&self.membership.roles, action, model)
+        self.access.can(action, model)
     }
 
     /// Rejects with `403` unless a held role grants the action on the model.
@@ -200,13 +204,7 @@ impl TeamMember {
     /// # Errors
     /// Returns a forbidden [`ApiError`] when no held role grants the action.
     pub fn require(&self, action: Action, model: &str) -> Result<(), ApiError> {
-        if self.can(action, model) {
-            Ok(())
-        } else {
-            Err(ApiError::forbidden(
-                "You do not have permission to do that.",
-            ))
-        }
+        self.access.require(action, model)
     }
 }
 
@@ -223,63 +221,27 @@ where
 
         let mut connection = pool.get().await.map_err(log_internal)?;
 
-        let found: Option<(Team, TeamMembership)> = admitted_teams(user.id)
-            .filter(teams::id.eq(team_id))
-            .select((Team::as_select(), TeamMembership::as_select()))
-            .first(&mut connection)
+        let found = resolve_team_access(&mut connection, &roles, user.id, team_id, &[])
             .await
-            .optional()
             .map_err(log_internal)?;
 
         // Unknown team, non-membership, and suspension answer identically.
-        let (team, membership) = found.ok_or_else(ApiError::not_found)?;
+        let (team, membership, access) = found.ok_or_else(ApiError::not_found)?;
 
         Ok(Self {
             user,
             team,
             membership,
-            roles,
+            access,
         })
     }
 }
 
-/// The teams `user_id` is admitted to, joined to the membership that admits them.
-///
-/// The one statement of who reaches a team, shared by [`TeamMember`] and the
-/// realtime stream's team channels, so a route and a channel can never
-/// disagree about it. A claimed membership admits, and a suspension denies:
-/// the organization's cuts every team in it, and a sub-tenant's cuts the
-/// teams scoped to that sub-tenant. Both are left joins filtered on a null
-/// timestamp, so a member with no membership at the tier above passes exactly
-/// as they did before the tier existed.
-#[diesel::dsl::auto_type(no_type_alias)]
-pub(crate) fn admitted_teams(user_id: Uuid) -> _ {
-    teams::table
-        .inner_join(
-            team_memberships::table.on(team_memberships::team_id
-                .eq(teams::id)
-                .and(team_memberships::user_id.eq(user_id))),
-        )
-        .left_join(
-            organization_memberships::table.on(organization_memberships::organization_id
-                .eq(teams::organization_id)
-                .and(organization_memberships::user_id.eq(user_id))),
-        )
-        .left_join(
-            sub_tenant_memberships::table.on(sub_tenant_memberships::sub_tenant_id
-                .nullable()
-                .eq(teams::sub_tenant_id)
-                .and(sub_tenant_memberships::user_id.eq(user_id))),
-        )
-        .filter(organization_memberships::suspended_at.is_null())
-        .filter(sub_tenant_memberships::suspended_at.is_null())
-}
-
 /// The signed-in user's standing in the route's `{sub_tenant_id}` sub-tenant.
 ///
-/// A caller reaches a sub-tenant along four paths (organization admin, full
-/// organization member, an explicit grant, or a team that reaches it), and
-/// this guard never works out which for itself: it asks
+/// A caller reaches a sub-tenant along four paths (organization administrator,
+/// full organization member, an explicit grant, or a team that reaches it),
+/// and this guard never works out which for itself: it asks
 /// [`resolve_sub_tenant_access`], the one function that answers, and the
 /// [`access`](Self::access) it carries is that answer.
 #[derive(Debug, Clone)]
@@ -288,16 +250,15 @@ pub struct SubTenantMember {
     pub user: User,
     /// The sub-tenant named in the route.
     pub sub_tenant: SubTenant,
-    /// How the user reaches it, and every role key that applies.
+    /// How the user reaches it, and what the roles that apply there allow.
     pub access: SubTenantAccess,
-    roles: Arc<RoleSet>,
 }
 
 impl SubTenantMember {
     /// Returns `true` when a held role grants the action on the model.
     #[must_use]
     pub fn can(&self, action: Action, model: &str) -> bool {
-        self.roles.can(&self.access.roles, action, model)
+        self.access.access.can(action, model)
     }
 
     /// Rejects with `403` unless a held role grants the action on the model.
@@ -305,13 +266,7 @@ impl SubTenantMember {
     /// # Errors
     /// Returns a forbidden [`ApiError`] when no held role grants the action.
     pub fn require(&self, action: Action, model: &str) -> Result<(), ApiError> {
-        if self.can(action, model) {
-            Ok(())
-        } else {
-            Err(ApiError::forbidden(
-                "You do not have permission to do that.",
-            ))
-        }
+        self.access.access.require(action, model)
     }
 }
 
@@ -328,7 +283,7 @@ where
 
         let mut connection = pool.get().await.map_err(log_internal)?;
 
-        let found = resolve_sub_tenant_access(&mut connection, user.id, sub_tenant_id)
+        let found = resolve_sub_tenant_access(&mut connection, &roles, user.id, sub_tenant_id)
             .await
             .map_err(log_internal)?;
 
@@ -339,12 +294,15 @@ where
             user,
             sub_tenant,
             access,
-            roles,
         })
     }
 }
 
 /// The signed-in user's standing in the route's `{organization_id}` organization.
+///
+/// The [`Access`] holds the organization-wide roles granted through the
+/// membership and the default role, resolved by
+/// [`anubis::tenancy::resolve_organization_access`](crate::tenancy::resolve_organization_access).
 #[derive(Debug, Clone)]
 pub struct OrganizationMember {
     /// The signed-in user.
@@ -353,14 +311,15 @@ pub struct OrganizationMember {
     pub organization: Organization,
     /// The user's membership in that organization.
     pub membership: OrganizationMembership,
-    roles: Arc<RoleSet>,
+    /// What the roles that apply organization-wide allow.
+    pub access: Access,
 }
 
 impl OrganizationMember {
     /// Returns `true` when a held role grants the action on the model.
     #[must_use]
     pub fn can(&self, action: Action, model: &str) -> bool {
-        self.roles.can(&self.membership.roles, action, model)
+        self.access.can(action, model)
     }
 
     /// Rejects with `403` unless a held role grants the action on the model.
@@ -368,13 +327,7 @@ impl OrganizationMember {
     /// # Errors
     /// Returns a forbidden [`ApiError`] when no held role grants the action.
     pub fn require(&self, action: Action, model: &str) -> Result<(), ApiError> {
-        if self.can(action, model) {
-            Ok(())
-        } else {
-            Err(ApiError::forbidden(
-                "You do not have permission to do that.",
-            ))
-        }
+        self.access.require(action, model)
     }
 }
 
@@ -391,33 +344,19 @@ where
 
         let mut connection = pool.get().await.map_err(log_internal)?;
 
-        let found: Option<(Organization, OrganizationMembership)> = organizations::table
-            .inner_join(
-                organization_memberships::table.on(organization_memberships::organization_id
-                    .eq(organizations::id)
-                    .and(organization_memberships::user_id.eq(user.id))),
-            )
-            .filter(organizations::id.eq(organization_id))
-            // A suspension is a deny, not a missing grant.
-            .filter(organization_memberships::suspended_at.is_null())
-            .select((
-                Organization::as_select(),
-                OrganizationMembership::as_select(),
-            ))
-            .first(&mut connection)
+        let found = resolve_organization_access(&mut connection, &roles, user.id, organization_id)
             .await
-            .optional()
             .map_err(log_internal)?;
 
         // Unknown organization, non-membership, and suspension answer
         // identically.
-        let (organization, membership) = found.ok_or_else(ApiError::not_found)?;
+        let (organization, membership, access) = found.ok_or_else(ApiError::not_found)?;
 
         Ok(Self {
             user,
             organization,
             membership,
-            roles,
+            access,
         })
     }
 }

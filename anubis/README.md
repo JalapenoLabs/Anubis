@@ -16,7 +16,7 @@ anubis = { package = "anubis-framework", version = "0.1.0" }
 - **Tenancy**: User, TeamMembership, Team, Organization, with invitations, ownership chains, and a personal org and default team at signup.
 - **Authentication**: passwords over argon2, TOTP and passkeys, OpenID Connect sign-in, sessions, and per-endpoint abuse budgets.
 - **A versioned REST API**: `anubis::api::v1::router_with`, an OpenAPI 3.1 document the application owns, and platform tokens.
-- **Permissions**: one `roles.yml`, compiled to Rust authorization and TypeScript UI affordances.
+- **Permissions**: one `roles.yml`, compiled to a typed permission vocabulary in Rust and TypeScript and the roles each organization is seeded with; each organization's roles are data it edits, granted at organization, sub-tenant, team, or record scope.
 - **Billing**: plans as configuration, Stripe Checkout and the customer portal, hard and soft limits, per-seat pricing.
 - **Background jobs**: a durable Postgres queue that needs no Redis, enqueued on the caller's connection so a job commits with the write that caused it.
 - **Webhooks**: outgoing deliveries signed with HMAC-SHA256, and incoming receivers that store first and process afterwards.

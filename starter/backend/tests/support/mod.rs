@@ -238,7 +238,67 @@ pub async fn bootstrapped_team(router: &Router, cookie: &str) -> String {
         .to_owned()
 }
 
-/// Invites `email` to `team_id` with `roles` and claims the invitation.
+/// The ids of the team organization's roles seeded from `keys`.
+///
+/// The default role is everybody's and is never granted, so asking for it
+/// asks for nothing.
+pub async fn role_ids(router: &Router, cookie: &str, team_id: &str, keys: &[&str]) -> Vec<String> {
+    let path = format!("/tenancy/teams/{team_id}/roles");
+    let (status, body) = send(router, "GET", &path, None, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    keys.iter()
+        .filter(|key| **key != "default")
+        .map(|key| {
+            body["roles"]
+                .as_array()
+                .expect("the listing carries roles")
+                .iter()
+                .find(|role| role["key"] == *key)
+                .and_then(|role| role["id"].as_str())
+                .unwrap_or_else(|| panic!("no role seeded from {key:?} in {body}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Grants the team member behind `email` the roles seeded from `roles` on one
+/// record of `team_id`, rather than team-wide.
+pub async fn grant_on_record(
+    router: &Router,
+    admin_cookie: &str,
+    team_id: &str,
+    email: &str,
+    roles: &[&str],
+    resource_id: &str,
+) {
+    let roster_path = format!("/tenancy/teams/{team_id}/members");
+    let (status, members) = send(router, "GET", &roster_path, None, Some(admin_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "body: {members}");
+    let membership_id = members["members"]
+        .as_array()
+        .expect("a roster lists members")
+        .iter()
+        .find(|member| member["email"] == email)
+        .and_then(|member| member["membership_id"].as_str())
+        .unwrap_or_else(|| panic!("{email} is not on the roster: {members}"))
+        .to_owned();
+
+    let role_ids = role_ids(router, admin_cookie, team_id, roles).await;
+    let grant = json!({ "role_ids": role_ids, "resource_id": resource_id });
+    let (status, body) = send(
+        router,
+        "PATCH",
+        &format!("{roster_path}/{membership_id}"),
+        Some(&grant),
+        Some(admin_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// Invites `email` to `team_id` with the roles seeded from `roles`, and
+/// claims the invitation.
 pub async fn invite_and_claim(
     router: &Router,
     outbox: &TestOutbox,
@@ -248,7 +308,8 @@ pub async fn invite_and_claim(
     email: &str,
     roles: &[&str],
 ) {
-    let invite = json!({ "email": email, "team_id": team_id, "roles": roles });
+    let role_ids = role_ids(router, admin_cookie, team_id, roles).await;
+    let invite = json!({ "email": email, "team_id": team_id, "role_ids": role_ids });
     let (status, body) = send(
         router,
         "POST",

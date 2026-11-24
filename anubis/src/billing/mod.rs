@@ -128,6 +128,8 @@ mod typescript;
 mod webhook;
 
 #[doc(inline)]
+pub use crate::roles::BILLING_ROLE;
+#[doc(inline)]
 pub use event::StripeBillingEvent;
 #[doc(inline)]
 pub use lifecycle::{HANDLED_EVENTS, ProcessStripeEvent, QUEUE, Reconciler, SyncSeats};
@@ -140,7 +142,7 @@ pub use model::{
 #[doc(inline)]
 pub use plans::{Enforcement, Interval, Limit, Plan, PlanSet, Price};
 #[doc(inline)]
-pub use routes::{BILLING_ROLE, router};
+pub use routes::router;
 #[doc(inline)]
 pub use stripe::LineItem;
 #[doc(inline)]

@@ -26,18 +26,33 @@ const USER = {
   created_at: '2026-01-01T00:00:00Z',
 }
 
-function memberships(teamRoles: string[]) {
+/** What a member holds, as the overview answers it: an administrator, or not. */
+function access(isAdministrator: boolean) {
+  return {
+    roles: isAdministrator
+      ? [{ id: 'role-admin', name: 'Administrator', color: '#e11d48', position: 3 }]
+      : [{ id: 'role-editor', name: 'Editor', color: '#2563eb', position: 1 }],
+    permissions: [],
+    rank: isAdministrator
+      ? 3
+      : 1,
+    is_administrator: isAdministrator,
+  }
+}
+
+function memberships(isTeamAdministrator: boolean) {
   return {
     organizations: [
       {
         id: ORGANIZATION_ID,
         name: 'Acme',
-        roles: [ 'admin' ],
+        is_member: true,
+        ...access(true),
         teams: [
           {
             id: TEAM_ID,
             name: 'Acme HQ',
-            roles: teamRoles,
+            ...access(isTeamAdministrator),
           },
         ],
       },
@@ -76,7 +91,7 @@ const SYSTEM_ACT = {
   request_id: null,
 }
 
-function stubAuditLog(events: unknown[], teamRoles: string[] = [ 'admin' ]) {
+function stubAuditLog(events: unknown[], isTeamAdministrator = true) {
   stubFetch({
     '/auth/me': {
       status: 200,
@@ -84,7 +99,7 @@ function stubAuditLog(events: unknown[], teamRoles: string[] = [ 'admin' ]) {
     },
     '/tenancy/memberships': {
       status: 200,
-      body: memberships(teamRoles),
+      body: memberships(isTeamAdministrator),
     },
     [`/account/teams/${TEAM_ID}/audit-events`]: {
       status: 200,
@@ -152,7 +167,7 @@ describe('AuditLogPage', () => {
   })
 
   it('should refuse a member without the admin role, as the endpoint does', async () => {
-    stubAuditLog([ RENAMED ], [ 'editor' ])
+    stubAuditLog([ RENAMED ], false)
 
     renderWithProviders(<App />, AUDIT_PATH)
 

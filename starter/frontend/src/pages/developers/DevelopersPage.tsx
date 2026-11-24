@@ -12,7 +12,6 @@ import { AppShell } from '../../components/AppShell'
 import { WebhookEndpointsCard } from '../../components/developers/WebhookEndpointsCard'
 
 // Misc
-import { ADMIN_ROLE } from '../../permissions'
 import { getOrganizationSettingsUrl, getTeamSettingsUrl } from '../../urls'
 
 /**
@@ -70,7 +69,7 @@ export function DevelopersPage() {
     </div>
     <WebhookEndpointsCard
       teamId={team.id}
-      canManage={team.roles.includes(ADMIN_ROLE)}
+      canManage={team.access.isAdministrator}
     />
   </AppShell>
 }

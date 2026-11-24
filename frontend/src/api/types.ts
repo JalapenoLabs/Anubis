@@ -241,17 +241,47 @@ export type PasskeyLoginChallenge = {
   requestOptions: WireRequestOptions
 }
 
+/** A role as a roster or a membership names it. */
+export type RoleSummary = {
+  id: string
+  name: string
+  /** `#rrggbb`. */
+  color: string
+  /** Rank: higher outranks lower; the default role is 0. */
+  position: number
+}
+
+/**
+ * What the signed-in person may do somewhere, as the server resolved it.
+ *
+ * The SPA draws a control only when this allows it; the server decides
+ * regardless, so this hides what would be refused rather than securing it.
+ */
+export type TenantAccess = {
+  /** The roles that apply there, highest first, the default role included. */
+  roles: RoleSummary[]
+  /** The permission keys those roles carry, `<Subject>.<action>`. */
+  permissions: string[]
+  /** The position of the highest role that applies. */
+  rank: number
+  /** Whether the administrator role applies. */
+  isAdministrator: boolean
+}
+
 export type MembershipTeam = {
   id: string
   name: string
-  roles: string[]
+  /** What the person may do in the team. */
+  access: TenantAccess
 }
 
 export type MembershipOrganization = {
   id: string
   name: string
-  /** Organization-level roles; empty for users who only belong to teams. */
-  roles: string[]
+  /** False for somebody who only belongs to teams inside the organization. */
+  isMember: boolean
+  /** What the person may do organization-wide; empty for a team-only member. */
+  access: TenantAccess
   teams: MembershipTeam[]
 }
 
@@ -259,11 +289,20 @@ export type MembershipsOverview = {
   organizations: MembershipOrganization[]
 }
 
+/** The roles one member was granted on a single record of the team. */
+export type ResourceRoles = {
+  resourceId: string
+  roles: RoleSummary[]
+}
+
 export type TeamRosterMember = {
   membershipId: string
   /** The member's email, from the account or the pending invitation. */
   email: string | null
-  roles: string[]
+  /** The roles granted team-wide, highest first; the default role is not listed. */
+  roles: RoleSummary[]
+  /** Roles granted on single records of the team. */
+  resourceRoles: ResourceRoles[]
   /** True for invited members who have not claimed their membership yet. */
   pending: boolean
   /** The invitation to revoke; set exactly for a pending member. */
@@ -281,10 +320,63 @@ export type OrganizationRosterMember = {
   membershipId: string | null
   /** The member's email, from the account or the pending invitation. */
   email: string
-  roles: string[]
+  /** Held organization-wide, or offered by the pending invitation. */
+  roles: RoleSummary[]
   pending: boolean
   /** The invitation to revoke; set exactly for a pending member. */
   invitationId: string | null
+}
+
+/** One of an organization's roles, everything resolved. */
+export type Role = {
+  id: string
+  /** The `roles.yml` key it was seeded from, or null for one the organization made. */
+  key: string | null
+  name: string
+  color: string
+  position: number
+  /** The permission keys it carries, sorted. */
+  permissions: string[]
+  /** Whether the organization wrote its own permissions rather than following `roles.yml`. */
+  customized: boolean
+  /** The role everybody holds. */
+  isDefault: boolean
+  /** The administrator role at the top. */
+  isAdministrator: boolean
+  /** The tiers it may be granted at; empty for the default role, which is everybody's. */
+  grantableAt: GrantTier[]
+}
+
+/** A tier a role is granted at. */
+export type GrantTier = 'organization' | 'sub_tenant' | 'team'
+
+/** An organization's roles, the vocabulary they draw from, and the viewer's standing. */
+export type RoleCatalog = {
+  /** Highest first. */
+  roles: Role[]
+  /** Every permission key a role may carry. */
+  permissions: string[]
+  /**
+   * The keys among them some role in `roles.yml` grants: the only ones a role
+   * can be given, by anybody, the administrator included.
+   */
+  grantable: string[]
+  /** The viewer's standing where the catalog was read, which decides what they may change. */
+  viewer: TenantAccess
+}
+
+/** A role to make. */
+export type RoleDraft = {
+  name: string
+  color: string
+  permissions: string[]
+}
+
+/** What to change about a role; `permissions: null` returns it to following `roles.yml`. */
+export type RoleUpdate = {
+  name?: string
+  color?: string
+  permissions?: string[] | null
 }
 
 export type TenancyOrganization = {
@@ -308,7 +400,8 @@ export type InviteMemberRequest = {
   email: string
   teamId?: string
   organizationId?: string
-  roles?: string[]
+  /** Roles of the target's organization to grant on claim, beyond the default role. */
+  roleIds?: string[]
 }
 
 export type ClaimedInvitation = {
@@ -409,7 +502,7 @@ export type BillingOverview = {
   subscription: BillingSubscription | null
   /**
    * Every live subscription: the plan subscription first, then subjects. Null
-   * for a member without the `admin` or `billing` role, who reads the plan but
+   * for a member who may not update the subscription, who reads the plan but
    * not what each record costs.
    */
   subscriptions: BillingSubscription[] | null

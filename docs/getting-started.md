@@ -111,7 +111,7 @@ acme-crm/
 ├── backend/            the Rust server: src/, migrations/, tests/
 ├── frontend/           the React SPA: src/, e2e/
 ├── config/
-│   ├── roles.yml       roles and per-model grants, compiled into both ends
+│   ├── roles.yml       the permission vocabulary and the roles every organization starts with
 │   └── billing.yml     the subscription plans this application sells
 ├── compose.yaml        the development Postgres
 ├── Dockerfile          the production image, one binary serving API and SPA
@@ -462,8 +462,8 @@ the plural resource key plus a `pagination` object, with `?page=`, `?limit=`, an
 `?sort=-created_at` as the conventions.
 
 The browsable docs are at <http://localhost:3000/api/v1/docs> and the document
-itself at `/api/v1/openapi.json`. A token belongs to its team and acts with that
-team's admin role, so another team's record answers `404`, identically to one
+itself at `/api/v1/openapi.json`. A token belongs to its team and acts as that
+team's administrator, so another team's record answers `404`, identically to one
 that does not exist.
 
 The application owns its OpenAPI document, so the generated TypeScript client

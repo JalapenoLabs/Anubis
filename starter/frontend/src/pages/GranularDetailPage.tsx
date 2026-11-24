@@ -77,9 +77,9 @@ export function GranularDetailPage() {
   // Read once: the form writes into this team, and a scaffolded child's
   // association options are scoped to it.
   const teamId = root?.team_id ?? ''
-  const heldRoles = current?.team.roles ?? []
-  const mayUpdate = can(heldRoles, 'update', GRANULAR_DETAIL_MODEL)
-  const mayDestroy = can(heldRoles, 'destroy', GRANULAR_DETAIL_MODEL)
+  const permissions = current?.team.access.permissions ?? []
+  const mayUpdate = can(permissions, 'update', GRANULAR_DETAIL_MODEL)
+  const mayDestroy = can(permissions, 'destroy', GRANULAR_DETAIL_MODEL)
 
   const breadcrumbs = [
     {

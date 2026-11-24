@@ -55,9 +55,9 @@ export function CreativeConceptPage() {
   // Read once: the form writes into this team, and a scaffolded child's
   // association options are scoped to it.
   const teamId = record?.team_id ?? ''
-  const heldRoles = current?.team.roles ?? []
-  const mayUpdate = can(heldRoles, 'update', CREATIVE_CONCEPT_MODEL)
-  const mayDestroy = can(heldRoles, 'destroy', CREATIVE_CONCEPT_MODEL)
+  const permissions = current?.team.access.permissions ?? []
+  const mayUpdate = can(permissions, 'update', CREATIVE_CONCEPT_MODEL)
+  const mayDestroy = can(permissions, 'destroy', CREATIVE_CONCEPT_MODEL)
 
   const breadcrumbs = [
     {

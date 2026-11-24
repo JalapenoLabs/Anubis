@@ -178,7 +178,7 @@ subscriptions.cancel(&audit_context, organization_id, &server, Cancellation::AtP
 
 ### Why the application owns the routes
 
-The framework serves no endpoint that starts or changes a subject subscription, and that is deliberate. Three questions decide whether one is allowed, and only the application can answer them: whether the record belongs to the organization, who may spend money on it, and which Stripe prices it is sold at. The last is the sharpest: an endpoint taking price ids from a browser would let a customer buy any price in the Stripe account. So the application's own route authorizes the caller against its own record and its own permission model, computes the prices, and calls `Subscriptions`, which owns doing it correctly at Stripe. The framework's `/billing` endpoints list every subscription the organization holds, with its items, and reconcile them. A route that spends money on a record should require what the framework's own billing writes require, the `admin` or `billing` organization role, unless the application has a reason to grant it more narrowly.
+The framework serves no endpoint that starts or changes a subject subscription, and that is deliberate. Three questions decide whether one is allowed, and only the application can answer them: whether the record belongs to the organization, who may spend money on it, and which Stripe prices it is sold at. The last is the sharpest: an endpoint taking price ids from a browser would let a customer buy any price in the Stripe account. So the application's own route authorizes the caller against its own record and its own permission model, computes the prices, and calls `Subscriptions`, which owns doing it correctly at Stripe. The framework's `/billing` endpoints list every subscription the organization holds, with its items, and reconcile them. A route that spends money on a record should require what the framework's own billing writes require, `Billing::Subscription.update` organization-wide (`member.can(Action::Update, SUBSCRIPTION)`), unless the application has a reason to grant it more narrowly.
 
 Every method names the organization, and a record that organization holds no live subscription for answers as not found, so a record another tenant pays for cannot be changed through this one.
 
@@ -248,13 +248,13 @@ Two mounts, both in the application's `main.rs` and both listed by `anubis route
 
 | Route | Guard | Effect |
 |---|---|---|
-| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the plan subscription behind it, the seats in use, whether billing is configured, and, for `admin` or `billing`, every live subscription with its line items |
-| `POST /billing/organizations/{organization_id}/checkout` | org `admin` or `billing` | Opens a Stripe Checkout session, answers with its URL |
-| `POST /billing/organizations/{organization_id}/portal` | org `admin` or `billing` | Opens the Stripe customer portal, answers with its URL |
-| `POST /billing/organizations/{organization_id}/reconcile` | org `admin` or `billing` | Reads Stripe and corrects every subscription this application shows |
+| `GET /billing/organizations/{organization_id}` | org member | The plan in force, the plan subscription behind it, the seats in use, whether billing is configured, and, for a member allowed `Billing::Subscription.update`, every live subscription with its line items |
+| `POST /billing/organizations/{organization_id}/checkout` | `Billing::Subscription.update` | Opens a Stripe Checkout session, answers with its URL |
+| `POST /billing/organizations/{organization_id}/portal` | `Billing::Subscription.update` | Opens the Stripe customer portal, answers with its URL |
+| `POST /billing/organizations/{organization_id}/reconcile` | `Billing::Subscription.update` | Reads Stripe and corrects every subscription this application shows |
 | `POST /webhooks/stripe-billing` | a Stripe signature | Stores one Stripe event and queues the job that acts on it |
 
-Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. The list of every subscription is the exception, served to `admin` and `billing` alone: a record's subscription names the record, its prices, and its status, and a member, a guest above all, may not reach every record the organization pays for. Spending money takes the `admin` role or the `billing` role, which the starter's `roles.yml` ships described as "can manage billing and subscriptions"; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on all four, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
+Reading is open to every member of the organization because the plan and its limits explain what the whole organization can do. The list of every subscription is the exception, served only to a member whose access allows `Billing::Subscription.update`: a record's subscription names the record, its prices, and its status, and a member, a guest above all, may not reach every record the organization pays for. Spending money takes `Billing::Subscription.update`, which the administrator role always holds and the framework grants the `billing` key itself (the starter's `roles.yml` ships it described as "can manage billing and subscriptions"), and which an organization may hand to a role of its own. The framework's grant goes to that key alone, never through `includes`: a key including `billing` inherits what the file gives `billing`, and spends only if the file says so. The permission counts only for a full member or an administrator: a guest reaches only what was granted by name, so a guest's organization-wide roles spend nothing and do not show them the list of every subscription; repairing the projection takes the same authority, because it is the same subject. A member of another organization gets `404` on all four, the same as a member of none: the `OrganizationMember` guard never reveals that an organization exists.
 
 The receiver is the exception to all of that: it is mounted under `/webhooks` rather than `/billing`, carries no guard, and authenticates its caller with a signature. See [the lifecycle](#the-subscription-lifecycle).
 
@@ -295,7 +295,7 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
 }
 ```
 
-`subscription` is the plan subscription, the one behind `plan`; `subscriptions` is everything the organization pays for, the plan subscription first and then its records, grouped by model and oldest first, and is `null` for a member without the `admin` or `billing` role. A screen that shows a record's subscription usually shows it where the record lives, and reads it from here or from `Subscription::live_for_subject`.
+`subscription` is the plan subscription, the one behind `plan`; `subscriptions` is everything the organization pays for, the plan subscription first and then its records, grouped by model and oldest first, and is `null` for a member whose access does not allow `Billing::Subscription.update`. A screen that shows a record's subscription usually shows it where the record lives, and reads it from here or from `Subscription::live_for_subject`.
 
 `seats_used` is the one usage figure the framework can count for every application, because memberships are its own table. A screen reads it against the plan's `seats` limit to show how full the organization is; an application's own limits are counted by the application.
 
@@ -303,7 +303,7 @@ The receiver is the exception to all of that: it is mounted under `/webhooks` ra
 
 | Answer | When |
 |---|---|
-| `403` | The caller holds neither `admin` nor `billing` |
+| `403` | The caller's organization-wide roles do not carry `Billing::Subscription.update` |
 | `503` | `STRIPE_SECRET_KEY` is unset |
 | `400` | Unknown plan, the free plan, an unknown interval, or an interval that plan does not sell |
 | `409` | The organization already has a live plan subscription; changing plans is the portal's job. Subscriptions for its records are no obstacle |
@@ -498,7 +498,7 @@ It renders in one shape with a few states:
 
 The screen renders the plan subscription. The subscriptions an application sells per record arrive in the same response, for the application to render where each record lives rather than on a page that cannot name them.
 
-Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for `admin` or `billing`, read from the compiled `roles.generated.ts` through `permissions.ts`, which is the same authority the endpoints enforce.
+Reading is open to every member of the organization, because the plan explains what the whole organization can do. The checkout buttons, the portal link, and the "refresh from Stripe" action are drawn only for a member whose resolved access allows `Billing::Subscription.update`, read from the membership overview, which is the same authority the endpoints enforce.
 
 The refresh action is `POST .../reconcile`. It exists on the screen because the one thing a customer does after paying is come back and look, and an event that has not landed yet is the one moment the page can be wrong.
 

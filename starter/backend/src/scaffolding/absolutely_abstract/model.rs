@@ -1,6 +1,7 @@
 //! The `CreativeConcept` model: a record owned directly by a team.
 
-use anubis::tenancy::TeamMembership;
+use anubis::roles::RoleSet;
+use anubis::tenancy::{Access, resolve_team_access};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -103,22 +104,26 @@ impl CreativeConceptChanges {
 impl CreativeConcept {
     /// Loads one creative concept the user may see, walking the chain to its team.
     ///
-    /// Returns the creative concept together with the caller's membership in
-    /// the owning team, or `None` when the record does not exist *or* the
-    /// caller is not a member of its team. Handlers answer both with `404`, so
-    /// probing ids reveals nothing about other tenants.
+    /// Returns the creative concept together with what the caller may do to
+    /// it, or `None` when the record does not exist *or* the caller does not
+    /// reach its team. Handlers answer both with `404`, so probing ids reveals
+    /// nothing about other tenants.
     ///
-    /// The membership lookup is a second query rather than a join: Rust's
-    /// orphan rules stop an application crate from declaring its tables and
-    /// the framework's in one Diesel query (see the note in `crate::schema`).
+    /// What the caller may do is the framework's answer, narrowed to this
+    /// record, so a role granted on the creative concept alone applies here and
+    /// to everything nested under it. That is a second query rather than a
+    /// join: Rust's orphan rules stop an application crate from declaring its
+    /// tables and the framework's in one Diesel query (see the note in
+    /// `crate::schema`).
     ///
     /// # Errors
     /// Returns the underlying Diesel error when either query fails.
     pub async fn load_for_member(
         connection: &mut AsyncPgConnection,
+        roles: &RoleSet,
         user_id: Uuid,
         creative_concept_id: Uuid,
-    ) -> QueryResult<Option<(Self, TeamMembership)>> {
+    ) -> QueryResult<Option<(Self, Access)>> {
         let creative_concept: Option<Self> = creative_concepts::table
             .filter(creative_concepts::id.eq(creative_concept_id))
             .select(Self::as_select())
@@ -129,9 +134,15 @@ impl CreativeConcept {
             return Ok(None);
         };
 
-        let membership =
-            TeamMembership::for_user(connection, user_id, creative_concept.team_id).await?;
-        Ok(membership.map(|membership| (creative_concept, membership)))
+        let found = resolve_team_access(
+            connection,
+            roles,
+            user_id,
+            creative_concept.team_id,
+            &[creative_concept.id],
+        )
+        .await?;
+        Ok(found.map(|(_team, _membership, access)| (creative_concept, access)))
     }
 
     /// Loads one creative concept owned by `team_id`, for the `/api/v1` handlers.

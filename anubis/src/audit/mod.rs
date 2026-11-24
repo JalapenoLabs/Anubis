@@ -97,7 +97,15 @@ pub const ORGANIZATION_DESTROYED: &str = "organization.destroyed";
 pub const MEMBER_ADDED: &str = "member.added";
 /// A member's roles were replaced with a new set.
 pub const MEMBER_ROLE_CHANGED: &str = "member.role_changed";
-/// An administrator removed somebody else from a tenant.
+/// An organization made a role of its own.
+pub const ROLE_CREATED: &str = "role.created";
+/// A role's name, colour, or permissions changed.
+pub const ROLE_UPDATED: &str = "role.updated";
+/// A role was deleted, and everybody holding it lost it.
+pub const ROLE_DESTROYED: &str = "role.destroyed";
+/// An organization's roles were put in a new order.
+pub const ROLE_REORDERED: &str = "role.reordered";
+/// Somebody removed somebody else from a tenant.
 pub const MEMBER_REMOVED: &str = "member.removed";
 /// Somebody left a tenant of their own accord.
 pub const MEMBER_LEFT: &str = "member.left";

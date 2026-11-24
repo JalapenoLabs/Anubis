@@ -126,7 +126,7 @@ function toOverview(wire: WireBilling): BillingOverview {
  *
  * Money lives at Stripe: buying a plan and managing one both answer with a URL
  * to send the browser to, and nothing here renders a card form. Reading is open
- * to every member; the three writes need the `admin` or `billing` role. A
+ * to every member; the three writes need `Billing::Subscription.update`. A
  * subscription paying for one of the application's records is bought and
  * changed through the application's own routes.
  */

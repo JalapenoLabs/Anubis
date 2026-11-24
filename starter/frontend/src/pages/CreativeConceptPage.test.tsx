@@ -31,17 +31,35 @@ const USER = {
   created_at: '2026-01-01T00:00:00Z',
 }
 
+/** What an administrator holds, as the overview answers it. */
+const ADMINISTRATOR = {
+  roles: [{ id: 'role-admin', name: 'Administrator', color: '#e11d48', position: 3 }],
+  permissions: [
+    'CreativeConcept.read',
+    'CreativeConcept.create',
+    'CreativeConcept.update',
+    'CreativeConcept.destroy',
+    'TangibleThing.read',
+    'TangibleThing.create',
+    'TangibleThing.update',
+    'TangibleThing.destroy',
+  ],
+  rank: 3,
+  is_administrator: true,
+}
+
 const MEMBERSHIPS = {
   organizations: [
     {
       id: ORGANIZATION_ID,
       name: 'Acme',
-      roles: [ 'admin' ],
+      is_member: true,
+      ...ADMINISTRATOR,
       teams: [
         {
           id: TEAM_ID,
           name: 'Acme HQ',
-          roles: [ 'admin' ],
+          ...ADMINISTRATOR,
         },
       ],
     },

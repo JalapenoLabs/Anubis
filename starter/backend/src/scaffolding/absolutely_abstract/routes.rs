@@ -25,7 +25,7 @@ use anubis::db::DbPool;
 use anubis::guard::TeamMember;
 use anubis::http::{ApiError, ListParams, Pagination};
 use anubis::roles::{Action, RoleSet};
-use anubis::tenancy::TeamMembership;
+use anubis::tenancy::Access;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -487,8 +487,9 @@ async fn show(
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Read)?;
+    let (record, access) =
+        load(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Read, MODEL)?;
 
     let creative_concept = CreativeConceptView::one(&mut connection, record)
         .await
@@ -504,8 +505,9 @@ async fn update(
     Json(body): Json<UpdateCreativeConceptBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (record, membership) = load(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Update)?;
+    let (record, access) =
+        load(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Update, MODEL)?;
 
     let creative_concept = apply_changes(&mut connection, record, body, &context.by(&user)).await?;
     Ok(Json(CreativeConceptBody { creative_concept }))
@@ -518,9 +520,9 @@ async fn destroy(
     Path(creative_concept_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut connection = state.pool.get().await.map_err(log_internal)?;
-    let (creative_concept, membership) =
-        load(&mut connection, user.id, creative_concept_id).await?;
-    require(&state.roles, &membership, Action::Destroy)?;
+    let (creative_concept, access) =
+        load(&mut connection, &state.roles, user.id, creative_concept_id).await?;
+    access.require(Action::Destroy, MODEL)?;
 
     delete_record(&mut connection, creative_concept, &context.by(&user)).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -710,10 +712,11 @@ async fn api_destroy(
 /// Loads the creative concept, answering `404` when it is absent or unreachable.
 async fn load(
     connection: &mut AsyncPgConnection,
+    roles: &RoleSet,
     user_id: Uuid,
     creative_concept_id: Uuid,
-) -> Result<(CreativeConcept, TeamMembership), ApiError> {
-    CreativeConcept::load_for_member(connection, user_id, creative_concept_id)
+) -> Result<(CreativeConcept, Access), ApiError> {
+    CreativeConcept::load_for_member(connection, roles, user_id, creative_concept_id)
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
@@ -729,17 +732,6 @@ async fn load_for_token(
         .await
         .map_err(log_internal)?
         .ok_or_else(ApiError::not_found)
-}
-
-/// Rejects with `403` unless a held role grants the action on this model.
-fn require(roles: &RoleSet, membership: &TeamMembership, action: Action) -> Result<(), ApiError> {
-    if roles.can(&membership.roles, action, MODEL) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "You do not have permission to do that.",
-        ))
-    }
 }
 
 /// Normalizes a submitted text value into a changeset column.

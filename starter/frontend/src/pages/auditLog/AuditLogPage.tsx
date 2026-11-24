@@ -12,7 +12,6 @@ import { AppShell } from '../../components/AppShell'
 import { AuditEventsCard } from '../../components/auditLog/AuditEventsCard'
 
 // Misc
-import { ADMIN_ROLE } from '../../permissions'
 import { getOrganizationSettingsUrl, getTeamSettingsUrl } from '../../urls'
 
 /**
@@ -66,7 +65,7 @@ export function AuditLogPage() {
     </div>
     <AuditEventsCard
       teamId={team.id}
-      canRead={team.roles.includes(ADMIN_ROLE)}
+      canRead={team.access.isAdministrator}
     />
   </AppShell>
 }

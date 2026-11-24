@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde_json::{Value, json};
-use support::{Harness, PASSWORD, TestDatabase, invitation_token, register, send};
+use support::{Harness, PASSWORD, TestDatabase, invitation_token, register, role_id, send};
 use uuid::Uuid;
 
 /// The suite's fixed cast, so a story reads as a story.
@@ -107,6 +107,7 @@ async fn tenancy_records_itself_and_the_team_admin_can_read_it() {
 
     // An invitation, and somebody claiming it.
     let guest_email = format!("guest-{}@example.com", Uuid::new_v4());
+    let editor = role_id(&cast.harness.router, &cast.owner, cast.team, "editor").await;
     let (status, _headers, body) = send(
         &cast.harness.router,
         "POST",
@@ -114,7 +115,7 @@ async fn tenancy_records_itself_and_the_team_admin_can_read_it() {
         Some(&json!({
             "email": guest_email,
             "team_id": cast.team,
-            "roles": [ "editor" ],
+            "role_ids": [ editor ],
         })),
         Some(&cast.owner),
     )
@@ -166,7 +167,9 @@ async fn tenancy_records_itself_and_the_team_admin_can_read_it() {
     let invited = find(&log, audit::INVITATION_CREATED);
     assert_eq!(invited["subject_type"], "Invitation");
     assert_eq!(invited["subject_label"], guest_email);
-    assert_eq!(invited["changes"]["roles"]["new"], json!(["editor"]));
+    // Roles are named as they read, because a role can be renamed later and
+    // the log keeps what was offered at the time.
+    assert_eq!(invited["changes"]["roles"]["new"], json!(["Editor"]));
 }
 
 #[tokio::test]
@@ -183,7 +186,6 @@ async fn a_role_change_and_a_removal_name_the_member_and_the_roles() {
         Some(&json!({
             "email": guest_email,
             "team_id": cast.team,
-            "roles": [ "default" ],
         })),
         Some(&cast.owner),
     )
@@ -204,12 +206,13 @@ async fn a_role_change_and_a_removal_name_the_member_and_the_roles() {
         .expect("the invited member must be on the roster")
         .to_owned();
 
+    let editor = role_id(&cast.harness.router, &cast.owner, cast.team, "editor").await;
     let path = format!("/tenancy/teams/{}/members/{membership_id}", cast.team);
     let (status, _headers, body) = send(
         &cast.harness.router,
         "PATCH",
         &path,
-        Some(&json!({ "roles": [ "editor" ] })),
+        Some(&json!({ "role_ids": [ editor ] })),
         Some(&cast.owner),
     )
     .await;
@@ -232,12 +235,14 @@ async fn a_role_change_and_a_removal_name_the_member_and_the_roles() {
     assert_eq!(changed["subject_type"], "TeamMembership");
     // A pending member reads as the address their invitation went to.
     assert_eq!(changed["subject_label"], guest_email);
-    assert_eq!(changed["changes"]["roles"]["old"], json!(["default"]));
-    assert_eq!(changed["changes"]["roles"]["new"], json!(["editor"]));
+    // The default role is everybody's, so it is never a grant to record.
+    assert_eq!(changed["changes"]["roles"]["old"], json!([]));
+    assert_eq!(changed["changes"]["roles"]["new"], json!(["Editor"]));
 
     let removed = find(&log, audit::MEMBER_REMOVED);
     // The label was read before the delete, so it survives the row it named.
     assert_eq!(removed["subject_label"], guest_email);
+    assert_eq!(removed["changes"]["roles"]["old"], json!(["Editor"]));
     assert_eq!(removed["changes"]["roles"]["new"], json!([]));
 }
 
@@ -300,6 +305,7 @@ async fn reading_the_team_log_takes_the_admin_role() {
 
     // A plain member of the same team, invited without the admin role.
     let guest_email = format!("guest-{}@example.com", Uuid::new_v4());
+    let editor = role_id(&cast.harness.router, &cast.owner, cast.team, "editor").await;
     let (status, _headers, body) = send(
         &cast.harness.router,
         "POST",
@@ -307,7 +313,7 @@ async fn reading_the_team_log_takes_the_admin_role() {
         Some(&json!({
             "email": guest_email,
             "team_id": cast.team,
-            "roles": [ "editor" ],
+            "role_ids": [ editor ],
         })),
         Some(&cast.owner),
     )
