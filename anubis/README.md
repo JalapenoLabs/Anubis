@@ -36,7 +36,7 @@ anubis doctor              # check the environment a deployment needs
 
 ## Requirements
 
-PostgreSQL is required; Redis is optional and only ever a cache or realtime's fanout and replay buffers, never durability. The crate builds with no native dependencies: no libpq, no OpenSSL.
+PostgreSQL is required; Redis is optional: realtime's fanout and replay buffers, and the session store when `SESSION_STORE=redis` chooses it, never the system of record. The crate builds with no native dependencies: no libpq, no OpenSSL.
 
 ## Documentation
 

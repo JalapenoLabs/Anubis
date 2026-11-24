@@ -8,15 +8,28 @@
 //! configuration uses, so a key that would fail a production boot fails here.
 //! Run from an application root, doctor also validates `config/roles.yml` and
 //! `config/billing.yml` with the same parsers the server boots with.
+//!
+//! The session store checks name where sessions are kept, reading
+//! `SESSION_STORE` and `REDIS_URL` with the configuration's own parser. When
+//! sessions live in Redis they ask that Redis exactly what the server's boot
+//! asks, through the same inspection: its version and its eviction policy,
+//! which fail here because the boot refuses them, and how it persists, which
+//! warns short of an append-only file.
 
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anubis::auth::secret_box::SecretKey;
+use anubis::auth::{Eviction, Persistence, RedisInspection};
+use anubis::config::{AppConfig, SessionStore};
 
 /// How long the database gets to accept a connection before doctor gives up.
 /// Long enough for a cold local Postgres, short enough to not feel hung.
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long Redis gets to answer every question doctor asks it, together.
+/// The same bound as the database, for the same reason.
+const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The variable holding the key that encrypts secrets at rest.
 const SECRET_KEY_VAR: &str = "ANUBIS_SECRET_KEY";
@@ -36,6 +49,7 @@ struct Check {
 pub(crate) fn run() -> ExitCode {
     let mut checks = tool_checks();
     checks.push(database_check());
+    checks.extend(session_store_checks());
     checks.push(secret_key_check());
     checks.push(roles_check());
     checks.push(billing_check());
@@ -116,6 +130,150 @@ fn database_check() -> Check {
             detail: "DATABASE_URL not set; `yarn dev` provides it for the dev database".to_owned(),
         },
     }
+}
+
+/// Where sessions are kept, read with the configuration's own parser.
+///
+/// Only `SESSION_STORE` and `REDIS_URL` reach the parser, so a mistake in some
+/// other variable cannot hide this one. A value the server would refuse fails
+/// here, `unix://` URLs and a Redis store without `REDIS_URL` among them.
+fn session_store_checks() -> Vec<Check> {
+    let parsed = AppConfig::from_lookup(|name| {
+        matches!(name, "SESSION_STORE" | "REDIS_URL")
+            .then(|| std::env::var(name).ok())
+            .flatten()
+    });
+    let config = match parsed {
+        Ok(config) => config,
+        Err(error) => {
+            return vec![Check {
+                status: Status::Fail,
+                detail: error.to_string(),
+            }];
+        }
+    };
+
+    match (config.session_store, config.redis) {
+        (SessionStore::Postgres, _) => vec![Check {
+            status: Status::Ok,
+            detail: "sessions are kept in Postgres".to_owned(),
+        }],
+        (SessionStore::Redis, Some(redis)) => redis_session_checks(redis.url()),
+        // The parser refuses this pair, so it is named rather than assumed.
+        (SessionStore::Redis, None) => vec![Check {
+            status: Status::Fail,
+            detail: "SESSION_STORE is redis, and REDIS_URL is not set".to_owned(),
+        }],
+    }
+}
+
+/// What the Redis holding the sessions says about holding them.
+///
+/// The verdicts are the boot's: a version or an eviction policy the boot
+/// refuses fails, and persistence short of an append-only file warns, because
+/// it costs sign-ins and one-at-a-time sign-outs on a restart rather than
+/// correctness while Redis runs.
+fn redis_session_checks(url: &str) -> Vec<Check> {
+    let inspected = match inspect(url) {
+        Ok(inspected) => inspected,
+        Err(reason) => {
+            return vec![Check {
+                status: Status::Fail,
+                detail: format!(
+                    "sessions are kept in Redis, and REDIS_URL did not answer: {reason}"
+                ),
+            }];
+        }
+    };
+
+    let version = inspected.version.as_deref().unwrap_or("(unreported)");
+    let version_check = match inspected.supports_version() {
+        Some(true) => Check {
+            status: Status::Ok,
+            detail: format!("sessions are kept in Redis {version}"),
+        },
+        Some(false) => Check {
+            status: Status::Fail,
+            detail: format!(
+                "sessions are kept in Redis {version}, older than the 7.0 the session store \
+                 needs; the server refuses to boot on it"
+            ),
+        },
+        None => Check {
+            status: Status::Warn,
+            detail: "sessions are kept in Redis, which reports no version; the session store \
+                     needs 7.0 or later"
+                .to_owned(),
+        },
+    };
+
+    let eviction_check = match &inspected.eviction {
+        Eviction::Never => Check {
+            status: Status::Ok,
+            detail: "Redis never evicts session keys".to_owned(),
+        },
+        Eviction::Evicts { policy } => Check {
+            status: Status::Fail,
+            detail: format!(
+                "Redis may evict session keys (maxmemory-policy {policy}, with a memory limit), \
+                 which drops sessions from the session list; the server refuses to boot on it. \
+                 Set noeviction"
+            ),
+        },
+        Eviction::Unreadable => Check {
+            status: Status::Warn,
+            detail: "Redis did not report its memory limit and policy in INFO memory, so whether \
+                     it may evict session keys is unknown; a session store needs noeviction"
+                .to_owned(),
+        },
+    };
+
+    let persistence_check = match inspected.persistence {
+        Persistence::AppendOnlyFile => Check {
+            status: Status::Ok,
+            detail: "Redis persists sessions in its append-only file".to_owned(),
+        },
+        Persistence::Snapshots => Check {
+            status: Status::Warn,
+            detail: "Redis persists sessions in RDB snapshots only; a restart loses the sign-ins \
+                     since the last one and brings back sessions signed out one at a time since \
+                     then. Set `appendonly yes`"
+                .to_owned(),
+        },
+        Persistence::Nothing => Check {
+            status: Status::Warn,
+            detail: "Redis persists nothing (appendonly is off and save is empty): a Redis \
+                     restart signs everyone out. Set `appendonly yes`"
+                .to_owned(),
+        },
+        Persistence::Unreadable => Check {
+            status: Status::Warn,
+            detail: "Redis would not say how it persists (it refused CONFIG GET, and INFO shows \
+                     no append-only file); confirm it persists, because a restart without \
+                     persistence signs everyone out"
+                .to_owned(),
+        },
+    };
+
+    vec![version_check, eviction_check, persistence_check]
+}
+
+/// Asks the Redis at `url` what the boot asks, bounded by [`REDIS_TIMEOUT`].
+///
+/// The URL may carry a password, so no error here ever quotes it.
+fn inspect(url: &str) -> Result<RedisInspection, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to start an async runtime: {error}"))?;
+
+    runtime.block_on(async {
+        match tokio::time::timeout(REDIS_TIMEOUT, anubis::auth::inspect_redis(url)).await {
+            Err(_elapsed) => Err(format!("timed out after {}s", REDIS_TIMEOUT.as_secs())),
+            Ok(Err(error)) => Err(error.to_string()),
+            Ok(Ok(inspected)) => Ok(inspected),
+        }
+    })
 }
 
 /// The key that encrypts secrets at rest, parsed exactly as boot parses it.

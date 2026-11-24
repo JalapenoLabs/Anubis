@@ -28,6 +28,7 @@ pub mod oauth_server;
 pub mod platform;
 pub mod rate_limit;
 pub mod realtime;
+mod redis_connection;
 pub mod reporting;
 pub mod roles;
 pub mod scaffold;

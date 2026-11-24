@@ -739,6 +739,83 @@ async fn readiness_succeeds_against_a_live_database() {
     assert_eq!(answer.body, json!({ "status": "ready" }));
 }
 
+#[tokio::test]
+async fn a_redis_session_store_that_does_not_answer_stops_the_boot() {
+    // Nothing listens on the discard port, so every connection is refused at
+    // once; the bound below only guards against a hang this test exists to
+    // rule out.
+    let config = config(&[
+        ("SESSION_STORE", "redis"),
+        ("REDIS_URL", "redis://127.0.0.1:9"),
+        ("PORT", "0"),
+    ]);
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        server::serve(Router::new(), unreachable_pool(), &config),
+    )
+    .await
+    .expect("a Redis that refuses connections must not hang the boot")
+    .expect_err("a session store that cannot answer must stop the boot");
+
+    assert!(refused.is_session_store(), "got: {refused}");
+    let rendered = refused.to_string();
+    assert!(
+        rendered.contains("SESSION_STORE") && rendered.contains("REDIS_URL"),
+        "the refusal names the settings to fix: {rendered}",
+    );
+}
+
+#[tokio::test]
+async fn a_redis_session_store_that_answers_lets_the_boot_through() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping server_flow Redis boot test: REDIS_URL is not set");
+        return;
+    };
+    // A free port, named in the configuration, so the test knows where the
+    // served application is; `serve` binds the configured address itself.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|probe| probe.local_addr())
+        .expect("an ephemeral port must be available")
+        .port()
+        .to_string();
+    let config = config(&[
+        ("SESSION_STORE", "redis"),
+        ("REDIS_URL", &redis_url),
+        ("PORT", &port),
+    ]);
+
+    let serving =
+        tokio::spawn(
+            async move { server::serve(Router::new(), unreachable_pool(), &config).await },
+        );
+
+    // The probe answering proves the boot passed the store's check and bound.
+    let mut answered = None;
+    for _attempt in 0..50 {
+        if serving.is_finished() {
+            break;
+        }
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            request_over(&mut stream, "/healthz").await;
+            answered = Some(read_response(&mut stream).await);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if serving.is_finished() {
+        // The boot stopped; say why, rather than blaming whichever assertion
+        // below would trip first. The port, picked and released above, may
+        // also have been taken in between.
+        let outcome = serving.await.expect("the serving task must not panic");
+        panic!("a Redis that answers must not stop the boot: {outcome:?}");
+    }
+    serving.abort();
+    let response = answered.expect("the served application must answer its probe");
+    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+}
+
 /// Reads one HTTP response off a socket, to the end of the connection.
 async fn read_response(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();

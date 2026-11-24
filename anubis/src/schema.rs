@@ -20,6 +20,7 @@ diesel::table! {
         locale -> Text,
         platform_roles -> Array<Text>,
         password_change_required -> Bool,
+        session_generation -> Int8,
     }
 }
 
@@ -65,6 +66,7 @@ diesel::table! {
         token_hash -> Text,
         created_at -> Timestamptz,
         expires_at -> Timestamptz,
+        generation -> Int8,
     }
 }
 

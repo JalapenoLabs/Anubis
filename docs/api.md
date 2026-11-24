@@ -82,7 +82,7 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 
 ## Authentication
 
-- **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor.
+- **Browser**: cookie sessions, kept in Postgres by default or in Redis with `SESSION_STORE=redis`, behaving identically in either. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the store keeps only the token's SHA-256, so a leaked database or Redis snapshot yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor. See [sessions.md](sessions.md).
 - **Sign-in methods**: password; passwordless emailed 6-digit codes (10-minute life, attempt-limited, enumeration-safe); and passkeys (WebAuthn discoverable credentials, password-manager-first, cross-platform authenticators welcome).
 - **Second factor**: TOTP (authenticator apps) with QR enrollment and single-use recovery codes. When confirmed, password and email-code login answer a 5-minute challenge instead of a session; a passkey is multi-factor by construction and bypasses the challenge.
 - **OAuth**: OpenID Connect providers, one line of setup each. See [OAuth sign-in](#oauth-sign-in) below.
