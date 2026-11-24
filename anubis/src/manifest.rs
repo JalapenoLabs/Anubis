@@ -60,8 +60,7 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         path: "/users/{user_id}/avatar",
         area: "auth",
     },
-    // The realtime channel socket. A plain GET is answered `426 Upgrade
-    // Required` by axum once the session is accepted.
+    // The realtime event stream, carrying the channels its query names.
     RouteEntry {
         method: "GET",
         path: "/realtime",
@@ -402,7 +401,8 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
         area: "notifications",
     },
     // The OAuth authorization server for connected clients: discovery,
-    // registration, consent, tokens, and the account's connections.
+    // registration, consent, the device grant, tokens, and the account's
+    // connections.
     RouteEntry {
         method: "GET",
         path: "/.well-known/oauth-authorization-server",
@@ -426,6 +426,16 @@ static FRAMEWORK_ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "GET",
         path: "/oauth/authorize",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/device_authorization",
+        area: "oauth_server",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/oauth/device_verification",
         area: "oauth_server",
     },
     RouteEntry {

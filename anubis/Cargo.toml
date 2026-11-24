@@ -84,13 +84,12 @@ webauthn-rs = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-# Integration tests are their own crates, so the websocket test needs its own
+# Integration tests are their own crates, so the stream tests need their own
 # entries for what the library already depends on.
 futures-util = { workspace = true }
 http-body-util = { workspace = true }
 # `start_paused` lets a test prove the request timeout without spending it.
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = { workspace = true }
 # The passkey ceremony suite's software authenticator, and the wire types it
 # implements a backend over. Test-only: nothing in the library signs a
 # ceremony, it only verifies one.

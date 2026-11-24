@@ -1,9 +1,13 @@
 //! Subscription billing: plans in configuration, money at Stripe.
 //!
 //! Billing attaches to the **organization**, which is the tenant that owns
-//! teams and pays for them (see `docs/tenancy.md`). An organization has at
-//! most one subscription that is not over, and the plan it buys is defined in
-//! the application's `config/billing.yml`, not in a database table.
+//! teams and pays for them (see `docs/tenancy.md`). An organization holds at
+//! most one live **plan subscription**, which buys a plan defined in the
+//! application's `config/billing.yml` rather than in a database table, and any
+//! number of live **subject subscriptions**, each paying for one of the
+//! application's own records (a [`Subject`]). Every subscription carries its
+//! line items, one per Stripe price, so an add-on is an item beside the thing
+//! it adds to.
 //!
 //! # The pieces
 //!
@@ -15,7 +19,11 @@
 //!   with: create a customer, open a checkout session, open a portal session,
 //!   and read subscriptions back.
 //! - [`Subscription`] is the row mirroring Stripe's own record, which the
-//!   application authorizes and renders from.
+//!   application authorizes and renders from, and [`SubscriptionItem`] is one
+//!   of its line items.
+//! - [`Subscriptions`] is what an application calls to start, change, and
+//!   cancel the subscriptions it sells per record, adding or removing an
+//!   add-on mid-period on Stripe's proration.
 //! - [`StripeBillingEvent`] is one thing Stripe said, stored before anything is
 //!   made of it, and [`Reconciler`] is the only thing that writes the
 //!   projection from it.
@@ -77,18 +85,22 @@
 //! # The free plan is the absence of a row
 //!
 //! Exactly one plan in `billing.yml` sells no prices, and that is the free
-//! plan. An organization with no subscription is on it. Nothing is written at
-//! signup, nothing is backfilled when a plan is renamed, and a cancellation
-//! lands back where a new organization starts. Plan resolution is therefore
-//! total: every organization is always on a plan.
+//! plan. An organization with no live plan subscription is on it. Nothing is
+//! written at signup, nothing is backfilled when a plan is renamed, and a
+//! cancellation lands back where a new organization starts. Plan resolution is
+//! therefore total: every organization is always on a plan. Subject
+//! subscriptions never move it, because each buys its own record rather than
+//! the organization's limits.
 //!
 //! # Stripe is the system of record for money
 //!
 //! The application never computes what a customer owes, never stores a card,
-//! and never renders a plan-change screen: Stripe Checkout takes the purchase
-//! and the Stripe Billing customer portal takes every change after it. What
-//! this framework keeps is the projection it has to authorize from, and the
-//! projection is only ever written from what Stripe reports.
+//! and never renders a plan-change screen: Stripe Checkout takes every
+//! purchase, the Stripe Billing customer portal takes every change to a plan
+//! subscription, and [`Subscriptions`] makes the changes an application makes
+//! to the records it sells. What this framework keeps is the projection it has
+//! to authorize from, and the projection is only ever written from what Stripe
+//! reports.
 //!
 //! # Billing disabled
 //!
@@ -111,6 +123,7 @@ mod model;
 pub mod plans;
 mod routes;
 pub mod stripe;
+pub mod subscriptions;
 mod typescript;
 mod webhook;
 
@@ -123,10 +136,16 @@ pub use lifecycle::{HANDLED_EVENTS, ProcessStripeEvent, QUEUE, Reconciler, SyncS
 #[doc(inline)]
 pub use limits::{Limits, SEATS};
 #[doc(inline)]
-pub use model::{Subscription, SubscriptionStatus};
+pub use model::{
+    Subject, Subscription, SubscriptionItem, SubscriptionStatus, SubscriptionWithItems,
+};
 #[doc(inline)]
 pub use plans::{Enforcement, Interval, Limit, Plan, PlanSet, Price};
 #[doc(inline)]
 pub use routes::router;
+#[doc(inline)]
+pub use stripe::LineItem;
+#[doc(inline)]
+pub use subscriptions::{Cancellation, ItemChange, NewSubscription, Subscriptions};
 #[doc(inline)]
 pub use webhook::{WEBHOOK_PATH, WEBHOOK_SECRET_VAR, router as webhook_router};

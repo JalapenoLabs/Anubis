@@ -17,8 +17,8 @@ const RealtimeContext = createContext<RealtimeClient | null>(null)
  * Provides one realtime connection to the component tree.
  *
  * Mount once near the root, above anything using `useChannel`. One client is
- * one websocket however many channels the page watches, so building a second
- * provider means opening a second socket.
+ * one event stream however many channels the page watches, so building a
+ * second provider means opening a second stream.
  */
 export function RealtimeProvider(props: Props) {
   return <RealtimeContext.Provider value={props.client}>{

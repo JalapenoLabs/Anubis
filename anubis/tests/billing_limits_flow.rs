@@ -17,13 +17,15 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anubis::billing::{Limits, PlanSet, Reconciler, SyncSeats};
 use anubis::config::AppConfig;
 use anubis::schema::{jobs, subscriptions};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse as _;
 use axum::routing::get;
 use axum::{Json, Router};
 use diesel::prelude::*;
@@ -86,6 +88,7 @@ fn plans(yaml: &str) -> PlanSet {
 struct Received {
     path: String,
     body: String,
+    idempotency_key: Option<String>,
 }
 
 type Log = Arc<Mutex<Vec<Received>>>;
@@ -101,6 +104,16 @@ type Quantity = Arc<Mutex<i64>>;
 struct MockState {
     log: Log,
     quantity: Quantity,
+    /// Updates still to refuse with a `500`.
+    refusals: Arc<Mutex<u32>>,
+    /// Stripe's idempotency cache: the first answer to each key, refusals
+    /// included, which Stripe replays to every retry with that key.
+    answered: Arc<Mutex<BTreeMap<String, (StatusCode, Value)>>>,
+    /// The subscription's status, which a test moves to `canceled`.
+    status: Arc<Mutex<String>>,
+    /// Whether the next update's answer is lost on its way back: Stripe applies
+    /// and saves it, and the client reads garbage.
+    lose_next_answer: Arc<Mutex<bool>>,
 }
 
 /// Serves the two subscription endpoints seat synchronization calls.
@@ -109,9 +122,20 @@ struct MockState {
 /// with afterwards, which is what makes running the job twice provably a no-op
 /// rather than an assertion about call counts alone.
 async fn start_mock_stripe() -> (String, Log, Quantity) {
+    let (base, state) = start_mock_stripe_refusing(0).await;
+    (base, state.log, state.quantity)
+}
+
+/// The same mock, refusing its first `refusals` updates with a `500` that it
+/// saves under the request's idempotency key, as Stripe does.
+async fn start_mock_stripe_refusing(refusals: u32) -> (String, MockState) {
     let state = MockState {
         log: Arc::new(Mutex::new(Vec::new())),
         quantity: Arc::new(Mutex::new(1)),
+        refusals: Arc::new(Mutex::new(refusals)),
+        answered: Arc::new(Mutex::new(BTreeMap::new())),
+        status: Arc::new(Mutex::new("active".to_owned())),
+        lose_next_answer: Arc::new(Mutex::new(false)),
     };
 
     let router = Router::new()
@@ -122,20 +146,61 @@ async fn start_mock_stripe() -> (String, Log, Quantity) {
                     unlock(&state.log).push(Received {
                         path: format!("GET /v1/subscriptions/{id}"),
                         body: String::new(),
+                        idempotency_key: None,
                     });
-                    Json(subscription_body(*unlock(&state.quantity)))
+                    Json(subscription_body(
+                        *unlock(&state.quantity),
+                        &unlock(&state.status),
+                    ))
                 },
             )
             .post(
-                async |State(state): State<MockState>, Path(id): Path<String>, body: String| {
+                async |State(state): State<MockState>,
+                       Path(id): Path<String>,
+                       headers: HeaderMap,
+                       body: String| {
+                    let key = headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
                     unlock(&state.log).push(Received {
                         path: format!("POST /v1/subscriptions/{id}"),
                         body: body.clone(),
+                        idempotency_key: key.clone(),
                     });
-                    if let Some(quantity) = quantity_of(&body) {
-                        *unlock(&state.quantity) = quantity;
+                    if let Some(saved) = key
+                        .as_ref()
+                        .and_then(|key| unlock(&state.answered).get(key).cloned())
+                    {
+                        // Stripe marks an answer it saved for an earlier request.
+                        return (saved.0, [("idempotent-replayed", "true")], Json(saved.1))
+                            .into_response();
                     }
-                    Json(subscription_body(*unlock(&state.quantity)))
+
+                    let answer = if *unlock(&state.refusals) > 0 {
+                        *unlock(&state.refusals) -= 1;
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({ "error": { "type": "api_error",
+                                               "message": "An unknown error occurred" } }),
+                        )
+                    } else {
+                        if let Some(quantity) = quantity_of(&body) {
+                            *unlock(&state.quantity) = quantity;
+                        }
+                        (
+                            StatusCode::OK,
+                            subscription_body(*unlock(&state.quantity), &unlock(&state.status)),
+                        )
+                    };
+                    if let Some(key) = key {
+                        unlock(&state.answered).insert(key, answer.clone());
+                    }
+                    if std::mem::take(&mut *unlock(&state.lose_next_answer)) {
+                        return (StatusCode::OK, "<the connection dropped mid-answer")
+                            .into_response();
+                    }
+                    (answer.0, Json(answer.1)).into_response()
                 },
             ),
         )
@@ -151,15 +216,15 @@ async fn start_mock_stripe() -> (String, Log, Quantity) {
         let _served = axum::serve(listener, router).await;
     });
 
-    (format!("http://{address}"), state.log, state.quantity)
+    (format!("http://{address}"), state)
 }
 
 /// Stripe's subscription document, as much of one as the framework reads.
-fn subscription_body(quantity: i64) -> Value {
+fn subscription_body(quantity: i64, status: &str) -> Value {
     json!({
         "id": SUBSCRIPTION_ID,
         "object": "subscription",
-        "status": "active",
+        "status": status,
         "customer": CUSTOMER_ID,
         "cancel_at_period_end": false,
         "items": { "object": "list", "data": [{
@@ -518,4 +583,199 @@ async fn seat_synchronization_tells_stripe_the_new_quantity_once() {
         .filter(|call| call.path.starts_with("POST"))
         .count();
     assert_eq!(updates, 1, "a correct quantity is never re-sent");
+}
+
+/// A seat update Stripe refused is retried under a fresh key, not replayed.
+///
+/// Stripe saves the first answer to an idempotency key, a `500` included, and
+/// replays it to every retry with that key for a day. The key names the
+/// subscription row's last write, so the refusal moves it: the job's next
+/// attempt is a new request, which Stripe can answer afresh.
+#[tokio::test]
+async fn a_seat_update_stripe_refused_is_sent_afresh_on_the_next_attempt() {
+    let Some(database) = TestDatabase::create("billing_limits_sync").await else {
+        return;
+    };
+    let harness = Harness::boot_with_plans(&database, plans(PER_SEAT_YML)).await;
+    let (stripe_base, stripe) = start_mock_stripe_refusing(1).await;
+    let (stripe_log, stripe_quantity) = (stripe.log, stripe.quantity);
+    let reconciler = Reconciler::new(
+        harness.pool.clone(),
+        plans(PER_SEAT_YML),
+        &config(&stripe_base),
+    );
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    insert_subscription(&harness.pool, organization_id, 1).await;
+    let (status, body) = invite(
+        &harness.router,
+        organization_id,
+        &owner,
+        &format!("guest-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("Stripe refuses the first attempt");
+    assert_eq!(*unlock(&stripe_quantity), 1, "nothing changed at Stripe");
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect("the retry is a new request, and Stripe takes it");
+    assert_eq!(*unlock(&stripe_quantity), 2);
+
+    let keys: Vec<Option<String>> = unlock(&stripe_log)
+        .iter()
+        .filter(|call| call.path.starts_with("POST"))
+        .map(|call| call.idempotency_key.clone())
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(
+        keys.iter().all(Option::is_some),
+        "every update is keyed: {keys:?}"
+    );
+    assert_ne!(keys[0], keys[1], "the refusal moved the key");
+}
+
+/// A seat update whose answer was lost is not sent again once Stripe has moved on.
+///
+/// The first attempt sets the seats at Stripe and its answer never arrives;
+/// before the job's retry, the subscription is cancelled. The retry reads
+/// Stripe, finds it over, and writes that, rather than resending the update
+/// and receiving the first attempt's saved answer, which still says active.
+#[tokio::test]
+async fn a_seat_update_whose_answer_was_lost_is_not_sent_again() {
+    let Some(database) = TestDatabase::create("billing_limits_sync").await else {
+        return;
+    };
+    let harness = Harness::boot_with_plans(&database, plans(PER_SEAT_YML)).await;
+    let (stripe_base, stripe) = start_mock_stripe_refusing(0).await;
+    let reconciler = Reconciler::new(
+        harness.pool.clone(),
+        plans(PER_SEAT_YML),
+        &config(&stripe_base),
+    );
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    insert_subscription(&harness.pool, organization_id, 1).await;
+    let (status, body) = invite(
+        &harness.router,
+        organization_id,
+        &owner,
+        &format!("guest-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    *unlock(&stripe.lose_next_answer) = true;
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("the answer never arrived");
+    assert_eq!(
+        *unlock(&stripe.quantity),
+        2,
+        "Stripe applied it all the same"
+    );
+
+    *unlock(&stripe.status) = "canceled".to_owned();
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect("the retry finds the subscription over, and records that");
+
+    let updates = unlock(&stripe.log)
+        .iter()
+        .filter(|call| call.path.starts_with("POST"))
+        .count();
+    assert_eq!(updates, 1, "the update was not sent a second time");
+    let mut connection = harness
+        .pool
+        .get()
+        .await
+        .expect("a connection must be available");
+    let recorded: String = subscriptions::table
+        .filter(subscriptions::stripe_subscription_id.eq(SUBSCRIPTION_ID))
+        .select(subscriptions::status)
+        .first(&mut connection)
+        .await
+        .expect("the subscription row must read");
+    assert_eq!(
+        recorded, "canceled",
+        "the projection holds what Stripe holds"
+    );
+}
+
+/// A seat update answered with a replay that shows other seats is retried afresh.
+///
+/// The first attempt sets two seats and its answer is lost; then the quantity
+/// is put back to one at Stripe directly. The retry sends the same request
+/// under the same key, and Stripe replays the first answer. Read back, the
+/// subscription bills one seat, not two, so the job fails to be retried under a
+/// fresh key rather than reporting seats it never synchronized.
+#[tokio::test]
+async fn a_seat_update_answered_by_a_stale_replay_is_retried_afresh() {
+    let Some(database) = TestDatabase::create("billing_limits_sync").await else {
+        return;
+    };
+    let harness = Harness::boot_with_plans(&database, plans(PER_SEAT_YML)).await;
+    let (stripe_base, stripe) = start_mock_stripe_refusing(0).await;
+    let reconciler = Reconciler::new(
+        harness.pool.clone(),
+        plans(PER_SEAT_YML),
+        &config(&stripe_base),
+    );
+
+    let owner = register(
+        &harness.router,
+        &format!("owner-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    let organization_id = bootstrapped_organization(&harness.router, &owner).await;
+    insert_subscription(&harness.pool, organization_id, 1).await;
+    let (status, body) = invite(
+        &harness.router,
+        organization_id,
+        &owner,
+        &format!("guest-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    *unlock(&stripe.lose_next_answer) = true;
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("the answer never arrived");
+    *unlock(&stripe.quantity) = 1;
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect_err("the replay shows one seat, so the seats are not synchronized");
+    assert_eq!(*unlock(&stripe.quantity), 1);
+
+    reconciler
+        .sync_seats(SyncSeats { organization_id })
+        .await
+        .expect("keyed afresh, the next attempt is a new request");
+    assert_eq!(
+        *unlock(&stripe.quantity),
+        2,
+        "Stripe bills the seats in use"
+    );
 }

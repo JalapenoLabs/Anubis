@@ -191,14 +191,30 @@ export type OauthClient = {
   clientUri: string | null
 }
 
+/**
+ * Where an approval goes, which decides what the consent screen warns about.
+ *
+ * A `redirect` request sends a code back to the program's address, which the
+ * screen must name. A `device` request was started by a program that showed
+ * the person a code to enter here, and the approval goes to that device
+ * wherever it is: the screen says so, because a code somebody else sent is
+ * how this flow is abused.
+ */
+export type AuthorizationDelivery =
+  | {
+    kind: 'redirect'
+    /** The host the code is delivered to. */
+    host: string
+    /** True when the code goes to a program on this device, worth a warning. */
+    isLoopback: boolean
+  }
+  | { kind: 'device' }
+
 /** What the consent screen asks the person to approve. */
 export type AuthorizationRequest = {
   id: string
   client: OauthClient
-  /** Where the code goes, which the screen must show. */
-  redirectHost: string
-  /** True when the code goes to a program on this device, worth a warning. */
-  redirectIsLoopback: boolean
+  delivery: AuthorizationDelivery
   scopes: OauthScope[]
   expiresAt: string
 }
@@ -432,8 +448,21 @@ export type BillingPlan = {
   limits: Record<string, BillingPlanLimit>
 }
 
+/** One line item of a subscription: a Stripe price, and how many of it. */
+export type BillingSubscriptionItem = {
+  id: string
+  stripeItemId: string
+  stripePriceId: string
+  /** Null for a metered price, which bills usage rather than a quantity. */
+  quantity: number | null
+}
+
 /**
- * The organization's subscription, mirroring Stripe's own record.
+ * One of the organization's subscriptions, mirroring Stripe's own record.
+ *
+ * The plan subscription names its plan and no subject; a subject subscription
+ * pays for one of the application's records, named by `subjectType` and
+ * `subjectId`, and names no plan.
  *
  * `status` is Stripe's vocabulary verbatim: `trialing`, `active`, `past_due`,
  * `canceled`, and the rest. `past_due` still grants access, because Stripe is
@@ -442,24 +471,36 @@ export type BillingPlan = {
 export type BillingSubscription = {
   id: string
   organizationId: string
-  planKey: string
+  /** The plan a plan subscription buys; null on a subject subscription. */
+  planKey: string | null
+  /** The model of the record a subject subscription pays for. */
+  subjectType: string | null
+  /** The id of that record. */
+  subjectId: string | null
   stripeSubscriptionId: string
   status: string
   /** `monthly` or `yearly`. */
   interval: string
-  /** Seats bought, which is the line item's quantity. */
+  /** Seats bought, which is the plan's line item's quantity. */
   quantity: number
   currentPeriodEnd: string | null
   cancelAtPeriodEnd: boolean
+  items: BillingSubscriptionItem[]
   createdAt: string
   updatedAt: string
 }
 
-/** What a billing screen renders: the plan, the subscription, and the seats. */
+/** What a billing screen renders: the plan, the subscriptions, and the seats. */
 export type BillingOverview = {
   plan: BillingPlan
-  /** Absent on the free plan, which is the absence of a subscription. */
+  /** The plan subscription; absent on the free plan, which is its absence. */
   subscription: BillingSubscription | null
+  /**
+   * Every live subscription: the plan subscription first, then subjects. Null
+   * for a member who may not update the subscription, who reads the plan but
+   * not what each record costs.
+   */
+  subscriptions: BillingSubscription[] | null
   /** False when this deployment has no Stripe key, so nothing can be bought. */
   billingEnabled: boolean
   /** People who can reach the organization, claimed and invited alike. */

@@ -75,7 +75,7 @@ and rehearsed, ready for a screencast.
 ## The stack
 
 - **Backend**: Rust on tokio, Axum, tower, Diesel with diesel-async, PostgreSQL,
-  optional Redis for realtime fanout and caching.
+  optional Redis for realtime fanout and replay, and, when chosen, sessions.
 - **Frontend**: React SPA with Vite, TypeScript, HeroUI, TailwindCSS, Redux
   Toolkit, React Router, ky with SWR, react-hook-form with zod, i18next.
 - **Contract**: OpenAPI 3.1 generated from the Rust handlers, driving a
@@ -93,19 +93,19 @@ feature categories are on the left.
 
 | Area | Status | What that means |
 |---|---|---|
-| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation, avatars, account deletion, and operator-set temporary passwords that admit nothing until replaced |
+| **Authentication** | Ships | Password (argon2id), passwordless email codes, passkeys (WebAuthn), TOTP second factor with recovery codes, email verification, password reset, session listing and revocation (sessions in Postgres, or Redis by one setting), avatars, account deletion, and operator-set temporary passwords that admit nothing until replaced |
 | **OAuth / SSO** | Ships | OpenID Connect with PKCE. Google in the registry; a provider is two environment variables, and `anubis scaffold oauth <provider>` prints them |
 | **Multi-tenancy** | Ships | User, TeamMembership, Team, Organization, OrganizationMembership, and Invitation. A personal organization and default team at signup. Team and organization settings screens, rosters, and the switcher |
 | **Platform tier** | Partial | A role scoped to `platform` is held on the account and operates the whole deployment, behind the `PlatformMember` guard. `ANUBIS_INITIAL_ADMIN_EMAIL` appoints the first operator at boot, and operators invite people (optionally as operators) with 24-hour links the invitee accepts by choosing a password. The primitives ship; operator screens do not yet, and the scaffolder still chains every model to a Team |
 | **Roles and permissions** | Ships | One `config/roles.yml` compiles the permission vocabulary into Rust and TypeScript, drift-gated in CI, and seeds the roles every organization starts with. Each organization's roles are data: named, coloured, ordered, edited in a role editor, and granted organization-wide, per sub-tenant, per team, or on one record, under a hierarchy nobody can climb by managing roles. Four tiers a role may be scoped to: `platform`, `organization`, `sub_tenant`, `team` |
 | **Scaffolding** | Ships | `scaffold model`, `field`, `join`, `oauth`, `webhook`. Six field spellings today (`text_field`, `text_area`, `number_field`, `boolean`, `date_field`, and `super_select` for both association shapes). Three levels of ownership |
 | **Field components** | Ships | Eighteen React controls in `@jalapenolabs/anubis`, including rich text, a code editor, and file and image pickers. The generator's table is the subset the living templates prove |
-| **Connected clients (MCP)** | Ships | An OAuth 2.1 authorization server (Client ID Metadata Documents, bounded dynamic registration, PKCE `S256`, rotating refresh tokens with reuse detection, revocation, both discovery documents) and an MCP endpoint at `/mcp` the application fills with tools, so Claude Code, Claude Desktop, and Codex act as the person who connected them. A consent screen and a connected apps list in settings |
+| **Connected clients (MCP)** | Ships | An OAuth 2.1 authorization server (Client ID Metadata Documents, bounded dynamic registration, PKCE `S256`, rotating refresh tokens with reuse detection, revocation, both discovery documents) and an MCP endpoint at `/mcp` the application fills with tools, so Claude Code, Claude Desktop, and Codex act as the person who connected them. The device authorization grant (RFC 8628) for programs on machines without a browser, entered at a code page. A consent screen and a connected apps list in settings |
 | **REST API** | Ships | Versioned `/api/v1`, per-team platform applications with bearer tokens, OpenAPI 3.1, Scalar docs, and a generated TypeScript client, all drift-gated |
 | **Outgoing webhooks** | Ships | Per-team subscriptions, HMAC-SHA256 signatures, at-least-once delivery on the job queue, a delivery log with redelivery, and a debugging screen |
 | **Incoming webhooks** | Ships | `anubis scaffold webhook <Provider>` generates the table, the store-then-process endpoint, the signature check, the job, and the test |
 | **Background jobs** | Ships | A durable Postgres queue. Enqueue rides the caller's transaction, at-least-once delivery, widening retry backoff, then a `dead_jobs` table |
-| **Realtime** | Ships | One session-authenticated websocket, team- and user-scoped channels, in-process fanout by default and Redis across instances |
+| **Realtime** | Ships | Server-Sent Events: one session-authenticated stream, team- and user-scoped channels with payloads and ids, resume from a bounded replay log, application streams of your own, in process by default and Redis across instances |
 | **Notifications** | Ships | A framework-owned inbox, one `notify` call that commits with the write that caused it, a realtime bell with an unread badge, and the framework's own notices for invitations, roles, and failing endpoints |
 | **Billing** | Ships | Plans in `config/billing.yml`, Stripe Checkout and the customer portal, the subscription projection kept current by Stripe's events, reconciliation, hard and soft limits, per-seat pricing, and the billing screen |
 | **Audit log** | Ships | An append-only record that commits with the write that caused it, framework surfaces recording themselves, every scaffolded model audited with no per-model code, and an admin-gated team screen |

@@ -19,15 +19,23 @@ const SEPARATOR: char = ':';
 /// The audience a channel name addresses.
 ///
 /// The audience is also the authorization rule: a team channel admits the
-/// team's members, and a user channel admits that one user. Adding a variant
-/// means adding the rule that goes with it, which is why the set is small and
-/// deliberate. See `docs/realtime.md`.
+/// team's members, a user channel admits that one user, and a resource
+/// channel admits whoever the application's own endpoint for that resource
+/// admits. Adding a variant means adding the rule that goes with it, which is
+/// why the set is small and deliberate. See `docs/realtime.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Audience {
     /// Everyone who belongs to the team.
     Team(Uuid),
     /// One user, on every device they are signed in on.
     User(Uuid),
+    /// One record the application owns, such as a game server's log.
+    ///
+    /// Nothing in the name says who may listen, so `GET /realtime` refuses
+    /// every resource channel. The application serves one from its own
+    /// endpoint, which authorizes the request its own way before it opens the
+    /// stream with [`super::Channels::stream`].
+    Resource(Uuid),
 }
 
 impl Audience {
@@ -36,13 +44,14 @@ impl Audience {
         match self {
             Self::Team(_) => "team",
             Self::User(_) => "user",
+            Self::Resource(_) => "resource",
         }
     }
 
     /// The id this audience names.
     fn id(self) -> Uuid {
         match self {
-            Self::Team(id) | Self::User(id) => id,
+            Self::Team(id) | Self::User(id) | Self::Resource(id) => id,
         }
     }
 }
@@ -51,8 +60,9 @@ impl Audience {
 ///
 /// Names are structured rather than free-form so that the server can decide
 /// who may listen without consulting a registry of hand-written rules. Build
-/// one with [`ChannelName::team`] or [`ChannelName::user`], parse one from a
-/// browser with `str::parse`, and render one with [`Display`].
+/// one with [`ChannelName::team`], [`ChannelName::user`], or
+/// [`ChannelName::resource`], parse one from a browser with `str::parse`, and
+/// render one with [`Display`].
 ///
 /// # Examples
 /// ```
@@ -93,6 +103,21 @@ impl ChannelName {
     #[must_use]
     pub fn user(user_id: Uuid, topic: impl AsRef<str>) -> Self {
         Self::new(Audience::User(user_id), topic.as_ref())
+    }
+
+    /// Names a topic about one record, served only by the application's own endpoint.
+    ///
+    /// `resource:{id}:{topic}`, such as a game server's log lines under
+    /// `resource:{server_id}:logs`. `GET /realtime` refuses these, because the
+    /// rule for who may hear a record's stream is the application's: open one
+    /// from a handler that has already authorized the request, with
+    /// [`super::Channels::stream`].
+    ///
+    /// # Panics
+    /// Panics on an invalid topic; see [`ChannelName::team`].
+    #[must_use]
+    pub fn resource(resource_id: Uuid, topic: impl AsRef<str>) -> Self {
+        Self::new(Audience::Resource(resource_id), topic.as_ref())
     }
 
     /// Returns who may listen to this channel.
@@ -151,7 +176,12 @@ impl FromStr for ChannelName {
         let audience = match prefix {
             "team" => Audience::Team(id),
             "user" => Audience::User(id),
-            _ => return Err(ParseError::new("a channel name begins with team or user")),
+            "resource" => Audience::Resource(id),
+            _ => {
+                return Err(ParseError::new(
+                    "a channel name begins with team, user, or resource",
+                ));
+            }
         };
 
         if !is_valid_topic(topic) {
@@ -169,11 +199,13 @@ impl FromStr for ChannelName {
 
 /// Returns `true` for a topic that renders and parses back unchanged.
 ///
+/// Shared with [`super::ChannelsBuilder::retain`], which names topics too.
+///
 /// The alphabet is deliberately narrow. Uppercase is excluded because two
 /// names differing only in case would look identical to a person and route
 /// differently, and the separator is excluded because it would split the name
 /// somewhere else on the way back in.
-fn is_valid_topic(topic: &str) -> bool {
+pub(crate) fn is_valid_topic(topic: &str) -> bool {
     !topic.is_empty()
         && topic.len() <= MAX_TOPIC
         && topic
@@ -224,6 +256,7 @@ mod tests {
             ChannelName::team(team_id, "projects"),
             ChannelName::user(user_id, "notifications"),
             ChannelName::team(team_id, "projects.comments-2"),
+            ChannelName::resource(team_id, "logs"),
         ] {
             let rendered = channel.to_string();
             let parsed: ChannelName = rendered.parse().expect("a rendered name must parse");
@@ -243,6 +276,10 @@ mod tests {
         assert_eq!(
             ChannelName::user(user_id, "inbox").audience(),
             Audience::User(user_id),
+        );
+        assert_eq!(
+            ChannelName::resource(team_id, "logs").audience(),
+            Audience::Resource(team_id),
         );
     }
 

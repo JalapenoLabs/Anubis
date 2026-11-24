@@ -339,17 +339,37 @@ pub async fn resolve_team_access(
     team_id: Uuid,
     resources: &[Uuid],
 ) -> QueryResult<Option<(Team, TeamMembership, Access)>> {
-    let found: Option<(Team, TeamMembership)> = teams::table
+    let found: Option<(Team, TeamMembership)> = admitted_teams(user_id)
+        .filter(teams::id.eq(team_id))
+        .select((Team::as_select(), TeamMembership::as_select()))
+        .first(connection)
+        .await
+        .optional()?;
+    let Some((team, membership)) = found else {
+        return Ok(None);
+    };
+
+    let access = team_membership_access(connection, roles, &team, membership.id, resources).await?;
+    Ok(Some((team, membership, access)))
+}
+
+/// The teams `user_id` is admitted to, joined to the membership that admits them.
+///
+/// The one statement of who reaches a team, shared by [`resolve_team_access`]
+/// (and so every team route's guard) and the realtime stream's team channels,
+/// so a route and a channel can never disagree about it. A claimed membership
+/// admits, and a suspension denies: the organization's cuts every team in it,
+/// and a sub-tenant's cuts the teams scoped to that sub-tenant. Both are left
+/// joins filtered on a null timestamp, so a member with no membership at the
+/// tier above passes.
+#[diesel::dsl::auto_type(no_type_alias)]
+pub(crate) fn admitted_teams(user_id: Uuid) -> _ {
+    teams::table
         .inner_join(
             team_memberships::table.on(team_memberships::team_id
                 .eq(teams::id)
                 .and(team_memberships::user_id.eq(user_id))),
         )
-        // A suspension is a deny, so it closes the team too: the
-        // organization's cuts every team in it, and a sub-tenant's cuts the
-        // teams scoped to that sub-tenant. Both joins are left joins filtered
-        // on a null timestamp, so a member with no membership at the tier
-        // above passes.
         .left_join(
             organization_memberships::table.on(organization_memberships::organization_id
                 .eq(teams::organization_id)
@@ -361,19 +381,8 @@ pub async fn resolve_team_access(
                 .eq(teams::sub_tenant_id)
                 .and(sub_tenant_memberships::user_id.eq(user_id))),
         )
-        .filter(teams::id.eq(team_id))
         .filter(organization_memberships::suspended_at.is_null())
         .filter(sub_tenant_memberships::suspended_at.is_null())
-        .select((Team::as_select(), TeamMembership::as_select()))
-        .first(connection)
-        .await
-        .optional()?;
-    let Some((team, membership)) = found else {
-        return Ok(None);
-    };
-
-    let access = team_membership_access(connection, roles, &team, membership.id, resources).await?;
-    Ok(Some((team, membership, access)))
 }
 
 /// The roles one team membership holds, claimed or not.

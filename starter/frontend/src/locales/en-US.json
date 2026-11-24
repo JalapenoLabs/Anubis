@@ -447,6 +447,7 @@
       "unverified": "This app registered itself, so nobody vouches for its name. Only continue if you started this connection yourself.",
       "redirect": "After you decide, you go back to {{host}}.",
       "loopbackWarning": "That address is a program on this computer. Continue only if you just ran a command or clicked a button that asked to connect.",
+      "deviceWarning": "This connects a device that showed you a code. Allow it only if you started this on a device of your own. If someone sent you the code, deny it.",
       "permissions": "It will be able to:",
       "identityOnly": "Know who you are. It asks for no other permission.",
       "signedInAs": "You are signed in as {{email}}.",
@@ -455,6 +456,24 @@
       "expired": "This request expired or was already answered. Start the connection again from the app.",
       "passwordChangeRequired": "Your account is on a temporary password. Choose a new one before you connect an app.",
       "choosePassword": "Choose a new password"
+    },
+    "device": {
+      "title": "Connect a device",
+      "subtitle": "Enter the code your device shows.",
+      "code": "Code",
+      "checkCode": "Check that this matches the code your device shows.",
+      "codeIncomplete": "Enter all 8 letters of the code.",
+      "continue": "Continue",
+      "invalid": "That code is not valid. Check it against your device's screen.",
+      "approved": {
+        "title": "Device approved",
+        "body": "Return to your device. It finishes signing in on its own."
+      },
+      "denied": {
+        "title": "Device denied",
+        "body": "Nothing was shared with the device."
+      },
+      "another": "Connect another device"
     },
     "errors": {
       "title": "This connection cannot continue",

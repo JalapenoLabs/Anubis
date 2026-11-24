@@ -53,6 +53,7 @@ use axum::{Extension, RequestPartsExt};
 use tower::layer::util::{Identity, Stack};
 use uuid::Uuid;
 
+use crate::auth::session::Sessions;
 use crate::auth::{CurrentUser, User};
 use crate::db::DbPool;
 use crate::http::ApiError;
@@ -102,6 +103,7 @@ pub struct PlatformMember {
     /// The signed-in operator.
     pub user: User,
     roles: Arc<RoleSet>,
+    sessions: Sessions,
 }
 
 impl PlatformMember {
@@ -111,6 +113,15 @@ impl PlatformMember {
     /// operator hands out is checked against the same file that admitted them.
     pub(crate) fn roles(&self) -> &RoleSet {
         &self.roles
+    }
+
+    /// The session store the operator's own session was found in.
+    ///
+    /// Read by the platform primitives that sign an account out, which run
+    /// with no request of their own to find the store on, so the one this
+    /// request carries is the one they use.
+    pub(crate) fn sessions(&self) -> &Sessions {
+        &self.sessions
     }
 
     /// Returns `true` when a held platform role grants the action on the model.
@@ -155,7 +166,11 @@ where
             return Err(ApiError::not_found());
         }
 
-        Ok(Self { user, roles })
+        Ok(Self {
+            user,
+            roles,
+            sessions: Sessions::for_request(parts),
+        })
     }
 }
 

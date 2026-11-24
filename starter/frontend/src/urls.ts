@@ -49,6 +49,17 @@ export const UrlTree = {
    * backend reserves that prefix for the protocol itself.
    */
   consent: '/consent',
+  /**
+   * Where a person types the code a device without a browser shows, such as a
+   * server agent signing in.
+   *
+   * The backend hands this URL to the device as its verification URI and
+   * returns the browser here once the person decided, so the path is a
+   * contract with `anubis::oauth_server::DEVICE_PATH`, like the consent
+   * screen's. Named for RFC 8628's verification URI rather than `device`,
+   * which is the key `anubis scaffold model Device` writes here.
+   */
+  deviceVerification: '/device',
   creativeConcepts: '/creative-concepts',
   creativeConcept: '/creative-concepts/:creativeConceptId',
   /**
@@ -85,6 +96,16 @@ export const DESTINATION_PARAM = 'next'
 export const AUTH_ERROR_PARAM = 'error'
 /** Query parameter naming the authorization request the consent screen shows. */
 export const CONSENT_REQUEST_PARAM = 'request'
+/**
+ * Query parameter a device's link to the code-entry page carries its code in,
+ * `anubis::oauth_server::USER_CODE_PARAM` on the backend.
+ */
+export const DEVICE_USER_CODE_PARAM = 'user_code'
+/**
+ * Query parameter the backend returns the browser to the code-entry page
+ * with once the person decided, `approved` or `denied`.
+ */
+export const DEVICE_RESULT_PARAM = 'result'
 
 // ///////////////////////////// //
 //         Link factories        //
@@ -149,6 +170,11 @@ export function getOauthStartUrl(provider: string, destination: string | null | 
   }
 
   return `/auth/oauth/${provider}/start?${DESTINATION_PARAM}=${encodeURIComponent(safeDestination)}`
+}
+
+/** The consent screen for one authorization request. */
+export function getConsentRequestUrl(requestId: string): string {
+  return `${UrlTree.consent}?${CONSENT_REQUEST_PARAM}=${encodeURIComponent(requestId)}`
 }
 
 export function getTeamSettingsUrl(teamId: string): string {

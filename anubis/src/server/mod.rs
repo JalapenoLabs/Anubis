@@ -64,6 +64,14 @@
 //! and never a knob on the timeout itself: a handler that reads a bounded body
 //! in bounded pieces is safe without one, and nothing else is.
 //!
+//! An event stream needs no declaration. The timeout clocks the handler,
+//! which for an upload includes reading the client's body, and for a stream
+//! ends the moment the stream is open and its head is sent. The body that
+//! follows is never timed, so a stream lives as long as its client listens,
+//! while its opening (the session check, the authorization, the replay read)
+//! stays bounded like any other request. The stream bounds itself from there:
+//! a lifetime, a heartbeat, and the drain below.
+//!
 //! # Compression
 //!
 //! One layer covers everything the server sends: the JavaScript bundle and the
@@ -80,10 +88,27 @@
 //!
 //! What is left alone is as deliberate as what is not. Responses under 32
 //! bytes, where a compression header costs more than the body saves; images and
-//! anything else already compressed; server-sent event streams, which must
-//! flush per event; and websocket upgrades, whose `101` carries no body at all.
-//! A response that arrives already encoded, a precompressed file straight off
-//! disk among them, passes through untouched.
+//! anything else already compressed; and server-sent event streams, which must
+//! flush per event, the realtime streams among them. A response that arrives
+//! already encoded, a precompressed file straight off disk among them, passes
+//! through untouched.
+//!
+//! # Sessions
+//!
+//! [`harden`] also puts the session store `SESSION_STORE` chose on every
+//! request, once, for every router the application composed, so the session
+//! cookie means the same thing on every route: Postgres by default, Redis when
+//! configured. That is the whole of opting in; no router is built differently.
+//! A Redis store connects on its first command, so [`serve`] asks it whether it
+//! can hold sessions before binding, and refuses to start, naming
+//! `SESSION_STORE`, when Redis does not answer, is older than 7.0, or may evict
+//! keys; it logs a warning when Redis persists less than an append-only file.
+//! A deployment that cannot check a session cannot serve anyone signed in, and
+//! finding out at the first request would mean every sign-in failing instead
+//! of one boot. An application that
+//! pairs [`harden`] with [`serve_with_shutdown`] skips that check, and its
+//! Redis store connects on the first request that needs it. See
+//! `docs/sessions.md`.
 //!
 //! # Shutdown
 //!
@@ -91,6 +116,11 @@
 //! graceful shutdown: the listener stops accepting immediately and in-flight
 //! requests get [`SHUTDOWN_DRAIN`] to finish. Windows has no `SIGTERM`, so
 //! ctrl-c is the whole story there.
+//!
+//! A long-lived response would hold the drain for its whole window, so the
+//! moment it starts, [`serve_with_shutdown`] tells every request it serves:
+//! an open [`crate::realtime::EventStream`] ends at once, and its client
+//! resumes against whichever instance answers next.
 //!
 //! Applications that must coordinate shutdown with something else, a
 //! [`crate::jobs::Worker`] above all, drive both from one signal with
@@ -115,18 +145,19 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, Response};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::{Extension, Router};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
 use uuid::Uuid;
 
+use crate::auth::session::{self, Sessions};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::http::ApiError;
@@ -208,8 +239,8 @@ impl Display for RequestId {
 /// the module docs.
 ///
 /// # Errors
-/// Returns an [`Error`] when the address cannot be bound, or when the accept
-/// loop fails.
+/// Returns an [`Error`] when the session store `SESSION_STORE` chose does not
+/// answer, when the address cannot be bound, or when the accept loop fails.
 pub async fn serve(router: Router, pool: DbPool, config: &AppConfig) -> Result<(), Error> {
     serve_with(router, pool, config, Hardening::default()).await
 }
@@ -224,12 +255,26 @@ pub async fn serve_with(
     config: &AppConfig,
     hardening: Hardening,
 ) -> Result<(), Error> {
-    let app = harden_with(router, pool, config, hardening);
+    // Before binding, so a deployment that cannot check a session never
+    // accepts a request it would have to fail; see the module docs.
+    let sessions = Sessions::from_config(config);
+    sessions.verify().await.map_err(|source| {
+        Error::new(
+            "SESSION_STORE is redis, and the Redis REDIS_URL names cannot keep sessions",
+            ErrorSource::Sessions(source),
+        )
+    })?;
+    tracing::info!(
+        session.store = %config.session_store,
+        "sessions are kept in {{session.store}}",
+    );
+
+    let app = stack(router, pool, config, hardening, sessions);
 
     let configured = config.server.socket_addr();
-    let listener = TcpListener::bind(configured)
-        .await
-        .map_err(|source| Error::new("failed to bind the server address", source))?;
+    let listener = TcpListener::bind(configured).await.map_err(|source| {
+        Error::new("failed to bind the server address", ErrorSource::Io(source))
+    })?;
 
     // The bound address, which differs from the configured one only when the
     // port was 0 and the kernel picked it.
@@ -252,6 +297,8 @@ pub async fn serve_with(
 ///
 /// Once `shutdown` resolves the listener closes at once and in-flight requests
 /// get [`SHUTDOWN_DRAIN`] to finish, after which the server returns anyway.
+/// Every request it serves can hear that moment, so an open event stream ends
+/// then rather than holding the drain until the window runs out.
 ///
 /// ```no_run
 /// # async fn boot(app: axum::Router, listener: tokio::net::TcpListener) {
@@ -275,6 +322,8 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Error> {
     let (drain_started, drain_starts) = oneshot::channel();
+    let (draining, drain) = watch::channel(false);
+    let app = app.layer(Extension(Drain(drain)));
 
     // Connect info, not just the router: the framework's rate limits charge
     // each request to the address it arrived from, which only the accept loop
@@ -285,6 +334,9 @@ pub async fn serve_with_shutdown(
     )
     .with_graceful_shutdown(async move {
         shutdown.await;
+        // Long-lived responses end first, so the drain below waits on the
+        // requests that are actually finishing rather than on open streams.
+        draining.send_replace(true);
         // The receiver is gone only if the server already stopped, in which
         // case there is nothing left to drain.
         let _ignored = drain_started.send(());
@@ -312,6 +364,31 @@ pub async fn serve_with_shutdown(
             );
             Ok(())
         }
+    }
+}
+
+/// The server's word that it has started to drain.
+///
+/// [`serve_with_shutdown`] puts one on every request it serves. A response
+/// that lives as long as its client wants, an event stream above all, listens
+/// for it and ends, because the drain exists for requests that are finishing
+/// and a stream is never finishing. A router served some other way carries
+/// none, and its streams end the way the connection does.
+#[derive(Debug, Clone)]
+pub(crate) struct Drain(watch::Receiver<bool>);
+
+impl Drain {
+    /// Resolves once the server has stopped accepting and begun its drain.
+    pub(crate) async fn started(&mut self) {
+        // A sender that is gone is a server that is gone, which is a drain too.
+        let _started = self.0.wait_for(|started| *started).await;
+    }
+
+    /// Whether the drain has started, without waiting for it.
+    pub(crate) fn has_started(&self) -> bool {
+        // `has_changed` fails only once the sender is gone, and a sender that
+        // is gone is a server that is gone, which is a drain too.
+        *self.0.borrow() || self.0.has_changed().is_err()
     }
 }
 
@@ -386,24 +463,55 @@ struct Untimed {
 
 /// Wraps an application's router in the framework's production middleware.
 ///
-/// Mounts the probes described in the module docs and applies the middleware
-/// stack listed there. [`serve`] calls this; call it directly only to drive the
-/// same application from somewhere else, such as an integration test.
+/// Mounts the probes described in the module docs, applies the middleware
+/// stack listed there, and puts the configured session store on every
+/// request. [`serve`] calls this; call it directly only to drive the same
+/// application from somewhere else, such as an integration test.
+///
+/// # Panics
+/// Panics outside a tokio runtime when `SESSION_STORE` is redis, because the
+/// store's connection is supervised by a task spawned here. Building a router
+/// to serve already happens inside one.
 pub fn harden(router: Router, pool: DbPool, config: &AppConfig) -> Router {
     harden_with(router, pool, config, Hardening::default())
 }
 
 /// [`harden`], with what an application declares beyond its router.
+///
+/// # Panics
+/// As [`harden`].
 pub fn harden_with(
     router: Router,
     pool: DbPool,
     config: &AppConfig,
     hardening: Hardening,
 ) -> Router {
+    stack(
+        router,
+        pool,
+        config,
+        hardening,
+        Sessions::from_config(config),
+    )
+}
+
+/// The stack [`harden_with`] describes, around a session store already built.
+///
+/// Split out so [`serve_with`] can prove its store answers before serving
+/// with that same store, rather than building a second one.
+fn stack(
+    router: Router,
+    pool: DbPool,
+    config: &AppConfig,
+    hardening: Hardening,
+    sessions: Sessions,
+) -> Router {
     // Each call wraps what came before, so the last layer is the outermost.
     // The stack is documented outermost-first in the module docs; read this
-    // bottom to top to match it.
+    // bottom to top to match it. The session store goes on the application's
+    // routes alone, since the probes never read a session.
     let app = router
+        .layer(Extension(sessions))
         .merge(health::router(pool))
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(hardening),
@@ -582,30 +690,68 @@ async fn shutdown_signal() {
 
 /// Renders an accept-loop failure as this module's error.
 fn stopped(source: std::io::Error) -> Error {
-    Error::new("the server stopped", source)
+    Error::new("the server stopped", ErrorSource::Io(source))
 }
 
-/// The server could not bind its address, or its accept loop failed.
+/// The server could not start, could not bind its address, or its accept loop
+/// failed.
 #[derive(Debug)]
 pub struct Error {
     context: &'static str,
-    source: std::io::Error,
+    source: ErrorSource,
     backtrace: Backtrace,
 }
 
+/// What went wrong underneath an [`Error`].
+#[derive(Debug)]
+enum ErrorSource {
+    /// Binding or accepting failed.
+    Io(std::io::Error),
+    /// The configured session store did not answer at boot, or cannot hold
+    /// sessions.
+    Sessions(session::Error),
+}
+
+impl ErrorSource {
+    /// The underlying error, whichever kind it is.
+    fn as_error(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Io(source) => source,
+            Self::Sessions(source) => source,
+        }
+    }
+}
+
 impl Error {
-    fn new(context: &'static str, source: std::io::Error) -> Self {
+    fn new(context: &'static str, source: ErrorSource) -> Self {
+        // A session store error carries its own backtrace and prints it, so
+        // capturing a second one here would print two, back to back.
+        let backtrace = match source {
+            ErrorSource::Io(_) => Backtrace::capture(),
+            ErrorSource::Sessions(_) => Backtrace::disabled(),
+        };
         Self {
             context,
             source,
-            backtrace: Backtrace::capture(),
+            backtrace,
         }
+    }
+
+    /// Returns `true` when the boot stopped because the session store the
+    /// configuration chose did not answer, or cannot hold sessions.
+    ///
+    /// A deployment problem: `REDIS_URL` names a Redis that is down,
+    /// unreachable from here, older than 7.0, or free to evict keys, while
+    /// `SESSION_STORE` keeps sessions there.
+    #[must_use]
+    pub fn is_session_store(&self) -> bool {
+        matches!(self.source, ErrorSource::Sessions(_))
     }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.context, self.source)?;
+        write!(f, "{}: {}", self.context, self.source.as_error())?;
         if self.backtrace.status() == BacktraceStatus::Captured {
             write!(f, "\n{}", self.backtrace)?;
         }
@@ -615,7 +761,7 @@ impl Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_error())
     }
 }
 
@@ -632,7 +778,10 @@ mod tests {
     use diesel_async::pooled_connection::deadpool::Pool;
     use tower::ServiceExt as _;
 
-    use super::{Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with};
+    use super::{
+        Drain, Hardening, REQUEST_TIMEOUT, RequestId, SHUTDOWN_DRAIN, harden_with,
+        serve_with_shutdown,
+    };
     use crate::config::AppConfig;
     use crate::db::DbPool;
 
@@ -699,6 +848,100 @@ mod tests {
             status_of(&app, Method::GET, "/slow").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// A body that keeps arriving for four times the test's timeout.
+    async fn trickle() -> Body {
+        let chunks = futures_util::stream::unfold(0_u8, |sent| async move {
+            if sent == 4 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((
+                Ok::<_, std::convert::Infallible>(vec![b'a' + sent]),
+                sent + 1,
+            ))
+        });
+        Body::from_stream(chunks)
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_outlives_the_timeout_without_a_declaration() {
+        // The timeout clocks the handler, and a stream's handler answers at
+        // once. What an event stream relies on, pinned: were the timeout ever
+        // to clock bodies, every stream would be cut thirty seconds in.
+        let router = Router::new().route("/stream", get(trickle));
+        let app = harden_with(
+            router,
+            unreachable_pool(),
+            &config(),
+            Hardening::new().timed_at(Duration::from_millis(30)),
+        );
+
+        let request = Request::builder()
+            .uri("/stream")
+            .body(Body::empty())
+            .expect("a well-formed request");
+        let response = app.oneshot(request).await.expect("the service answers");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the whole body arrives")
+            .to_bytes();
+        assert_eq!(&*body, b"abcd");
+    }
+
+    /// Waits for the server to start draining, then says so.
+    async fn wait_for_drain(axum::Extension(mut drain): axum::Extension<Drain>) -> &'static str {
+        drain.started().await;
+        "drained"
+    }
+
+    #[tokio::test]
+    async fn a_request_hears_the_drain_start_and_the_server_stops_without_waiting_it_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port must be available");
+        let address = listener.local_addr().expect("the listener is bound");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(serve_with_shutdown(
+            listener,
+            Router::new().route("/wait", get(wait_for_drain)),
+            async move {
+                let _stopped = stopped.await;
+            },
+        ));
+
+        let mut connection = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the server accepts");
+        connection
+            .write_all(b"GET /wait HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .expect("the request is written");
+        // Give the request time to reach its handler before shutdown starts.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _stopping = stop.send(());
+
+        let mut answer = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), connection.read_to_end(&mut answer)).await;
+        assert!(
+            read.is_ok(),
+            "the response must not wait out the drain window"
+        );
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.contains("drained"), "got: {answer}");
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("the server stops well inside its drain window");
+        finished
+            .expect("the serve task does not panic")
+            .expect("the server stops cleanly");
     }
 
     #[tokio::test]

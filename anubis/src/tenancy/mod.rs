@@ -40,6 +40,7 @@ mod role;
 mod role_routes;
 mod routes;
 
+pub(crate) use access::admitted_teams;
 pub(crate) use bootstrap::create_personal_organization;
 pub(crate) use departure::settle_departure;
 pub(crate) use grants::{organization_administrators, team_administrators};

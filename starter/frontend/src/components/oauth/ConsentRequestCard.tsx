@@ -22,12 +22,15 @@ type Props = {
  *
  * The MCP specification requires the screen to name where the code goes, and
  * to warn when that is a program on this device, because any program on the
- * device could have started the request. A client that registered itself gets
- * a second warning: its name is its own word, where a metadata document's
- * host is something it cannot fake.
+ * device could have started the request. A device that showed the person a
+ * code gets the warning RFC 8628 asks for instead: the approval reaches that
+ * device wherever it is, and a code somebody else sent is how the flow is
+ * abused. A client that registered itself gets a second warning: its name is
+ * its own word, where a metadata document's host is something it cannot fake.
  *
- * Either answer leaves the application: the backend says where, which is the
- * program's own redirect address carrying a code or a refusal.
+ * Either answer leaves the page: the backend says where, which is the
+ * program's own redirect address carrying a code or a refusal, or, for a
+ * device, the code-entry page saying how it went.
  */
 export function ConsentRequestCard(props: Props) {
   const { t } = useTranslation()
@@ -72,15 +75,23 @@ export function ConsentRequestCard(props: Props) {
       }
     </div>
     <div className='relaxed'>
-      <p className='compact'>{
-          t('oauth.consent.redirect', { host: request.redirectHost })
-        }</p>
-      { request.redirectIsLoopback
+      { request.delivery.kind === 'device'
         ? <Alert
             color='warning'
-            title={t('oauth.consent.loopbackWarning')}
+            title={t('oauth.consent.deviceWarning')}
           />
-        : null
+        : <>
+            <p className='compact'>{
+                t('oauth.consent.redirect', { host: request.delivery.host })
+              }</p>
+            { request.delivery.isLoopback
+              ? <Alert
+                  color='warning'
+                  title={t('oauth.consent.loopbackWarning')}
+                />
+              : null
+            }
+          </>
       }
     </div>
     <div className='relaxed'>

@@ -121,8 +121,10 @@ async fn a_client_connects_calls_a_tool_and_is_audited() {
     assert_eq!(request["client"]["name"], "Claude Code");
     assert_eq!(request["client"]["kind"], "metadata_document");
     assert_eq!(request["client"]["verified_host"], "127.0.0.1");
-    assert_eq!(request["redirect_host"], "localhost");
-    assert_eq!(request["redirect_is_loopback"], true);
+    assert_eq!(
+        request["delivery"],
+        json!({ "kind": "redirect", "host": "localhost", "is_loopback": true }),
+    );
     assert_eq!(request["scopes"][0]["name"], "notes:read");
     assert_eq!(request["scopes"][0]["description"], "Read your notes");
 

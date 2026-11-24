@@ -216,6 +216,26 @@ async fn insert_subscription(
         .await
 }
 
+/// Writes one subscription paying for a `Server` record, the way Stripe's events do.
+async fn insert_subject_subscription(
+    connection: &mut diesel_async::AsyncPgConnection,
+    organization_id: Uuid,
+    stripe_subscription_id: &str,
+    server_id: Uuid,
+) -> QueryResult<usize> {
+    diesel::insert_into(subscriptions::table)
+        .values((
+            subscriptions::organization_id.eq(organization_id),
+            subscriptions::subject_type.eq("Server"),
+            subscriptions::subject_id.eq(server_id),
+            subscriptions::stripe_subscription_id.eq(stripe_subscription_id.to_owned()),
+            subscriptions::status.eq("active"),
+            subscriptions::billing_interval.eq("monthly"),
+        ))
+        .execute(connection)
+        .await
+}
+
 /// The organization the registered account was bootstrapped into.
 async fn bootstrapped_organization(router: &Router, cookie: &str) -> Uuid {
     let (status, _headers, body) =
@@ -616,12 +636,16 @@ async fn without_a_stripe_key_reading_works_and_buying_says_so() {
     }
 }
 
-/// A subscription belongs to exactly one organization at a time.
+/// An organization holds one live plan subscription, and one per record beside it.
 ///
-/// The database enforces it rather than the handler, because two events
+/// The database enforces both rather than the handler, because two events
 /// arriving at once would otherwise each write a row and neither would know.
 #[tokio::test]
-async fn an_organization_holds_one_live_subscription_at_a_time() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one narrative walking both live-subscription rules and the plan-or-subject check"
+)]
+async fn an_organization_holds_one_live_plan_subscription_and_one_per_record() {
     let Some(database) = TestDatabase::create("billing_flow").await else {
         return;
     };
@@ -636,27 +660,102 @@ async fn an_organization_holds_one_live_subscription_at_a_time() {
 
     insert_subscription(&mut connection, organization_id, "sub_first", "active")
         .await
-        .expect("the first subscription must insert");
+        .expect("the first plan subscription must insert");
     insert_subscription(&mut connection, organization_id, "sub_second", "trialing")
         .await
-        .expect_err("a second live subscription must be refused");
+        .expect_err("a second live plan subscription must be refused");
+
+    // Subscriptions paying for the organization's records sit beside the plan
+    // subscription, as many as it has records, but a record is paid for once.
+    let first_server = Uuid::new_v4();
+    let second_server = Uuid::new_v4();
+    insert_subject_subscription(
+        &mut connection,
+        organization_id,
+        "sub_server_1",
+        first_server,
+    )
+    .await
+    .expect("a subscription for a record lives beside the plan one");
+    insert_subject_subscription(
+        &mut connection,
+        organization_id,
+        "sub_server_2",
+        second_server,
+    )
+    .await
+    .expect("and so does one for a second record");
+    insert_subject_subscription(
+        &mut connection,
+        organization_id,
+        "sub_server_3",
+        first_server,
+    )
+    .await
+    .expect_err("a second live subscription for one record must be refused");
+
+    // A subscription buys a plan or a record, never both and never neither.
+    let refused = diesel::insert_into(subscriptions::table)
+        .values((
+            subscriptions::organization_id.eq(organization_id),
+            subscriptions::plan_key.eq("pro"),
+            subscriptions::subject_type.eq("Server"),
+            subscriptions::subject_id.eq(Uuid::new_v4()),
+            subscriptions::stripe_subscription_id.eq("sub_both"),
+            subscriptions::status.eq("active"),
+            subscriptions::billing_interval.eq("monthly"),
+        ))
+        .execute(&mut connection)
+        .await;
+    refused.expect_err("a subscription naming a plan and a record must be refused");
+    let refused = diesel::insert_into(subscriptions::table)
+        .values((
+            subscriptions::organization_id.eq(organization_id),
+            subscriptions::stripe_subscription_id.eq("sub_neither"),
+            subscriptions::status.eq("active"),
+            subscriptions::billing_interval.eq("monthly"),
+        ))
+        .execute(&mut connection)
+        .await;
+    refused.expect_err("a subscription naming neither must be refused");
 
     // A subscription that is over holds no slot, so the next one may start.
     diesel::update(subscriptions::table)
-        .filter(subscriptions::stripe_subscription_id.eq("sub_first"))
+        .filter(subscriptions::stripe_subscription_id.eq_any(["sub_first", "sub_server_1"]))
         .set(subscriptions::status.eq("canceled"))
         .execute(&mut connection)
         .await
-        .expect("the subscription must update");
+        .expect("the subscriptions must update");
     insert_subscription(&mut connection, organization_id, "sub_second", "trialing")
         .await
-        .expect("a new subscription may start once the old one ended");
+        .expect("a new plan subscription may start once the old one ended");
+    insert_subject_subscription(
+        &mut connection,
+        organization_id,
+        "sub_server_3",
+        first_server,
+    )
+    .await
+    .expect("and a record may be paid for again once its subscription ended");
 
-    let live: Value = json!(
+    let plan: Value = json!(
         anubis::billing::Subscription::current_for_organization(&mut connection, organization_id)
             .await
             .expect("the query must run")
             .map(|subscription| subscription.stripe_subscription_id)
     );
-    assert_eq!(live, json!("sub_second"));
+    assert_eq!(plan, json!("sub_second"));
+
+    let live: Vec<String> =
+        anubis::billing::Subscription::live_for_organization(&mut connection, organization_id)
+            .await
+            .expect("the query must run")
+            .into_iter()
+            .map(|subscription| subscription.stripe_subscription_id)
+            .collect();
+    assert_eq!(
+        live,
+        ["sub_second", "sub_server_2", "sub_server_3"],
+        "the plan subscription first, then the records oldest first",
+    );
 }

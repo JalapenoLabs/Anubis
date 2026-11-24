@@ -83,7 +83,7 @@ let worker = anubis::jobs::Worker::builder(pool.clone())
     .build();
 ```
 
-The ping runs on its own `notifications` queue and carries an empty payload. **Nothing durable rides the socket**: the frame says "look again", and the client reads `/account/notifications`. `anubis new` stamps the registration above into the application's `main.rs`. An application that removes it still delivers every notification, and its bells update on their next fetch instead of at once, but the ping rows then sit in the queue unclaimed, because a worker draws only from the queues it has handlers for.
+The ping runs on its own `notifications` queue and carries an empty payload. **Nothing durable rides the stream**: the event says "look again", and the client reads `/account/notifications`. The notice itself never travels as a payload, because the row is the only source of what it says. A browser that was disconnected hears the pings it missed from the [replay log](realtime.md#ids-and-replay) when it resumes, or a reset when the log no longer holds them, and refetches either way. `anubis new` stamps the registration above into the application's `main.rs`. An application that removes it still delivers every notification, and its bells update on their next fetch instead of at once, but the ping rows then sit in the queue unclaimed, because a worker draws only from the queues it has handlers for.
 
 ## The API
 
@@ -119,7 +119,7 @@ A notification id that belongs to somebody else answers `404`, exactly as one th
 />
 ```
 
-It is one component and one hook. `useNotifications` fetches the first page with SWR, subscribes to the recipient's channel under a `RealtimeProvider`, refetches on every ping, and exposes `markRead` and `markAllRead`. Pressing an entry marks it read and follows its `href`, which is what makes the badge mean "waiting for you" rather than "happened recently".
+It is one component and one hook. `useNotifications` fetches the first page with SWR, listens to the recipient's channel under a `RealtimeProvider`, refetches on every ping and every reset, and exposes `markRead` and `markAllRead`. Pressing an entry marks it read and follows its `href`, which is what makes the badge mean "waiting for you" rather than "happened recently".
 
 The package imports no i18next and no router, so the bell takes its four strings as `labels` (English defaults) and its navigation as `onNavigate`, the same shape the field components use. Without a `RealtimeProvider` above it the bell still works; it just waits for its next fetch rather than being pushed.
 

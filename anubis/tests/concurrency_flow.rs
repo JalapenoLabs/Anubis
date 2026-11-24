@@ -19,8 +19,9 @@ use std::time::Duration;
 use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
-    dead_jobs, jobs as jobs_table, organizations, role_grants, roles, sessions, team_memberships,
-    teams, user_avatars, webhook_deliveries, webhook_endpoints,
+    audit_events, dead_jobs, jobs as jobs_table, oauth_authorization_requests, oauth_device_codes,
+    oauth_grants, organizations, role_grants, roles, sessions, team_memberships, teams,
+    user_avatars, webhook_deliveries, webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -35,9 +36,10 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use support::oauth::{MetadataDocument, device_codes, mcp, poll, request_for_code};
 use support::{
     Harness, PASSWORD, TestDatabase, invitation_token, register, role_id, send, session_token,
-    socket,
+    sign_in, stream,
 };
 
 /// How many racers a test fires at once.
@@ -965,87 +967,88 @@ async fn a_role_deleted_while_its_invitation_is_claimed_leaves_no_grant() {
 // Realtime channels
 // ---------------------------------------------------------------------------
 
-/// Two sockets churning their subscriptions while events publish underneath
-/// them. Neither may deadlock, and neither may ever see a frame for a channel
-/// it is not entitled to: the socket that unsubscribed stops receiving, and
-/// the socket that never subscribed never started.
+/// Streams opening and closing while events publish underneath them. Nothing
+/// may deadlock, a stream that stays open hears every event on its channel in
+/// order, and no stream ever hears a channel it was not given: the churning
+/// streams carry only their own, and the steady one only its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sockets_churn_without_deadlocking_or_leaking_across_channels() {
+async fn streams_churn_without_deadlocking_or_leaking_across_channels() {
     let Some(database) = TestDatabase::create("concurrency_flow").await else {
         return;
     };
     let harness = Harness::boot(&database).await;
-    let address = harness.serve();
 
     let listener = register(&harness.router, "listener@example.com").await;
     let bystander = register(&harness.router, "bystander@example.com").await;
     let listener_id = signed_in_user(&harness, &listener).await;
     let bystander_id = signed_in_user(&harness, &bystander).await;
 
-    let mut attentive = socket::connect(address, &listener).await;
-    let mut standing_by = socket::connect(address, &bystander).await;
+    let mine = ChannelName::user(listener_id, "inbox").to_string();
+    let theirs = ChannelName::user(bystander_id, "inbox").to_string();
 
-    let mine = ChannelName::user(listener_id, "inbox");
-    let theirs = ChannelName::user(bystander_id, "inbox");
-
-    let reply = socket::subscribe(&mut attentive, &mine.to_string()).await;
-    assert_eq!(reply["type"], json!("subscribed"), "reply: {reply}");
-
-    // The bystander subscribes and immediately drops it again, while events
-    // publish the whole time.
-    let reply = socket::subscribe(&mut standing_by, &theirs.to_string()).await;
-    assert_eq!(reply["type"], json!("subscribed"), "reply: {reply}");
-    socket::send(
-        &mut standing_by,
-        &json!({ "type": "unsubscribe", "channel": theirs.to_string() }),
+    let mut attentive = stream::connect(
+        &harness.router,
+        &stream::path(&[&mine], &[]),
+        &listener,
+        None,
     )
     .await;
-    let reply = socket::next_frame(&mut standing_by).await;
-    assert_eq!(reply["type"], json!("unsubscribed"), "reply: {reply}");
+    let _live = attentive.opening().await;
 
-    for round in 0..RACERS {
+    // The bystander's streams open, read a little, and close again, over and
+    // over, on other tasks, while events publish to both channels.
+    let mut churners = Vec::with_capacity(RACERS);
+    for _churner in 0..RACERS {
+        let router = harness.router.clone();
+        let cookie = bystander.clone();
+        let path = stream::path(&[&theirs], &[]);
+        let theirs = theirs.clone();
+        churners.push(tokio::spawn(async move {
+            for _round in 0..RACERS {
+                let mut churning = stream::connect(&router, &path, &cookie, None).await;
+                let opening = churning.opening().await;
+                for frame in &opening.frames {
+                    assert_eq!(frame.channel(), theirs, "a stream heard another channel");
+                }
+            }
+        }));
+    }
+
+    for round in 0..RACERS * RACERS {
         harness
             .channels
-            .publish(&mine, "tick", json!({ "round": round }))
+            .publish(
+                &mine.parse().expect("a channel"),
+                "tick",
+                json!({ "round": round }),
+            )
             .await
             .expect("publishing must succeed");
         harness
             .channels
-            .publish(&theirs, "tick", json!({ "round": round }))
+            .publish(
+                &theirs.parse().expect("a channel"),
+                "tick",
+                json!({ "round": round }),
+            )
             .await
             .expect("publishing must succeed");
     }
-
-    // The listener receives its own channel's rounds, in order and complete.
-    for round in 0..RACERS {
-        let frame = socket::next_frame(&mut attentive).await;
-        assert_eq!(frame["type"], json!("event"), "frame: {frame}");
-        assert_eq!(frame["channel"], json!(mine.to_string()), "frame: {frame}");
-        assert_eq!(frame["payload"]["round"], json!(round), "frame: {frame}");
+    for churner in churners {
+        churner.await.expect("a churning stream must not panic");
     }
 
-    // A channel it never held cannot reach it, so the next thing this socket
-    // hears is its own subscription again rather than the bystander's.
-    harness
-        .channels
-        .publish(&mine, "last", json!({}))
-        .await
-        .expect("publishing must succeed");
-    let frame = socket::next_frame(&mut attentive).await;
-    assert_eq!(frame["event"], json!("last"), "frame: {frame}");
-
-    // The unsubscribed socket heard nothing at all, which it proves by
-    // answering the next request it is given rather than a queued event.
-    socket::send(
-        &mut standing_by,
-        &json!({ "type": "unsubscribe", "channel": theirs.to_string() }),
-    )
-    .await;
-    let frame = socket::next_frame(&mut standing_by).await;
-    assert_eq!(
-        frame,
-        json!({ "type": "unsubscribed", "channel": theirs.to_string() }),
-        "an unsubscribed socket received an event it should never have seen",
+    // The steady stream heard its own channel's rounds, in order and complete,
+    // and nothing else.
+    for round in 0..RACERS * RACERS {
+        let event = attentive.next().await;
+        assert_eq!(event.kind(), "event", "{event:?}");
+        assert_eq!(event.channel(), mine, "{event:?}");
+        assert_eq!(event.frame["payload"]["round"], json!(round), "{event:?}");
+    }
+    assert!(
+        attentive.stays_quiet(Duration::from_millis(200)).await,
+        "the steady stream heard something that was never its own",
     );
 }
 
@@ -1151,4 +1154,188 @@ async fn concurrent_emissions_deliver_exactly_the_committed_writes() {
         .await
         .expect("count must run");
     assert_eq!(queued, committed, "one delivery job per delivery row");
+}
+
+// ---------------------------------------------------------------------------
+// The device grant
+// ---------------------------------------------------------------------------
+
+/// Polls the token endpoint with a device code on a task of its own.
+fn spawn_poll(
+    harness: &Harness,
+    client_id: &str,
+    device_code: &str,
+) -> JoinHandle<(StatusCode, Value)> {
+    let router = harness.router.clone();
+    let client_id = client_id.to_owned();
+    let device_code = device_code.to_owned();
+    tokio::spawn(async move { poll(&router, &client_id, &device_code).await })
+}
+
+/// A program polling with several requests at once after the person approved
+/// gets one token set. A device code is exchanged once, and the polls behind
+/// it find it spent, which is how a copied device code looks, so the grant
+/// those tokens came from ends and the arrival is recorded once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn polls_racing_after_an_approval_mint_one_token_set() {
+    let Some(database) = TestDatabase::create("concurrency_device_polls").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let cookie = register(&harness.router, "device-polls@example.com").await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(&harness.router, &program.client_id, "").await;
+    let request_id = request_for_code(&harness.router, &cookie, &codes.user_code).await;
+    support::oauth::decide(&harness.router, &cookie, &request_id, true).await;
+
+    // Every poll queues behind the row lock the handlers take, so all of them
+    // are in flight before any one decides.
+    let mut blocker = harness.pool.get().await.expect("connection");
+    let racers = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            oauth_device_codes::table
+                .select(oauth_device_codes::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_racer| spawn_poll(&harness, &program.client_id, &codes.device_code))
+                .collect();
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(racers)
+        })
+        .await
+        .expect("holding the device code lock must succeed");
+    drop(blocker);
+
+    let mut answers = Vec::new();
+    for racer in racers {
+        answers.push(racer.await.expect("the poll task must not panic"));
+    }
+    let exchanged: Vec<&Value> = answers
+        .iter()
+        .filter(|(status, _body)| *status == StatusCode::OK)
+        .map(|(_status, body)| body)
+        .collect();
+    assert_eq!(exchanged.len(), 1, "one token set is minted: {answers:?}");
+    assert!(
+        answers
+            .iter()
+            .filter(|(status, _body)| *status != StatusCode::OK)
+            .all(|(_status, body)| body["error"] == "invalid_grant"),
+        "every other poll is refused: {answers:?}",
+    );
+
+    let access_token = exchanged[0]["access_token"]
+        .as_str()
+        .expect("an access token");
+    let (status, _headers, _answer) = mcp(
+        &harness.router,
+        Some(access_token),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}}}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the spent code's arrival ended the grant"
+    );
+    let mut connection = harness.pool.get().await.expect("connection");
+    let reused: i64 = audit_events::table
+        .filter(audit_events::action.eq(anubis::audit::OAUTH_DEVICE_CODE_REUSED))
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    assert_eq!(reused, 1, "the revocation is recorded once");
+}
+
+/// Two browsers signed in to one account entered one user code and decided at
+/// the same instant, one approving and one denying. The request they share is
+/// consumed once, so exactly one decision lands on the device and the program
+/// reads that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_and_a_refusal_of_one_device_decide_once() {
+    let Some(database) = TestDatabase::create("concurrency_device_decisions").await else {
+        return;
+    };
+    let harness = Harness::boot(&database).await;
+    let approver = register(&harness.router, "device-decider@example.com").await;
+    let refuser = sign_in(&harness.router, "device-decider@example.com").await;
+    let program = MetadataDocument::serve_device("Server agent");
+    let codes = device_codes(&harness.router, &program.client_id, "").await;
+    let request_id = request_for_code(&harness.router, &approver, &codes.user_code).await;
+    let seen_by_refuser = request_for_code(&harness.router, &refuser, &codes.user_code).await;
+    assert_eq!(request_id, seen_by_refuser, "one code names one request");
+    let request_uuid: Uuid = request_id.parse().expect("a request id is a UUID");
+
+    let decide = |cookie: &str, approve: bool| {
+        let router = harness.router.clone();
+        let cookie = cookie.to_owned();
+        let path = format!("/oauth/requests/{request_id}");
+        tokio::spawn(async move {
+            let (status, _headers, _body) = send(
+                &router,
+                "POST",
+                &path,
+                Some(&json!({ "approve": approve })),
+                Some(&cookie),
+            )
+            .await;
+            status
+        })
+    };
+    let mut blocker = harness.pool.get().await.expect("connection");
+    let racing = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            oauth_authorization_requests::table
+                .find(request_uuid)
+                .select(oauth_authorization_requests::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let racing = (decide(&approver, true), decide(&refuser, false));
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(racing)
+        })
+        .await
+        .expect("holding the request lock must succeed");
+    drop(blocker);
+
+    let approval = racing.0.await.expect("the approval task must not panic");
+    let refusal = racing.1.await.expect("the refusal task must not panic");
+    let outcomes = [approval, refusal];
+    assert_eq!(
+        outcomes.iter().filter(|status| status.is_success()).count(),
+        1,
+        "exactly one decision lands: {outcomes:?}",
+    );
+    assert!(
+        outcomes.contains(&StatusCode::NOT_FOUND),
+        "the other finds the request gone: {outcomes:?}",
+    );
+
+    let mut connection = harness.pool.get().await.expect("connection");
+    let grants: i64 = oauth_grants::table
+        .count()
+        .get_result(&mut connection)
+        .await
+        .expect("count must run");
+    let (status, body) = poll(&harness.router, &program.client_id, &codes.device_code).await;
+    if approval.is_success() {
+        assert_eq!(grants, 1);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the approval is what the program reads: {body}"
+        );
+    } else {
+        assert_eq!(grants, 0, "a refusal grants nothing");
+        assert_eq!(
+            body["error"], "access_denied",
+            "the refusal is what it reads: {body}"
+        );
+    }
 }

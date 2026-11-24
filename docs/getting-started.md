@@ -554,7 +554,10 @@ plans:
 ```
 
 Exactly one plan sells no prices, and that is the free plan: an organization
-with no subscription row is on it, so plan resolution is always total. The
+with no plan subscription is on it, so plan resolution is always total. An
+application that sells a subscription per record (a server, a workspace) starts
+and changes those through `anubis::billing::Subscriptions`; see
+[billing.md](billing.md#subscriptions-per-record). The
 billing screen is at `/organizations/:organizationId/billing`, linked from
 organization settings.
 
@@ -687,7 +690,8 @@ The image bakes the deployment shape and none of its secrets:
 | `ANUBIS_INITIAL_ADMIN_EMAIL`, `ANUBIS_INITIAL_ADMIN_PASSWORD` | to appoint an operator | Grants that address the platform `operator` role at every boot, creating the account once. A grant, never a password reset |
 | `SMTP_URL`, `MAIL_FROM` | to send real email | Otherwise mail goes to the log |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | to charge money | Otherwise every organization is on the free plan |
-| `REDIS_URL` | for more than one instance | Fans realtime channels out across instances |
+| `REDIS_URL` | for more than one instance | Moves realtime's event sequence, replay buffers, and fanout into Redis, shared by every instance |
+| `SESSION_STORE` | to keep sessions in Redis | `redis` keeps them in the Redis `REDIS_URL` names, which must then persist; unset, they stay in Postgres. See [sessions.md](sessions.md) |
 | `CORS_ALLOWED_ORIGINS` | for cross-origin API callers | Exact origins, comma separated |
 | `TRUSTED_PROXY_HEADER` | behind a proxy | Names the header carrying the client address |
 

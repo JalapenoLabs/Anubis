@@ -26,10 +26,10 @@ mod database;
 mod harness;
 pub mod oauth;
 mod passkey;
-pub mod socket;
+pub mod stream;
 
 pub use database::TestDatabase;
 pub use harness::{
-    Harness, PASSWORD, invitation_token, register, role_id, send, serve, session_token,
+    Harness, PASSWORD, invitation_token, register, role_id, send, serve, session_token, sign_in,
 };
 pub use passkey::SoftAuthenticator;

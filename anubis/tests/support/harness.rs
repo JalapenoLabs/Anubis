@@ -91,13 +91,28 @@ impl Harness {
         Self::boot_with(database, Some(plans)).await
     }
 
+    /// Composes the same routers over a realtime service built elsewhere.
+    ///
+    /// For the realtime suites, which run every narrative against both
+    /// backends, and boot two harnesses over one Redis to stand in for two
+    /// instances of one application.
+    ///
+    /// # Panics
+    /// Panics for the same reasons [`Harness::boot`] does.
+    pub async fn boot_with_channels(database: &TestDatabase, channels: Channels) -> Self {
+        Self::compose(database, None, channels).await
+    }
+
     async fn boot_with(database: &TestDatabase, plans: Option<PlanSet>) -> Self {
+        Self::compose(database, plans, Channels::in_process()).await
+    }
+
+    async fn compose(database: &TestDatabase, plans: Option<PlanSet>, channels: Channels) -> Self {
         let pool = database.pool().await;
 
         let config = Self::config();
         let roles = RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
         let (mailer, outbox) = anubis::mail::Mailer::test();
-        let channels = Channels::in_process();
         let rate_limit = anubis::rate_limit::RateLimiter::new(&config.rate_limit);
         let authorization =
             anubis::oauth_server::Server::new(pool.clone(), &config, Self::scopes());
@@ -230,10 +245,10 @@ impl Harness {
 
 /// Serves a router on a loopback port and returns its address.
 ///
-/// Only a websocket and a benchmark need this: everything else drives the
-/// router directly with `oneshot`, which is faster and needs no port. The
-/// server runs with connect info, as production does, so the rate limiter can
-/// charge a caller; it stops when the test's runtime does.
+/// Only a benchmark needs this: everything else, event streams included,
+/// drives the router directly with `oneshot`, which is faster and needs no
+/// port. The server runs with connect info, as production does, so the rate
+/// limiter can charge a caller; it stops when the test's runtime does.
 ///
 /// Must be called from inside a runtime, which every `#[tokio::test]` is.
 ///
@@ -339,6 +354,19 @@ pub async fn register(router: &Router, email: &str) -> String {
     let (status, headers, body) =
         send(router, "POST", "/auth/register", Some(&credentials), None).await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    session_token(&headers)
+}
+
+/// Signs an existing account in again, answering the new session's token: a
+/// second browser, signed in to the same account.
+///
+/// # Panics
+/// Panics when the sign-in is refused.
+pub async fn sign_in(router: &Router, email: &str) -> String {
+    let credentials = json!({ "email": email, "password": PASSWORD });
+    let (status, headers, body) =
+        send(router, "POST", "/auth/login", Some(&credentials), None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
     session_token(&headers)
 }
 

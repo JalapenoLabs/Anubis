@@ -265,7 +265,7 @@ Open `config/billing.yml`, then the billing screen at
 **SHOT**: the plans grid beside the YAML that produced it.
 
 > "Plans are configuration, not rows. Exactly one plan sells no prices, and that
-> is the free plan, which is what an organization with no subscription row is
+> is the free plan, which is what an organization with no plan subscription is
 > on, so plan resolution is always total. Stripe Checkout takes the purchase and
 > the Stripe portal takes every change after it. This framework keeps only the
 > projection it has to authorize from."

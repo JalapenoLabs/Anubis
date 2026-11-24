@@ -16,10 +16,10 @@
 //!     .route("/register", post(register).layer(limiter.layer(Budget::Registration)))
 //! ```
 //!
-//! Budgets keyed by something inside the request body, today only
-//! [`Budget::EmailPerRecipient`], cannot be charged by a layer that has not
-//! read the body, so handlers charge those themselves with
-//! [`RateLimiter::check_recipient`].
+//! Budgets keyed by something a layer cannot see, the email address inside a
+//! request body ([`Budget::EmailPerRecipient`]) or the signed-in account
+//! ([`Budget::UserCodePerAccount`]), are charged by their handlers with
+//! [`RateLimiter::check_recipient`] and the crate's own user-code check.
 //!
 //! # The algorithm
 //!
@@ -151,6 +151,21 @@ const AUTHORIZATIONS: u32 = 30;
 /// The window [`AUTHORIZATIONS`] is spent over.
 const AUTHORIZATION_PERIOD: Duration = Duration::from_hours(1);
 
+/// Device user codes one client address, or one account, may enter per
+/// [`USER_CODE_PERIOD`].
+///
+/// A person enters one code per device they connect, and a mistyped one or
+/// two more, so thirty an hour covers setting up a rack of machines. A user
+/// code is eight characters from twenty letters, about 34 bits, so a guesser
+/// held to thirty an hour per account (code entry requires one) and per
+/// address finds a live code with odds that stay negligible however many
+/// codes are waiting. RFC 8628 section 5.1 asks for exactly this pairing of
+/// entropy and limiting.
+const USER_CODE_ENTRIES: u32 = 30;
+
+/// The window [`USER_CODE_ENTRIES`] is spent over.
+const USER_CODE_PERIOD: Duration = Duration::from_hours(1);
+
 /// How many keys the limiter tracks before it starts evicting.
 ///
 /// At roughly a hundred bytes per key this bounds the map at a few megabytes,
@@ -198,9 +213,19 @@ pub enum Budget {
     /// Table spam: OAuth Dynamic Client Registration. See
     /// [`crate::oauth_server`].
     ClientRegistration,
-    /// Fetch amplification: OAuth authorization requests, which may fetch a
-    /// client's metadata document. See [`crate::oauth_server`].
+    /// Fetch amplification: OAuth authorization requests and device
+    /// authorizations, which may fetch a client's metadata document. See
+    /// [`crate::oauth_server`].
     Authorization,
+    /// Code guessing measured per client: entering a device's user code.
+    UserCodePerClient,
+    /// Code guessing measured per signed-in account, whatever address it uses.
+    ///
+    /// Charged by the framework's code-entry handler, which knows the account.
+    /// Through [`RateLimiter::layer`] it would be keyed by client address,
+    /// which is [`Budget::UserCodePerClient`]'s job, so it is not one for a
+    /// route of an application's own.
+    UserCodePerAccount,
 }
 
 impl Budget {
@@ -215,6 +240,7 @@ impl Budget {
             Self::ErrorReports => ERROR_REPORTS,
             Self::ClientRegistration => CLIENT_REGISTRATIONS,
             Self::Authorization => AUTHORIZATIONS,
+            Self::UserCodePerClient | Self::UserCodePerAccount => USER_CODE_ENTRIES,
         }
     }
 
@@ -228,6 +254,7 @@ impl Budget {
             Self::ErrorReports => ERROR_REPORT_PERIOD,
             Self::ClientRegistration => CLIENT_REGISTRATION_PERIOD,
             Self::Authorization => AUTHORIZATION_PERIOD,
+            Self::UserCodePerClient | Self::UserCodePerAccount => USER_CODE_PERIOD,
         }
     }
 
@@ -247,6 +274,8 @@ impl Budget {
             Self::ErrorReports => "error-reports",
             Self::ClientRegistration => "client-registration",
             Self::Authorization => "authorization",
+            Self::UserCodePerClient => "user-code-client",
+            Self::UserCodePerAccount => "user-code-account",
         }
     }
 }
@@ -317,6 +346,22 @@ impl RateLimiter {
         self.check(
             Budget::EmailPerRecipient,
             &crate::auth::token::hash(email),
+            Instant::now(),
+        )
+    }
+
+    /// Charges one device user-code entry against the account that made it.
+    ///
+    /// Entering a code requires a session, so the account is the one key a
+    /// guesser rotating client addresses cannot rotate. Charged before the code
+    /// is looked up, so the answer never depends on whether it was real.
+    ///
+    /// # Errors
+    /// Returns a `429` [`ApiError`] carrying the wait once the budget is spent.
+    pub(crate) fn check_user_code_entry(&self, account: uuid::Uuid) -> Result<(), ApiError> {
+        self.check(
+            Budget::UserCodePerAccount,
+            &account.to_string(),
             Instant::now(),
         )
     }

@@ -68,6 +68,8 @@ The framework implements the convention once: handlers take `anubis::http::ListP
 
 Every response, on every route, carries an `x-request-id` and the framework's security headers, and every request runs under a timeout. Cross-origin access is off until `CORS_ALLOWED_ORIGINS` names exact origins; the `/api/v1` bearer-token surface is what that exists for, since session cookies stay same-origin. [The server](server.md) covers the whole serve path, the headers, and the liveness and readiness probes.
 
+A route may also answer with a Server-Sent Events stream of its own, such as a record's log tail under `/api/v1`, through `anubis::realtime::Channels::stream` and the `Subscriber` extractor. Such a stream is session-authenticated, because a browser is what reads it, and it resumes, heartbeats, and drains exactly as `/realtime` does; [realtime.md](realtime.md#serving-a-stream-of-your-own) has the handler.
+
 ## Versioning
 
 `/api/v1` is stable once users build against it. A breaking change means minting `/api/v2` handlers and serializers while `/api/v1` continues to serve frozen behavior. The scaffolder always targets the newest version.
@@ -80,11 +82,11 @@ Handlers and serializers register with utoipa, producing an OpenAPI 3.1 document
 
 ## Authentication
 
-- **Browser**: Postgres-backed cookie sessions. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the database stores only the token's SHA-256, so a leaked database yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor.
+- **Browser**: cookie sessions, kept in Postgres by default or in Redis with `SESSION_STORE=redis`, behaving identically in either. The cookie carries an opaque 256-bit token (`HttpOnly`, `SameSite=Lax`, `Secure` in production); the store keeps only the token's SHA-256, so a leaked database or Redis snapshot yields no usable sessions. Passwords hash with argon2id. Handlers require sign-in via the `CurrentUser` extractor. See [sessions.md](sessions.md).
 - **Sign-in methods**: password; passwordless emailed 6-digit codes (10-minute life, attempt-limited, enumeration-safe); and passkeys (WebAuthn discoverable credentials, password-manager-first, cross-platform authenticators welcome).
 - **Second factor**: TOTP (authenticator apps) with QR enrollment and single-use recovery codes. When confirmed, password and email-code login answer a 5-minute challenge instead of a session; a passkey is multi-factor by construction and bypasses the challenge.
 - **OAuth**: OpenID Connect providers, one line of setup each. See [OAuth sign-in](#oauth-sign-in) below.
-- **Connected clients**: the other direction, a program such as Claude Code acting as the person through the MCP endpoint, with tokens from the framework's own OAuth 2.1 authorization server. See [oauth-server.md](oauth-server.md) and [mcp.md](mcp.md).
+- **Connected clients**: the other direction, a program such as Claude Code acting as the person through the MCP endpoint, with tokens from the framework's own OAuth 2.1 authorization server, and a program on a machine with no browser signing in with a device code. See [oauth-server.md](oauth-server.md) and [mcp.md](mcp.md).
 - **Secrets at rest**: recovery codes hash like every other token. A TOTP seed must be read back to compute the expected code, so it is encrypted instead, with AES-256-GCM under the application key in `ANUBIS_SECRET_KEY` (base64 for exactly 32 bytes, required in production; development and test fall back to a public built-in key and warn at startup). Stored values are versioned and self-describing, `v1:<nonce>:<ciphertext>`, so a future scheme can be added without a migration. Mint a key with `anubis secret generate`. A seed that no longer decrypts, because the key rotated, is discarded: the account drops back to single-factor login and the user enrolls again. Rotating therefore un-enrolls every second factor at once, by design; see [key rotation](architecture.md#secrets-at-rest-and-key-rotation). The same `anubis::auth::secret_box` module covers any later secret that needs recoverable storage.
 - **Account management routes**: profile (names, time zone, locale), avatar upload/serve/delete, signed-in password and email change, session listing and revocation, and password-confirmed account deletion.
 - **Invitations from an operator**: `POST /auth/invitations/lookup` (`{token}`) answers `{email, expires_at}` for a live link, and `POST /auth/invitations/accept` (`{token, password, time_zone?, locale?}`) creates the invited account with its address verified and signs it in, answering `201` with the user like registration does. Every unusable token, whether unknown, used, revoked, or expired, answers the same `400` with the same sentence; an address that gained an account after the invitation went out answers `409`. The operator's half is `anubis::platform::Accounts`, behind the application's own routes. See [tenancy.md](tenancy.md#bringing-people-in).
@@ -121,7 +123,9 @@ Tokens are attempt-limited individually, but the endpoints that accept them woul
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /auth/verify-email/request` | 20 per hour | Client address |
 | `POST /auth/password-reset/request`, `POST /auth/email-code/request`, `POST /tenancy/invitations` | 5 per hour | Target email address |
 | `POST /oauth/register` | 10 per hour | Client address |
-| `GET /oauth/authorize` | 30 per hour | Client address |
+| `GET /oauth/authorize`, `POST /oauth/device_authorization` | 30 per hour, one balance across both | Client address |
+| `POST /oauth/device_verification` | 30 per hour | Client address |
+| `POST /oauth/device_verification` | 30 per hour | Signed-in account |
 
 Each budget is a burst followed by a steady refill: ten credential attempts are available at once, then one more every six seconds. The confirm endpoints are absent on purpose, because guessing a 256-bit token is not an attack a budget improves on. The invitation endpoints carry one anyway, because accepting hashes a password, which is the cost a stranger must not get at network speed.
 

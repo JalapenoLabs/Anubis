@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::auth::password::Hasher;
-use crate::auth::{User, session};
+use crate::auth::{User, token};
 use crate::config::AppConfig;
 use crate::guard::PlatformMember;
 use crate::http::ApiError;
@@ -98,11 +98,11 @@ impl Accounts {
     /// Gives an account a generated password it must replace at its next sign-in.
     ///
     /// In one transaction, holding the account: sets the password, marks the
-    /// account as required to change it, deletes every session it has, revokes
-    /// every OAuth grant it gave a connected client (each recorded as
-    /// `oauth.revoked` by the operator), and records
-    /// [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
-    /// because the fact is the whole of what an auditor needs. The account
+    /// account as required to change it, revokes every OAuth grant it gave a
+    /// connected client (each recorded as `oauth.revoked` by the operator),
+    /// records [`audit::PASSWORD_TEMPORARY_SET`] with an empty change set,
+    /// because the fact is the whole of what an auditor needs, and ends every
+    /// session it has. The account
     /// signs in with the returned password by any path a password reaches,
     /// and a confirmed second factor is still asked for.
     ///
@@ -120,8 +120,8 @@ impl Accounts {
         let password = TemporaryPassword::generate();
         let password_hash = self.hasher.hash(password.reveal().to_owned()).await?;
 
-        connection
-            .transaction::<(), ApiError, _>(async |transaction| {
+        let revocation = connection
+            .transaction::<_, ApiError, _>(async |transaction| {
                 let user: User = users::table
                     .find(user_id)
                     .select(User::as_select())
@@ -141,8 +141,7 @@ impl Accounts {
 
                 // Whoever holds a session for this account now may be the
                 // reason it needed rescuing, and so may a program somebody
-                // connected in its name.
-                session::delete_all_for_user(transaction, user.id).await?;
+                // connected in its name. The sessions end last, below.
                 crate::oauth_server::revoke_every_grant(
                     transaction,
                     &context.by(&operator.user),
@@ -163,9 +162,17 @@ impl Accounts {
                         .label(&label),
                 )
                 .await?;
-                Ok(())
+
+                // The last statement, so the sessions end exactly when the
+                // temporary password commits. The store is the one the
+                // operator's own request was authenticated against, which is
+                // the one the configuration chose.
+                Ok(operator.sessions().revoke_all(transaction, user.id).await?)
             })
             .await?;
+
+        // After the commit, so a slow store never holds the account's row.
+        operator.sessions().sweep(revocation).await;
 
         Ok(password)
     }
@@ -198,35 +205,11 @@ impl TemporaryPassword {
     /// Panics when the operating system has no random source, which is a
     /// broken host rather than a condition anything could recover from.
     fn generate() -> Self {
-        // The largest multiple of the alphabet's size that fits in a byte;
-        // a byte at or above it would favour the first few characters.
-        const REJECTION_THRESHOLD: u8 = 248;
-
-        let length = Self::GROUPS * Self::GROUP_LENGTH;
-        let mut password = Zeroizing::new(String::with_capacity(length + Self::GROUPS));
-        let mut drawn = 0;
-        // One draw usually covers the whole password; a draw whose bytes were
-        // mostly rejected is simply followed by another.
-        let mut entropy = Zeroizing::new([0u8; 32]);
-        while drawn < length {
-            getrandom::fill(entropy.as_mut()).expect("the OS random source must be available");
-            for &byte in entropy.iter() {
-                if drawn == length {
-                    break;
-                }
-                if byte >= REJECTION_THRESHOLD {
-                    continue;
-                }
-
-                if drawn > 0 && drawn % Self::GROUP_LENGTH == 0 {
-                    password.push('-');
-                }
-                let index = usize::from(byte) % Self::ALPHABET.len();
-                password.push(char::from(Self::ALPHABET[index]));
-                drawn += 1;
-            }
-        }
-        Self(password)
+        Self(token::readable(
+            Self::ALPHABET,
+            Self::GROUPS,
+            Self::GROUP_LENGTH,
+        ))
     }
 
     /// The password itself, for the one response that hands it over.

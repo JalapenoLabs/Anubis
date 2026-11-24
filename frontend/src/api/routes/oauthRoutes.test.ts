@@ -59,8 +59,7 @@ describe('getAuthorizationRequest', () => {
     const { routes, sent } = recordingRoutes({
       id: 'request-1',
       client: WIRE_CLIENT,
-      redirect_host: 'localhost',
-      redirect_is_loopback: true,
+      delivery: { kind: 'redirect', host: 'localhost', is_loopback: true },
       scopes: [{ name: 'samples:read', description: 'Browse samples' }],
       expires_at: '2026-10-06T00:10:00Z',
     })
@@ -77,11 +76,39 @@ describe('getAuthorizationRequest', () => {
         verifiedHost: 'claude.ai',
         clientUri: 'https://claude.ai',
       },
-      redirectHost: 'localhost',
-      redirectIsLoopback: true,
+      delivery: { kind: 'redirect', host: 'localhost', isLoopback: true },
       scopes: [{ name: 'samples:read', description: 'Browse samples' }],
       expiresAt: '2026-10-06T00:10:00Z',
     })
+  })
+
+  it('should read a device request as one with nowhere to redirect', async () => {
+    const { routes } = recordingRoutes({
+      id: 'request-2',
+      client: { ...WIRE_CLIENT, name: 'Server agent' },
+      delivery: { kind: 'device' },
+      scopes: [],
+      expires_at: '2026-10-06T00:10:00Z',
+    })
+
+    const request = await routes.getAuthorizationRequest('request-2')
+
+    expect(request.delivery).toEqual({ kind: 'device' })
+  })
+})
+
+describe('verifyUserCode', () => {
+  it('should send the code as typed and answer the request it names', async () => {
+    const { routes, sent } = recordingRoutes({ request_id: 'request-2' })
+
+    const requestId = await routes.verifyUserCode('wdjb-mjht')
+
+    expect(sent[0]).toEqual({
+      method: 'POST',
+      url: 'http://localhost/oauth/device_verification',
+      body: { user_code: 'wdjb-mjht' },
+    })
+    expect(requestId).toBe('request-2')
   })
 })
 

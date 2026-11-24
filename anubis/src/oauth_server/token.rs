@@ -4,7 +4,8 @@
 //! 7009 require and which Claude sends; a JSON-only endpoint would refuse every
 //! real client. Clients are public, so a client authenticates by naming its
 //! `client_id` and by holding what only it could hold: the PKCE verifier for a
-//! code, and the current refresh token for a refresh.
+//! code, the current refresh token for a refresh, and the device code for the
+//! device grant, whose polling lives in [`super::device`].
 //!
 //! # Spending a code or a refresh token
 //!
@@ -34,9 +35,10 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::auth::token;
+use crate::oauth_server::client::GrantType;
 use crate::oauth_server::error::OauthError;
 use crate::oauth_server::grant::{self, ACCESS_TOKEN_TTL, Grant, IssuedTokens};
-use crate::oauth_server::{Server, pkce};
+use crate::oauth_server::{Server, device, pkce};
 use crate::schema::{
     oauth_access_tokens, oauth_authorization_codes, oauth_clients, oauth_grants,
     oauth_refresh_tokens,
@@ -52,6 +54,7 @@ pub(crate) struct TokenForm {
     redirect_uri: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    pub(crate) device_code: Option<String>,
     resource: Option<String>,
     scope: Option<String>,
 }
@@ -116,12 +119,17 @@ pub(crate) async fn exchange(
     // is a refusal. Outcomes are values here, never the transaction's error.
     let outcome = connection
         .transaction::<_, diesel::result::Error, _>(async |transaction| {
-            match form.grant_type.as_deref() {
-                Some("authorization_code") => {
+            match form.grant_type.as_deref().and_then(GrantType::parse) {
+                Some(GrantType::AuthorizationCode) => {
                     exchange_code(transaction, &context, client_id, &form).await
                 }
-                Some("refresh_token") => refresh(transaction, &context, client_id, &form).await,
-                _ => Ok(Err(OauthError::unsupported_grant_type())),
+                Some(GrantType::RefreshToken) => {
+                    refresh(transaction, &context, client_id, &form).await
+                }
+                Some(GrantType::DeviceCode) => {
+                    device::exchange(transaction, &context, client_id, &form).await
+                }
+                None => Ok(Err(OauthError::unsupported_grant_type())),
             }
         })
         .await??;
@@ -133,7 +141,7 @@ pub(crate) async fn exchange(
 }
 
 /// What one exchange produced: tokens, or the refusal to answer with.
-type Outcome = Result<IssuedTokens, OauthError>;
+pub(crate) type Outcome = Result<IssuedTokens, OauthError>;
 
 #[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = oauth_authorization_codes)]
@@ -183,14 +191,15 @@ async fn exchange_code(
             .await
             .optional()?;
         if let Some(grant_id) = replayed {
-            revoke_for_reuse(connection, context, grant_id, audit::OAUTH_CODE_REUSED).await?;
+            grant::revoke_for_reuse(connection, context, grant_id, audit::OAUTH_CODE_REUSED)
+                .await?;
         }
         return Ok(Err(OauthError::invalid_grant(
             "The authorization code is invalid or was already used.",
         )));
     };
 
-    let Some((grant, owner)) = live_grant_with_client(connection, spent.grant_id).await? else {
+    let Some((grant, owner)) = grant::live_with_client(connection, spent.grant_id).await? else {
         return Ok(Err(OauthError::invalid_grant(
             "The authorization code is invalid or was already used.",
         )));
@@ -279,14 +288,15 @@ async fn refresh(
             .await
             .optional()?;
         if let Some(grant_id) = rotated_away {
-            revoke_for_reuse(connection, context, grant_id, audit::OAUTH_REFRESH_REUSED).await?;
+            grant::revoke_for_reuse(connection, context, grant_id, audit::OAUTH_REFRESH_REUSED)
+                .await?;
         }
         return Ok(Err(OauthError::invalid_grant(
             "The refresh token is invalid, expired, or was already used.",
         )));
     };
 
-    let Some((grant, owner)) = live_grant_with_client(connection, grant_id).await? else {
+    let Some((grant, owner)) = grant::live_with_client(connection, grant_id).await? else {
         return Ok(Err(OauthError::invalid_grant(
             "The refresh token is invalid, expired, or was already used.",
         )));
@@ -308,50 +318,6 @@ async fn refresh(
     };
 
     Ok(Ok(grant::issue_tokens(connection, &grant, scopes).await?))
-}
-
-/// A live grant and the `client_id` string of the client it belongs to.
-async fn live_grant_with_client(
-    connection: &mut AsyncPgConnection,
-    grant_id: Uuid,
-) -> QueryResult<Option<(Grant, String)>> {
-    oauth_grants::table
-        .inner_join(oauth_clients::table)
-        .filter(oauth_grants::id.eq(grant_id))
-        .filter(oauth_grants::revoked_at.is_null())
-        .select((Grant::as_select(), oauth_clients::client_id))
-        .first(connection)
-        .await
-        .optional()
-}
-
-/// Revokes a grant whose code or refresh token was presented twice.
-async fn revoke_for_reuse(
-    connection: &mut AsyncPgConnection,
-    context: &audit::Context,
-    grant_id: Uuid,
-    action: &str,
-) -> QueryResult<()> {
-    let found: Option<(Grant, String)> = oauth_grants::table
-        .inner_join(oauth_clients::table)
-        .filter(oauth_grants::id.eq(grant_id))
-        .select((Grant::as_select(), oauth_clients::name))
-        .first(connection)
-        .await
-        .optional()?;
-    let Some((reused, client_name)) = found else {
-        return Ok(());
-    };
-
-    if grant::revoke(connection, grant_id).await? {
-        tracing::warn!(
-            oauth.grant_id = %grant_id,
-            oauth.action = action,
-            "a spent credential was presented again; grant {{oauth.grant_id}} is revoked",
-        );
-        grant::record(connection, context, action, &reused, &client_name).await?;
-    }
-    Ok(())
 }
 
 /// A revocation request, RFC 7009 section 2.1.

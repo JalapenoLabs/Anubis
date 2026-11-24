@@ -16,8 +16,9 @@
 //! - Redirects are not followed, only a `200` is a document, and at most five
 //!   kilobytes are read.
 //! - The document's `client_id` must be the URL exactly, it must name a
-//!   client and at least one redirect URI this server would register, and it
-//!   must not describe a client that authenticates with a shared secret.
+//!   client, a grant this server supports, and (for the authorization code
+//!   flow) at least one redirect URI this server would register, and it must
+//!   not describe a client that authenticates with a shared secret.
 //!
 //! The draft lets a deployment for development or testing fetch from loopback
 //! addresses. Outside production this module does, over `http` too, which is
@@ -31,6 +32,7 @@ use reqwest::header::CACHE_CONTROL;
 use serde::Deserialize;
 use url::Url;
 
+use crate::oauth_server::client::{self, GrantType};
 use crate::oauth_server::redirect;
 
 /// How long a fetch may take, resolving the host and reading the body included.
@@ -68,6 +70,8 @@ pub(crate) struct ClientDocument {
     pub(crate) name: String,
     pub(crate) client_uri: Option<String>,
     pub(crate) redirect_uris: Vec<String>,
+    /// The grants this server supports among those the document declares.
+    pub(crate) grant_types: Vec<GrantType>,
     /// When the document should be fetched again.
     pub(crate) refresh_after: DateTime<Utc>,
 }
@@ -220,6 +224,7 @@ struct RawDocument {
     client_uri: Option<String>,
     #[serde(default)]
     redirect_uris: Vec<String>,
+    grant_types: Option<Vec<String>>,
     token_endpoint_auth_method: Option<String>,
     client_secret: Option<serde_json::Value>,
 }
@@ -257,7 +262,20 @@ fn check_document(
         return Err("the client's name is longer than 100 characters");
     }
 
-    if document.redirect_uris.is_empty() || document.redirect_uris.len() > MAX_REDIRECT_URIS {
+    // A document describes its client to every server it meets, so grants
+    // this one does not support are passed over rather than refused; one it
+    // does support has to be among them.
+    let grant_types = client::supported_grants(document.grant_types.as_deref());
+    if !client::can_connect(&grant_types) {
+        return Err("the client's metadata document declares no grant this server supports");
+    }
+
+    // Only the authorization code flow redirects, so only its clients must
+    // name somewhere to be sent.
+    let needs_redirect = grant_types.contains(&GrantType::AuthorizationCode);
+    if (needs_redirect && document.redirect_uris.is_empty())
+        || document.redirect_uris.len() > MAX_REDIRECT_URIS
+    {
         return Err("the client's metadata document must name 1 to 10 redirect URIs");
     }
     if document
@@ -275,6 +293,7 @@ fn check_document(
             .client_uri
             .filter(|uri| uri.starts_with("https://") && Url::parse(uri).is_ok()),
         redirect_uris: document.redirect_uris,
+        grant_types,
         refresh_after,
     })
 }
@@ -362,8 +381,8 @@ mod tests {
     use reqwest::header::HeaderValue;
 
     use super::{
-        DEFAULT_CACHE, FETCH_TIMEOUT, Fetcher, MAX_CACHE, MIN_CACHE, RawDocument, cache_lifetime,
-        check_document, is_public,
+        DEFAULT_CACHE, FETCH_TIMEOUT, Fetcher, GrantType, MAX_CACHE, MIN_CACHE, RawDocument,
+        cache_lifetime, check_document, is_public,
     };
 
     const CLAUDE_CODE: &str = "https://claude.ai/oauth/claude-code-client-metadata";
@@ -377,6 +396,10 @@ mod tests {
                 "http://localhost/callback".to_owned(),
                 "http://127.0.0.1/callback".to_owned(),
             ],
+            grant_types: Some(vec![
+                "authorization_code".to_owned(),
+                "refresh_token".to_owned(),
+            ]),
             token_endpoint_auth_method: Some("none".to_owned()),
             client_secret: None,
         }
@@ -389,6 +412,37 @@ mod tests {
 
         assert_eq!(checked.name, "Claude Code");
         assert_eq!(checked.redirect_uris.len(), 2);
+        assert_eq!(
+            checked.grant_types,
+            [GrantType::AuthorizationCode, GrantType::RefreshToken],
+        );
+    }
+
+    #[test]
+    fn a_device_client_names_no_redirect_and_ignores_grants_it_cannot_use_here() {
+        let mut device = document(CLAUDE_CODE);
+        device.redirect_uris = Vec::new();
+        device.grant_types = Some(vec![
+            "urn:ietf:params:oauth:grant-type:device_code".to_owned(),
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
+        ]);
+
+        let checked = check_document(CLAUDE_CODE, device, Utc::now())
+            .expect("a device client needs no redirect URI");
+        assert_eq!(
+            checked.grant_types,
+            [GrantType::DeviceCode, GrantType::RefreshToken],
+        );
+
+        let mut nothing_usable = document(CLAUDE_CODE);
+        nothing_usable.grant_types = Some(vec!["client_credentials".to_owned()]);
+        check_document(CLAUDE_CODE, nothing_usable, Utc::now())
+            .expect_err("a document must declare a grant this server supports");
+
+        let mut code_without_redirect = document(CLAUDE_CODE);
+        code_without_redirect.redirect_uris = Vec::new();
+        check_document(CLAUDE_CODE, code_without_redirect, Utc::now())
+            .expect_err("the authorization code flow needs a redirect URI");
     }
 
     #[test]

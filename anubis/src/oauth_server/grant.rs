@@ -1,11 +1,12 @@
 //! Grants, the tokens that descend from them, and ending both.
 //!
 //! A grant is one person's consent for one client, and it is the unit
-//! everything else hangs off: the authorization code that starts it, every
-//! access token, and the refresh-token family. Revoking a grant is therefore
-//! the one way a connection ends, whoever ends it: the person from their
-//! account screen, the client through `POST /oauth/revoke`, or this server on
-//! finding a spent code or a rotated refresh token presented a second time.
+//! everything else hangs off: the authorization code or device code that
+//! starts it, every access token, and the refresh-token family. Revoking a
+//! grant is therefore the one way a connection ends, whoever ends it: the
+//! person from their account screen, the client through `POST /oauth/revoke`,
+//! or this server on finding a spent code or a rotated refresh token presented
+//! a second time.
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
@@ -17,8 +18,8 @@ use crate::audit;
 use crate::auth::User;
 use crate::auth::token;
 use crate::schema::{
-    oauth_access_tokens, oauth_authorization_codes, oauth_clients, oauth_grants,
-    oauth_refresh_tokens, users,
+    oauth_access_tokens, oauth_authorization_codes, oauth_clients, oauth_device_codes,
+    oauth_grants, oauth_refresh_tokens, users,
 };
 
 /// How long an access token is honored.
@@ -106,8 +107,58 @@ pub(crate) async fn revoke(
     )
     .execute(connection)
     .await?;
+    // An approved device code not yet exchanged would otherwise hand the
+    // program tokens for a connection that already ended.
+    diesel::delete(oauth_device_codes::table.filter(oauth_device_codes::grant_id.eq(grant_id)))
+        .execute(connection)
+        .await?;
 
     Ok(ended > 0)
+}
+
+/// A live grant and the `client_id` string of the client it belongs to.
+pub(crate) async fn live_with_client(
+    connection: &mut AsyncPgConnection,
+    grant_id: Uuid,
+) -> QueryResult<Option<(Grant, String)>> {
+    oauth_grants::table
+        .inner_join(oauth_clients::table)
+        .filter(oauth_grants::id.eq(grant_id))
+        .filter(oauth_grants::revoked_at.is_null())
+        .select((Grant::as_select(), oauth_clients::client_id))
+        .first(connection)
+        .await
+        .optional()
+}
+
+/// Revokes a grant whose code, device code, or refresh token was presented
+/// after it was spent, recording `action` as the reason.
+pub(crate) async fn revoke_for_reuse(
+    connection: &mut AsyncPgConnection,
+    context: &audit::Context,
+    grant_id: Uuid,
+    action: &str,
+) -> QueryResult<()> {
+    let found: Option<(Grant, String)> = oauth_grants::table
+        .inner_join(oauth_clients::table)
+        .filter(oauth_grants::id.eq(grant_id))
+        .select((Grant::as_select(), oauth_clients::name))
+        .first(connection)
+        .await
+        .optional()?;
+    let Some((reused, client_name)) = found else {
+        return Ok(());
+    };
+
+    if revoke(connection, grant_id).await? {
+        tracing::warn!(
+            oauth.grant_id = %grant_id,
+            oauth.action = action,
+            "a spent credential was presented again; grant {{oauth.grant_id}} is revoked",
+        );
+        record(connection, context, action, &reused, &client_name).await?;
+    }
+    Ok(())
 }
 
 /// A fresh access token and refresh token, as the token endpoint answers them.
