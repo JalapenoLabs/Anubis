@@ -70,8 +70,10 @@ pub(super) fn render(plans: &PlanSet) -> String {
          \x20\x20description: string | null\n\
          \x20\x20/** True for the plan a pricing grid should make stand out. */\n\
          \x20\x20highlighted: boolean\n\
-         \x20\x20/** True for the plan an organization with no subscription is on. */\n\
+         \x20\x20/** True for the plan an organization paying for nothing is on. */\n\
          \x20\x20free: boolean\n\
+         \x20\x20/** True for the plan an organization paying for anything but a plan is on. */\n\
+         \x20\x20paid: boolean\n\
          \x20\x20prices: Partial<Record<BillingInterval, PlanPrice>>\n\
          \x20\x20limits: Partial<Record<string, PlanLimit>>\n\
          }\n\
@@ -117,6 +119,7 @@ fn render_plan(out: &mut String, plan: &Plan) {
     }
     let _ = writeln!(out, "    highlighted: {},", plan.is_highlighted());
     let _ = writeln!(out, "    free: {},", plan.is_free());
+    let _ = writeln!(out, "    paid: {},", plan.is_paid());
 
     if plan.prices().is_empty() {
         out.push_str("    prices: {},\n");

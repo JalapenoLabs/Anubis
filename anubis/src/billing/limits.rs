@@ -57,6 +57,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::Serialize;
 use uuid::Uuid;
 
 use super::lifecycle::SyncSeats;
@@ -101,20 +102,20 @@ impl Limits {
     /// The plan an organization is on right now.
     ///
     /// Total, like every other plan resolution here: a plan subscription that
-    /// grants access names its plan, and everything else, including no
-    /// subscription at all, is the free plan. See [`plan_in_force`].
+    /// grants access names its plan, paying for anything else puts the
+    /// organization on the paid plan when `billing.yml` names one, and
+    /// everything else is the free plan. See [`plan_in_force`].
     ///
     /// # Errors
-    /// Returns an [`Error`] when the subscription cannot be read.
+    /// Returns an [`Error`] when the subscriptions or the wallet cannot be read.
     pub async fn plan_for(
         &self,
         connection: &mut AsyncPgConnection,
         organization_id: Uuid,
     ) -> Result<&Plan, Error> {
-        let subscription =
-            Subscription::current_for_organization(connection, organization_id).await?;
+        let standing = Standing::load(connection, &self.plans, organization_id).await?;
 
-        Ok(plan_in_force(&self.plans, subscription.as_ref()))
+        Ok(plan_in_force(&self.plans, &standing).0)
     }
 
     /// Refuses one more record when a hard limit is already reached.
@@ -211,47 +212,128 @@ impl fmt::Debug for Limits {
     }
 }
 
-/// The plan an organization's live plan subscription puts in force.
+/// Why the plan in force is the one in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanSource {
+    /// A live plan subscription that grants access names the plan.
+    PlanSubscription,
+    /// No plan subscription grants access, and the organization pays for
+    /// something else, so it is on the paid plan.
+    PaidStatus,
+    /// The organization pays for nothing, so it is on the free plan.
+    Free,
+}
+
+/// Everything about an organization that decides its plan.
+///
+/// Read by [`Standing::load`] and decided by [`plan_in_force`], so the two
+/// halves of resolution stay one rule with one reading of the database.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Standing {
+    /// The live plan subscription, if the organization holds one.
+    pub(super) plan_subscription: Option<Subscription>,
+    /// Whether a live subscription paying for one of its records grants access.
+    pub(super) pays_for_records: bool,
+    /// The wallet's balance, zero for an organization with no wallet.
+    pub(super) balance_micros: i64,
+}
+
+impl Standing {
+    /// Reads what [`plan_in_force`] needs, and nothing it does not.
+    ///
+    /// The plan subscription is always read. The records and the wallet are
+    /// read only when they could matter: when `billing.yml` names a paid plan
+    /// and no plan subscription already grants access.
+    ///
+    /// # Errors
+    /// Returns the underlying Diesel error when a read fails.
+    pub(super) async fn load(
+        connection: &mut AsyncPgConnection,
+        plans: &PlanSet,
+        organization_id: Uuid,
+    ) -> QueryResult<Self> {
+        let plan_subscription =
+            Subscription::current_for_organization(connection, organization_id).await?;
+        let decided = plan_subscription
+            .as_ref()
+            .is_some_and(Subscription::grants_access);
+        if decided || plans.paid().is_none() {
+            return Ok(Self {
+                plan_subscription,
+                ..Self::default()
+            });
+        }
+
+        let pays_for_records = Subscription::pays_for_records(connection, organization_id).await?;
+        let balance_micros = if pays_for_records {
+            0
+        } else {
+            super::wallet::balance_of(connection, organization_id).await?
+        };
+
+        Ok(Self {
+            plan_subscription,
+            pays_for_records,
+            balance_micros,
+        })
+    }
+
+    /// Whether the organization pays for anything besides a plan subscription.
+    fn pays_for_something(&self) -> bool {
+        self.pays_for_records || self.balance_micros > 0
+    }
+}
+
+/// The plan an organization is on, and why.
 ///
 /// The one place an organization's plan is decided; [`Limits::plan_for`], the
 /// billing endpoints, and seat enforcement all come through here, so they
-/// cannot disagree. The rule:
+/// cannot disagree. The rule, in order:
 ///
-/// - The **plan subscription** decides, which is the live one naming no
-///   subject. The database holds an organization to one, so the answer is
-///   single-valued however many subscriptions it pays for.
-/// - **Subject subscriptions never move the plan.** Each buys its own record,
-///   not the organization's limits, so holding a hundred of them leaves the
-///   organization on whatever its plan subscription says.
-/// - A plan subscription that grants nothing (incomplete, unpaid, paused, or a
-///   status this version does not know) leaves the organization on the free
-///   plan, which is where a cancellation lands too. So does a plan the file no
-///   longer defines, which is logged for an operator to reconcile.
+/// 1. The **plan subscription** decides, which is the live one naming no
+///    subject. The database holds an organization to one, so the answer is
+///    single-valued however many subscriptions it pays for. An explicit
+///    purchase of a plan is never overruled by anything else it pays for.
+/// 2. Otherwise an organization that **pays for anything** is on the paid
+///    plan, when `billing.yml` names one with `paid_plan`: a live subscription
+///    for one of its records that grants access, or a wallet balance above
+///    zero. A balance of exactly zero, or below it after a refund, is not
+///    paying for anything.
+/// 3. Everything else is the **free plan**, which is total.
 ///
-/// Counting an organization as paid while it holds any subscription that
-/// grants access, or a positive prepaid balance, is planned work that extends
-/// this function rather than a second rule beside it.
+/// A plan subscription that grants nothing (incomplete, unpaid, paused, or a
+/// status this version does not know) decides nothing, so the organization
+/// falls through to the next rule, which is where a cancellation lands too. So
+/// does a plan the file no longer defines, which is logged for an operator.
 pub(super) fn plan_in_force<'plans>(
     plans: &'plans PlanSet,
-    plan_subscription: Option<&Subscription>,
-) -> &'plans Plan {
-    let Some(subscription) = plan_subscription.filter(|held| held.grants_access()) else {
-        return plans.free();
-    };
-
-    let plan_key = subscription.plan_key.as_deref().unwrap_or_default();
-    plans.find(plan_key).unwrap_or_else(|| {
+    standing: &Standing,
+) -> (&'plans Plan, PlanSource) {
+    if let Some(subscription) = standing
+        .plan_subscription
+        .as_ref()
+        .filter(|held| held.grants_access())
+    {
+        let plan_key = subscription.plan_key.as_deref().unwrap_or_default();
+        if let Some(plan) = plans.find(plan_key) {
+            return (plan, PlanSource::PlanSubscription);
+        }
         // The plan was renamed or removed while a subscription still named it.
-        // Falling back to free keeps every page answering; the log is what
-        // tells an operator to reconcile `config/billing.yml` with Stripe.
+        // Falling through keeps every page answering; the log is what tells an
+        // operator to reconcile `config/billing.yml` with Stripe.
         tracing::error!(
             billing.plan = plan_key,
             organization.id = %subscription.organization_id,
             "subscription names plan {{billing.plan}}, which config/billing.yml no longer \
-             defines; falling back to the free plan",
+             defines; resolving the organization's plan without it",
         );
-        plans.free()
-    })
+    }
+
+    match plans.paid() {
+        Some(paid) if standing.pays_for_something() => (paid, PlanSource::PaidStatus),
+        _unpaid => (plans.free(), PlanSource::Free),
+    }
 }
 
 /// Answers whether `resulting` records are allowed on `plan`.
@@ -420,7 +502,7 @@ impl std::error::Error for Error {}
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{Error, ErrorKind, SEATS, enforce, plan_in_force};
+    use super::{Error, ErrorKind, PlanSource, SEATS, Standing, enforce, plan_in_force};
     use crate::billing::{PlanSet, Subscription};
     use crate::http::ApiError;
 
@@ -468,9 +550,35 @@ plans:
         }
     }
 
+    /// What an organization holds, shaped by hand for [`plan_in_force`].
+    fn standing(plan: Option<(&str, &str)>, pays_for_records: bool, balance: i64) -> Standing {
+        Standing {
+            plan_subscription: plan.map(|(key, status)| plan_subscription(key, status)),
+            pays_for_records,
+            balance_micros: balance,
+        }
+    }
+
+    /// The same plans, with a paid plan that no subscription sells.
+    fn plans_with_paid() -> PlanSet {
+        let with_member = format!(
+            "{PLANS}  - key: member
+    name: Member
+    limits:
+      seats: 100
+
+paid_plan: member
+"
+        );
+        PlanSet::from_yaml(&with_member).expect("the plans must parse")
+    }
+
     #[test]
     fn no_plan_subscription_resolves_to_the_free_plan() {
-        assert_eq!(plan_in_force(&plans(), None).key(), "free");
+        let plans = plans();
+        let (plan, source) = plan_in_force(&plans, &Standing::default());
+        assert_eq!(plan.key(), "free");
+        assert_eq!(source, PlanSource::Free);
     }
 
     #[test]
@@ -478,12 +586,9 @@ plans:
         let plans = plans();
 
         for status in ["active", "trialing", "past_due"] {
-            let held = plan_subscription("pro", status);
-            assert_eq!(
-                plan_in_force(&plans, Some(&held)).key(),
-                "pro",
-                "for status {status}",
-            );
+            let (plan, source) = plan_in_force(&plans, &standing(Some(("pro", status)), false, 0));
+            assert_eq!(plan.key(), "pro", "for status {status}");
+            assert_eq!(source, PlanSource::PlanSubscription);
         }
     }
 
@@ -492,20 +597,82 @@ plans:
         let plans = plans();
 
         for status in ["incomplete", "unpaid", "paused", "an_unknown_word"] {
-            let held = plan_subscription("pro", status);
+            let held = standing(Some(("pro", status)), false, 0);
             assert_eq!(
-                plan_in_force(&plans, Some(&held)).key(),
+                plan_in_force(&plans, &held).0.key(),
                 "free",
-                "for status {status}",
+                "for status {status}"
             );
         }
     }
 
     #[test]
     fn a_plan_the_file_no_longer_defines_resolves_to_free() {
-        let held = plan_subscription("legacy_gold", "active");
+        let held = standing(Some(("legacy_gold", "active")), false, 0);
 
-        assert_eq!(plan_in_force(&plans(), Some(&held)).key(), "free");
+        assert_eq!(plan_in_force(&plans(), &held).0.key(), "free");
+    }
+
+    #[test]
+    fn paying_for_anything_resolves_to_the_paid_plan_only_when_one_is_named() {
+        let with_paid = plans_with_paid();
+        let cases = [
+            // (plan subscription, pays for records, balance) -> (plan, source)
+            (None, false, 0, "free", PlanSource::Free),
+            (None, false, 1, "member", PlanSource::PaidStatus),
+            (None, true, 0, "member", PlanSource::PaidStatus),
+            (None, true, 5_000_000, "member", PlanSource::PaidStatus),
+            (
+                Some(("pro", "active")),
+                false,
+                0,
+                "pro",
+                PlanSource::PlanSubscription,
+            ),
+            (
+                Some(("pro", "active")),
+                true,
+                5_000_000,
+                "pro",
+                PlanSource::PlanSubscription,
+            ),
+            (
+                Some(("pro", "canceled")),
+                false,
+                5_000_000,
+                "member",
+                PlanSource::PaidStatus,
+            ),
+            (Some(("pro", "unpaid")), false, 0, "free", PlanSource::Free),
+            // A refund past what was left is not credit.
+            (None, false, -2_000_000, "free", PlanSource::Free),
+            (
+                Some(("legacy_gold", "active")),
+                false,
+                1,
+                "member",
+                PlanSource::PaidStatus,
+            ),
+        ];
+
+        for (plan_subscription, records, balance, expected, source) in cases {
+            let held = standing(plan_subscription, records, balance);
+            let (plan, resolved) = plan_in_force(&with_paid, &held);
+            assert_eq!(
+                (plan.key(), resolved),
+                (expected, source),
+                "for {plan_subscription:?}, records {records}, balance {balance}",
+            );
+        }
+
+        // Without a paid plan, nothing but the plan subscription moves the plan.
+        let unnamed = plans();
+        assert_eq!(
+            plan_in_force(&unnamed, &standing(None, true, 9_000_000))
+                .0
+                .key(),
+            "free"
+        );
     }
 
     #[test]

@@ -116,6 +116,7 @@
 //! Limits are the exception: they are a product decision rather than a Stripe
 //! one, so the free plan's limits hold whether or not Stripe is configured.
 
+pub mod currency;
 mod event;
 pub mod lifecycle;
 pub mod limits;
@@ -125,6 +126,7 @@ mod routes;
 pub mod stripe;
 pub mod subscriptions;
 mod typescript;
+pub mod wallet;
 mod webhook;
 
 #[doc(inline)]
@@ -132,18 +134,20 @@ pub use event::StripeBillingEvent;
 #[doc(inline)]
 pub use lifecycle::{HANDLED_EVENTS, ProcessStripeEvent, QUEUE, Reconciler, SyncSeats};
 #[doc(inline)]
-pub use limits::{Limits, SEATS};
+pub use limits::{Limits, PlanSource, SEATS};
 #[doc(inline)]
 pub use model::{
     Subject, Subscription, SubscriptionItem, SubscriptionStatus, SubscriptionWithItems,
 };
 #[doc(inline)]
-pub use plans::{Enforcement, Interval, Limit, Plan, PlanSet, Price};
+pub use plans::{Enforcement, Interval, Limit, Plan, PlanSet, Price, WalletTerms};
 #[doc(inline)]
 pub use routes::{BILLING_ROLE, router};
 #[doc(inline)]
 pub use stripe::LineItem;
 #[doc(inline)]
 pub use subscriptions::{Cancellation, ItemChange, NewSubscription, Subscriptions};
+#[doc(inline)]
+pub use wallet::{EntryKind, RechargeWallet, Spend, Spent, Wallet, WalletEntry, Wallets};
 #[doc(inline)]
 pub use webhook::{WEBHOOK_PATH, WEBHOOK_SECRET_VAR, router as webhook_router};

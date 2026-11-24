@@ -2,8 +2,8 @@
 //!
 //! Anubis talks to Stripe over its REST API directly, with [`Client`], rather
 //! than through a generated SDK. The reasoning is in `docs/billing.md`, and it
-//! comes down to surface area: the whole integration is nine calls, five
-//! writes and four reads, every one of them answering flat JSON. The
+//! comes down to surface area: the whole integration is fourteen calls, seven
+//! writes and seven reads, every one of them answering flat JSON. The
 //! framework already carries a `reqwest` client built on rustls for outgoing
 //! webhooks, so this module adds no dependency, no second TLS stack, and no
 //! compile time worth measuring.
@@ -21,6 +21,11 @@
 //! | [`Client::list_subscriptions`] | `GET /v1/subscriptions` | Reconciling an organization against Stripe |
 //! | [`Client::complete_items`] | `GET /v1/subscription_items` | Reading the rest of a long item list |
 //! | [`Client::retrieve_price`] | `GET /v1/prices/{id}` | Checking a record's prices recur monthly or yearly before Checkout |
+//! | [`Client::create_top_up_session`] | `POST /v1/checkout/sessions` | Buying credit for the wallet |
+//! | [`Client::create_recharge`] | `POST /v1/payment_intents` | Charging a saved card off-session for auto-recharge |
+//! | [`Client::retrieve_payment_intent`] | `GET /v1/payment_intents/{id}` | Reading a wallet payment back when an event names it |
+//! | [`Client::list_payment_intents`] | `GET /v1/payment_intents` | Finding a recharge whose answer was lost, and reconciling a wallet |
+//! | [`Client::list_refunds`] | `GET /v1/refunds` | Reading every refund of a wallet payment |
 //!
 //! The reads exist because an event's body is a snapshot of the moment it was
 //! created, and a job may process it minutes later. Stripe's own guidance is to
@@ -397,6 +402,192 @@ impl Client {
         Ok(subscription)
     }
 
+    /// Opens a Stripe Checkout session that buys credit for an organization's wallet.
+    ///
+    /// One line, priced inline in the wallet's currency, in `payment` mode.
+    /// The payment carries the organization and `wallet=top_up` in its
+    /// metadata, which is how the event that follows is told apart from every
+    /// other payment the account takes. With `save_card`, the card is saved
+    /// to the customer for charging off-session, which is what auto-recharge
+    /// needs.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    pub async fn create_top_up_session(
+        &self,
+        session: &NewTopUpSession<'_>,
+    ) -> Result<CheckoutSession, Error> {
+        let organization_id = session.organization_id.to_string();
+
+        let mut form = Form::new();
+        form.text("mode", "payment");
+        form.text("customer", session.customer_id);
+        form.text("line_items[0][price_data][currency]", session.currency);
+        form.text(
+            "line_items[0][price_data][product_data][name]",
+            session.name,
+        );
+        form.text(
+            "line_items[0][price_data][unit_amount]",
+            &session.amount_minor.to_string(),
+        );
+        form.text("line_items[0][quantity]", "1");
+        form.text("success_url", session.success_url);
+        form.text("cancel_url", session.cancel_url);
+        form.text("client_reference_id", &organization_id);
+        for (name, value) in [
+            (ORGANIZATION_METADATA, organization_id.as_str()),
+            (WALLET_METADATA, WALLET_TOP_UP),
+        ] {
+            form.text(&format!("metadata[{name}]"), value);
+            form.text(&format!("payment_intent_data[metadata][{name}]"), value);
+        }
+        if session.save_card {
+            form.text("payment_intent_data[setup_future_usage]", "off_session");
+        }
+
+        self.post("/v1/checkout/sessions", &form, None).await
+    }
+
+    /// Charges a wallet's saved card off-session, for one armed recharge.
+    ///
+    /// Confirmed in the same call, with redirects refused, because nobody is
+    /// there to follow one. The payment carries the organization,
+    /// `wallet=recharge`, and the attempt's id in its metadata, which is how a
+    /// recharge whose answer was lost is found again by
+    /// [`Client::list_payment_intents`]. The idempotency key is the attempt and
+    /// its `revision`, so a retry of one attempt is one charge, and an attempt
+    /// re-keyed after Stripe saved an unusable answer is a new request.
+    ///
+    /// A replayed answer describes the payment as it was, so the payment is
+    /// read back and that is the answer instead.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    /// A declined card is a refusal that [`Error::is_declined`] reports.
+    pub async fn create_recharge(
+        &self,
+        recharge: &NewRecharge<'_>,
+        revision: i32,
+    ) -> Result<PaymentIntent, Error> {
+        let organization_id = recharge.organization_id.to_string();
+        let attempt_id = recharge.attempt_id.to_string();
+
+        let mut form = Form::new();
+        form.text("amount", &recharge.amount_minor.to_string());
+        form.text("currency", recharge.currency);
+        form.text("customer", recharge.customer_id);
+        form.text("payment_method", recharge.payment_method_id);
+        form.text("off_session", "true");
+        form.text("confirm", "true");
+        form.text("automatic_payment_methods[enabled]", "true");
+        form.text("automatic_payment_methods[allow_redirects]", "never");
+        form.text("description", recharge.description);
+        form.text(
+            &format!("metadata[{ORGANIZATION_METADATA}]"),
+            &organization_id,
+        );
+        form.text(&format!("metadata[{WALLET_METADATA}]"), WALLET_RECHARGE);
+        form.text(
+            &format!("metadata[{RECHARGE_ATTEMPT_METADATA}]"),
+            &attempt_id,
+        );
+
+        let path = "/v1/payment_intents";
+        let key = format!("anubis-wallet-recharge-{attempt_id}-{revision}");
+        let (payment, replayed): (PaymentIntent, bool) = self
+            .exchange(self.post_request(path, &form, Some(&key)), path)
+            .await?;
+        if replayed {
+            return self.retrieve_payment_intent(&payment.id).await;
+        }
+        Ok(payment)
+    }
+
+    /// Reads one payment's current state.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached.
+    pub async fn retrieve_payment_intent(&self, id: &str) -> Result<PaymentIntent, Error> {
+        // Percent-encoded because the id reaches this call from an event body.
+        let path = format!("/v1/payment_intents/{}", encode_path_segment(id));
+        self.get(&path, &[]).await
+    }
+
+    /// Lists a customer's payments, newest first, created at or after `since`.
+    ///
+    /// Each payment's latest charge is expanded, which is what tells a
+    /// reconciliation whether a payment was ever refunded without a call per
+    /// payment. Follows Stripe's pages to the end.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached,
+    /// and when the list runs past [`MAX_LIST_PAGES`] pages.
+    pub async fn list_payment_intents(
+        &self,
+        customer_id: &str,
+        since: Option<i64>,
+    ) -> Result<Vec<PaymentIntent>, Error> {
+        let since = since.map(|seconds| seconds.to_string());
+        let mut query = vec![
+            ("customer", customer_id),
+            ("expand[]", "data.latest_charge"),
+        ];
+        if let Some(since) = since.as_deref() {
+            query.push(("created[gte]", since));
+        }
+        self.list_all("/v1/payment_intents", &query, |payment: &PaymentIntent| {
+            payment.id.clone()
+        })
+        .await
+    }
+
+    /// Lists every refund of one payment, newest first.
+    ///
+    /// # Errors
+    /// Returns an [`Error`] when Stripe refuses the call or cannot be reached,
+    /// and when the list runs past [`MAX_LIST_PAGES`] pages.
+    pub async fn list_refunds(&self, payment_intent_id: &str) -> Result<Vec<Refund>, Error> {
+        self.list_all(
+            "/v1/refunds",
+            &[("payment_intent", payment_intent_id)],
+            |refund: &Refund| refund.id.clone(),
+        )
+        .await
+    }
+
+    /// Reads a whole Stripe list, page by page, `id` naming each record's cursor.
+    async fn list_all<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        filters: &[(&str, &str)],
+        id: impl Fn(&T) -> String,
+    ) -> Result<Vec<T>, Error> {
+        let mut held = Vec::new();
+        let mut after: Option<String> = None;
+
+        for _page in 0..MAX_LIST_PAGES {
+            let mut query = filters.to_vec();
+            query.push(("limit", PAGE_SIZE));
+            if let Some(last) = after.as_deref() {
+                query.push(("starting_after", last));
+            }
+
+            let page: List<T> = self.get(path, &query).await?;
+            after = page.data.last().map(&id);
+            let has_more = page.has_more;
+            held.extend(page.data);
+            if !has_more || after.is_none() {
+                return Ok(held);
+            }
+        }
+
+        Err(Error::decode(
+            path,
+            &format!("the list did not end within {MAX_LIST_PAGES} pages"),
+        ))
+    }
+
     /// POSTs a form to one Stripe endpoint and parses what comes back.
     ///
     /// The one place the secret key is used, so it is also the one place that
@@ -520,6 +711,18 @@ pub(super) const SUBJECT_TYPE_METADATA: &str = "subject_type";
 
 /// Stripe's metadata key naming the id of the record a subscription pays for.
 pub(super) const SUBJECT_ID_METADATA: &str = "subject_id";
+
+/// Stripe's metadata key naming which wallet payment a payment is.
+pub(super) const WALLET_METADATA: &str = "wallet";
+
+/// The [`WALLET_METADATA`] value of a payment that bought credit at Checkout.
+pub(super) const WALLET_TOP_UP: &str = "top_up";
+
+/// The [`WALLET_METADATA`] value of a payment auto-recharge made.
+pub(super) const WALLET_RECHARGE: &str = "recharge";
+
+/// Stripe's metadata key naming the recharge attempt a payment belongs to.
+pub(super) const RECHARGE_ATTEMPT_METADATA: &str = "recharge_attempt";
 
 /// The header Stripe deduplicates writes by.
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
@@ -700,6 +903,9 @@ pub struct CompletedCheckout {
     /// The subscription the purchase created, absent for a one-off payment.
     #[serde(default)]
     pub subscription: Option<String>,
+    /// The payment a one-off purchase made, absent for a subscription.
+    #[serde(default)]
+    pub payment_intent: Option<String>,
     /// The customer that paid, e.g. `cus_1Q...`.
     #[serde(default)]
     pub customer: Option<String>,
@@ -886,6 +1092,113 @@ impl Recurring {
     }
 }
 
+/// A top-up about to be handed to Stripe Checkout.
+#[derive(Debug, Clone)]
+pub struct NewTopUpSession<'a> {
+    /// The Stripe customer paying, e.g. `cus_1Q...`.
+    pub customer_id: &'a str,
+    /// The organization whose wallet the payment credits.
+    pub organization_id: Uuid,
+    /// What Checkout calls the purchase, from the wallet's terms.
+    pub name: &'a str,
+    /// The wallet's currency, lowercase ISO 4217.
+    pub currency: &'a str,
+    /// What to charge, in the currency's smallest unit.
+    pub amount_minor: i64,
+    /// Whether to save the card for charging off-session.
+    pub save_card: bool,
+    /// Where Stripe returns the browser after the payment.
+    pub success_url: &'a str,
+    /// Where Stripe returns the browser when the customer backs out.
+    pub cancel_url: &'a str,
+}
+
+/// One recharge about to charge a saved card.
+#[derive(Debug, Clone)]
+pub struct NewRecharge<'a> {
+    /// The Stripe customer the card belongs to.
+    pub customer_id: &'a str,
+    /// The saved card, e.g. `pm_1Q...`.
+    pub payment_method_id: &'a str,
+    /// What to charge, in the currency's smallest unit.
+    pub amount_minor: i64,
+    /// The wallet's currency, lowercase ISO 4217.
+    pub currency: &'a str,
+    /// What the customer's statement and receipt call the charge.
+    pub description: &'a str,
+    /// The organization whose wallet the payment credits.
+    pub organization_id: Uuid,
+    /// The armed attempt, named in the payment's metadata.
+    pub attempt_id: Uuid,
+}
+
+/// A Stripe PaymentIntent, as much of one as the wallet reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaymentIntent {
+    /// Stripe's id for the payment, e.g. `pi_1Q...`.
+    pub id: String,
+    /// Stripe's status vocabulary: `succeeded`, `processing`,
+    /// `requires_payment_method`, `requires_action`, `canceled`, and so on.
+    pub status: String,
+    /// What the payment received, in the currency's smallest unit.
+    #[serde(default)]
+    pub amount_received: i64,
+    /// The currency, lowercase ISO 4217.
+    pub currency: String,
+    /// The customer that paid.
+    #[serde(default)]
+    pub customer: Option<String>,
+    /// The payment method that paid, e.g. `pm_1Q...`.
+    #[serde(default)]
+    pub payment_method: Option<String>,
+    /// `off_session` when the payment saved its card for later charges.
+    #[serde(default)]
+    pub setup_future_usage: Option<String>,
+    /// When Stripe created the payment, as Unix seconds.
+    #[serde(default)]
+    pub created: i64,
+    /// What the framework put on the payment when it began.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// The latest charge: its id, or the charge itself when a listing expanded it.
+    #[serde(default)]
+    latest_charge: Option<serde_json::Value>,
+}
+
+impl PaymentIntent {
+    /// The value Stripe's metadata holds under `name`.
+    #[must_use]
+    pub fn metadata(&self, name: &str) -> Option<&str> {
+        self.metadata.get(name).map(String::as_str)
+    }
+
+    /// How much of the payment was refunded, when its charge was expanded.
+    #[must_use]
+    pub fn amount_refunded(&self) -> Option<i64> {
+        self.latest_charge
+            .as_ref()?
+            .get("amount_refunded")?
+            .as_i64()
+    }
+}
+
+/// A Stripe refund, as much of one as the wallet reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Refund {
+    /// Stripe's id for the refund, e.g. `re_1Q...`.
+    pub id: String,
+    /// What was refunded, in the currency's smallest unit.
+    pub amount: i64,
+    /// The currency, lowercase ISO 4217.
+    pub currency: String,
+    /// `pending`, `requires_action`, `succeeded`, `failed`, or `canceled`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The payment the refund returns money from.
+    #[serde(default)]
+    pub payment_intent: Option<String>,
+}
+
 /// One page of a Stripe list response.
 #[derive(Debug, Clone, Deserialize)]
 struct List<T> {
@@ -968,6 +1281,8 @@ enum ErrorKind {
         code: Option<String>,
         /// Whether Stripe refused the idempotency key rather than the request.
         idempotency: bool,
+        /// Whether a card was declined, Stripe's `card_error`.
+        card: bool,
     },
     /// Stripe answered with something this client could not read.
     Decode,
@@ -1037,6 +1352,35 @@ impl Error {
         )
     }
 
+    /// Returns `true` when Stripe declined the card, which no retry changes.
+    ///
+    /// Stripe answers a declined off-session charge `402` with a `card_error`,
+    /// leaving the payment waiting for another payment method.
+    #[must_use]
+    pub fn is_declined(&self) -> bool {
+        matches!(self.kind, ErrorKind::Api { card: true, .. })
+    }
+
+    /// Returns `true` when Stripe refused the request for good.
+    ///
+    /// An answered refusal that is not a server error, a refused idempotency
+    /// key, a rate limit, or a credential problem: the request as sent will
+    /// never succeed, and sending it again under any key changes nothing.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::Api { status, idempotency: false, .. }
+                if status < 500 && !matches!(status, 401 | 403 | 429)
+        )
+    }
+
+    /// The failure on its own, without the backtrace [`Display`] adds.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// Stripe's own error code, when it named one, e.g. `resource_missing`.
     #[must_use]
     pub fn code(&self) -> Option<&str> {
@@ -1067,12 +1411,14 @@ impl Error {
         let message = message.unwrap_or_else(|| "Stripe gave no reason".to_owned());
         let idempotency = family.as_deref() == Some("idempotency_error")
             || code.as_deref() == Some("idempotency_key_in_use");
+        let card = family.as_deref() == Some("card_error");
 
         Self::new(
             ErrorKind::Api {
                 status,
                 code,
                 idempotency,
+                card,
             },
             &format!("Stripe answered {status} for {path}: {message}"),
         )

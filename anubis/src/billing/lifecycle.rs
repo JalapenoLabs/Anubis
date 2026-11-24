@@ -78,6 +78,8 @@ use super::stripe::{
     self, CompletedCheckout, ItemUpdate, ORGANIZATION_METADATA, PLAN_METADATA, SUBJECT_ID_METADATA,
     SUBJECT_TYPE_METADATA, SubscriptionUpdate,
 };
+use super::wallet::RechargeWallet;
+use super::wallet::payments::{self, Refunds};
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::jobs::{BoxError, Job};
@@ -96,11 +98,19 @@ pub const QUEUE: &str = "billing";
 /// dashboard. Sending more than these is harmless: an event of any other type
 /// is stored, marked processed, and ignored, because a receiver that failed on
 /// unknown types would fail on every feature Stripe ships.
-pub const HANDLED_EVENTS: [&str; 4] = [
+pub const HANDLED_EVENTS: [&str; 12] = [
     CHECKOUT_COMPLETED,
     SUBSCRIPTION_CREATED,
     SUBSCRIPTION_UPDATED,
     SUBSCRIPTION_DELETED,
+    CHECKOUT_ASYNC_PAYMENT_SUCCEEDED,
+    PAYMENT_SUCCEEDED,
+    PAYMENT_FAILED,
+    CHARGE_REFUNDED,
+    CHARGE_REFUND_UPDATED,
+    REFUND_CREATED,
+    REFUND_UPDATED,
+    REFUND_FAILED,
 ];
 
 /// A purchase finished at Stripe Checkout; the subscription now exists.
@@ -114,6 +124,30 @@ const SUBSCRIPTION_UPDATED: &str = "customer.subscription.updated";
 
 /// A subscription ended, and nothing further will be charged for it.
 const SUBSCRIPTION_DELETED: &str = "customer.subscription.deleted";
+
+/// A Checkout payment by a method that settles later, such as a bank debit, settled.
+const CHECKOUT_ASYNC_PAYMENT_SUCCEEDED: &str = "checkout.session.async_payment_succeeded";
+
+/// A payment succeeded: a top-up, or a recharge.
+const PAYMENT_SUCCEEDED: &str = "payment_intent.succeeded";
+
+/// A payment attempt failed, which ends a recharge.
+const PAYMENT_FAILED: &str = "payment_intent.payment_failed";
+
+/// A charge was refunded, in full or in part; its object is the charge.
+const CHARGE_REFUNDED: &str = "charge.refunded";
+
+/// A refund changed status, as older API versions announce it.
+const CHARGE_REFUND_UPDATED: &str = "charge.refund.updated";
+
+/// A refund was created; its object is the refund.
+const REFUND_CREATED: &str = "refund.created";
+
+/// A refund changed status.
+const REFUND_UPDATED: &str = "refund.updated";
+
+/// A refund failed, so its money came back.
+const REFUND_FAILED: &str = "refund.failed";
 
 /// The background job that processes one stored Stripe event.
 ///
@@ -358,6 +392,25 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Charges a wallet's saved card for its armed recharge.
+    ///
+    /// Runs [`RechargeWallet`]; see [`crate::billing::wallet`] for when one is
+    /// armed and how a lost answer is found again rather than charged twice.
+    ///
+    /// # Errors
+    /// Returns the failure so the queue retries it when Stripe's answer is
+    /// unknown. A declined card is not a failure: it ends the attempt and turns
+    /// auto-recharge off.
+    pub async fn recharge_wallet(&self, job: RechargeWallet) -> Result<(), BoxError> {
+        let Some(stripe) = self.stripe.as_ref() else {
+            // Billing is off, so there is no card to charge. The attempt stays
+            // armed and runs again once a spend finds it stale.
+            return Ok(());
+        };
+        payments::recharge(&self.pool, &self.plans, stripe, job.organization_id).await?;
+        Ok(())
+    }
+
     /// The Stripe price the plan subscription bills per seat, if it does.
     ///
     /// Read from the plan the row names rather than from Stripe, because that
@@ -439,6 +492,24 @@ impl Reconciler {
             }
         }
 
+        if self.plans.wallet().is_some() {
+            // The wallet's payments converge the same way: a top-up whose
+            // event was missed is credited, and a refund debited.
+            for payment in stripe.list_payment_intents(&customer_id, None).await? {
+                if let Err(failure) = payments::converge_payment(
+                    &mut connection,
+                    &self.plans,
+                    stripe,
+                    &payment,
+                    Refunds::WhenRefunded,
+                )
+                .await
+                {
+                    unrecorded.push(format!("{}: {}", payment.id, failure.message()));
+                }
+            }
+        }
+
         tracing::info!(
             organization.id = %organization_id,
             billing.subscriptions.read = held.len(),
@@ -450,10 +521,9 @@ impl Reconciler {
             return Err(Error::new(
                 ErrorKind::Data,
                 format!(
-                    "{} of {} Stripe subscriptions could not be recorded; the rest were \
+                    "{} Stripe subscriptions or payments could not be recorded; the rest were \
                      repaired. {}",
                     unrecorded.len(),
-                    held.len(),
                     unrecorded.join("; "),
                 ),
             ));
@@ -489,14 +559,16 @@ impl Reconciler {
                     )
                 })?;
                 let Some(subscription_id) = session.subscription.as_deref() else {
-                    // A one-off payment rather than a subscription. Nothing here
-                    // bills for those, so the event is a fact about Stripe and
-                    // not about this application.
-                    tracing::debug!(
-                        billing.checkout.session = session.id,
-                        "checkout session {{billing.checkout.session}} bought no subscription",
-                    );
-                    return Ok(());
+                    // A one-off payment rather than a subscription: a top-up
+                    // when the wallet's metadata names it, and otherwise a fact
+                    // about Stripe rather than about this application.
+                    return self
+                        .converge_payment_named(
+                            connection,
+                            session.payment_intent.as_deref(),
+                            Refunds::Skip,
+                        )
+                        .await;
                 };
 
                 let subscription = stripe.retrieve_subscription(subscription_id).await?;
@@ -525,6 +597,36 @@ impl Reconciler {
                 self.converge(connection, &ended, &Origin::default(), event_at)
                     .await
             }
+            CHECKOUT_ASYNC_PAYMENT_SUCCEEDED => {
+                let session = CompletedCheckout::deserialize(object).map_err(|source| {
+                    Error::data(format!("the checkout session could not be read: {source}"))
+                })?;
+                self.converge_payment_named(
+                    connection,
+                    session.payment_intent.as_deref(),
+                    Refunds::Skip,
+                )
+                .await
+            }
+            PAYMENT_SUCCEEDED | PAYMENT_FAILED => {
+                let named = object.get("id").and_then(serde_json::Value::as_str);
+                self.converge_payment_named(connection, named, Refunds::Skip)
+                    .await
+            }
+            CHARGE_REFUNDED
+            | CHARGE_REFUND_UPDATED
+            | REFUND_CREATED
+            | REFUND_UPDATED
+            | REFUND_FAILED => {
+                // A charge and a refund both name the payment they belong to,
+                // and every refund of it is read back, so which event this is,
+                // and in what order they arrive, does not matter.
+                let named = object
+                    .get("payment_intent")
+                    .and_then(serde_json::Value::as_str);
+                self.converge_payment_named(connection, named, Refunds::Read)
+                    .await
+            }
             other => {
                 // Stored, stamped, and ignored. A receiver that failed on the
                 // types it does not know would fail on every feature Stripe
@@ -538,6 +640,25 @@ impl Reconciler {
                 Ok(())
             }
         }
+    }
+
+    /// Reads a payment an event named back from Stripe, and converges it.
+    ///
+    /// An event naming no payment is a fact about Stripe rather than about
+    /// this application, and so is a payment that is not a wallet's.
+    async fn converge_payment_named(
+        &self,
+        connection: &mut AsyncPgConnection,
+        payment_intent_id: Option<&str>,
+        refunds: Refunds,
+    ) -> Result<(), Error> {
+        let stripe = self.stripe.as_ref().ok_or_else(Error::unconfigured)?;
+        let Some(payment_intent_id) = payment_intent_id else {
+            tracing::debug!("a Stripe event named no payment, so the wallet has nothing to record");
+            return Ok(());
+        };
+        let payment = stripe.retrieve_payment_intent(payment_intent_id).await?;
+        payments::converge_payment(connection, &self.plans, stripe, &payment, refunds).await
     }
 
     /// Writes one Stripe subscription, and its line items, into the projection.
@@ -1148,6 +1269,17 @@ impl Error {
             ErrorKind::Unconfigured,
             "billing is not configured for this deployment: set STRIPE_SECRET_KEY",
         )
+    }
+
+    /// Stripe said something this application cannot act on.
+    pub(super) fn data(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Data, message)
+    }
+}
+
+impl From<super::wallet::Error> for Error {
+    fn from(source: super::wallet::Error) -> Self {
+        Self::new(ErrorKind::Data, source.message())
     }
 }
 

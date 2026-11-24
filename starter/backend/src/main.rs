@@ -262,9 +262,10 @@ fn behind_the_spa(app: Router, config: &AppConfig) -> Router {
 /// Builds the background job worker this process runs.
 ///
 /// Registering a job is the whole of the wiring: it subscribes the worker to
-/// that job's queue and captures whatever the handler needs. Four jobs are the
-/// framework's own, outgoing webhook delivery, the notification ping, and the
-/// two halves of the Stripe subscription lifecycle; the application's are
+/// that job's queue and captures whatever the handler needs. Five jobs are the
+/// framework's own, outgoing webhook delivery, the notification ping, the two
+/// halves of the Stripe subscription lifecycle, and the wallet's auto-recharge;
+/// the application's are
 /// registered by `register_jobs`, which is where a scaffolded job lands.
 fn worker(
     pool: &anubis::db::DbPool,
@@ -275,6 +276,7 @@ fn worker(
     let deliverer = anubis::webhooks::Deliverer::new(pool.clone(), config);
     let reconciler = anubis::billing::Reconciler::new(pool.clone(), plans, config);
     let seats = reconciler.clone();
+    let recharger = reconciler.clone();
     // A notification commits with the write that caused it; this is what tells
     // the recipient's browser to refetch once that commit has happened.
     let pinger = anubis::notifications::Pinger::new(channels);
@@ -297,6 +299,12 @@ fn worker(
         .register(move |job: anubis::billing::SyncSeats| {
             let seats = seats.clone();
             async move { seats.sync_seats(job).await }
+        })
+        // And a spend that leaves the wallet below its auto-recharge
+        // threshold becomes one charge of the saved card.
+        .register(move |job: anubis::billing::RechargeWallet| {
+            let recharger = recharger.clone();
+            async move { recharger.recharge_wallet(job).await }
         });
 
     register_jobs(pool, worker).build()

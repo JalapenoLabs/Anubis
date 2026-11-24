@@ -39,6 +39,18 @@
 #
 # The limit vocabulary below is this application's own: name whatever the
 # product meters.
+#
+# `wallet` sells prepaid credit: customers top up through Stripe Checkout, or
+# let auto-recharge charge a saved card below a threshold they choose, and the
+# application spends it as usage accrues with `anubis::billing::Wallets::spend`.
+# Its amounts are micro-units of the currency, 1000000 to the dollar, so a
+# charge for one minute of usage never rounds to zero. Delete the section to
+# sell no credit.
+#
+# `paid_plan`, when set, names the plan an organization without a plan
+# subscription is on while it pays for anything else: a subscription for one of
+# its records, or credit in its wallet. It may sell no prices of its own. Unset,
+# only a plan subscription moves an organization off the free plan.
 
 plans:
   - key: free
@@ -68,3 +80,9 @@ plans:
       creative_concepts:
         count: 100
         enforcement: soft
+
+wallet:
+  name: Account credit
+  currency: usd
+  minimum_top_up_micros: 10000000
+  low_balance_micros: 2000000

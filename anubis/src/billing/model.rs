@@ -277,6 +277,28 @@ impl Subscription {
             .optional()
     }
 
+    /// Whether a live subscription paying for one of the organization's records grants access.
+    ///
+    /// What makes an organization count as paying for something without a
+    /// plan subscription; see [`crate::billing::limits`]. One `EXISTS`, so an
+    /// organization paying for hundreds of records is asked about one row.
+    ///
+    /// # Errors
+    /// Returns the underlying Diesel error when the query fails.
+    pub async fn pays_for_records(
+        connection: &mut AsyncPgConnection,
+        organization_id: Uuid,
+    ) -> QueryResult<bool> {
+        diesel::select(diesel::dsl::exists(
+            subscriptions::table
+                .filter(subscriptions::organization_id.eq(organization_id))
+                .filter(subscriptions::subject_type.is_not_null())
+                .filter(subscriptions::status.eq_any(granting_statuses())),
+        ))
+        .get_result(connection)
+        .await
+    }
+
     /// The record this subscription pays for, or `None` for the plan subscription.
     #[must_use]
     pub fn subject(&self) -> Option<Subject> {
@@ -311,6 +333,18 @@ pub(super) fn terminal_statuses() -> Vec<&'static str> {
     SubscriptionStatus::ALL
         .into_iter()
         .filter(|status| status.is_terminal())
+        .map(SubscriptionStatus::as_str)
+        .collect()
+}
+
+/// The statuses a subscription grants access in, as the column stores them.
+///
+/// Read from [`SubscriptionStatus::grants_access`], so the query and the
+/// predicate agree.
+fn granting_statuses() -> Vec<&'static str> {
+    SubscriptionStatus::ALL
+        .into_iter()
+        .filter(|status| status.grants_access())
         .map(SubscriptionStatus::as_str)
         .collect()
 }

@@ -396,6 +396,53 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// One prepaid credit balance per organization, with its auto-recharge
+    /// settings and the recharge in flight. See `docs/billing.md`.
+    ///
+    /// `balance_micros` is the sum of the organization's `wallet_entries`,
+    /// moved in the same transaction as each entry under this row's lock.
+    wallets (organization_id) {
+        organization_id -> Uuid,
+        balance_micros -> Int8,
+        auto_recharge_threshold_micros -> Nullable<Int8>,
+        auto_recharge_amount_micros -> Nullable<Int8>,
+        recharge_payment_method_id -> Nullable<Text>,
+        recharge_payment_method_saved_at -> Nullable<Timestamptz>,
+        recharge_attempt_id -> Nullable<Uuid>,
+        recharge_attempt_amount_micros -> Nullable<Int8>,
+        recharge_attempt_revision -> Int4,
+        recharge_armed_at -> Nullable<Timestamptz>,
+        recharge_queued_at -> Nullable<Timestamptz>,
+        recharge_failed_at -> Nullable<Timestamptz>,
+        recharge_failure -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    /// The wallet's append-only ledger: credits positive, debits negative.
+    ///
+    /// Nothing updates or deletes a row. `position` orders one organization's
+    /// entries as their balances chain. See `docs/billing.md`.
+    wallet_entries (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        position -> Int8,
+        kind -> Text,
+        amount_micros -> Int8,
+        balance_after_micros -> Int8,
+        requested_micros -> Nullable<Int8>,
+        idempotency_key -> Text,
+        stripe_payment_intent_id -> Nullable<Text>,
+        description -> Nullable<Text>,
+        subject_type -> Nullable<Text>,
+        subject_id -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     /// Subscription events received from Stripe. See `docs/billing.md`.
     ///
     /// Written the moment a signed request arrives and never rewritten, only
@@ -520,6 +567,9 @@ diesel::joinable!(subscriptions -> organizations (organization_id));
 diesel::allow_tables_to_appear_in_same_query!(subscriptions, organizations);
 diesel::joinable!(subscription_items -> subscriptions (subscription_id));
 diesel::allow_tables_to_appear_in_same_query!(subscription_items, subscriptions);
+diesel::joinable!(wallets -> organizations (organization_id));
+diesel::joinable!(wallet_entries -> wallets (organization_id));
+diesel::allow_tables_to_appear_in_same_query!(wallet_entries, wallets);
 diesel::joinable!(webhook_endpoints -> teams (team_id));
 diesel::joinable!(webhook_deliveries -> webhook_endpoints (webhook_endpoint_id));
 diesel::allow_tables_to_appear_in_same_query!(platform_applications, platform_tokens, teams);

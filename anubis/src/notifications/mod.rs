@@ -87,6 +87,14 @@ pub const MEMBERSHIP_ROLES_CHANGED: &str = "membership.roles_changed";
 /// An outgoing webhook delivery ran out of attempts, told to team admins.
 pub const WEBHOOK_DELIVERY_FAILED: &str = "webhook.delivery_failed";
 
+/// A spend took an organization's credit below the wallet's low-balance mark,
+/// told to its billing members.
+pub const WALLET_LOW_BALANCE: &str = "wallet.low_balance";
+
+/// A recharge was refused at Stripe and auto-recharge turned off, told to the
+/// organization's billing members.
+pub const WALLET_RECHARGE_FAILED: &str = "wallet.recharge_failed";
+
 /// Writes one notification and asks its recipient's browsers to refetch.
 ///
 /// The insert and the ping's enqueue both ride `connection`, which is the
@@ -203,8 +211,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        INVITATION_CLAIMED, INVITATION_RECEIVED, MEMBERSHIP_ROLES_CHANGED, WEBHOOK_DELIVERY_FAILED,
-        organization_settings_href, team_developers_href, team_settings_href,
+        INVITATION_CLAIMED, INVITATION_RECEIVED, MEMBERSHIP_ROLES_CHANGED, WALLET_LOW_BALANCE,
+        WALLET_RECHARGE_FAILED, WEBHOOK_DELIVERY_FAILED, organization_settings_href,
+        team_developers_href, team_settings_href,
     };
 
     #[test]
@@ -214,6 +223,8 @@ mod tests {
             INVITATION_CLAIMED,
             MEMBERSHIP_ROLES_CHANGED,
             WEBHOOK_DELIVERY_FAILED,
+            WALLET_LOW_BALANCE,
+            WALLET_RECHARGE_FAILED,
         ] {
             let (subject, event) = kind.split_once('.').expect("a kind carries one dot");
             assert!(!subject.is_empty(), "{kind} names a subject");
