@@ -138,9 +138,12 @@ const USER_CODE_GROUP_LENGTH: usize = 4;
 /// every call stores two rows, so this caps what a flood from rotating
 /// addresses can hold for the ten minutes they live: a hundred thousand
 /// authorizations take about 65 MB with their indexes, and counting them takes
-/// milliseconds. It sits far above real use, a person connecting a device and
-/// done within minutes, because reaching it refuses every client; the address
-/// budget, not this, is what holds a stranger back.
+/// milliseconds. It also bounds the sweep at the start of every issue, which
+/// at worst deletes the whole ceiling's worth at once, about 300 ms with the
+/// requests that cascade; raising this raises that. It sits far above real
+/// use, a person connecting a device and done within minutes, because reaching
+/// it refuses every client; the address budget, not this, is what holds a
+/// stranger back.
 pub(crate) const MAX_LIVE_DEVICE_CODES: i64 = 100_000;
 
 /// How many user codes are drawn before giving up on finding an unused one.
