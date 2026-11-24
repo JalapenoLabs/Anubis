@@ -306,16 +306,19 @@ impl RedisSessions {
         Ok(())
     }
 
-    /// Deletes the keys of every session the user has that is not stamped
-    /// with `generation`.
+    /// Deletes the keys of the user's sessions stamped with `ended`, the
+    /// generation a committed sign-out-everywhere ended.
     ///
-    /// Housekeeping after a sign-out-everywhere has committed: those sessions
-    /// ended when the account moved to `generation`, so this only stops them
-    /// taking up memory until they expire. A session stamped with
-    /// `generation`, one created since the commit or the one a password change
-    /// kept, stays, and so does its index entry. With no generation, the
-    /// account is gone and everything goes.
-    pub(super) async fn sweep(&self, user_id: Uuid, generation: Option<i64>) -> Result<(), Error> {
+    /// Housekeeping: those sessions ended with the commit, so this only stops
+    /// them taking up memory until they expire. Nothing else is judged by
+    /// comparing with the account's generation, because the sweep runs after
+    /// the commit and may run after a later sign-out-everywhere too: a session
+    /// that later one kept, or one created since, carries a generation this
+    /// sweep never heard of and stays, with its index entry. A session stamped
+    /// with a value no account took, left by a rolled-back password change,
+    /// stays as well; it signs nobody in and expires on its own. With no
+    /// generation, the account is gone and everything goes.
+    pub(super) async fn sweep(&self, user_id: Uuid, ended: Option<i64>) -> Result<(), Error> {
         let user_key = format!("{USER_KEY_PREFIX}{user_id}");
         let mut redis_connection = self.connection.clone();
         let indexed = redis_connection.zrange(&user_key, 0, -1).await?;
@@ -331,12 +334,16 @@ impl RedisSessions {
         let mut swept_hashes = Vec::with_capacity(indexed.len());
         let mut swept_keys = Vec::with_capacity(indexed.len());
         for ((token_hash, token_key), stored) in indexed.into_iter().zip(token_keys).zip(stored) {
-            // A key that is gone or does not parse ends with the rest; only a
-            // session carrying the new generation is still alive.
             let stamp = stored
                 .and_then(|stored| serde_json::from_str::<StoredSession>(&stored).ok())
                 .map(|session| session.generation);
-            if generation.is_some() && stamp == generation {
+            let swept = match (ended, stamp) {
+                (Some(ended), Some(stamp)) => stamp == ended,
+                // Every session of an account that is gone goes, and so does a
+                // key that is gone or does not parse, since it signs nobody in.
+                (None, _) | (_, None) => true,
+            };
+            if !swept {
                 continue;
             }
             swept_keys.push(token_key);

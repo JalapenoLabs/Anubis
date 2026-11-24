@@ -45,6 +45,10 @@ use redis::AsyncTypedCommands;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::{PASSWORD, TestDatabase, send, session_token};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use url::Url;
 use uuid::Uuid;
 
 /// An operator may manage accounts; nobody else operates.
@@ -227,6 +231,189 @@ async fn stamp_left_behind(database: &TestDatabase, store: &Store) {
         StatusCode::UNAUTHORIZED,
         "the next sign-out-everywhere never takes a value a rolled-back change drew",
     );
+}
+
+/// A sweep runs after its commit, so it can run after a later
+/// sign-out-everywhere has committed too. It must remove only the sessions its
+/// own revocation ended, never a session that later one kept. Only Redis
+/// sweeps after the commit; the Postgres store deletes inside the transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_sweep_spares_a_session_a_later_sign_out_everywhere_kept() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("skipping session_store_flow late sweep test: REDIS_URL is not set");
+        return;
+    };
+    let Some(database) = TestDatabase::create("session_store_late_sweep").await else {
+        return;
+    };
+    let gate = RedisGate::start(&redis_url).await;
+    let client = redis::Client::open(redis_url.as_str()).expect("REDIS_URL must parse");
+    let connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("REDIS_URL must name a reachable Redis");
+    // The deployment reaches Redis through the gate; the test reads and
+    // writes it directly, so the test is never held.
+    let store = Store::Redis {
+        url: gate.url.clone(),
+        connection,
+    };
+    let deployment = Deployment::boot(&database, &store).await;
+    let router = &deployment.router;
+    let email = format!("late-sweep-{}@example.com", Uuid::new_v4());
+    let ended = support::register(router, &email).await;
+    let kept = sign_in(router, &email, PASSWORD).await;
+    let user_id = deployment.user_id(&email).await;
+
+    let (status, _headers, _body) = send(
+        router,
+        "POST",
+        "/auth/password-reset/request",
+        Some(&json!({ "email": email })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let reset = deployment.reset_token(&email);
+
+    // A reset reaches Redis only to sweep, after its commit, so holding the
+    // gate holds exactly the reset's sweep.
+    let mut connection = deployment.pool.get().await.expect("a connection");
+    let before: i64 = users::table
+        .find(user_id)
+        .select(users::session_generation)
+        .first(&mut connection)
+        .await
+        .expect("the account exists");
+    gate.hold();
+    let resetting = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let (status, _headers, _body) = send(
+                &router,
+                "POST",
+                "/auth/password-reset/confirm",
+                Some(&json!({ "token": reset, "password": RESET_PASSWORD })),
+                None,
+            )
+            .await;
+            status
+        })
+    };
+    wait_for_the_generation_to_leave(&mut connection, user_id, before).await;
+
+    // What a later password change commits while the reset's sweep waits: a
+    // newer generation, and the browser it keeps re-stamped with it.
+    let later: i64 = diesel::update(users::table.find(user_id))
+        .set(users::session_generation.eq(nextval("session_generations")))
+        .returning(users::session_generation)
+        .get_result(&mut connection)
+        .await
+        .expect("the account must move");
+    store.stamp(&deployment.pool, &kept, later).await;
+    gate.release();
+
+    let status = resetting.await.expect("the reset must not panic");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deployment.whoami(&kept).await,
+        StatusCode::OK,
+        "a late sweep spares a session a later sign-out-everywhere kept",
+    );
+    // Proves the sweep ran after the release rather than giving up while
+    // held, which would leave `kept` alone for the wrong reason.
+    store.assert_gone(&deployment.pool, user_id, &ended).await;
+}
+
+/// Waits until the account's generation is no longer `before`, which is how
+/// the late sweep test knows the reset it started has committed.
+async fn wait_for_the_generation_to_leave(
+    connection: &mut diesel_async::AsyncPgConnection,
+    user_id: Uuid,
+    before: i64,
+) {
+    for _attempt in 0..1000 {
+        let current: i64 = users::table
+            .find(user_id)
+            .select(users::session_generation)
+            .first(connection)
+            .await
+            .expect("the account exists");
+        if current != before {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the reset never committed");
+}
+
+/// A relay in front of Redis that can hold what a deployment sends, so a test
+/// decides when that deployment's next Redis command arrives.
+///
+/// Holding is only ever brief: the deployment gives up on a command Redis has
+/// not answered within a second, so a test releases well inside that.
+struct RedisGate {
+    /// The `REDIS_URL` that reaches Redis through the gate.
+    url: String,
+    open: watch::Sender<bool>,
+}
+
+impl RedisGate {
+    async fn start(redis_url: &str) -> Self {
+        let mut url = Url::parse(redis_url).expect("REDIS_URL must parse");
+        let redis_addresses = url
+            .socket_addrs(|| Some(6379))
+            .expect("REDIS_URL must name a host");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port must be free");
+        let address = listener.local_addr().expect("the port is bound");
+        url.set_host(Some("127.0.0.1"))
+            .expect("a Redis URL takes a host");
+        url.set_port(Some(address.port()))
+            .expect("a Redis URL takes a port");
+
+        let (open, gate) = watch::channel(true);
+        tokio::spawn(async move {
+            while let Ok((client, _peer)) = listener.accept().await {
+                let server = TcpStream::connect(redis_addresses.as_slice())
+                    .await
+                    .expect("Redis must accept a connection");
+                tokio::spawn(relay(client, server, gate.clone()));
+            }
+        });
+        Self {
+            url: url.to_string(),
+            open,
+        }
+    }
+
+    fn hold(&self) {
+        self.open.send_replace(false);
+    }
+
+    fn release(&self) {
+        self.open.send_replace(true);
+    }
+}
+
+/// Carries one connection's bytes both ways, holding what the client sends
+/// while the gate is closed. The relay ends when either side closes or the
+/// gate is dropped with its test.
+async fn relay(client: TcpStream, server: TcpStream, mut gate: watch::Receiver<bool>) {
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    tokio::spawn(async move { tokio::io::copy(&mut from_server, &mut to_client).await });
+
+    let mut buffer = vec![0_u8; 16 * 1024];
+    while let Ok(read) = from_client.read(&mut buffer).await {
+        let Some(sent) = buffer.get(..read).filter(|sent| !sent.is_empty()) else {
+            return;
+        };
+        if gate.wait_for(|open| *open).await.is_err() || to_server.write_all(sent).await.is_err() {
+            return;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1230,10 +1417,14 @@ async fn narrative(database: &TestDatabase, store: Store) {
         .as_str()
         .expect("the password is handed over")
         .to_owned();
+    // The sweep removes the sessions the temporary password ended. The key
+    // the snapshot brought back carries an older generation, so it is not
+    // this sweep's to judge; it signs nobody in, as above, and expires on its
+    // own.
     for token in [&rescued, &also_rescued] {
         assert_eq!(deployment.whoami(token).await, StatusCode::UNAUTHORIZED);
+        store.assert_gone(&deployment.pool, user_id, token).await;
     }
-    store.assert_holds_none(&deployment.pool, user_id).await;
     // The operator's own session is untouched by what it did to another's.
     assert_eq!(
         deployment.whoami(&deployment.operator).await,

@@ -23,7 +23,11 @@
 //! Deleting them afterwards is housekeeping, done after the commit by
 //! [`Sessions::sweep`]: a store that loses those deletes, evicts the keys that
 //! would have found them, comes back from an older snapshot, or was the other
-//! store when `SESSION_STORE` changed, cannot bring an ended session back.
+//! store when `SESSION_STORE` changed, cannot bring an ended session back. A
+//! sweep removes the sessions stamped with the generation its revocation
+//! ended, which is dead for good, and nothing else: sweeps run after their
+//! commits and may run late, behind a later sign-out-everywhere, so a stamp
+//! other than the ended one may belong to a session that later one kept.
 //!
 //! A new generation is drawn from the `session_generations` sequence, never
 //! computed from the old one, because a sequence never hands a value out
@@ -197,10 +201,11 @@ pub(crate) struct ListedSession {
 #[must_use = "sweep the ended sessions once the transaction has committed"]
 pub(crate) struct Revocation {
     user_id: Uuid,
-    /// The account's new generation, which the sweep spares sessions stamped
-    /// with: a session created since the commit, or the one a password change
-    /// kept. `None` when the account is gone and every session goes.
-    generation: Option<i64>,
+    /// The generation the revocation ended, the one stamp the sweep removes.
+    /// No account takes it again, so a session carrying it is dead however
+    /// many sign-outs-everywhere commit before the sweep runs. `None` when the
+    /// account is gone and every session goes.
+    ended: Option<i64>,
 }
 
 /// Where browser sessions are kept, and every way to read or change them.
@@ -386,13 +391,13 @@ impl Sessions {
         connection: &mut AsyncPgConnection,
         user_id: Uuid,
     ) -> Result<Revocation, Error> {
-        let generation = advance_generation(connection, user_id).await?;
+        let moved = advance_generation(connection, user_id).await?;
         if let Store::Postgres = self.store {
             postgres_store::delete_all(connection, user_id).await?;
         }
         Ok(Revocation {
             user_id,
-            generation,
+            ended: moved.map(|moved| moved.ended),
         })
     }
 
@@ -414,27 +419,27 @@ impl Sessions {
         user_id: Uuid,
         keep_token: &str,
     ) -> Result<Revocation, Error> {
-        let Some(generation) = advance_generation(connection, user_id).await? else {
+        let Some(moved) = advance_generation(connection, user_id).await? else {
             tracing::debug!(
                 user.id = %user_id,
                 "a password change for {{user.id}} found no account to move",
             );
             return Ok(Revocation {
                 user_id,
-                generation: None,
+                ended: None,
             });
         };
 
         let keep_hash = token::hash(keep_token);
         match &self.store {
             Store::Postgres => {
-                postgres_store::keep_only(connection, user_id, &keep_hash, generation).await?;
+                postgres_store::keep_only(connection, user_id, &keep_hash, moved.drawn).await?;
             }
-            Store::Redis(redis) => redis.restamp(&keep_hash, generation).await?,
+            Store::Redis(redis) => redis.restamp(&keep_hash, moved.drawn).await?,
         }
         Ok(Revocation {
             user_id,
-            generation: Some(generation),
+            ended: Some(moved.ended),
         })
     }
 
@@ -445,13 +450,14 @@ impl Sessions {
     /// commit, so a Redis that is slow or away never holds the account's row
     /// or a connection; a failure only means the ended sessions take up memory
     /// until they expire, so it is logged and not returned. Only sessions
-    /// stamped with something other than the new generation go, so a session
-    /// created since the commit, or kept by a password change, stays.
+    /// stamped with the generation the revocation ended go, so a session
+    /// created since the commit, or kept by a password change, stays, even one
+    /// a later sign-out-everywhere kept before this sweep ran.
     pub(crate) async fn sweep(&self, revocation: Revocation) {
         let Store::Redis(redis) = &self.store else {
             return;
         };
-        if let Err(error) = redis.sweep(revocation.user_id, revocation.generation).await {
+        if let Err(error) = redis.sweep(revocation.user_id, revocation.ended).await {
             tracing::warn!(
                 error.message = %error,
                 user.id = %revocation.user_id,
@@ -562,22 +568,43 @@ diesel::define_sql_function! {
     fn nextval(sequence: diesel::sql_types::Text) -> diesel::sql_types::BigInt;
 }
 
+/// One account's move to a new session generation.
+struct GenerationMove {
+    /// The generation the move ended, which the account never takes again.
+    ended: i64,
+    /// The generation drawn to replace it.
+    drawn: i64,
+}
+
 /// Moves the account to a new session generation, ending every session
-/// stamped with any other, and answers it, or `None` when the account is gone.
+/// stamped with any other, or answers `None` when the account is gone.
 ///
-/// The value is drawn from [`GENERATION_SEQUENCE`] rather than computed from
-/// the current one, so a value a rolled-back transaction drew is never the
-/// account's; see the module docs.
+/// The generation being ended is read under the row lock the move then holds
+/// until its transaction commits, so it is exactly the one replaced, which is
+/// what the sweep afterwards removes. The new value is drawn from
+/// [`GENERATION_SEQUENCE`] rather than computed from the current one, so a
+/// value a rolled-back transaction drew is never the account's; see the
+/// module docs.
 async fn advance_generation(
     connection: &mut AsyncPgConnection,
     user_id: Uuid,
-) -> Result<Option<i64>, diesel::result::Error> {
-    diesel::update(users::table.find(user_id))
+) -> Result<Option<GenerationMove>, diesel::result::Error> {
+    let Some(ended) = users::table
+        .find(user_id)
+        .select(users::session_generation)
+        .for_update()
+        .first(connection)
+        .await
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let drawn = diesel::update(users::table.find(user_id))
         .set(users::session_generation.eq(nextval(GENERATION_SEQUENCE)))
         .returning(users::session_generation)
         .get_result(connection)
-        .await
-        .optional()
+        .await?;
+    Ok(Some(GenerationMove { ended, drawn }))
 }
 
 /// A session could not be read or written.
