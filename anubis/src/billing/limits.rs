@@ -100,9 +100,9 @@ impl Limits {
 
     /// The plan an organization is on right now.
     ///
-    /// Total, like every other plan resolution here: a subscription that grants
-    /// access names its plan, and everything else, including no subscription at
-    /// all, is the free plan.
+    /// Total, like every other plan resolution here: a plan subscription that
+    /// grants access names its plan, and everything else, including no
+    /// subscription at all, is the free plan. See [`plan_in_force`].
     ///
     /// # Errors
     /// Returns an [`Error`] when the subscription cannot be read.
@@ -114,14 +114,7 @@ impl Limits {
         let subscription =
             Subscription::current_for_organization(connection, organization_id).await?;
 
-        let Some(subscription) = subscription.filter(Subscription::grants_access) else {
-            return Ok(self.plans.free());
-        };
-
-        Ok(self
-            .plans
-            .find(&subscription.plan_key)
-            .unwrap_or_else(|| self.plans.free()))
+        Ok(plan_in_force(&self.plans, subscription.as_ref()))
     }
 
     /// Refuses one more record when a hard limit is already reached.
@@ -216,6 +209,49 @@ impl fmt::Debug for Limits {
             .field("plans", &self.plans.plans().len())
             .finish_non_exhaustive()
     }
+}
+
+/// The plan an organization's live plan subscription puts in force.
+///
+/// The one place an organization's plan is decided; [`Limits::plan_for`], the
+/// billing endpoints, and seat enforcement all come through here, so they
+/// cannot disagree. The rule:
+///
+/// - The **plan subscription** decides, which is the live one naming no
+///   subject. The database holds an organization to one, so the answer is
+///   single-valued however many subscriptions it pays for.
+/// - **Subject subscriptions never move the plan.** Each buys its own record,
+///   not the organization's limits, so holding a hundred of them leaves the
+///   organization on whatever its plan subscription says.
+/// - A plan subscription that grants nothing (incomplete, unpaid, paused, or a
+///   status this version does not know) leaves the organization on the free
+///   plan, which is where a cancellation lands too. So does a plan the file no
+///   longer defines, which is logged for an operator to reconcile.
+///
+/// Counting an organization as paid while it holds any subscription that
+/// grants access, or a positive prepaid balance, is planned work that extends
+/// this function rather than a second rule beside it.
+pub(super) fn plan_in_force<'plans>(
+    plans: &'plans PlanSet,
+    plan_subscription: Option<&Subscription>,
+) -> &'plans Plan {
+    let Some(subscription) = plan_subscription.filter(|held| held.grants_access()) else {
+        return plans.free();
+    };
+
+    let plan_key = subscription.plan_key.as_deref().unwrap_or_default();
+    plans.find(plan_key).unwrap_or_else(|| {
+        // The plan was renamed or removed while a subscription still named it.
+        // Falling back to free keeps every page answering; the log is what
+        // tells an operator to reconcile `config/billing.yml` with Stripe.
+        tracing::error!(
+            billing.plan = plan_key,
+            organization.id = %subscription.organization_id,
+            "subscription names plan {{billing.plan}}, which config/billing.yml no longer \
+             defines; falling back to the free plan",
+        );
+        plans.free()
+    })
 }
 
 /// Answers whether `resulting` records are allowed on `plan`.
@@ -384,8 +420,8 @@ impl std::error::Error for Error {}
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{Error, ErrorKind, SEATS, enforce};
-    use crate::billing::PlanSet;
+    use super::{Error, ErrorKind, SEATS, enforce, plan_in_force};
+    use crate::billing::{PlanSet, Subscription};
     use crate::http::ApiError;
 
     const PLANS: &str = "
@@ -410,6 +446,66 @@ plans:
 
     fn plans() -> PlanSet {
         PlanSet::from_yaml(PLANS).expect("the plans must parse")
+    }
+
+    /// A plan subscription row shaped by hand, since the database is not involved.
+    fn plan_subscription(plan_key: &str, status: &str) -> Subscription {
+        let now = chrono::Utc::now();
+        Subscription {
+            id: uuid::Uuid::new_v4(),
+            organization_id: uuid::Uuid::new_v4(),
+            plan_key: Some(plan_key.to_owned()),
+            subject_type: None,
+            subject_id: None,
+            stripe_subscription_id: "sub_test".to_owned(),
+            status: status.to_owned(),
+            billing_interval: "monthly".to_owned(),
+            quantity: 1,
+            current_period_end: None,
+            cancel_at_period_end: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn no_plan_subscription_resolves_to_the_free_plan() {
+        assert_eq!(plan_in_force(&plans(), None).key(), "free");
+    }
+
+    #[test]
+    fn a_paying_plan_subscription_resolves_to_its_plan() {
+        let plans = plans();
+
+        for status in ["active", "trialing", "past_due"] {
+            let held = plan_subscription("pro", status);
+            assert_eq!(
+                plan_in_force(&plans, Some(&held)).key(),
+                "pro",
+                "for status {status}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_subscription_that_grants_nothing_resolves_to_free() {
+        let plans = plans();
+
+        for status in ["incomplete", "unpaid", "paused", "an_unknown_word"] {
+            let held = plan_subscription("pro", status);
+            assert_eq!(
+                plan_in_force(&plans, Some(&held)).key(),
+                "free",
+                "for status {status}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_the_file_no_longer_defines_resolves_to_free() {
+        let held = plan_subscription("legacy_gold", "active");
+
+        assert_eq!(plan_in_force(&plans(), Some(&held)).key(), "free");
     }
 
     #[test]
