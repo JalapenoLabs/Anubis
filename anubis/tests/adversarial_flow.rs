@@ -2689,32 +2689,16 @@ async fn sharing_is_held_to_what_the_sharer_holds() {
 }
 
 #[tokio::test]
-async fn neither_the_default_role_nor_a_team_standing_shares_anything() {
+async fn a_default_role_that_reads_shares_nothing_and_a_team_standing_shares_nothing() {
     let Some(database) = TestDatabase::create("adversarial_flow").await else {
         return;
     };
     let fleet = Fleet::open(&database).await;
 
-    // Raising everybody through the default role reaches nothing: it is no
-    // grant, so a sharer whose granted roles do not read machines still
-    // cannot share them, whatever the default role carries.
-    let (status, body) = fleet
-        .send(
-            "GET",
-            &format!("/tenancy/organizations/{}/roles", fleet.organization),
-            None,
-            &fleet.owner,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let default_role = id_of(
-        &body["roles"]
-            .as_array()
-            .expect("roles are listed")
-            .iter()
-            .find(|role| role["key"] == "default")
-            .expect("the default role")["id"],
-    );
+    // A default role that reads machines lets every full member read every
+    // one of them, because reaching is holding. Sharing still takes every
+    // permission on them, which reading alone is not.
+    let default_role = default_role_of(&fleet).await;
     let (status, body) = fleet
         .send(
             "PATCH",
@@ -2722,7 +2706,7 @@ async fn neither_the_default_role_nor_a_team_standing_shares_anything() {
                 "/tenancy/organizations/{}/roles/{default_role}",
                 fleet.organization
             ),
-            Some(&json!({ "permissions": EVERY_MACHINE_PERMISSION })),
+            Some(&json!({ "permissions": ["Machine.read"] })),
             &fleet.owner,
         )
         .await;
@@ -2735,13 +2719,14 @@ async fn neither_the_default_role_nor_a_team_standing_shares_anything() {
         .await;
     grant_organization_wide(&fleet, &email, &[grant_only]).await;
     assert_eq!(
-        fleet.share(&cookie, fleet.team_c, true, &[]).await,
-        StatusCode::FORBIDDEN,
+        fleet.open_machine(&cookie, fleet.machines[0]).await.0,
+        StatusCode::OK,
+        "every full member holds what the default role carries, and so reaches",
     );
     assert_eq!(
-        fleet.open_machine(&cookie, fleet.machines[0]).await.0,
-        StatusCode::NOT_FOUND,
-        "the default role is everybody's, so it reaches no machine",
+        fleet.share(&cookie, fleet.team_c, true, &[]).await,
+        StatusCode::FORBIDDEN,
+        "reading every machine is not holding every machine permission",
     );
 
     // A team's administrator cannot share with their own team what they do
@@ -3185,5 +3170,179 @@ async fn a_grant_change_must_state_the_whole_end_state() {
         fleet.grant_rows(fleet.team_a).await,
         1,
         "a refused change leaves the grant as it was",
+    );
+}
+
+/// The organization's default role, by id.
+async fn default_role_of(fleet: &Fleet) -> Uuid {
+    id_of(
+        &body_of_roles(fleet).await["roles"]
+            .as_array()
+            .expect("roles are listed")
+            .iter()
+            .find(|role| role["key"] == "default")
+            .expect("the default role")["id"],
+    )
+}
+
+#[tokio::test]
+async fn role_management_never_widens_reach_past_what_the_manager_holds() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let reader = fleet.create_role("Reader", &["Machine.read"]).await;
+    // Made after the Reader, so it ranks above it and may grant and edit it.
+    let manager = fleet
+        .create_role(
+            "Manager",
+            &[
+                "Tenancy::Membership.create",
+                "Tenancy::Membership.update",
+                "Tenancy::Role.update",
+            ],
+        )
+        .await;
+    let (email, cookie) = fleet
+        .join(("organization_id", fleet.organization), &[])
+        .await;
+    grant_organization_wide(&fleet, &email, &[manager]).await;
+    let membership = fleet.organization_membership(&email).await;
+    let first = fleet.machines[0];
+    assert_eq!(
+        fleet.open_machine(&cookie, first).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Granting themselves the role that reads machines, adding read to a role
+    // they hold, or inviting somebody into it: each hands out a permission the
+    // manager does not hold, so each is refused, and reach stays as it was.
+    let (status, _body) = fleet
+        .send(
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/members/{membership}",
+                fleet.organization
+            ),
+            Some(&json!({ "role_ids": [manager, reader] })),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _body) = fleet
+        .send(
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/roles/{manager}",
+                fleet.organization
+            ),
+            Some(&json!({
+                "permissions": [
+                    "Tenancy::Membership.create",
+                    "Tenancy::Membership.update",
+                    "Tenancy::Role.update",
+                    "Machine.read",
+                ],
+            })),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let invitation = json!({
+        "email": format!("invitee-{}@example.com", Uuid::new_v4()),
+        "organization_id": fleet.organization,
+        "role_ids": [reader],
+    });
+    let (status, _body) = fleet
+        .send("POST", "/tenancy/invitations", Some(&invitation), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fleet.open_machine(&cookie, first).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Holding is reaching: once the default role reads machines, every full
+    // member does, so granting the Reader role adds no reach anybody lacked.
+    let default_role = default_role_of(&fleet).await;
+    let (status, body) = fleet
+        .send(
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/roles/{default_role}",
+                fleet.organization
+            ),
+            Some(&json!({ "permissions": ["Machine.read"] })),
+            &fleet.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        fleet.open_machine(&cookie, first).await.0,
+        StatusCode::OK,
+        "what a member may do organization-wide is what they reach there",
+    );
+    let (_team_only_email, team_only) = fleet.join(("team_id", fleet.team_c), &[]).await;
+    assert_eq!(
+        fleet.open_machine(&team_only, first).await.0,
+        StatusCode::NOT_FOUND,
+        "the default role reaches nothing for somebody outside the organization's membership",
+    );
+}
+
+#[tokio::test]
+async fn a_suspension_through_the_teams_sub_tenant_ends_what_the_team_shares() {
+    use anubis::schema::{sub_tenant_memberships, sub_tenants, teams};
+
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    assert_eq!(
+        fleet.share(&fleet.owner, fleet.team_a, true, &[]).await,
+        StatusCode::OK
+    );
+    let (email, member) = fleet
+        .join(("team_id", fleet.team_a), &[fleet.operator])
+        .await;
+
+    // Team A is scoped to the organization's sub-tenant, and the member is
+    // suspended there: the team admits them nowhere, so it shares nothing.
+    let mut connection = fleet.harness.pool.get().await.expect("a connection");
+    let sub_tenant: Uuid = sub_tenants::table
+        .filter(sub_tenants::organization_id.eq(fleet.organization))
+        .select(sub_tenants::id)
+        .first(&mut connection)
+        .await
+        .expect("every organization has a sub-tenant");
+    diesel::update(teams::table.find(fleet.team_a))
+        .set(teams::sub_tenant_id.eq(Some(sub_tenant)))
+        .execute(&mut connection)
+        .await
+        .expect("the team is scoped to the sub-tenant");
+    assert_eq!(
+        fleet.open_machine(&member, fleet.machines[0]).await.0,
+        StatusCode::OK
+    );
+
+    let user: Uuid = users::table
+        .filter(users::email.eq(&email))
+        .select(users::id)
+        .first(&mut connection)
+        .await
+        .expect("the member has an account");
+    diesel::insert_into(sub_tenant_memberships::table)
+        .values((
+            sub_tenant_memberships::sub_tenant_id.eq(sub_tenant),
+            sub_tenant_memberships::user_id.eq(user),
+            sub_tenant_memberships::suspended_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("the member is suspended in the sub-tenant");
+    assert_eq!(
+        fleet.open_machine(&member, fleet.machines[0]).await.0,
+        StatusCode::NOT_FOUND,
+        "a suspension through the team's sub-tenant ends what the team shares",
     );
 }

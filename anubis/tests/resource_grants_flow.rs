@@ -138,8 +138,8 @@ async fn an_organization_shares_its_machines_team_by_team() {
     assert_eq!(status, StatusCode::FORBIDDEN, "an Operator does not delete");
 
     // ------------------------------------------------------------------
-    // The default role is everybody's and reaches nothing; an organization
-    // grant that reads machines reaches every one of them.
+    // A full member whose organization roles do not read machines reaches
+    // none of them; an organization grant that reads them reaches every one.
     // ------------------------------------------------------------------
     let (olga_email, olga) = fleet
         .join(("organization_id", fleet.organization), &[])

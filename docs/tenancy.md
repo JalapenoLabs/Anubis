@@ -280,10 +280,10 @@ Most records belong to a team and are reached through it. Some belong to the org
 | Path | Rule |
 |---|---|
 | Organization administrator | The administrator role, granted organization-wide, reaches every record the organization owns |
-| An organization grant that reads the kind | A full member holding `K.read` through a role granted organization-wide reaches every record of `K` |
+| The organization's roles read the kind | A full member whose roles that apply organization-wide, the default role among them, carry `K.read` reaches every record of `K` |
 | A team granted the record | A claimed member of a team granted every record of `K`, or this one, reaches it |
 
-**The default role is no grant, and reaches nothing by itself.** It is everybody's, so were it a way in, every member would reach every record and no team could be held to three machines; it applies wherever somebody reaches, as everywhere, and carrying `K.read` it lets every member who reaches a machine read it. A guest's organization standing reaches nothing here, as it reaches no sub-tenant: a guest reaches what a team they were put on was granted.
+**Reaching is holding.** What decides organization-wide reach is what the caller may do organization-wide, the same `Access` every role change is held to: a role can only be granted, edited, or offered by somebody who holds what it carries there, so managing roles never hands out reach its actor lacks. The consequence is deliberate: holding people to what their teams were granted means leaving `K.read` off the roles that apply to them organization-wide, and the default role first, since it applies to every full member. A default role that reads machines lets every full member read every machine, exactly as its permissions say. A guest's organization standing reaches nothing here, as it reaches no sub-tenant, and neither does the default role for somebody who belongs only to teams: both reach what a team they were put on was granted.
 
 On a record the caller reaches, the roles that apply are the default role, the organization-wide grants (for a full member or an administrator, since the record is the organization's own surface), and the team-wide grants of every team of theirs granted the record. **A team's grants add permissions but never rank**, exactly as in a sub-tenant: rank and the administrator role there come from the organization-wide grants alone, so reach through a team never makes anybody senior anywhere. A grant on one of a team's own records is about that team's records and never applies here.
 
@@ -311,7 +311,8 @@ Holding `Tenancy::ResourceGrant.update` is not enough on its own. A team granted
 |---|---|
 | A team's administrator sharing a kind with their own team | Refused: a team standing counts for nothing here, and a team-only member does not reach the organization's grants at all (`404`) |
 | A delegate holding the sharing permission and reading the kind, but not changing it | `403`: sharing takes every permission on the kind |
-| Editing the default role to carry the kind, then sharing | `403`: the default role reaches nothing, so the sharer's granted roles must read the kind |
+| Granting yourself, editing, or offering a role that reads the kind, to reach records you do not | `403` by hierarchy rule 2: reach is what you hold, so the role carries what you lack |
+| Editing the default role to read the kind, then sharing | Every full member now reads every record, which is what the edit says; sharing still takes every permission on the kind, which reading alone is not |
 | A guest holding delegated permissions organization-wide | A guest's organization standing reaches and shares nothing |
 | Naming another organization's record or team | `404`, byte-identical to an id that never existed |
 | Raising rank or the administrator role through a team's reach | A team's grants never rank and never carry the administrator role |
@@ -344,7 +345,7 @@ A grant names an application record by id and is never a foreign key, so deletin
 The scaffolder's ownership chains end in `Team` today, so a model the organization owns is written by hand. `anubis/tests/support/machines.rs` is a complete worked example, every surface included.
 
 1. **The table** carries `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`, indexed, and nothing about teams.
-2. **`roles.yml`** names the model under the roles that work with it, as any model is named. Leaving `read` on it off the default role is what lets teams be held to what they were granted: a role that `includes: [default]` carries what the default role carries, and granted organization-wide it would reach every record.
+2. **`roles.yml`** names the model under the roles that work with it, as any model is named. Leaving `read` on it off the default role is what lets teams be held to what they were granted: the default role applies to every full member organization-wide, and a role that `includes: [default]` carries what it carries.
 3. **A `ResourceKind`** describes the table to the framework: `name()` is the model, `find` answers the named records the organization owns with their names and locks them `FOR KEY SHARE`, and `options` answers a picker's page. Another organization's id is left out exactly as a missing one is.
 4. **Register the kind**: mount `anubis::tenancy::router_with(..., anubis::tenancy::Options::new().resource_kind(Machines))` where `router` was mounted. `router` is `router_with` with no kinds, and a kind `roles.yml` does not name as a model panics at composition.
 5. **Load through the resolver** on every surface, as the table above says, and answer `404` for `None`.

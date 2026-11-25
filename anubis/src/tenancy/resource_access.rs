@@ -18,11 +18,14 @@
 //!
 //! 1. **The caller administers the organization.** The administrator role,
 //!    granted organization-wide, reaches every record the organization owns.
-//! 2. **An organization-wide grant reads the kind.** A full member holding,
-//!    through a role granted organization-wide, `K.read` reaches every record
-//!    of `K`. The default role is not a grant and reaches nothing by itself,
-//!    because it is everybody's: were it a way in, every member would reach
-//!    every record, and no team could be held to three machines.
+//! 2. **The organization's roles read the kind.** A full member whose roles
+//!    that apply organization-wide, the default role among them, carry
+//!    `K.read` reaches every record of `K`. Reaching is holding: a role can
+//!    only be granted, edited, or offered by somebody holding what it carries
+//!    organization-wide, so managing roles never hands out reach its actor
+//!    lacks. Holding the people a kind is meant for to their teams' grants
+//!    therefore means leaving `K.read` off the roles that apply to them
+//!    organization-wide, the default role first.
 //! 3. **One of the caller's teams was granted the record.** A claimed member
 //!    of a team granted every record of `K`, or this record, reaches it.
 //!
@@ -145,13 +148,13 @@ pub async fn resolve_resource_access(
     let narrower = standing.teams.into_iter().map(|team| team.roles).collect();
     let policy = Rules {
         organization: standing.organization.as_ref(),
+        default_role: &standing.default_role,
         kind: resource.kind,
         roles,
     };
-    Ok(policy.on_record(narrower).map(|(mut ranking, narrower)| {
-        ranking.push(standing.default_role);
-        Access::ranked(ranking, narrower, roles)
-    }))
+    Ok(policy
+        .on_record(narrower)
+        .map(|(ranking, narrower)| Access::ranked(ranking, narrower, roles)))
 }
 
 /// Resolves which records of `kind` in an organization a caller may `action`.
@@ -180,14 +183,11 @@ pub async fn resolve_resource_scope(
 
     let policy = Rules {
         organization: standing.organization.as_ref(),
+        default_role: &standing.default_role,
         kind,
         roles,
     };
-    Ok(Some(policy.scope(
-        standing.teams,
-        standing.default_role,
-        action,
-    )))
+    Ok(Some(policy.scope(standing.teams, action)))
 }
 
 /// Returns `true` when `team` was granted `resource`.
@@ -364,15 +364,14 @@ impl OrganizationReach {
     pub(crate) fn on_every(&self, kind: &str, roles: &RoleSet) -> Option<Access> {
         let policy = Rules {
             organization: self.organization.as_ref(),
+            default_role: &self.default_role,
             kind,
             roles,
         };
         if !policy.organization_reaches() {
             return None;
         }
-        let mut ranking = policy.ranking();
-        ranking.push(self.default_role.clone());
-        Some(Access::ranked(ranking, Vec::new(), roles))
+        Some(Access::ranked(policy.ranking(), Vec::new(), roles))
     }
 }
 
@@ -476,6 +475,8 @@ fn coverage(granted: Vec<Option<Uuid>>) -> ResourceScope {
 /// the resolver reads as "gather the grants" and this as "apply them".
 struct Rules<'a> {
     organization: Option<&'a OrganizationStanding>,
+    /// The organization's default role, which applies wherever the caller reaches.
+    default_role: &'a Role,
     kind: &'a str,
     roles: &'a RoleSet,
 }
@@ -494,6 +495,11 @@ impl Rules<'_> {
     }
 
     /// Whether organization standing alone reaches every record of the kind.
+    ///
+    /// It does when the roles that apply organization-wide, the default role
+    /// among them, read the kind: reaching is exactly holding, so nobody can
+    /// hand out reach they lack through a role they may grant or edit, since
+    /// both are already held to what the actor holds organization-wide.
     fn organization_reaches(&self) -> bool {
         let Some(organization) = self.organization.filter(|_held| self.cascades()) else {
             return false;
@@ -502,23 +508,26 @@ impl Rules<'_> {
         organization
             .granted
             .iter()
+            .chain(std::iter::once(self.default_role))
             .any(|role| role.is_administrator() || role.permissions(self.roles).contains(&reads))
     }
 
-    /// The organization-wide roles that rank on the organization's records.
+    /// The roles that rank on the organization's records: the default role,
+    /// and the organization-wide grants when they apply here.
     fn ranking(&self) -> Vec<Role> {
-        match self.organization.filter(|_held| self.cascades()) {
+        let mut ranking = match self.organization.filter(|_held| self.cascades()) {
             Some(organization) => organization.granted.clone(),
             None => Vec::new(),
-        }
+        };
+        ranking.push(self.default_role.clone());
+        ranking
     }
 
     /// The roles that apply on one record, split by whether they rank there.
     ///
     /// `narrower` holds the team-wide roles of every team of the caller's that
     /// was granted the record; with none and no organization reach, the
-    /// caller does not reach it at all. The default role is the caller's to
-    /// add to the ranking half.
+    /// caller does not reach it at all.
     fn on_record(&self, narrower: Vec<Vec<Role>>) -> Option<(Vec<Role>, Vec<Role>)> {
         if narrower.is_empty() && !self.organization_reaches() {
             return None;
@@ -531,9 +540,8 @@ impl Rules<'_> {
     /// Permission is monotone in the roles held, so asking each path on its
     /// own is exact: a record two teams share is actionable when either of
     /// their standings, with the organization's, allows the action there.
-    fn scope(&self, teams: Vec<TeamStanding>, default_role: Role, action: Action) -> ResourceScope {
-        let mut ranking = self.ranking();
-        ranking.push(default_role);
+    fn scope(&self, teams: Vec<TeamStanding>, action: Action) -> ResourceScope {
+        let ranking = self.ranking();
 
         if self.organization_reaches()
             && Access::ranked(ranking.clone(), Vec::new(), self.roles).can(action, self.kind)
@@ -564,21 +572,18 @@ mod tests {
     use crate::tenancy::model::OrganizationAccess;
     use crate::tenancy::role::Role;
 
+    /// Nothing reads machines through `includes` here: `viewer` and
+    /// `operator` name them directly, and the default role names nothing.
     const ROLES: &str = "
 roles:
   default:
-    models:
-      Machine: [read]
+    models: {}
   viewer:
-    includes: [default]
     models:
       Machine: [read]
   operator:
-    includes: [default]
     models:
       Machine: [manage]
-  # Includes nothing, so nothing it carries reads machines: a role including
-  # `default` here would read them through it.
   bookkeeper:
     models: {}
   admin:
@@ -599,13 +604,26 @@ roles:
         }
     }
 
+    /// The default role as an organization edited it, carrying `permissions`.
+    fn default_carrying(permissions: &[&str]) -> Role {
+        Role {
+            permissions: Some(permissions.iter().map(|key| (*key).to_owned()).collect()),
+            ..role("default", 0)
+        }
+    }
+
     fn organization(access: OrganizationAccess, granted: Vec<Role>) -> OrganizationStanding {
         OrganizationStanding { access, granted }
     }
 
-    fn policy<'a>(organization: Option<&'a OrganizationStanding>, roles: &'a RoleSet) -> Rules<'a> {
+    fn policy<'a>(
+        organization: Option<&'a OrganizationStanding>,
+        default_role: &'a Role,
+        roles: &'a RoleSet,
+    ) -> Rules<'a> {
         Rules {
             organization,
+            default_role,
             kind: "Machine",
             roles,
         }
@@ -616,13 +634,12 @@ roles:
     }
 
     #[test]
-    fn the_default_role_alone_reaches_no_record() {
-        // The default role here reads machines, and that is the point: it is
-        // everybody's, so it applies where they reach and never makes reach.
+    fn a_member_whose_organization_roles_do_not_read_the_kind_reaches_nothing() {
         let roles = compiled();
-        let member = organization(OrganizationAccess::Full, Vec::new());
+        let default_role = role("default", 0);
+        let member = organization(OrganizationAccess::Full, vec![role("bookkeeper", 1)]);
         assert!(
-            policy(Some(&member), &roles)
+            policy(Some(&member), &default_role, &roles)
                 .on_record(Vec::new())
                 .is_none()
         );
@@ -631,32 +648,51 @@ roles:
     #[test]
     fn an_organization_grant_that_reads_the_kind_reaches_every_record() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let member = organization(OrganizationAccess::Full, vec![role("viewer", 1)]);
-        let (ranking, narrower) = policy(Some(&member), &roles)
+        let (ranking, narrower) = policy(Some(&member), &default_role, &roles)
             .on_record(Vec::new())
             .expect("an organization-wide reader reaches the record");
 
-        assert_eq!(ranking.len(), 1);
+        assert_eq!(ranking.len(), 2, "the viewer role and the default role");
         assert!(narrower.is_empty());
     }
 
     #[test]
-    fn an_organization_grant_that_does_not_read_the_kind_reaches_nothing() {
+    fn a_default_role_that_reads_the_kind_reaches_every_full_member_and_nobody_else() {
+        // Reaching is holding: every full member holds what the default role
+        // carries organization-wide, so every one of them reaches.
         let roles = compiled();
-        let member = organization(OrganizationAccess::Full, vec![role("bookkeeper", 1)]);
+        let default_role = default_carrying(&["Machine.read"]);
+        let member = organization(OrganizationAccess::Full, Vec::new());
         assert!(
-            policy(Some(&member), &roles)
+            policy(Some(&member), &default_role, &roles)
                 .on_record(Vec::new())
-                .is_none()
+                .is_some()
+        );
+
+        let guest = organization(OrganizationAccess::Guest, Vec::new());
+        assert!(
+            policy(Some(&guest), &default_role, &roles)
+                .on_record(Vec::new())
+                .is_none(),
+            "a guest's organization standing reaches nothing",
+        );
+        assert!(
+            policy(None, &default_role, &roles)
+                .on_record(Vec::new())
+                .is_none(),
+            "nor does the standing of somebody outside the organization's membership",
         );
     }
 
     #[test]
     fn an_administrator_reaches_every_record_even_marked_as_a_guest() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let administrator = organization(OrganizationAccess::Guest, vec![role("admin", 4)]);
         assert!(
-            policy(Some(&administrator), &roles)
+            policy(Some(&administrator), &default_role, &roles)
                 .on_record(Vec::new())
                 .is_some()
         );
@@ -665,8 +701,9 @@ roles:
     #[test]
     fn a_guest_reaches_only_what_a_team_of_theirs_was_granted() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let guest = organization(OrganizationAccess::Guest, vec![role("viewer", 1)]);
-        let guest_policy = policy(Some(&guest), &roles);
+        let guest_policy = policy(Some(&guest), &default_role, &roles);
 
         assert!(
             guest_policy.on_record(Vec::new()).is_none(),
@@ -675,21 +712,18 @@ roles:
         let (ranking, narrower) = guest_policy
             .on_record(vec![vec![role("operator", 2)]])
             .expect("a team grant admits a guest");
-        assert!(
-            ranking.is_empty(),
-            "a guest's organization roles never apply"
-        );
+        assert_eq!(ranking.len(), 1, "a guest's organization roles never apply");
         assert_eq!(narrower.len(), 1);
     }
 
     #[test]
     fn a_team_grant_adds_permissions_and_never_rank() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let member = organization(OrganizationAccess::Full, Vec::new());
-        let (mut ranking, narrower) = policy(Some(&member), &roles)
+        let (ranking, narrower) = policy(Some(&member), &default_role, &roles)
             .on_record(vec![vec![role("admin", 4)]])
             .expect("the team's grant reaches the record");
-        ranking.push(role("default", 0));
         let access = super::Access::ranked(ranking, narrower, &roles);
 
         assert!(access.can(Action::Destroy, "Machine"));
@@ -704,16 +738,27 @@ roles:
     #[test]
     fn a_team_only_member_reaches_what_the_team_was_granted() {
         let roles = compiled();
-        let (ranking, narrower) = policy(None, &roles)
+        let default_role = role("default", 0);
+        let (ranking, narrower) = policy(None, &default_role, &roles)
             .on_record(vec![Vec::new()])
             .expect("belonging to a granted team admits");
-        assert!(ranking.is_empty() && narrower.is_empty());
-        assert!(policy(None, &roles).on_record(Vec::new()).is_none());
+        assert_eq!(
+            ranking.len(),
+            1,
+            "the default role applies wherever they reach"
+        );
+        assert!(narrower.is_empty());
+        assert!(
+            policy(None, &default_role, &roles)
+                .on_record(Vec::new())
+                .is_none()
+        );
     }
 
     #[test]
     fn a_scope_takes_in_what_each_path_allows() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let member = organization(OrganizationAccess::Full, Vec::new());
         let shared = Uuid::new_v4();
         let other = Uuid::new_v4();
@@ -728,7 +773,7 @@ roles:
             },
         ];
 
-        let scope = policy(Some(&member), &roles).scope(teams, role("default", 0), Action::Update);
+        let scope = policy(Some(&member), &default_role, &roles).scope(teams, Action::Update);
         assert_eq!(
             scope,
             ResourceScope::Only(BTreeSet::from([shared])),
@@ -739,9 +784,9 @@ roles:
     #[test]
     fn a_scope_is_every_record_for_an_organization_reader() {
         let roles = compiled();
+        let default_role = role("default", 0);
         let member = organization(OrganizationAccess::Full, vec![role("viewer", 1)]);
-        let scope =
-            policy(Some(&member), &roles).scope(Vec::new(), role("default", 0), Action::Read);
+        let scope = policy(Some(&member), &default_role, &roles).scope(Vec::new(), Action::Read);
         assert_eq!(scope, ResourceScope::Every);
     }
 
