@@ -72,7 +72,9 @@ use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 #[doc(inline)]
-pub use permission::{MEMBERSHIP, ParsePermissionError, Permission, ROLE, SUBSCRIPTION};
+pub use permission::{
+    MEMBERSHIP, ParsePermissionError, Permission, RESOURCE_GRANT, ROLE, SUBSCRIPTION,
+};
 
 use permission::{FRAMEWORK_GRANTS, FRAMEWORK_SUBJECTS, framework_actions};
 

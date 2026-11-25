@@ -58,7 +58,9 @@ pub struct SubTenant {
     pub updated_at: DateTime<Utc>,
 }
 
-/// The working tenant: all domain resources chain ownership back to a team.
+/// The working tenant: domain resources chain ownership back to a team, apart
+/// from the records an organization owns directly and shares through resource
+/// grants.
 #[derive(Debug, Clone, Serialize, Queryable, Selectable)]
 #[diesel(table_name = teams)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

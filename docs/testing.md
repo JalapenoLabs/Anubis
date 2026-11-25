@@ -14,6 +14,8 @@ The framework's tests are unit tests beside the code they cover, and integration
 
 A narrative is one linear story with a caller, a sequence, and assertions on what each step answered. It reads top to bottom and needs no shared fixtures beyond `tests/support/`.
 
+The framework cannot see an application's tables, so the suites that prove [resource grants](tenancy.md#resource-grants) carry a small application of their own in `tests/support/machines.rs`: a `machines` table the organization owns, the `ResourceKind` describing it, and the routes an application writes over it on every surface (session routes, `/api/v1`, an MCP tool, a realtime stream), registered by the `Harness` beside the framework's routers. `resource_grants_flow.rs` is the narrative, and the adversarial and concurrency suites take the same fleet apart.
+
 Every suite that needs a database gates on `DATABASE_URL` and logs a skip when it is unset, so `cargo test` works on a machine without one. A test that needs Redis, the realtime fanout and the Redis half of the session store narrative, gates on `REDIS_URL` the same way. CI always provides both. See [ci.md](ci.md).
 
 ### One narrative, two stores

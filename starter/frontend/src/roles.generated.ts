@@ -27,6 +27,7 @@ export const PermissionKeys = [
   'Tenancy::Membership.create',
   'Tenancy::Membership.update',
   'Tenancy::Membership.destroy',
+  'Tenancy::ResourceGrant.update',
   'Tenancy::Role.create',
   'Tenancy::Role.update',
   'Tenancy::Role.destroy',

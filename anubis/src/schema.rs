@@ -116,7 +116,9 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Working tenants. All domain resources chain ownership back to a team.
+    /// Working tenants. Domain resources chain ownership back to a team, apart
+    /// from the records an organization owns directly and shares through
+    /// `resource_grants`.
     ///
     /// `sub_tenant_id` is null for an organization-level team, which every
     /// sub-tenant inherits; a set value scopes the team to one sub-tenant.
@@ -599,6 +601,20 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// A team's reach into the records its organization owns directly: every
+    /// record of one kind (`resource_id` null), or one record of it.
+    resource_grants (id) {
+        id -> Uuid,
+        organization_id -> Uuid,
+        team_id -> Uuid,
+        kind -> Text,
+        resource_id -> Nullable<Uuid>,
+        granted_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(sessions, users);
 diesel::allow_tables_to_appear_in_same_query!(oauth_identities, users);
 diesel::allow_tables_to_appear_in_same_query!(user_tokens, users);
@@ -614,8 +630,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     roles,
     role_grants,
     invitation_roles,
+    resource_grants,
 );
 diesel::joinable!(roles -> organizations (organization_id));
+diesel::joinable!(resource_grants -> teams (team_id));
 diesel::joinable!(role_grants -> roles (role_id));
 diesel::joinable!(invitation_roles -> roles (role_id));
 diesel::joinable!(invitation_roles -> invitations (invitation_id));

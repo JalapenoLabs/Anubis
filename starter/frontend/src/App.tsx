@@ -22,6 +22,7 @@ import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPa
 import { NewRolePage } from './pages/roles/NewRolePage'
 import { RolePage } from './pages/roles/RolePage'
 import { RolesPage } from './pages/roles/RolesPage'
+import { ResourceAccessPage } from './pages/access/ResourceAccessPage'
 import { TeamSettingsPage } from './pages/tenancy/TeamSettingsPage'
 import { ProfileSettingsPage } from './pages/settings/ProfileSettingsPage'
 import { SecuritySettingsPage } from './pages/settings/SecuritySettingsPage'
@@ -194,6 +195,14 @@ export function App() {
       element={
         <Workspace>
           <RolesPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationAccess}
+      element={
+        <Workspace>
+          <ResourceAccessPage />
         </Workspace>
       }
     />

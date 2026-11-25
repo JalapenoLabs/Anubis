@@ -4,7 +4,14 @@
 import { useTranslation } from 'react-i18next'
 import { useParams } from 'react-router'
 import useSWR from 'swr'
-import { MEMBERSHIP_SUBJECT, allows, useAnubisApi, useCurrentUser, useRoles } from '@jalapenolabs/anubis'
+import {
+  MEMBERSHIP_SUBJECT,
+  allows,
+  useAnubisApi,
+  useCurrentUser,
+  useResourceGrants,
+  useRoles,
+} from '@jalapenolabs/anubis'
 import { useTeamContext } from '../../context/TeamProvider'
 
 // UI
@@ -18,7 +25,11 @@ import { OrganizationTeamsCard } from '../../components/tenancy/OrganizationTeam
 import { RenameTenantCard } from '../../components/tenancy/RenameTenantCard'
 
 // Misc
-import { getOrganizationBillingUrl, getOrganizationRolesUrl } from '../../urls'
+import {
+  getOrganizationAccessUrl,
+  getOrganizationBillingUrl,
+  getOrganizationRolesUrl,
+} from '../../urls'
 
 /**
  * Administering one organization: its name, its people, and its teams.
@@ -48,6 +59,11 @@ export function OrganizationSettingsPage() {
     () => api.listOrganizationMembers(organizationId),
   )
   const roles = useRoles(isOrganizationMember ? { organizationId } : null)
+  // The team access card appears once the application shares a kind of
+  // record, by registering a `ResourceKind` with the tenancy router; until
+  // then there is nothing for it to open.
+  const resourceGrants = useResourceGrants(isOrganizationMember ? organizationId : null)
+  const sharesRecords = Boolean(resourceGrants.overview?.kinds.length)
 
   // RequireAuth guarantees a user before this page renders.
   if (!user) {
@@ -140,6 +156,34 @@ export function OrganizationSettingsPage() {
               >
                 <span>{
                     t('roles.cardAction')
+                  }</span>
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+      : null
+    }
+    { isOrganizationMember && sharesRecords
+      ? <Card className='relaxed p-2'>
+          <CardBody>
+            <div className='level items-start'>
+              <div>
+                <h3 className='compact text-xl font-semibold'>{
+                    t('access.cardTitle')
+                  }</h3>
+                <p className='opacity-70'>{
+                    t('access.cardSubtitle')
+                  }</p>
+              </div>
+              <Button
+                as={Link}
+                to={getOrganizationAccessUrl(organization.id)}
+                color='primary'
+                variant='flat'
+                className='shrink-0'
+              >
+                <span>{
+                    t('access.cardAction')
                   }</span>
               </Button>
             </div>

@@ -18,7 +18,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use anubis::roles::{Action, MEMBERSHIP, Permission, ROLE, RoleSet, SUBSCRIPTION};
+use anubis::roles::{Action, MEMBERSHIP, Permission, RESOURCE_GRANT, ROLE, RoleSet, SUBSCRIPTION};
 use anubis::schema::{invitation_roles, organizations, role_grants, roles};
 use anubis::tenancy::{
     Access, Reach, resolve_organization_access, resolve_sub_tenant_access, resolve_team_access,
@@ -410,6 +410,7 @@ fn assert_access(set: &RoleSet, access: &Access, keys: &[&str], administrator: b
                 (ROLE, Action::Update),
                 (ROLE, Action::Destroy),
                 (SUBSCRIPTION, Action::Update),
+                (RESOURCE_GRANT, Action::Update),
             ]
             .into_iter()
             .map(|(subject, action)| Permission::new(subject, action)),

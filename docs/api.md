@@ -292,6 +292,9 @@ The framework mounts the tenancy surface under `/tenancy`. These are account (br
 | `PATCH /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.update` | Rename, recolour, or change a role's permissions; `permissions: null` returns a seeded role to following `roles.yml` |
 | `DELETE /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.destroy` | Delete a role, revoking it from everybody |
 | `PUT /tenancy/organizations/{organization_id}/role-order` | `Tenancy::Role.update` | Put every role but the two structural ones in a new order, highest first |
+| `GET /tenancy/organizations/{organization_id}/resource-grants` | org member | The kinds of record the application shares, the teams, and the grants of every kind the caller reaches |
+| `PUT /tenancy/organizations/{organization_id}/teams/{team_id}/resource-grants/{kind}` | `Tenancy::ResourceGrant.update`, and every permission on the kind | Replace what one team reaches of one kind: `{every, resource_ids}`, both required |
+| `GET /tenancy/organizations/{organization_id}/resource-grants/{kind}/options` | the same | The organization's records of a kind, fifty at a time, narrowed by `?search=` |
 | `PATCH /tenancy/teams/{team_id}` | team administrator | Rename the team |
 | `GET /tenancy/teams/{team_id}/roles` | team member | The organization's roles, with the caller's standing in the team |
 | `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | `Tenancy::Membership.update` | Replace a member's roles in the team, or with `resource_id` on one record of it |
@@ -303,7 +306,7 @@ Guarded routes answer `401` when signed out, `404` when the caller is not a memb
 
 ### The tenancy screens
 
-Two screens cover the surface above, in the settings style the identity screens established, and the team switcher in the application frame reaches both:
+These screens cover the surface above, in the settings style the identity screens established; the team switcher in the application frame reaches the two settings screens, and the organization's settings reach the rest:
 
 | Screen | Route | What it does |
 |---|---|---|
@@ -312,6 +315,7 @@ Two screens cover the surface above, in the settings style the identity screens 
 | Roles | `/organizations/{organizationId}/roles` | The ladder, highest first, reordered by dragging or with the move buttons |
 | New role | `/organizations/{organizationId}/roles/new` | Name, colour, and permission switches; a draft survives a reload |
 | Role | `/organizations/{organizationId}/roles/{roleId}` | Rename, recolour, and switch permissions, saved in the top right; return to the recommended permissions; delete |
+| Team access | `/organizations/{organizationId}/access` | Which teams reach the records the organization owns directly: nothing, every record of a kind, or only the ones picked by name, saved in the top right |
 
 Affordances come from the access the server resolved, never from role names: `GET /tenancy/memberships` answers each organization and team with the roles that apply, their permission keys, the rank, and whether the administrator role applies, and the screens draw a control only when that allows it. The package's `outranks`, `assignability`, and `outranksMember` mirror the hierarchy, so a role the viewer may not hand out is shown locked with the reason beneath it rather than offered and refused. The role editor locks a permission switch the viewer does not hold, and, for everybody, one no role in `roles.yml` grants (the catalog's `grantable`), each with its reason. The screens only mirror the server, which still answers `403`, and the refusals worth reading (`409` for the last administrator, `400` for removing yourself instead of leaving) are surfaced verbatim where the action was taken.
 

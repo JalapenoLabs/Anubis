@@ -12,6 +12,7 @@ import { createAuthRoutes } from './routes/authRoutes'
 import { createBillingRoutes } from './routes/billingRoutes'
 import { createNotificationRoutes } from './routes/notificationRoutes'
 import { createOauthRoutes } from './routes/oauthRoutes'
+import { createResourceGrantRoutes } from './routes/resourceGrantRoutes'
 import { createTenancyRoutes } from './routes/tenancyRoutes'
 
 type AnubisApiOptions = {
@@ -78,6 +79,7 @@ export function createAnubisApi(options: AnubisApiOptions = {}) {
     ...createAuthRoutes(client),
     ...createAccountRoutes(client),
     ...createTenancyRoutes(client),
+    ...createResourceGrantRoutes(client),
     ...createBillingRoutes(client),
     ...createNotificationRoutes(client),
     ...createOauthRoutes(client),

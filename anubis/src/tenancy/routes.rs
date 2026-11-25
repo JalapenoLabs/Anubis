@@ -18,6 +18,7 @@
 //! [`crate::rate_limit`].
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -52,6 +53,7 @@ use crate::tenancy::hierarchy;
 use crate::tenancy::invitation::{self, Invitation, InvitationTarget};
 use crate::tenancy::management::lock_organization;
 use crate::tenancy::model::{Organization, OrganizationAccess, Team};
+use crate::tenancy::resource_kind::{ResourceKind, ResourceKinds};
 use crate::tenancy::role::{Role, RoleSummary};
 
 /// Returns the tenancy routes for an application to mount.
@@ -71,6 +73,9 @@ use crate::tenancy::role::{Role, RoleSummary};
 /// per-recipient inbox budget an invitation charges is the one a password
 /// reset charges. Two limiters would be two budgets, and an inbox would take
 /// both.
+///
+/// This is [`router_with`] and [`Options::default`]: an application that
+/// shares no records its organizations own directly needs nothing more.
 pub fn router(
     pool: DbPool,
     mailer: Mailer,
@@ -79,6 +84,79 @@ pub fn router(
     config: &AppConfig,
     rate_limit: &RateLimiter,
 ) -> Router {
+    router_with(
+        pool,
+        mailer,
+        roles,
+        plans,
+        config,
+        rate_limit,
+        Options::default(),
+    )
+}
+
+/// What an application adds to the tenancy routes.
+///
+/// ```ignore
+/// .nest(
+///     "/tenancy",
+///     anubis::tenancy::router_with(
+///         pool.clone(),
+///         mailer.clone(),
+///         roles.clone(),
+///         plans,
+///         &config,
+///         &rate_limit,
+///         anubis::tenancy::Options::new().resource_kind(Machines),
+///     ),
+/// )
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    kinds: ResourceKinds,
+}
+
+impl Options {
+    /// Nothing added: the routes behave as [`router`] mounts them.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shares one kind of record the organizations own directly with their teams.
+    ///
+    /// The access screen lists the kind, and its endpoints grant teams every
+    /// record of it or specific ones. See [`ResourceKind`].
+    ///
+    /// # Panics
+    /// Panics when another kind registered here already took the name.
+    #[must_use]
+    pub fn resource_kind(mut self, kind: impl ResourceKind) -> Self {
+        self.kinds.register(Arc::new(kind));
+        self
+    }
+}
+
+/// Returns the tenancy routes with the application's additions plugged in.
+///
+/// Everything [`router`] says holds here; `options` adds what the application
+/// chose, and [`Options::default`] is [`router`] exactly.
+///
+/// # Panics
+/// Panics when a shared kind is not a model `roles.yml` names, which is a
+/// mistake in how the application composed its router rather than something
+/// a request could cause.
+pub fn router_with(
+    pool: DbPool,
+    mailer: Mailer,
+    roles: RoleSet,
+    plans: Option<PlanSet>,
+    config: &AppConfig,
+    rate_limit: &RateLimiter,
+    options: Options,
+) -> Router {
+    options.kinds.validate(&roles);
+
     Router::new()
         .route("/memberships", get(list_memberships))
         .route("/teams/{team_id}/members", get(list_team_members))
@@ -90,6 +168,7 @@ pub fn router(
         .route("/invitations/claim", post(claim_invitation))
         .merge(super::management::routes())
         .merge(super::role_routes::routes())
+        .merge(super::resource_grant_routes::routes())
         .with_state(TenancyState {
             pool: pool.clone(),
             mailer,
@@ -97,6 +176,7 @@ pub fn router(
             limits: plans.map(Limits::new),
             app_url: config.app_url.clone(),
             rate_limit: rate_limit.clone(),
+            kinds: options.kinds,
         })
         // CurrentUser and the guard extractors resolve their dependencies
         // from these request extensions.
@@ -113,6 +193,8 @@ pub(super) struct TenancyState {
     app_url: String,
     /// The inbox budget an invitation charges, shared with the auth surface.
     rate_limit: RateLimiter,
+    /// The kinds of record organizations own directly and share with teams.
+    pub(super) kinds: ResourceKinds,
 }
 
 impl TenancyState {

@@ -40,6 +40,8 @@ export const UrlTree = {
   organizationRole: '/organizations/:organizationId/roles/:roleId',
   /** Making a role, on a page of its own. */
   organizationRoleNew: '/organizations/:organizationId/roles/new',
+  /** Which teams reach the records the organization owns directly. */
+  organizationAccess: '/organizations/:organizationId/access',
   claimInvitation: '/claim-invitation',
   /**
    * Where a connecting program such as Claude Code sends the person to approve
@@ -205,6 +207,10 @@ export function getOrganizationBillingActivityUrl(organizationId: string): strin
 
 export function getOrganizationRolesUrl(organizationId: string): string {
   return UrlTree.organizationRoles.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationAccessUrl(organizationId: string): string {
+  return UrlTree.organizationAccess.replace(':organizationId', organizationId)
 }
 
 export function getOrganizationRoleNewUrl(organizationId: string): string {

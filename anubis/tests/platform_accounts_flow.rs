@@ -207,7 +207,7 @@ impl Deployment {
             .merge(anubis::oauth_server::router(&authorization, &rate_limit))
             .merge(anubis::mcp::router(
                 &authorization,
-                support::Harness::tools(),
+                support::Harness::tools(&roles),
             ))
             .layer(Extension(accounts))
             .layer(anubis::guard::layer(pool.clone(), roles));

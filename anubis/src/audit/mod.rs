@@ -105,6 +105,8 @@ pub const ROLE_UPDATED: &str = "role.updated";
 pub const ROLE_DESTROYED: &str = "role.destroyed";
 /// An organization's roles were put in a new order.
 pub const ROLE_REORDERED: &str = "role.reordered";
+/// What a team reaches of one kind of the organization's own records changed.
+pub const TEAM_ACCESS_CHANGED: &str = "team.access_changed";
 /// Somebody removed somebody else from a tenant.
 pub const MEMBER_REMOVED: &str = "member.removed";
 /// Somebody left a tenant of their own accord.

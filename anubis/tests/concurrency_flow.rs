@@ -20,8 +20,8 @@ use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
     audit_events, dead_jobs, jobs as jobs_table, oauth_authorization_requests, oauth_device_codes,
-    oauth_grants, organizations, role_grants, roles, sessions, team_memberships, teams,
-    user_avatars, webhook_deliveries, webhook_endpoints,
+    oauth_grants, organizations, resource_grants, role_grants, roles, sessions, team_memberships,
+    teams, user_avatars, webhook_deliveries, webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use support::machines::{self, Fleet};
 use support::oauth::{MetadataDocument, device_codes, mcp, poll, request_for_code};
 use support::{
     Harness, PASSWORD, TestDatabase, invitation_token, register, role_id, send, session_token,
@@ -1376,4 +1377,316 @@ async fn an_approval_and_a_refusal_of_one_device_decide_once() {
             "the refusal is what it reads: {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resource grants
+// ---------------------------------------------------------------------------
+
+/// Replaces what `team` reaches of the machines, on its own task.
+fn share_machines(fleet: &Fleet, team: Uuid, every: bool, ids: &[Uuid]) -> JoinHandle<StatusCode> {
+    let router = fleet.harness.router.clone();
+    let cookie = fleet.owner.clone();
+    let path = format!(
+        "/tenancy/organizations/{}/teams/{team}/resource-grants/{}",
+        fleet.organization,
+        machines::KIND
+    );
+    let body = json!({ "every": every, "resource_ids": ids });
+    tokio::spawn(async move {
+        let (status, _headers, _body) =
+            send(&router, "PUT", &path, Some(&body), Some(&cookie)).await;
+        status
+    })
+}
+
+/// What `team` reaches of the machines, as rows: `None` for every machine.
+async fn team_grants(fleet: &Fleet, team: Uuid) -> Vec<Option<Uuid>> {
+    let mut connection = fleet.harness.pool.get().await.expect("connection");
+    resource_grants::table
+        .filter(resource_grants::team_id.eq(team))
+        .select(resource_grants::resource_id)
+        .load(&mut connection)
+        .await
+        .expect("the grants must read")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_grant_changes_land_whole_and_record_each_change_once() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let first = fleet.machines[0];
+
+    // Every request queues behind the organization's lock, which the handlers
+    // take first, so they all arrive together and are ordered by it.
+    let mut blocker = fleet.harness.pool.get().await.expect("connection");
+    let racers = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            organizations::table
+                .find(fleet.organization)
+                .select(organizations::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let racers: Vec<JoinHandle<StatusCode>> = (0..RACERS)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        share_machines(&fleet, fleet.team_a, true, &[])
+                    } else {
+                        share_machines(&fleet, fleet.team_a, false, &[first])
+                    }
+                })
+                .collect();
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(racers)
+        })
+        .await
+        .expect("holding the organization lock must succeed");
+    drop(blocker);
+
+    for racer in racers {
+        assert_eq!(
+            racer.await.expect("the request task must not panic"),
+            StatusCode::OK
+        );
+    }
+
+    let rows = team_grants(&fleet, fleet.team_a).await;
+    assert!(
+        rows == [None] || rows == [Some(first)],
+        "the team ends holding exactly one of the two end states, never both: {rows:?}",
+    );
+
+    let mut connection = fleet.harness.pool.get().await.expect("connection");
+    let recorded: Vec<Value> = audit_events::table
+        .filter(audit_events::subject_id.eq(fleet.team_a))
+        .filter(audit_events::action.eq(anubis::audit::TEAM_ACCESS_CHANGED))
+        .order(audit_events::created_at.asc())
+        .select(audit_events::changes)
+        .load(&mut connection)
+        .await
+        .expect("the audit log must read");
+    assert!(!recorded.is_empty(), "the first change is recorded");
+    for change in &recorded {
+        assert_ne!(
+            change[machines::KIND]["old"],
+            change[machines::KIND]["new"],
+            "a request that changed nothing records nothing: {change}",
+        );
+    }
+    let last = &recorded[recorded.len() - 1][machines::KIND]["new"];
+    assert_eq!(
+        last["every"],
+        rows == [None],
+        "the log's last word is the state the team is left in",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_deleted_while_it_is_granted_leaves_no_grant_behind() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let [first, second, _third, _fourth] = fleet.machines;
+
+    // The delete is first: the grant queues behind the deleting transaction's
+    // row lock, finds the machine gone once it commits, and is refused.
+    let mut deleting = fleet.harness.pool.get().await.expect("connection");
+    let granting = deleting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::delete(machines::machines::table.find(first))
+                .execute(transaction)
+                .await?;
+            anubis::tenancy::forget_resource(transaction, machines::KIND, first).await?;
+            let granting = share_machines(&fleet, fleet.team_a, false, &[first]);
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            Ok(granting)
+        })
+        .await
+        .expect("the delete must commit");
+    drop(deleting);
+    assert_eq!(
+        granting.await.expect("the request task must not panic"),
+        StatusCode::NOT_FOUND,
+        "a machine deleted before the grant is refused as missing",
+    );
+    assert!(team_grants(&fleet, fleet.team_a).await.is_empty());
+
+    // The grant is first: it holds the machine `FOR KEY SHARE` as the kind's
+    // lookup does, so the delete waits until it commits and its forget then
+    // sees the grant and takes it.
+    let mut granting = fleet.harness.pool.get().await.expect("connection");
+    let deleting = granting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            machines::machines::table
+                .find(second)
+                .select(machines::machines::id)
+                .for_key_share()
+                .first::<Uuid>(transaction)
+                .await?;
+            diesel::insert_into(resource_grants::table)
+                .values((
+                    resource_grants::organization_id.eq(fleet.organization),
+                    resource_grants::team_id.eq(fleet.team_a),
+                    resource_grants::kind.eq(machines::KIND),
+                    resource_grants::resource_id.eq(Some(second)),
+                ))
+                .execute(transaction)
+                .await?;
+            let pool = fleet.harness.pool.clone();
+            let deleting = tokio::spawn(async move {
+                let mut connection = pool.get().await.expect("connection");
+                machines::delete(&mut connection, second).await
+            });
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            assert!(!deleting.is_finished(), "the delete waits for the grant");
+            Ok(deleting)
+        })
+        .await
+        .expect("the grant must commit");
+    drop(granting);
+    assert_eq!(
+        deleting
+            .await
+            .expect("the delete task must not panic")
+            .expect("the delete must succeed"),
+        1,
+    );
+    assert!(
+        team_grants(&fleet, fleet.team_a).await.is_empty(),
+        "the delete's forget takes the grant that committed ahead of it",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_team_deleted_with_grants_takes_them_and_a_racing_grant_is_refused() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    assert_eq!(
+        share_machines(&fleet, fleet.team_c, true, &[])
+            .await
+            .expect("the request task must not panic"),
+        StatusCode::OK,
+    );
+    let (status, _headers, body) = send(
+        &fleet.harness.router,
+        "DELETE",
+        &format!(
+            "/tenancy/organizations/{}/teams/{}",
+            fleet.organization, fleet.team_c
+        ),
+        None,
+        Some(&fleet.owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "body: {body}");
+    assert!(
+        team_grants(&fleet, fleet.team_c).await.is_empty(),
+        "a deleted team's grants go with it",
+    );
+
+    // A grant queued behind the organization's lock while the team is deleted
+    // finds no team once it runs, and says so rather than failing. The team
+    // goes inside the transaction holding the lock, because the delete route
+    // records its audit event against the organization, which waits on it.
+    let mut blocker = fleet.harness.pool.get().await.expect("connection");
+    let granting = blocker
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            organizations::table
+                .find(fleet.organization)
+                .select(organizations::id)
+                .for_update()
+                .first::<Uuid>(transaction)
+                .await?;
+            let granting = share_machines(&fleet, fleet.team_a, true, &[]);
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            diesel::delete(teams::table.find(fleet.team_a))
+                .execute(transaction)
+                .await?;
+            Ok(granting)
+        })
+        .await
+        .expect("the team's delete must commit");
+    drop(blocker);
+    assert_eq!(
+        granting.await.expect("the request task must not panic"),
+        StatusCode::NOT_FOUND,
+    );
+    assert!(team_grants(&fleet, fleet.team_a).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_grant_while_its_record_is_deleted_never_deadlocks() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let [first, second, _third, _fourth] = fleet.machines;
+    assert_eq!(
+        share_machines(&fleet, fleet.team_a, false, &[first, second])
+            .await
+            .expect("the request task must not panic"),
+        StatusCode::OK,
+    );
+
+    // The application's delete takes the machine first and forgets its grants
+    // second, as documented; the revocation runs in between. Neither side may
+    // wait on a row the other holds.
+    let mut deleting = fleet.harness.pool.get().await.expect("connection");
+    let revoking = deleting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::delete(machines::machines::table.find(first))
+                .execute(transaction)
+                .await?;
+            let revoking = share_machines(&fleet, fleet.team_a, false, &[second]);
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            anubis::tenancy::forget_resource(transaction, machines::KIND, first).await?;
+            Ok(revoking)
+        })
+        .await
+        .expect("the delete must commit rather than lose a deadlock");
+    drop(deleting);
+    assert_eq!(
+        revoking.await.expect("the request task must not panic"),
+        StatusCode::OK,
+        "the revocation must commit rather than lose a deadlock",
+    );
+    assert_eq!(team_grants(&fleet, fleet.team_a).await, [Some(second)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_never_waits_on_a_record_being_deleted() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let first = fleet.machines[0];
+    assert_eq!(
+        share_machines(&fleet, fleet.team_a, false, &[first])
+            .await
+            .expect("the request task must not panic"),
+        StatusCode::OK,
+    );
+
+    let mut deleting = fleet.harness.pool.get().await.expect("connection");
+    let listed = deleting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::delete(machines::machines::table.find(first))
+                .execute(transaction)
+                .await?;
+            let listing = tokio::time::timeout(Duration::from_secs(5), fleet.grants(&fleet.owner));
+            Ok(listing.await.map(|(status, _body)| status))
+        })
+        .await
+        .expect("the delete must commit");
+    assert_eq!(
+        listed.ok(),
+        Some(StatusCode::OK),
+        "a read is answered while a record it names is being deleted",
+    );
 }

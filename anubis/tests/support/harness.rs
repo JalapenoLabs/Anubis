@@ -24,13 +24,16 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::TestDatabase;
+use super::{TestDatabase, machines};
 
 /// The starter's role vocabulary, which is what tenancy bootstrapping needs.
 ///
 /// Two entries exist for the suites that probe what an organization's roles
 /// may carry: `Invoice` is named with less than every action, and `Ledger` is
 /// named only by a platform role, so neither is wholly a tenant's to grant.
+/// `Machine` is the suites' own kind of record an organization owns directly
+/// (see [`super::machines`]); only the administrator role holds it, so every
+/// other standing on a machine is one a test granted on purpose.
 const ROLES_YML: &str = "
 roles:
   default:
@@ -46,6 +49,7 @@ roles:
     models:
       Team: [manage]
       Invoice: [read]
+      Machine: [manage]
   operator:
     scopes: [platform]
     models:
@@ -118,6 +122,7 @@ impl Harness {
 
     async fn compose(database: &TestDatabase, plans: Option<PlanSet>, channels: Channels) -> Self {
         let pool = database.pool().await;
+        machines::create_table(&pool).await;
 
         let config = Self::config();
         let roles = RoleSet::from_yaml(ROLES_YML).expect("roles must parse");
@@ -133,13 +138,14 @@ impl Harness {
             )
             .nest(
                 "/tenancy",
-                anubis::tenancy::router(
+                anubis::tenancy::router_with(
                     pool.clone(),
                     mailer,
                     roles.clone(),
                     plans,
                     &config,
                     &rate_limit,
+                    anubis::tenancy::Options::new().resource_kind(machines::Machines),
                 ),
             )
             .nest(
@@ -158,7 +164,8 @@ impl Harness {
             .merge(anubis::realtime::router(pool.clone(), channels.clone()))
             .merge(anubis::auth::avatar_router(pool.clone()))
             .merge(anubis::oauth_server::router(&authorization, &rate_limit))
-            .merge(anubis::mcp::router(&authorization, Self::tools()))
+            .merge(anubis::mcp::router(&authorization, Self::tools(&roles)))
+            .merge(machines::router(channels.clone()))
             .layer(anubis::guard::layer(pool.clone(), roles));
 
         Self {
@@ -186,9 +193,10 @@ impl Harness {
             .scope("notes:write", "Write notes in your name")
     }
 
-    /// The MCP tools these suites call: the framework's `whoami`, and one
-    /// that needs a scope, so scope enforcement has something to refuse.
-    pub fn tools() -> anubis::mcp::Registry {
+    /// The MCP tools these suites call: the framework's `whoami`, one that
+    /// needs a scope, so scope enforcement has something to refuse, and one
+    /// that reads a machine, so a connected client's reach is the person's.
+    pub fn tools(roles: &RoleSet) -> anubis::mcp::Registry {
         anubis::mcp::Registry::new("Anubis test", "0.0.0")
             .tool(anubis::mcp::whoami())
             .tool(
@@ -207,6 +215,7 @@ impl Harness {
                 }))
                 .requires("notes:write"),
             )
+            .tool(machines::tool(roles.clone()))
     }
 
     /// The application config these suites boot with.

@@ -15,14 +15,15 @@ User ─< TeamMembership >─ Team ───────────────
 ```
 
 - **User**: a person who can log in. Owns credentials, profile, and preferences. Owns nothing domain-related directly.
-- **Organization**: the top-level tenant. The billing and policy umbrella. It owns people and policy, not work.
+- **Organization**: the top-level tenant. The billing and policy umbrella. It owns people and policy, and the records it shares across its teams; every other record is a team's.
 - **SubTenant**: the tier that owns the work. GCP calls it a project, Jira calls it a project, GitHub calls it a repository, Linear calls it a workspace; the shape is the same every time. It belongs to exactly one Organization and holds its own membership and its own Teams.
-- **Team**: the working tenant. All domain resources chain their ownership back to a Team.
+- **Team**: the working tenant. Domain resources chain their ownership back to a Team, except the records an organization owns directly and shares with its teams (see [resource grants](#resource-grants)).
 - **OrganizationMembership**: joins a User to an Organization, carrying an `access` level and a `suspended_at` marker. Organization-wide role grants hang off it.
 - **SubTenantMembership**: joins a User to a SubTenant, carrying its own `suspended_at`. This is the explicit grant a guest reaches a sub-tenant through, and the sub-tenant's role grants hang off it.
 - **TeamMembership**: joins a User to a Team. Domain resources are assigned to TeamMemberships, never directly to Users. This allows assigning work to invited people who have not signed up yet, and keeps assignments intact when a user leaves. The team's role grants, and grants on single records of the team, hang off it.
 - **Role**: one of an organization's own roles, a named, coloured, ordered bundle of permission keys. Seeded from `roles.yml` and edited from there; see [runtime roles](#runtime-roles).
 - **RoleGrant**: one role held through one membership, which is the grant's scope.
+- **ResourceGrant**: one team's reach into the records its organization owns directly: every record of one kind, or one record of it.
 - **Invitation**: created when someone is added to a Team or Organization by email. The emailed 256-bit token (hashed at rest, 14-day expiry) is the credential; whichever signed-in account holds it may claim, and claiming consumes the invitation. It offers roles by id. Team invitations pre-create the unclaimed TeamMembership and grant the offered roles on it, so the membership (id, grants, and any resource assignments) survives the claim intact; organization invitations create the OrganizationMembership at claim time and grant the roles their offer still names. Re-inviting an email replaces the pending invitation. Inviting takes `Tenancy::Membership.create` on the target, and the organization's managers may invite into any team in their organization. A manager can revoke a pending invitation, which discards the unclaimed membership with it; a claimed invitation no longer exists, so a claim cannot be taken back.
 
 At signup, every user gets a personal Organization containing a default SubTenant ("Main") and a default Team ("General"), so solo use requires zero tenancy ceremony. The UI reveals organization complexity only when the user opts into it.
@@ -155,6 +156,8 @@ anubis scaffold model Goal Project,Team description:text_field
 
 The chain drives everything: authorization scoping, nested routes, breadcrumbs, and the parent's show-view table. Tenant isolation is enforced by walking the chain, never by trusting a client-supplied id.
 
+A chain may also end in the Organization, for records an organization owns directly and shares with its teams by choice. That root is the framework's today and not yet the scaffolder's: [resource grants](#resource-grants) states the rules and the pattern an application writes by hand.
+
 Enforcement is extractor-based. A handler that takes `anubis::guard::TeamMember` (or `OrganizationMember`) gets, before its body runs: authentication (401), the route's `{team_id}` resolved against the caller's membership (404 for non-members, byte-identical to a nonexistent id, so probing reveals nothing), and permission checks via `member.require(Action::Update, "Project")` against the compiled role set (403). Routers provide the needed request extensions with `anubis::guard::layer(pool, roles)`. Scaffolded models resolve their parent chain to the owning team and ride the same primitives.
 
 Selectable associations are scoped through generated `valid_*` methods on the model. `anubis scaffold field Project lead_id:super_select{class_name=TeamMembership}` writes `Project::valid_leads`, and these methods populate select fields and enforce the tenancy boundary on write, so a form can never smuggle in another tenant's record. See [scaffolding.md](scaffolding.md#belongs_to-one-record-one-foreign-key).
@@ -174,6 +177,7 @@ Permission keys are declared once, in `config/roles.yml`, and compiled into both
 | `Tenancy::Membership` | `create`, `update`, `destroy` | Inviting; granting and revoking roles; removing members and revoking invitations |
 | `Tenancy::Role` | `create`, `update`, `destroy` | Making, editing, reordering, and deleting roles |
 | `Billing::Subscription` | `update` | Spending the organization's money: checkout, the portal, reconciling |
+| `Tenancy::ResourceGrant` | `update` | Choosing which teams reach the records the organization owns directly; see [resource grants](#resource-grants) for what else it takes |
 
 The framework's subjects are namespaced, which no scaffolded model can be, so an application's own `Subscription` never collides with the framework's. A framework subject takes only the actions it guards, and `roles.yml` naming another is refused at boot, because a switch that guards nothing would mislead whoever reads the role editor.
 
@@ -216,13 +220,14 @@ A grant is one role held through one membership (`role_grants`), and **the membe
 
 ### Who decides
 
-Three functions decide reach and permissions, each answering `None` for a tenant that does not exist and for one the caller cannot reach alike:
+Four functions decide reach and permissions, each answering `None` for a tenant or record that does not exist and for one the caller cannot reach alike:
 
 | Function | Answers for |
 |---|---|
 | `resolve_organization_access` | The organization itself: its roster, its roles, its money |
 | `resolve_sub_tenant_access` | One sub-tenant and the work it owns, under the rules above |
 | `resolve_team_access` | One team, narrowed to the records in hand |
+| `resolve_resource_access` | One record the organization owns directly, with `resolve_resource_scope` answering which of a kind's records a caller may list; see [resource grants](#resource-grants) |
 
 Each returns an `Access`: the roles that apply there, highest first, the permissions they carry, `rank()` (the position of the highest that ranks there, which in a sub-tenant leaves out the team grants), and `can`, `require`, and `require_administrator`. The guards carry it (`OrganizationMember::access`, `TeamMember::access`, `SubTenantMember::access`), and a scaffolded model's `load_for_member` resolves the team with the record and its parents as the records in hand, so a role granted on a record reaches it and everything nested under it. `GET /tenancy/memberships` answers each organization and team with the same resolved access, which is what the browser draws its affordances from, and leaves out an organization whose membership is suspended and a team its member is not admitted to.
 
@@ -249,6 +254,7 @@ Holding a role-management permission lets somebody change what others may do, so
 | Removing the last holder of role management | The administrator role holds every framework permission, cannot be deleted, and always keeps a holder |
 | Raising organization-wide or sub-tenant rank through a team or record grant | Rank is measured where the change happens; a narrow grant never reaches wider, and a team's grants never rank in a sub-tenant |
 | Naming another organization's role, team, or membership | `404`, byte-identical to an id that does not exist |
+| Sharing the organization's records with your own team to act on them through it | Refused: sharing a kind takes organization standing that reaches every record of it and holds every permission on it; see [resource grants](#resource-grants) |
 | Two managers editing one role, or reordering, at once | Every role and grant change locks the organization row first and reads the actor's standing again under it, so the second is judged against what the first left behind. Claiming an invitation and deleting an account take the same lock (a departure locks every organization it touches, in id order), so a role deleted mid-claim lands wholly before or after it, and the administrator a departure promotes is chosen from the roster as it stands |
 
 **Deleting a role** revokes it from everybody holding it, at once, through the cascading foreign key: holders keep their other roles and the default role, and each is told with the "roles changed" notification. The roles above close the gap.
@@ -260,6 +266,100 @@ Holding a role-management permission lets somebody change what others may do, so
 Migration `000029` converts an application's `roles TEXT[]` grants, the `roles.yml` keys its memberships and invitations hold, into runtime roles: each organization gets a role for every key its people held, plus the two structural roles, all following `roles.yml`; each key a membership held becomes a grant of that role at the membership's scope; an organization invitation's keys become its offer; and the columns are dropped. Nothing is lost and nothing is gained but the default role every member holds, and a team administrator's key reaches a sub-tenant with every permission it carried there, without ranking as the sub-tenant's administrator. Between the two structural roles, the converted roles are ordered by key, because the migration cannot read `roles.yml`, so a migrated organization's ladder can differ from a fresh one's (in the starter, `billing` lands below `editor`); rank is what the hierarchy is measured in, so an administrator reorders them once after upgrading. The migration rewrites the membership and invitation tables in one transaction under `ACCESS EXCLUSIVE` locks, which every guard waits on, so it runs in a maintenance window that grows with the membership count. `anubis/tests/roles_migration_flow.rs` pins every legacy shape (administrators of both tiers, team-only members, guests, suspended members, sub-tenant grants, invitations in flight).
 
 Going back narrows and never widens: a role maps back to its key only while it still means exactly that key, so one the organization made or edited is dropped rather than widened, and a record grant is dropped rather than widened to its team.
+
+## Resource grants
+
+Most records belong to a team and are reached through it. Some belong to the organization itself, a fleet of machines or a shared catalog, and are shared with its teams by choice: teams A and B reach every machine in the organization, team C reaches three of them. A **resource grant** is that choice, one row (`resource_grants`) giving one team every record of a kind in the organization, or one record of it. A grant is reach, never a role: what a member may do with a record they reach still comes from their roles.
+
+`kind` is the model the records are, spelled as `roles.yml` spells it, so the permissions a member holds on them are `<kind>.<action>` like any model's. A kind-wide grant takes in the records added later, of that kind and in that organization only. The team is tied to the grant's organization by a composite foreign key, so a grant naming another organization's team is impossible in the schema, and deleting a team deletes its grants with it.
+
+### Who reaches an organization's record
+
+`anubis::tenancy::resolve_resource_access` is the one function that answers, beside the three tenant resolvers, and nothing re-derives it. **A suspension is a deny**, checked first: a suspended organization membership reaches nothing in the organization, and a team the caller is suspended from through its sub-tenant shares nothing with them. Otherwise a record of kind `K` is reached along any of these paths:
+
+| Path | Rule |
+|---|---|
+| Organization administrator | The administrator role, granted organization-wide, reaches every record the organization owns |
+| The organization's roles read the kind | A full member whose roles that apply organization-wide, the default role among them, carry `K.read` reaches every record of `K` |
+| A team granted the record | A claimed member of a team granted every record of `K`, or this one, reaches it |
+
+**Reaching is holding.** What decides organization-wide reach is what the caller may do organization-wide, the same `Access` every role change is held to: a role can only be granted, edited, or offered by somebody who holds what it carries there, so managing roles never hands out reach its actor lacks. The consequence is deliberate: holding people to what their teams were granted means leaving `K.read` off the roles that apply to them organization-wide, and the default role first, since it applies to every full member. A default role that reads machines lets every full member read every machine, exactly as its permissions say. A guest's organization standing reaches nothing here, as it reaches no sub-tenant, and neither does the default role for somebody who belongs only to teams: both reach what a team they were put on was granted.
+
+On a record the caller reaches, the roles that apply are the default role, the organization-wide grants (for a full member or an administrator, since the record is the organization's own surface), and the team-wide grants of every team of theirs granted the record. **A team's grants add permissions but never rank**, exactly as in a sub-tenant: rank and the administrator role there come from the organization-wide grants alone, so reach through a team never makes anybody senior anywhere. A grant on one of a team's own records is about that team's records and never applies here.
+
+The record's organization is read off the record's own row, never the request:
+
+```rust
+let resource = OrganizationResource {
+    kind: "Machine",
+    organization_id: machine.organization_id,
+    id: machine.id,
+};
+let access = anubis::tenancy::resolve_resource_access(connection, roles, user.id, resource)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+access.require(Action::Update, "Machine")?;
+```
+
+A list asks `resolve_resource_scope(connection, roles, user_id, organization_id, kind, action)`, which answers `ResourceScope::Every` or `ResourceScope::Only(ids)` for the records the caller may take that action on, and `None` for a caller with no standing in the organization at all (no membership and no team granted anything of the kind), which a list route answers `404` like an unreachable tenant. `Every` means every record of the kind in that organization, so the query filters by the organization either way.
+
+### Who may share
+
+Holding `Tenancy::ResourceGrant.update` is not enough on its own. A team granted a kind acts on its records with its own roles, its administrators with everything the administrator role carries, and its administrator's platform tokens with the compiled `admin` grants, so a grant hands the team, at most, every permission on the kind a tenant may hold. **Choosing which teams reach a kind therefore takes organization standing that reaches every record of it and holds every one of those permissions** (the kind's share of `RoleSet::grantable`); an administrator is exempt from holding, as everywhere. That is hierarchy rule 2, "only what you hold can be given", asked of the whole kind at once. The hierarchy's ranks do not apply, because a grant is neither a role nor a member.
+
+| Attempt | Answer |
+|---|---|
+| A team's administrator sharing a kind with their own team | Refused: a team standing counts for nothing here, and a team-only member does not reach the organization's grants at all (`404`) |
+| A delegate holding the sharing permission and reading the kind, but not changing it | `403`: sharing takes every permission on the kind |
+| Granting yourself, editing, or offering a role that reads the kind, to reach records you do not | `403` by hierarchy rule 2: reach is what you hold, so the role carries what you lack |
+| Editing the default role to read the kind, then sharing | Every full member now reads every record, which is what the edit says; sharing still takes every permission on the kind, which reading alone is not |
+| A guest holding delegated permissions organization-wide | A guest's organization standing reaches and shares nothing |
+| Naming another organization's record or team | `404`, byte-identical to an id that never existed |
+| Raising rank or the administrator role through a team's reach | A team's grants never rank and never carry the administrator role |
+| A kind-wide grant reaching another organization's records, or another kind | It covers one kind in one organization; the resolver, the token helpers, and the list scope each filter both |
+
+### The endpoints and the screen
+
+`PUT /tenancy/organizations/{organization_id}/teams/{team_id}/resource-grants/{kind}` states the end state for one team and one kind: `{"every": true, "resource_ids": []}` for every record, `{"every": false, "resource_ids": [...]}` for specific ones (at most 1,000), or both empty for nothing. Both fields are required and an unknown one is refused (`422`), so a stale client is never read as "nothing"; asking for both answers `400`. The change runs under the organization's lock with the caller's standing read again there, holds the team `FOR KEY SHARE`, and holds every named record `FOR KEY SHARE` through the kind's own lookup, so two changes are ordered and the second is judged against what the first left behind. A record or team that is not this organization's answers `404`. A change that leaves what the team reaches as it was records nothing, clearing a grant whose record was deleted since included; one that moves it records `team.access_changed` on the organization, the team as its subject, the change set naming the records by name before and after (`{"Machine": {"old": {"every": false, "resources": ["Rack 1"]}, "new": {"every": true, "resources": []}}}`).
+
+`GET /tenancy/organizations/{organization_id}/resource-grants` answers every member with the kinds the application shares, each marked `reaches` and `may_manage` for the caller, and, for the kinds the caller reaches, teams and their grants with the records named; a record's name never reaches a member who could not open the record. An administrator or a sharer is shown every team, since any of them is a target; anybody else is shown the teams that admit them, as the membership overview shows them, so no team a suspension cut them out of is named. Its reads lock nothing, so it never waits on a record being deleted. `GET .../resource-grants/{kind}/options?search=` offers a sharer the organization's records, fifty at a time.
+
+The screen is `/organizations/:organizationId/access` in the starter, reached from a card in the organization's settings that appears once the application registers a kind (before then the route sends the browser back to the settings): one card per team, one choice per kind (nothing, every record, or only these, picked by name), saved in the top right. A kind the viewer does not reach is listed with the reason beneath it, and one they may not share is shown locked with its reason, never hidden. `@jalapenolabs/anubis` carries the pieces: `ResourceGrantEditor`, `useResourceGrants`, `useResourceOptions`, `draftOf`, `changeOf`, and `isSameGrant`.
+
+### Every surface asks the same function
+
+| Surface | How it reaches an organization's record |
+|---|---|
+| Session routes | The application's loader reads the record and calls `resolve_resource_access` |
+| `/api/v1` | A token acts as its team with the compiled `admin` grants: `caller.require(...)`, then `team_reaches_resource(connection, &caller.team, resource)`, and `team_resource_scope` for a list |
+| MCP tools | A tool calls `resolve_resource_access` with `call.caller.user`, so a connected client reaches what the person does |
+| Realtime | `/realtime` never serves a `resource:` channel; the application's stream endpoint calls `resolve_resource_access` before `Channels::stream` |
+| Team-owned records | Untouched: `resolve_team_access` never reads a resource grant, so a grant cannot widen a team-owned record's reach |
+
+### Records that go away
+
+A grant names an application record by id and is never a foreign key, so deleting the record leaves the grant behind. **It is inert**: access is only ever resolved with a record in hand, and a record id is never issued twice. The listing leaves it out. An application's delete still calls `anubis::tenancy::forget_resource(connection, kind, id)` in its own transaction, **after** the delete: a grant being written at the same instant holds the record `FOR KEY SHARE`, so the delete waits for it to commit and the forget then sees it, while a delete that got there first leaves the grant to find no record and answer `404`. `anubis/tests/concurrency_flow.rs` races both orders.
+
+### Writing an organization-owned model
+
+The scaffolder's ownership chains end in `Team` today, so a model the organization owns is written by hand. `anubis/tests/support/machines.rs` is a complete worked example, every surface included.
+
+1. **The table** carries `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`, indexed, and nothing about teams.
+2. **`roles.yml`** names the model under the roles that work with it, as any model is named. Leaving `read` on it off the default role is what lets teams be held to what they were granted: the default role applies to every full member organization-wide, and a role that `includes: [default]` carries what it carries.
+3. **A `ResourceKind`** describes the table to the framework: `name()` is the model, `find` answers the named records the organization owns with their names, one entry per record, and locks them `FOR KEY SHARE`, `labels` answers the same without locking, for reads, and `options` answers a picker's page, matching what a person typed literally (escape `%`, `_`, and the escape character before `LIKE`). Another organization's id is left out exactly as a missing one is.
+4. **Register the kind**: mount `anubis::tenancy::router_with(..., anubis::tenancy::Options::new().resource_kind(Machines))` where `router` was mounted. `router` is `router_with` with no kinds, and a kind `roles.yml` does not name as a model panics at composition.
+5. **Load through the resolver** on every surface, as the table above says, and answer `404` for `None`.
+6. **Delete, then forget**, in one transaction. `forget_resource` reads the grants by kind and record through an index of their own.
+7. **Audit on the organization** (`audit::Event::...organization(organization_id)`), since the record is no team's.
+
+**A model authorized through a shared record is not supported.** Sharing a kind is held to every permission on that kind, so a child nested under a shared record and acted on with the access resolved for its parent would reach a team with the child's permissions, which the sharer was never held to. Organization-owned models are one level deep until the scaffolder's family lands with a way to name the subjects a kind carries ([#147](https://github.com/JalapenoLabs/Anubis/issues/147)).
+
+### Not built yet
+
+- The scaffolder's template family for an ownership chain ending in `Organization`, at every depth, tracked on [Anubis #147](https://github.com/JalapenoLabs/Anubis/issues/147).
+- A role granted on one organization-owned record ("Moderator on this machine"). `role_grants` holds record grants through team memberships, which is the check (`role_grants_resource_in_team`) that would widen to organization memberships for it.
+- Outgoing webhooks for organization-owned records: endpoints are subscribed per team, and such a record belongs to none.
+- A notice to a team's members when what it reaches changes, and an organization roll-up screen for the audit log, where `team.access_changed` is recorded and readable through the database meanwhile.
 
 ## Managing tenants
 
@@ -282,6 +382,9 @@ Tenancy is manageable from the API, not only at signup. The routes mount under `
 | `PATCH /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.update` | Rename, recolour, or change a role's permissions |
 | `DELETE /tenancy/organizations/{organization_id}/roles/{role_id}` | `Tenancy::Role.destroy` | Delete a role, revoking it from everybody |
 | `PUT /tenancy/organizations/{organization_id}/role-order` | `Tenancy::Role.update` | Put the roles in a new order |
+| `GET /tenancy/organizations/{organization_id}/resource-grants` | org member | The kinds the application shares, the teams, and the grants of every kind the caller reaches |
+| `PUT /tenancy/organizations/{organization_id}/teams/{team_id}/resource-grants/{kind}` | `Tenancy::ResourceGrant.update`, and every permission on the kind | Replace what one team reaches of one kind |
+| `GET /tenancy/organizations/{organization_id}/resource-grants/{kind}/options` | the same | The organization's records of a kind, for a picker |
 | `PATCH /tenancy/teams/{team_id}` | team administrator | Rename the team |
 | `GET /tenancy/teams/{team_id}/roles` | team member | The organization's roles, with the caller's standing in the team |
 | `PATCH /tenancy/teams/{team_id}/members/{membership_id}` | `Tenancy::Membership.update` | Replace a member's roles in the team, or on one record of it |
@@ -315,7 +418,7 @@ So removing another member normally cannot break the rule, since the caller outr
 
 ### Cascade semantics
 
-Deletion cascades, deliberately. The framework's migrations declare `ON DELETE CASCADE` from `organizations` to sub-tenants, teams, memberships, and invitations; from `sub_tenants` to their memberships and to the teams scoped to them; and from `teams` to memberships, invitations, and platform applications. The scaffolder's living templates declare the same on the ownership chain: a team-owned table's `team_id` references `teams(id) ON DELETE CASCADE`, and a nested model cascades from its parent. So deleting a team deletes the records that chain to it, and deleting an organization deletes its teams first.
+Deletion cascades, deliberately. The framework's migrations declare `ON DELETE CASCADE` from `organizations` to sub-tenants, teams, memberships, and invitations; from `sub_tenants` to their memberships and to the teams scoped to them; and from `teams` to memberships, invitations, platform applications, and resource grants. A table of records the organization owns directly references `organizations (id) ON DELETE CASCADE` the same way. The scaffolder's living templates declare the same on the ownership chain: a team-owned table's `team_id` references `teams(id) ON DELETE CASCADE`, and a nested model cascades from its parent. So deleting a team deletes the records that chain to it, and deleting an organization deletes its teams first.
 
 Cascade is the right default here because the ownership chain already means "this record exists inside that team". Restrict would force a caller to empty a team by hand through endpoints that may not exist yet, and orphaning is not an option since a record with no team has no tenant and therefore no reachable authorization. An application that deliberately declares a restricting reference of its own is respected rather than overridden: the delete answers `409 Conflict` telling the caller to remove those records first, instead of failing as a `500`.
 

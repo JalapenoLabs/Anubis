@@ -38,7 +38,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::roles::{
-    ADMIN_ROLE, Action, DEFAULT_ROLE, MEMBERSHIP, Permission, ROLE, RoleSet, SUBSCRIPTION, Scope,
+    ADMIN_ROLE, Action, DEFAULT_ROLE, MEMBERSHIP, Permission, RESOURCE_GRANT, ROLE, RoleSet,
+    SUBSCRIPTION, Scope,
 };
 use crate::schema::{organizations, roles as role_rows};
 
@@ -204,6 +205,7 @@ pub(crate) fn framework_permissions() -> impl Iterator<Item = Permission> {
         (ROLE, Action::Update),
         (ROLE, Action::Destroy),
         (SUBSCRIPTION, Action::Update),
+        (RESOURCE_GRANT, Action::Update),
     ]
     .into_iter()
     .map(|(subject, action)| Permission::new(subject, action))
