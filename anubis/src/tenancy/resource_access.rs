@@ -577,8 +577,9 @@ roles:
     includes: [default]
     models:
       Machine: [manage]
+  # Includes nothing, so nothing it carries reads machines: a role including
+  # `default` here would read them through it.
   bookkeeper:
-    includes: [default]
     models: {}
   admin:
     includes: [operator]

@@ -344,7 +344,7 @@ A grant names an application record by id and is never a foreign key, so deletin
 The scaffolder's ownership chains end in `Team` today, so a model the organization owns is written by hand. `anubis/tests/support/machines.rs` is a complete worked example, every surface included.
 
 1. **The table** carries `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`, indexed, and nothing about teams.
-2. **`roles.yml`** names the model under the roles that work with it, as any model is named. Leaving it off the default role is what lets teams be held to what they were granted.
+2. **`roles.yml`** names the model under the roles that work with it, as any model is named. Leaving `read` on it off the default role is what lets teams be held to what they were granted: a role that `includes: [default]` carries what the default role carries, and granted organization-wide it would reach every record.
 3. **A `ResourceKind`** describes the table to the framework: `name()` is the model, `find` answers the named records the organization owns with their names and locks them `FOR KEY SHARE`, and `options` answers a picker's page. Another organization's id is left out exactly as a missing one is.
 4. **Register the kind**: mount `anubis::tenancy::router_with(..., anubis::tenancy::Options::new().resource_kind(Machines))` where `router` was mounted. `router` is `router_with` with no kinds, and a kind `roles.yml` does not name as a model panics at composition.
 5. **Load through the resolver** on every surface, as the table above says, and answer `404` for `None`.

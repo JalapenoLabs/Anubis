@@ -20,8 +20,8 @@ use anubis::jobs::{self, BoxError, Job, Worker};
 use anubis::realtime::ChannelName;
 use anubis::schema::{
     audit_events, dead_jobs, jobs as jobs_table, oauth_authorization_requests, oauth_device_codes,
-    oauth_grants, organizations, role_grants, roles, sessions, team_memberships, teams,
-    user_avatars, webhook_deliveries, webhook_endpoints,
+    oauth_grants, organizations, resource_grants, role_grants, roles, sessions, team_memberships,
+    teams, user_avatars, webhook_deliveries, webhook_endpoints,
 };
 use axum::body::Body;
 use axum::http::header::{CONTENT_TYPE, COOKIE};
@@ -1400,10 +1400,8 @@ fn share_machines(fleet: &Fleet, team: Uuid, every: bool, ids: &[Uuid]) -> JoinH
     })
 }
 
-/// What team A reaches of the machines, as rows: `None` for every machine.
+/// What `team` reaches of the machines, as rows: `None` for every machine.
 async fn team_grants(fleet: &Fleet, team: Uuid) -> Vec<Option<Uuid>> {
-    use anubis::schema::resource_grants;
-
     let mut connection = fleet.harness.pool.get().await.expect("connection");
     resource_grants::table
         .filter(resource_grants::team_id.eq(team))
@@ -1529,18 +1527,15 @@ async fn a_machine_deleted_while_it_is_granted_leaves_no_grant_behind() {
                 .for_key_share()
                 .first::<Uuid>(transaction)
                 .await?;
-            {
-                use anubis::schema::resource_grants;
-                diesel::insert_into(resource_grants::table)
-                    .values((
-                        resource_grants::organization_id.eq(fleet.organization),
-                        resource_grants::team_id.eq(fleet.team_a),
-                        resource_grants::kind.eq(machines::KIND),
-                        resource_grants::resource_id.eq(Some(second)),
-                    ))
-                    .execute(transaction)
-                    .await?;
-            }
+            diesel::insert_into(resource_grants::table)
+                .values((
+                    resource_grants::organization_id.eq(fleet.organization),
+                    resource_grants::team_id.eq(fleet.team_a),
+                    resource_grants::kind.eq(machines::KIND),
+                    resource_grants::resource_id.eq(Some(second)),
+                ))
+                .execute(transaction)
+                .await?;
             let pool = fleet.harness.pool.clone();
             let deleting = tokio::spawn(async move {
                 let mut connection = pool.get().await.expect("connection");

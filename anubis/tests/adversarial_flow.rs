@@ -26,7 +26,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use anubis::schema::{
-    audit_events, organization_memberships, role_grants, roles, team_memberships, users,
+    audit_events, organization_memberships, resource_grants, role_grants, roles, team_memberships,
+    users,
 };
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -2603,34 +2604,31 @@ async fn a_grant_reaches_no_other_organization_and_no_other_kind() {
         .join(("team_id", fleet.team_c), &[fleet.operator])
         .await;
     let mut connection = fleet.harness.pool.get().await.expect("a connection");
-    {
-        use anubis::schema::resource_grants;
-        diesel::insert_into(resource_grants::table)
-            .values((
-                resource_grants::organization_id.eq(fleet.organization),
-                resource_grants::team_id.eq(fleet.team_c),
-                resource_grants::kind.eq("Server"),
-                resource_grants::resource_id.eq(Some(fleet.machines[0])),
-            ))
-            .execute(&mut connection)
-            .await
-            .expect("the stray grant is written");
+    diesel::insert_into(resource_grants::table)
+        .values((
+            resource_grants::organization_id.eq(fleet.organization),
+            resource_grants::team_id.eq(fleet.team_c),
+            resource_grants::kind.eq("Server"),
+            resource_grants::resource_id.eq(Some(fleet.machines[0])),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("the stray grant is written");
 
-        // The schema refuses a grant naming a team of another organization.
-        let refused = diesel::insert_into(resource_grants::table)
-            .values((
-                resource_grants::organization_id.eq(fleet.organization),
-                resource_grants::team_id.eq(their_team),
-                resource_grants::kind.eq(machines::KIND),
-                resource_grants::resource_id.eq(None::<Uuid>),
-            ))
-            .execute(&mut connection)
-            .await;
-        assert!(
-            refused.is_err(),
-            "a grant across organizations is impossible"
-        );
-    }
+    // The schema refuses a grant naming a team of another organization.
+    let refused = diesel::insert_into(resource_grants::table)
+        .values((
+            resource_grants::organization_id.eq(fleet.organization),
+            resource_grants::team_id.eq(their_team),
+            resource_grants::kind.eq(machines::KIND),
+            resource_grants::resource_id.eq(None::<Uuid>),
+        ))
+        .execute(&mut connection)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a grant across organizations is impossible"
+    );
     assert_eq!(
         fleet.open_machine(&cleo, fleet.machines[0]).await.0,
         StatusCode::NOT_FOUND,
@@ -2688,6 +2686,14 @@ async fn sharing_is_held_to_what_the_sharer_holds() {
             "the screen draws the control only for who may use it: {reason}",
         );
     }
+}
+
+#[tokio::test]
+async fn neither_the_default_role_nor_a_team_standing_shares_anything() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
 
     // Raising everybody through the default role reaches nothing: it is no
     // grant, so a sharer whose granted roles do not read machines still
@@ -3014,35 +3020,43 @@ async fn a_token_reaches_what_its_team_was_granted() {
                 .to_owned()
         }
     };
-    let team_c_token = mint(fleet.team_c).await;
-    let team_a_token = mint(fleet.team_a).await;
+    let one_machine_token = mint(fleet.team_c).await;
+    let every_machine_token = mint(fleet.team_a).await;
     let router = &fleet.harness.router;
 
     assert_eq!(
-        bearer_get(router, &format!("/api/v1/machines/{first}"), &team_c_token)
-            .await
-            .0,
+        bearer_get(
+            router,
+            &format!("/api/v1/machines/{first}"),
+            &one_machine_token
+        )
+        .await
+        .0,
         StatusCode::OK,
     );
     assert_eq!(
-        bearer_get(router, &format!("/api/v1/machines/{third}"), &team_c_token)
-            .await
-            .0,
+        bearer_get(
+            router,
+            &format!("/api/v1/machines/{third}"),
+            &one_machine_token
+        )
+        .await
+        .0,
         StatusCode::NOT_FOUND,
         "a token reaches only what its team was granted",
     );
-    let (status, body) = bearer_get(router, "/api/v1/machines", &team_c_token).await;
+    let (status, body) = bearer_get(router, "/api/v1/machines", &one_machine_token).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["machines"], json!(["Machine 0"]));
 
-    let (status, body) = bearer_get(router, "/api/v1/machines", &team_a_token).await;
+    let (status, body) = bearer_get(router, "/api/v1/machines", &every_machine_token).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["machines"].as_array().map(Vec::len), Some(4));
     assert_eq!(
         bearer_get(
             router,
             &format!("/api/v1/machines/{their_machine}"),
-            &team_a_token
+            &every_machine_token
         )
         .await
         .0,

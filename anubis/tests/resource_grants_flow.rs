@@ -21,6 +21,10 @@ use support::TestDatabase;
 use support::machines::{self, Fleet, KIND};
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear end-to-end narrative, read top to bottom"
+)]
 async fn an_organization_shares_its_machines_team_by_team() {
     let Some(database) = TestDatabase::create("resource_grants_flow").await else {
         return;
