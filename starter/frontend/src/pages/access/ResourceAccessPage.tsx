@@ -35,6 +35,7 @@ import { getOrganizationSettingsUrl } from '../../urls'
  */
 export function ResourceAccessPage() {
   const { t } = useTranslation()
+  const api = useAnubisApi()
   const { user } = useCurrentUser()
   const { memberships } = useTeamContext()
   const { organizationId = '' } = useParams()
@@ -77,7 +78,13 @@ export function ResourceAccessPage() {
       ? <EditAccess
           organizationId={organization.id}
           overview={grants.overview}
-          onSaved={grants.refresh}
+          onSaved={async () => {
+            // Read back directly rather than through a revalidation, which
+            // keeps the old grants and resolves quietly when the read fails:
+            // the screen must know whether what it shows is the server's.
+            const fresh = await api.listResourceGrants(organization.id)
+            await grants.refresh(fresh, { revalidate: false })
+          }}
         />
       : null
     }
@@ -91,6 +98,7 @@ export function ResourceAccessPage() {
 type EditAccessProps = {
   organizationId: string
   overview: ResourceGrantsOverview
+  /** Reads the grants back after a save, and rejects when it cannot. */
   onSaved: () => Promise<unknown>
 }
 
@@ -133,34 +141,46 @@ function EditAccess(props: EditAccessProps) {
   )
   const reached = props.overview.kinds.filter((kind) => kind.reaches)
 
-  // Each team and kind is its own end state, sent one after another. An edit
-  // leaves the screen once it is saved; a refusal stops the run there, names
-  // the team, and leaves that edit and every one after it in place to save.
+  // Each team and kind is its own end state, sent one after another. A
+  // refusal stops the run there, names the team, and leaves that edit and
+  // every one after it in place to save. The edits that were written leave
+  // the screen only once the grants are read back, so until then, and for
+  // good when the read fails, the screen shows what was written rather than
+  // the grants from before it.
   async function onSave() {
     setIsSaving(true)
     setIsSaved(false)
     setErrorMessage(null)
-    let failed = false
+    const written: string[] = []
+    let refusal: string | null = null
     for (const key of changed) {
       const [ teamId, kind ] = key.split('/')
       try {
         await api.replaceResourceGrants(props.organizationId, teamId, kind, changeOf(edits[key]))
-        setEdits((current) => Object.fromEntries(
-          Object.entries(current).filter(([ kept ]) => kept !== key),
-        ))
+        written.push(key)
       }
       catch (error) {
-        failed = true
         const team = props.overview.teams.find((candidate) => candidate.id === teamId)
-        setErrorMessage(t('access.saveFailed', {
+        refusal = t('access.saveFailed', {
           team: team?.name ?? teamId,
           message: getApiErrorMessage(error) ?? t('common.somethingWentWrong'),
-        }))
+        })
         break
       }
     }
-    await props.onSaved()
-    setIsSaved(!failed)
+
+    try {
+      await props.onSaved()
+      setEdits((current) => Object.fromEntries(
+        Object.entries(current).filter(([ kept ]) => !written.includes(kept)),
+      ))
+      setErrorMessage(refusal)
+      setIsSaved(!refusal)
+    }
+    catch (error) {
+      console.debug('ResourceAccessPage could not read the grants back after saving', error)
+      setErrorMessage(refusal ?? t('common.somethingWentWrong'))
+    }
     setIsSaving(false)
   }
 
@@ -231,8 +251,21 @@ function EditAccess(props: EditAccessProps) {
                 kindLabel={labels.subjectLabel(kind.kind)}
                 draft={edits[`${team.id}/${kind.kind}`] ?? saved[`${team.id}/${kind.kind}`]}
                 onChange={(draft) => {
+                  const key = `${team.id}/${kind.kind}`
                   setIsSaved(false)
-                  setEdits((current) => ({ ...current, [`${team.id}/${kind.kind}`]: draft }))
+                  // An edit taken back is no edit: keeping it would hold the
+                  // old value over whatever the server reads next, and the
+                  // next save would undo somebody else's change with it. The
+                  // choice must match too, so "only these" with nothing
+                  // picked yet stays on screen to pick from.
+                  setEdits((current) => {
+                    if (draft.mode === saved[key].mode && isSameGrant(draft, saved[key])) {
+                      return Object.fromEntries(
+                        Object.entries(current).filter(([ kept ]) => kept !== key),
+                      )
+                    }
+                    return { ...current, [key]: draft }
+                  })
                 }}
                 isDisabled={isSaving}
               />)

@@ -74,11 +74,13 @@ function overview(standing: Standing, teams = [{ id: TEAM_A, name: 'Team A' }, {
 /**
  * The backend these cases render against, with the listing and the writes
  * under the test's control: `listing` is what the next read of the grants
- * answers, and a path in `refusing` answers its write `403`.
+ * answers (or a `500` while `listingFails`), and a path in `refusing` answers
+ * its write `403`.
  */
 function stubBackend(standing: Standing) {
   const backend = {
     listing: overview(standing) as unknown,
+    listingFails: false,
     refusing: new Set<string>(),
     writes: [] as { path: string, body: unknown }[],
   }
@@ -112,8 +114,8 @@ function stubBackend(standing: Standing) {
       })
     }
     if (path === GRANTS_PATH) {
-      return new Response(JSON.stringify(backend.listing), {
-        status: 200,
+      return new Response(JSON.stringify(backend.listingFails ? {} : backend.listing), {
+        status: backend.listingFails ? 500 : 200,
         headers: { 'content-type': 'application/json' },
       })
     }
@@ -220,5 +222,74 @@ describe('ResourceAccessPage', () => {
 
     expect(await screen.findByRole('heading', { name: 'Organization settings' })).toBeTruthy()
     await waitFor(() => expect(screen.queryByText('Manage team access')).toBeNull())
+  })
+
+  it('never holds on to an edit that was taken back, so it cannot undo somebody else\'s change', async () => {
+    const user = userEvent.setup()
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    // Team A is changed and changed back, which is no change at all.
+    const teamA = await screen.findByRole('radiogroup', { name: 'Team A: Machine' })
+    await user.click(within(teamA).getByRole('radio', { name: 'Nothing' }))
+    await user.click(within(teamA).getByRole('radio', { name: 'Every record' }))
+
+    // Another manager takes team A's access away, and saving team C reads
+    // that back.
+    const listing = overview({ reaches: true, may_manage: true })
+    listing.grants = listing.grants.filter((grant) => grant.team_id !== TEAM_A)
+    backend.listing = listing
+    const teamC = screen.getByRole('radiogroup', { name: 'Team C: Machine' })
+    await user.click(within(teamC).getByRole('radio', { name: 'Every record' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Team access saved.')).toBeTruthy()
+
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'Team A: Machine' }))
+        .getByRole('radio', { name: 'Nothing' }),
+      'team A reads as the server has it',
+    ).toHaveProperty('checked', true)
+    expect(screen.getByRole('button', { name: 'Save' }), 'nothing is left to send')
+      .toHaveProperty('disabled', true)
+    expect(backend.writes.map((write) => write.path)).toEqual([ writePath(TEAM_C) ])
+  })
+
+  it('keeps showing what was saved when the grants cannot be read back', async () => {
+    const user = userEvent.setup()
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    const teamC = await screen.findByRole('radiogroup', { name: 'Team C: Machine' })
+    await user.click(within(teamC).getByRole('radio', { name: 'Every record' }))
+    backend.listingFails = true
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(backend.writes).toHaveLength(1))
+    expect(await screen.findByText('Something went wrong. Try again.')).toBeTruthy()
+    expect(screen.queryByText('Team access saved.')).toBeNull()
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'Team C: Machine' }))
+        .getByRole('radio', { name: 'Every record' }),
+      'the screen shows what was written, not the grants from before it',
+    ).toHaveProperty('checked', true)
+  })
+
+  it('lets a team that reaches nothing move to only these, to pick records', async () => {
+    const user = userEvent.setup()
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    backend.listing = overview(
+      { reaches: true, may_manage: true },
+      [{ id: TEAM_A, name: 'Team A' }, { id: TEAM_B, name: 'Team B' }, { id: TEAM_C, name: 'Team C' }],
+    )
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    const teamB = await screen.findByRole('radiogroup', { name: 'Team B: Machine' })
+    await user.click(within(teamB).getByRole('radio', { name: 'Only these' }))
+
+    expect(within(teamB).getByRole('radio', { name: 'Only these' })).toHaveProperty('checked', true)
+    expect(
+      screen.getAllByRole('combobox', { name: 'Add a record' }),
+      'team B opens a picker beside team C\'s',
+    ).toHaveLength(2)
   })
 })
