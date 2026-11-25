@@ -4,7 +4,14 @@
 import { useTranslation } from 'react-i18next'
 import { useParams } from 'react-router'
 import useSWR from 'swr'
-import { MEMBERSHIP_SUBJECT, allows, useAnubisApi, useCurrentUser, useRoles } from '@jalapenolabs/anubis'
+import {
+  MEMBERSHIP_SUBJECT,
+  allows,
+  useAnubisApi,
+  useCurrentUser,
+  useResourceGrants,
+  useRoles,
+} from '@jalapenolabs/anubis'
 import { useTeamContext } from '../../context/TeamProvider'
 
 // UI
@@ -52,6 +59,11 @@ export function OrganizationSettingsPage() {
     () => api.listOrganizationMembers(organizationId),
   )
   const roles = useRoles(isOrganizationMember ? { organizationId } : null)
+  // The team access card appears once the application shares a kind of
+  // record, by registering a `ResourceKind` with the tenancy router; until
+  // then there is nothing for it to open.
+  const resourceGrants = useResourceGrants(isOrganizationMember ? organizationId : null)
+  const sharesRecords = Boolean(resourceGrants.overview?.kinds.length)
 
   // RequireAuth guarantees a user before this page renders.
   if (!user) {
@@ -151,7 +163,7 @@ export function OrganizationSettingsPage() {
         </Card>
       : null
     }
-    { isOrganizationMember
+    { isOrganizationMember && sharesRecords
       ? <Card className='relaxed p-2'>
           <CardBody>
             <div className='level items-start'>

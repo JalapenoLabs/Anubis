@@ -34,3 +34,9 @@ CREATE TABLE resource_grants (
 -- record in hand or for every record of the kind.
 CREATE INDEX resource_grants_organization_kind_idx
     ON resource_grants (organization_id, kind, resource_id);
+
+-- An application's delete forgets the grants naming the record it removed,
+-- by kind and id, which the index above cannot serve without its leading
+-- organization column.
+CREATE INDEX resource_grants_kind_resource_idx
+    ON resource_grants (kind, resource_id) WHERE resource_id IS NOT NULL;

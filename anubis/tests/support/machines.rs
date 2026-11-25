@@ -145,6 +145,26 @@ impl ResourceKind for Machines {
         })
     }
 
+    fn labels<'a>(
+        &'a self,
+        connection: &'a mut AsyncPgConnection,
+        organization_id: Uuid,
+        resource_ids: &'a [Uuid],
+    ) -> ResourceKindFuture<'a, Vec<FieldOption>> {
+        Box::pin(async move {
+            let rows: Vec<(Uuid, String)> = machines::table
+                .filter(machines::organization_id.eq(organization_id))
+                .filter(machines::id.eq_any(resource_ids))
+                .select((machines::id, machines::name))
+                .load(connection)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|(value, label)| FieldOption { value, label })
+                .collect())
+        })
+    }
+
     fn options<'a>(
         &'a self,
         connection: &'a mut AsyncPgConnection,
@@ -160,7 +180,13 @@ impl ResourceKind for Machines {
                 .limit(limit)
                 .into_boxed();
             if let Some(search) = search {
-                query = query.filter(machines::name.ilike(format!("%{search}%")));
+                // What a person typed is matched literally, so the characters
+                // `LIKE` reads as patterns are escaped first.
+                let literal = search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                query = query.filter(machines::name.ilike(format!("%{literal}%")).escape('\\'));
             }
             let rows: Vec<(Uuid, String)> = query.load(connection).await?;
             Ok(rows

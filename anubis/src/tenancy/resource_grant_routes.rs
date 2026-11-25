@@ -40,7 +40,7 @@ use crate::guard::OrganizationMember;
 use crate::http::{ApiError, FieldOption, FieldOptions};
 use crate::roles::{Action, RESOURCE_GRANT, RoleSet};
 use crate::schema::{resource_grants, teams};
-use crate::tenancy::access::Access;
+use crate::tenancy::access::{Access, admitted_teams};
 use crate::tenancy::hierarchy;
 use crate::tenancy::management::lock_organization;
 use crate::tenancy::model::Team;
@@ -109,10 +109,12 @@ struct GrantView {
 #[derive(Serialize)]
 struct ListBody {
     kinds: Vec<KindView>,
-    /// The organization's teams, when the viewer reaches some kind; a viewer
-    /// who reaches none is shown no grants to read them against.
+    /// The teams the viewer may read grants against: every team of the
+    /// organization for an administrator or a sharer, who may make any of
+    /// them a target; the teams that admit the viewer for anybody else; none
+    /// for a viewer who reaches no kind.
     teams: Vec<TeamView>,
-    /// Grants of the kinds the viewer reaches, and only those.
+    /// Those teams' grants, of the kinds the viewer reaches.
     grants: Vec<GrantView>,
 }
 
@@ -144,7 +146,10 @@ struct OptionsQuery {
 /// Readable by any member, because the screen says who may manage what; the
 /// grants of a kind are listed only to somebody whose organization standing
 /// reaches every record of it, so a record's name never reaches a member who
-/// could not open the record itself.
+/// could not open the record itself. Only an administrator or a sharer is
+/// shown every team: anybody else reads the teams that admit them, which is
+/// what the membership overview already shows them, so no team a suspension
+/// cut them out of is named here.
 async fn list_grants(
     State(state): State<TenancyState>,
     member: OrganizationMember,
@@ -180,12 +185,25 @@ async fn list_grants(
         }));
     }
 
-    let teams: Vec<TeamView> = teams::table
-        .filter(teams::organization_id.eq(organization_id))
-        .select((teams::id, teams::name))
-        .order((teams::name.asc(), teams::id.asc()))
-        .load::<(Uuid, String)>(&mut connection)
-        .await?
+    let sees_every_team =
+        member.access.is_administrator() || kinds.iter().any(|kind| kind.may_manage);
+    let listed: Vec<(Uuid, String)> = if sees_every_team {
+        teams::table
+            .filter(teams::organization_id.eq(organization_id))
+            .select((teams::id, teams::name))
+            .order((teams::name.asc(), teams::id.asc()))
+            .load(&mut connection)
+            .await?
+    } else {
+        admitted_teams(member.user.id)
+            .filter(teams::organization_id.eq(organization_id))
+            .select((teams::id, teams::name))
+            .order((teams::name.asc(), teams::id.asc()))
+            .load(&mut connection)
+            .await?
+    };
+    let team_ids: Vec<Uuid> = listed.iter().map(|(id, _name)| *id).collect();
+    let teams: Vec<TeamView> = listed
         .into_iter()
         .map(|(id, name)| TeamView { id, name })
         .collect();
@@ -195,6 +213,7 @@ async fn list_grants(
         let rows: Vec<(Uuid, Option<Uuid>)> = resource_grants::table
             .filter(resource_grants::organization_id.eq(organization_id))
             .filter(resource_grants::kind.eq(kind.name()))
+            .filter(resource_grants::team_id.eq_any(&team_ids))
             .select((resource_grants::team_id, resource_grants::resource_id))
             .load(&mut connection)
             .await?;
@@ -211,7 +230,9 @@ async fn list_grants(
         // One lookup labels every record any team was granted, and leaves out
         // the ones that were deleted since.
         let named: Vec<Uuid> = named.into_iter().collect();
-        let found = kind.find(&mut connection, organization_id, &named).await?;
+        let found = kind
+            .labels(&mut connection, organization_id, &named)
+            .await?;
         for (team_id, granted) in by_team {
             grants.push(grant_view(team_id, kind.name(), &granted, &found));
         }
@@ -301,7 +322,8 @@ async fn replace_grants(
             let found = kind.find(transaction, organization_id, &named).await?;
             // Another organization's record and one that never existed are the
             // same answer, so a probe learns nothing about either.
-            if found.len() != named.len() {
+            let owned: BTreeSet<Uuid> = found.iter().map(|option| option.value).collect();
+            if owned != requested {
                 return Err(ApiError::not_found());
             }
 
@@ -310,6 +332,14 @@ async fn replace_grants(
                 .filter(resource_grants::kind.eq(kind.name()))
                 .select(resource_grants::resource_id)
                 .load(transaction)
+                .await?;
+            // Named before anything is written, and without a lock: a record
+            // being deleted is waiting to forget the grants this change is
+            // about to remove, so locking it now would wait on that delete
+            // while it waits on these rows.
+            let was_named: Vec<Uuid> = held.iter().flatten().copied().collect();
+            let was = kind
+                .labels(transaction, organization_id, &was_named)
                 .await?;
             let wanted: BTreeSet<Option<Uuid>> = if body.every {
                 BTreeSet::from([None])
@@ -329,19 +359,27 @@ async fn replace_grants(
             )
             .await?;
 
+            // Recorded only when what the team reaches moved: two identical
+            // requests in a row, or racing, record one event between them, and
+            // clearing a grant whose record was deleted since, which was inert,
+            // records none. Compared by id, since two records may share a name.
+            let reached: BTreeSet<Option<Uuid>> = held
+                .iter()
+                .filter(|granted| {
+                    granted.is_none_or(|id| was.iter().any(|option| option.value == id))
+                })
+                .copied()
+                .collect();
+            let moved = revoked + granted > 0 && reached != wanted;
+
+            let held: Vec<Option<Uuid>> = held.into_iter().collect();
             let wanted: Vec<Option<Uuid>> = wanted.into_iter().collect();
             let after = grant_view(team.id, kind.name(), &wanted, &found);
-            // Recorded only when a row moved, so two identical requests in a
-            // row, or racing, record one event between them.
-            if revoked + granted == 0 {
+            if !moved {
                 return Ok(after);
             }
 
-            // Labelled as the records read now; one deleted since has no name
-            // left to copy, and its grant was inert anyway.
-            let held: Vec<Option<Uuid>> = held.into_iter().collect();
-            let named: Vec<Uuid> = held.iter().flatten().copied().collect();
-            let was = kind.find(transaction, organization_id, &named).await?;
+            // Named as the records read now; one deleted since has no name left.
             let changes = Changes::new().field(
                 kind.name(),
                 describe(&held, &was),
@@ -419,6 +457,10 @@ async fn find_team(
 }
 
 /// Deletes the team's grants of `kind` the end state no longer holds.
+///
+/// At most two statements, whatever the size of the change, because the
+/// organization's lock is held across them: the named records go in one, and
+/// the grant of every record in the other.
 async fn revoke(
     connection: &mut AsyncPgConnection,
     team: &Team,
@@ -427,16 +469,30 @@ async fn revoke(
     wanted: &BTreeSet<Option<Uuid>>,
 ) -> QueryResult<usize> {
     let mut revoked = 0;
-    for resource_id in held.difference(wanted) {
+
+    let named: Vec<Uuid> = held.difference(wanted).flatten().copied().collect();
+    if !named.is_empty() {
         revoked += diesel::delete(
             resource_grants::table
                 .filter(resource_grants::team_id.eq(team.id))
                 .filter(resource_grants::kind.eq(kind))
-                .filter(resource_grants::resource_id.is_not_distinct_from(*resource_id)),
+                .filter(resource_grants::resource_id.eq_any(&named)),
         )
         .execute(connection)
         .await?;
     }
+
+    if held.contains(&None) && !wanted.contains(&None) {
+        revoked += diesel::delete(
+            resource_grants::table
+                .filter(resource_grants::team_id.eq(team.id))
+                .filter(resource_grants::kind.eq(kind))
+                .filter(resource_grants::resource_id.is_null()),
+        )
+        .execute(connection)
+        .await?;
+    }
+
     Ok(revoked)
 }
 

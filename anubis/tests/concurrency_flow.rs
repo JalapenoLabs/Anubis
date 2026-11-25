@@ -1619,3 +1619,74 @@ async fn a_team_deleted_with_grants_takes_them_and_a_racing_grant_is_refused() {
     );
     assert!(team_grants(&fleet, fleet.team_a).await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_grant_while_its_record_is_deleted_never_deadlocks() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let [first, second, _third, _fourth] = fleet.machines;
+    assert_eq!(
+        share_machines(&fleet, fleet.team_a, false, &[first, second])
+            .await
+            .expect("the request task must not panic"),
+        StatusCode::OK,
+    );
+
+    // The application's delete takes the machine first and forgets its grants
+    // second, as documented; the revocation runs in between. Neither side may
+    // wait on a row the other holds.
+    let mut deleting = fleet.harness.pool.get().await.expect("connection");
+    let revoking = deleting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::delete(machines::machines::table.find(first))
+                .execute(transaction)
+                .await?;
+            let revoking = share_machines(&fleet, fleet.team_a, false, &[second]);
+            tokio::time::sleep(QUEUING_WINDOW).await;
+            anubis::tenancy::forget_resource(transaction, machines::KIND, first).await?;
+            Ok(revoking)
+        })
+        .await
+        .expect("the delete must commit rather than lose a deadlock");
+    drop(deleting);
+    assert_eq!(
+        revoking.await.expect("the request task must not panic"),
+        StatusCode::OK,
+        "the revocation must commit rather than lose a deadlock",
+    );
+    assert_eq!(team_grants(&fleet, fleet.team_a).await, [Some(second)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_never_waits_on_a_record_being_deleted() {
+    let Some(database) = TestDatabase::create("concurrency_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let first = fleet.machines[0];
+    assert_eq!(
+        share_machines(&fleet, fleet.team_a, false, &[first])
+            .await
+            .expect("the request task must not panic"),
+        StatusCode::OK,
+    );
+
+    let mut deleting = fleet.harness.pool.get().await.expect("connection");
+    let listed = deleting
+        .transaction::<_, diesel::result::Error, _>(async |transaction| {
+            diesel::delete(machines::machines::table.find(first))
+                .execute(transaction)
+                .await?;
+            let listing = tokio::time::timeout(Duration::from_secs(5), fleet.grants(&fleet.owner));
+            Ok(listing.await.map(|(status, _body)| status))
+        })
+        .await
+        .expect("the delete must commit");
+    assert_eq!(
+        listed.ok(),
+        Some(StatusCode::OK),
+        "a read is answered while a record it names is being deleted",
+    );
+}

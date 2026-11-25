@@ -3,9 +3,9 @@
 import type { ResourceGrantDraft, ResourceGrantsOverview } from '@jalapenolabs/anubis'
 
 // Core
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useParams } from 'react-router'
+import { Navigate, useParams } from 'react-router'
 import {
   changeOf,
   draftOf,
@@ -67,12 +67,22 @@ export function ResourceAccessPage() {
       { label: t('access.title') },
     ]}
   >
-    { grants.overview
+    {/* An application that shares no kind of record has nothing to show
+        here, and its settings show no way in either. */}
+    { grants.overview && !grants.overview.kinds.length
+      ? <Navigate to={getOrganizationSettingsUrl(organization.id)} replace />
+      : null
+    }
+    { grants.overview?.kinds.length
       ? <EditAccess
           organizationId={organization.id}
           overview={grants.overview}
           onSaved={grants.refresh}
         />
+      : null
+    }
+    { grants.overview
+      ? null
       : <Spinner />
     }
   </AppShell>
@@ -110,39 +120,48 @@ function EditAccess(props: EditAccessProps) {
   const [ isSaved, setIsSaved ] = useState(false)
   const [ errorMessage, setErrorMessage ] = useState<string | null>(null)
 
+  // The server's grants, and the viewer's edits on top of them. Only the
+  // edits are state: whatever the server answers next, a team added or gone
+  // included, the screen reads every row from `saved` and lays an edit over
+  // it only where one was made, so a background refresh never loses an edit
+  // and never meets a row it has no draft for.
   const saved = useMemo(() => draftsOf(props.overview), [ props.overview ])
-  const [ drafts, setDrafts ] = useState(saved)
-  // A save, or somebody else's change, moves the grants underneath the
-  // screen; the screen follows what the server has.
-  useEffect(() => {
-    setDrafts(saved)
-  }, [ saved ])
+  const [ edits, setEdits ] = useState<Record<string, ResourceGrantDraft>>({})
 
-  const changed = Object.keys(drafts).filter(
-    (key) => !isSameGrant(drafts[key], saved[key]),
+  const changed = Object.keys(saved).filter(
+    (key) => edits[key] && !isSameGrant(edits[key], saved[key]),
   )
   const reached = props.overview.kinds.filter((kind) => kind.reaches)
 
-  // Each team and kind is its own end state, sent one after another; a
-  // refusal stops there, says why, and the screen reads back what landed.
+  // Each team and kind is its own end state, sent one after another. An edit
+  // leaves the screen once it is saved; a refusal stops the run there, names
+  // the team, and leaves that edit and every one after it in place to save.
   async function onSave() {
     setIsSaving(true)
     setIsSaved(false)
     setErrorMessage(null)
-    try {
-      for (const key of changed) {
-        const [ teamId, kind ] = key.split('/')
-        await api.replaceResourceGrants(props.organizationId, teamId, kind, changeOf(drafts[key]))
+    let failed = false
+    for (const key of changed) {
+      const [ teamId, kind ] = key.split('/')
+      try {
+        await api.replaceResourceGrants(props.organizationId, teamId, kind, changeOf(edits[key]))
+        setEdits((current) => Object.fromEntries(
+          Object.entries(current).filter(([ kept ]) => kept !== key),
+        ))
       }
-      setIsSaved(true)
+      catch (error) {
+        failed = true
+        const team = props.overview.teams.find((candidate) => candidate.id === teamId)
+        setErrorMessage(t('access.saveFailed', {
+          team: team?.name ?? teamId,
+          message: getApiErrorMessage(error) ?? t('common.somethingWentWrong'),
+        }))
+        break
+      }
     }
-    catch (error) {
-      setErrorMessage(getApiErrorMessage(error) ?? t('common.somethingWentWrong'))
-    }
-    finally {
-      await props.onSaved()
-      setIsSaving(false)
-    }
+    await props.onSaved()
+    setIsSaved(!failed)
+    setIsSaving(false)
   }
 
   const mayManageAny = reached.some((kind) => kind.mayManage)
@@ -185,12 +204,6 @@ function EditAccess(props: EditAccessProps) {
         }</p>
       : null
     }
-    { props.overview.kinds.length
-      ? null
-      : <p className='relaxed opacity-70'>{
-          t('access.nothingShared')
-        }</p>
-    }
     { props.overview.kinds
       .filter((kind) => !kind.reaches)
       .map((kind) => <Card key={kind.kind} className='relaxed p-2'>
@@ -216,10 +229,10 @@ function EditAccess(props: EditAccessProps) {
                 teamName={team.name}
                 kind={kind}
                 kindLabel={labels.subjectLabel(kind.kind)}
-                draft={drafts[`${team.id}/${kind.kind}`]}
+                draft={edits[`${team.id}/${kind.kind}`] ?? saved[`${team.id}/${kind.kind}`]}
                 onChange={(draft) => {
                   setIsSaved(false)
-                  setDrafts((current) => ({ ...current, [`${team.id}/${kind.kind}`]: draft }))
+                  setEdits((current) => ({ ...current, [`${team.id}/${kind.kind}`]: draft }))
                 }}
                 isDisabled={isSaving}
               />)

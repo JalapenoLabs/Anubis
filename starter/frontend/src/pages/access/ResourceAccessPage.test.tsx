@@ -48,62 +48,88 @@ type Standing = {
   may_manage: boolean
 }
 
+const TEAM_B = '3f1a2b3c-0000-4000-8000-0000000000b1'
+const GRANTS_PATH = `/tenancy/organizations/${ORGANIZATION_ID}/resource-grants`
+
+function overview(standing: Standing, teams = [{ id: TEAM_A, name: 'Team A' }, { id: TEAM_C, name: 'Team C' }]) {
+  return {
+    kinds: [{ kind: 'Machine', ...standing }],
+    teams: standing.reaches
+      ? teams
+      : [],
+    grants: standing.reaches
+      ? [
+          { team_id: TEAM_A, kind: 'Machine', every: true, resources: []},
+          {
+            team_id: TEAM_C,
+            kind: 'Machine',
+            every: false,
+            resources: [{ value: RACK, label: 'Rack' }],
+          },
+        ]
+      : [],
+  }
+}
+
+/**
+ * The backend these cases render against, with the listing and the writes
+ * under the test's control: `listing` is what the next read of the grants
+ * answers, and a path in `refusing` answers its write `403`.
+ */
 function stubBackend(standing: Standing) {
-  const grantsPath = `/tenancy/organizations/${ORGANIZATION_ID}/resource-grants`
+  const backend = {
+    listing: overview(standing) as unknown,
+    refusing: new Set<string>(),
+    writes: [] as { path: string, body: unknown }[],
+  }
   stubFetch({
     '/auth/me': { status: 200, body: { user: USER }},
     '/tenancy/memberships': { status: 200, body: MEMBERSHIPS },
     '/account/notifications': { status: 200, body: { notifications: [], unread_count: 0 }},
-    [grantsPath]: {
-      status: 200,
-      body: {
-        kinds: [{ kind: 'Machine', ...standing }],
-        teams: standing.reaches
-          ? [{ id: TEAM_A, name: 'Team A' }, { id: TEAM_C, name: 'Team C' }]
-          : [],
-        grants: standing.reaches
-          ? [
-              { team_id: TEAM_A, kind: 'Machine', every: true, resources: []},
-              {
-                team_id: TEAM_C,
-                kind: 'Machine',
-                every: false,
-                resources: [{ value: RACK, label: 'Rack' }],
-              },
-            ]
-          : [],
-      },
-    },
-    [`${grantsPath}/Machine/options`]: {
+    [`${GRANTS_PATH}/Machine/options`]: {
       status: 200,
       body: { options: [{ value: RACK, label: 'Rack' }]},
     },
-    [`/tenancy/organizations/${ORGANIZATION_ID}/teams/${TEAM_C}/resource-grants/Machine`]: {
-      status: 200,
-      body: { grant: { team_id: TEAM_C, kind: 'Machine', every: true, resources: []}},
-    },
   })
 
-  // The table above answers by path alone, so the writes are recorded here to
-  // be read back by what they asked for.
   const answer = globalThis.fetch
-  const writes: { path: string, body: unknown }[] = []
   vi.stubGlobal('fetch', async (input: Request | string | URL) => {
-    if (input instanceof Request && input.method === 'PUT') {
-      writes.push({
-        path: new URL(input.url).pathname,
-        body: await input.clone().json(),
+    const request = input instanceof Request
+      ? input
+      : new Request(new URL(String(input), 'http://localhost'))
+    const path = new URL(request.url).pathname
+    if (request.method === 'PUT') {
+      backend.writes.push({ path, body: await request.clone().json() })
+      const status = backend.refusing.has(path)
+        ? 403
+        : 200
+      const body = status === 200
+        ? { grant: { team_id: '', kind: 'Machine', every: true, resources: []}}
+        : { message: 'You do not have permission to do that.' }
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    if (path === GRANTS_PATH) {
+      return new Response(JSON.stringify(backend.listing), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
       })
     }
     return answer(input)
   })
-  return writes
+  return backend
+}
+
+function writePath(teamId: string) {
+  return `/tenancy/organizations/${ORGANIZATION_ID}/teams/${teamId}/resource-grants/Machine`
 }
 
 describe('ResourceAccessPage', () => {
   it('shows what each team reaches, and saves only the team that changed', async () => {
     const user = userEvent.setup()
-    const writes = stubBackend({ reaches: true, may_manage: true })
+    const { writes } = stubBackend({ reaches: true, may_manage: true })
     renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
 
     const teamA = await screen.findByRole('radiogroup', { name: 'Team A: Machine' })
@@ -120,7 +146,7 @@ describe('ResourceAccessPage', () => {
 
     await waitFor(() => expect(writes).toHaveLength(1))
     expect(writes[0]).toEqual({
-      path: `/tenancy/organizations/${ORGANIZATION_ID}/teams/${TEAM_C}/resource-grants/Machine`,
+      path: writePath(TEAM_C),
       body: { every: true, resource_ids: []},
     })
   })
@@ -143,5 +169,56 @@ describe('ResourceAccessPage', () => {
 
     expect(await screen.findByText('Sharing these takes roles that reach every one of them.')).toBeTruthy()
     expect(screen.queryByRole('radiogroup')).toBeNull()
+  })
+
+  it('keeps working when the organization\'s teams change underneath it', async () => {
+    const user = userEvent.setup()
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    const teamC = await screen.findByRole('radiogroup', { name: 'Team C: Machine' })
+    await user.click(within(teamC).getByRole('radio', { name: 'Every record' }))
+
+    // The save reads the grants back, and by then a team was added and one
+    // went: the screen redraws from the new list rather than falling over.
+    backend.listing = overview(
+      { reaches: true, may_manage: true },
+      [{ id: TEAM_B, name: 'Team B' }, { id: TEAM_C, name: 'Team C' }],
+    )
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByRole('radiogroup', { name: 'Team B: Machine' })).toBeTruthy()
+    expect(screen.queryByRole('radiogroup', { name: 'Team A: Machine' })).toBeNull()
+  })
+
+  it('keeps the edits a refused save did not reach, and says which team refused', async () => {
+    const user = userEvent.setup()
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    backend.refusing.add(writePath(TEAM_A))
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    const teamA = await screen.findByRole('radiogroup', { name: 'Team A: Machine' })
+    const teamC = screen.getByRole('radiogroup', { name: 'Team C: Machine' })
+    await user.click(within(teamA).getByRole('radio', { name: 'Nothing' }))
+    await user.click(within(teamC).getByRole('radio', { name: 'Nothing' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Team A: You do not have permission to do that.')).toBeTruthy()
+    expect(backend.writes.map((write) => write.path)).toEqual([ writePath(TEAM_A) ])
+    expect(
+      within(screen.getByRole('radiogroup', { name: 'Team C: Machine' }))
+        .getByRole('radio', { name: 'Nothing' }),
+      'an edit the save never reached is still there to save',
+    ).toHaveProperty('checked', true)
+    expect(screen.getByRole('button', { name: 'Save' })).toHaveProperty('disabled', false)
+  })
+
+  it('sends the organization back to its settings when it shares nothing', async () => {
+    const backend = stubBackend({ reaches: true, may_manage: true })
+    backend.listing = { kinds: [], teams: [], grants: []}
+    renderWithProviders(<App />, `/organizations/${ORGANIZATION_ID}/access`)
+
+    expect(await screen.findByRole('heading', { name: 'Organization settings' })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByText('Manage team access')).toBeNull())
   })
 })

@@ -3346,3 +3346,150 @@ async fn a_suspension_through_the_teams_sub_tenant_ends_what_the_team_shares() {
         "a suspension through the team's sub-tenant ends what the team shares",
     );
 }
+
+#[tokio::test]
+async fn a_reader_who_shares_nothing_sees_only_the_teams_that_admit_them() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    assert_eq!(
+        fleet.share(&fleet.owner, fleet.team_a, true, &[]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fleet
+            .share(&fleet.owner, fleet.team_c, false, &[fleet.machines[0]])
+            .await,
+        StatusCode::OK
+    );
+
+    // Every full member reads machines through the default role, and this one
+    // belongs to team C alone: the listing names team C and its grants, and no
+    // other team of the organization.
+    let default_role = default_role_of(&fleet).await;
+    let (status, body) = fleet
+        .send(
+            "PATCH",
+            &format!(
+                "/tenancy/organizations/{}/roles/{default_role}",
+                fleet.organization
+            ),
+            Some(&json!({ "permissions": ["Machine.read"] })),
+            &fleet.owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (email, reader) = fleet
+        .join(("organization_id", fleet.organization), &[])
+        .await;
+    fleet
+        .add(&email, &reader, ("team_id", fleet.team_c), &[])
+        .await;
+
+    let (status, body) = fleet.grants(&reader).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["kinds"][0]["reaches"], true);
+    assert_eq!(body["kinds"][0]["may_manage"], false);
+    assert_eq!(
+        body["teams"],
+        json!([{ "id": fleet.team_c, "name": "Team C" }]),
+        "a member who shares nothing is shown only the teams that admit them",
+    );
+    let teams: Vec<&Value> = body["grants"]
+        .as_array()
+        .expect("grants are listed")
+        .iter()
+        .map(|grant| &grant["team_id"])
+        .collect();
+    assert_eq!(teams, [&json!(fleet.team_c)]);
+
+    let (status, body) = fleet.grants(&fleet.owner).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["teams"].as_array().map(Vec::len),
+        Some(3),
+        "an administrator sees every team, as every one is a target",
+    );
+}
+
+#[tokio::test]
+async fn a_picker_search_matches_names_literally() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    machines::insert(&fleet.harness.pool, fleet.organization, "Rack_1 100%").await;
+    let path = |search: &str| {
+        format!(
+            "/tenancy/organizations/{}/resource-grants/{}/options?search={search}",
+            fleet.organization,
+            machines::KIND
+        )
+    };
+
+    for (search, expected) in [
+        ("%25", json!(["Rack_1 100%"])),
+        ("_", json!(["Rack_1 100%"])),
+        (
+            "Machine",
+            json!(["Machine 0", "Machine 1", "Machine 2", "Machine 3"]),
+        ),
+    ] {
+        let (status, body) = fleet.send("GET", &path(search), None, &fleet.owner).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let labels: Vec<&Value> = body["options"]
+            .as_array()
+            .expect("options are listed")
+            .iter()
+            .map(|option| &option["label"])
+            .collect();
+        assert_eq!(json!(labels), expected, "search {search:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_change_that_leaves_the_set_as_it_reads_records_nothing() {
+    let Some(database) = TestDatabase::create("adversarial_flow").await else {
+        return;
+    };
+    let fleet = Fleet::open(&database).await;
+    let [first, second, _third, _fourth] = fleet.machines;
+    assert_eq!(
+        fleet
+            .share(&fleet.owner, fleet.team_c, false, &[first, second])
+            .await,
+        StatusCode::OK
+    );
+
+    // The second machine goes without its grants being forgotten, so the
+    // team reads as holding the first alone; stating exactly that changes
+    // nothing anybody can read, and records nothing.
+    let mut connection = fleet.harness.pool.get().await.expect("a connection");
+    diesel::delete(machines::machines::table.find(second))
+        .execute(&mut connection)
+        .await
+        .expect("the machine is deleted");
+    let recorded = || async {
+        audit_events::table
+            .filter(audit_events::subject_id.eq(fleet.team_c))
+            .filter(audit_events::action.eq(anubis::audit::TEAM_ACCESS_CHANGED))
+            .count()
+            .get_result::<i64>(&mut fleet.harness.pool.get().await.expect("a connection"))
+            .await
+            .expect("the audit log must count")
+    };
+    let before = recorded().await;
+    assert_eq!(
+        fleet
+            .share(&fleet.owner, fleet.team_c, false, &[first])
+            .await,
+        StatusCode::OK
+    );
+    assert_eq!(recorded().await, before);
+    assert_eq!(
+        fleet.grant_rows(fleet.team_c).await,
+        1,
+        "the inert grant is still cleared",
+    );
+}
