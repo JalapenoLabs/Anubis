@@ -39,10 +39,20 @@
 //!
 //! # The free plan
 //!
-//! Exactly one plan carries no prices, and that is the free plan. It is what
-//! an organization with no subscription resolves to, which makes plan
-//! resolution total: every organization is always on a plan, and no code path
-//! has to answer "what does an unsubscribed organization get".
+//! Exactly one plan carries no prices, leaving aside the plan `paid_plan`
+//! names, and that is the free plan. It is what an organization paying for
+//! nothing resolves to, which makes plan resolution total: every organization
+//! is always on a plan, and no code path has to answer "what does an
+//! unsubscribed organization get".
+//!
+//! # The paid plan and the wallet
+//!
+//! Two optional top-level keys sit beside `plans`. `paid_plan` names the plan
+//! an organization without a plan subscription is on while it pays for
+//! anything else, a subscription for one of its records or credit in its
+//! wallet; it may sell no prices of its own, and it is never the free plan.
+//! `wallet` is the [`WalletTerms`] prepaid credit is sold on. Absent, both
+//! leave plan resolution and billing exactly as they are without them.
 //!
 //! # Plans do not inherit
 //!
@@ -315,6 +325,12 @@ pub struct Plan {
     prices: BTreeMap<Interval, Price>,
     #[serde(default)]
     limits: BTreeMap<String, Limit>,
+    /// Set by [`PlanSet::from_yaml`]: whether this is the free plan.
+    #[serde(skip)]
+    free: bool,
+    /// Set by [`PlanSet::from_yaml`]: whether paying for anything resolves here.
+    #[serde(skip)]
+    paid: bool,
 }
 
 impl Plan {
@@ -370,10 +386,24 @@ impl Plan {
         self.limits.get(name).copied()
     }
 
-    /// Whether this is the free plan, which is the plan that sells no price.
+    /// Whether this is the free plan: the plan an organization paying for
+    /// nothing is on.
+    ///
+    /// It is the one plan that sells no price, leaving aside the
+    /// [paid plan](Plan::is_paid), which may sell none either.
     #[must_use]
     pub fn is_free(&self) -> bool {
-        self.prices.is_empty()
+        self.free
+    }
+
+    /// Whether this is the plan `paid_plan` names in `billing.yml`.
+    ///
+    /// An organization with no plan subscription is on it while it pays for
+    /// anything else: a subscription for one of its records, or credit in its
+    /// wallet. See [`crate::billing::limits`].
+    #[must_use]
+    pub fn is_paid(&self) -> bool {
+        self.paid
     }
 
     /// Whether any of this plan's prices is charged per seat.
@@ -387,6 +417,64 @@ impl Plan {
 #[serde(deny_unknown_fields)]
 struct BillingFile {
     plans: Vec<Plan>,
+    /// The plan paying for anything puts an organization on.
+    #[serde(default)]
+    paid_plan: Option<String>,
+    /// The prepaid credit wallet, when the application sells credit.
+    #[serde(default)]
+    wallet: Option<WalletTerms>,
+}
+
+/// The terms an application sells prepaid credit on, from `billing.yml`.
+///
+/// Every amount is in micro-units of `currency` (1 USD is 1,000,000), the unit
+/// the whole wallet keeps, so a charge for one minute of usage never rounds to
+/// zero:
+///
+/// ```yaml
+/// wallet:
+///   name: Account credit
+///   currency: usd
+///   minimum_top_up_micros: 10000000   # $10.00
+///   low_balance_micros: 2000000       # tell the administrators below $2.00
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletTerms {
+    name: String,
+    currency: String,
+    minimum_top_up_micros: i64,
+    #[serde(default)]
+    low_balance_micros: Option<i64>,
+}
+
+impl WalletTerms {
+    /// What Stripe Checkout calls a top-up, e.g. `Account credit`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The ISO 4217 currency the wallet holds, lowercase, as Stripe writes it.
+    #[must_use]
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    /// The smallest top-up, and the smallest auto-recharge, in micro-units.
+    ///
+    /// A card charge carries a fixed fee, which is why credit is bought in
+    /// amounts rather than as it is spent.
+    #[must_use]
+    pub fn minimum_top_up_micros(&self) -> i64 {
+        self.minimum_top_up_micros
+    }
+
+    /// The balance below which a spend tells the administrators, if any.
+    #[must_use]
+    pub fn low_balance_micros(&self) -> Option<i64> {
+        self.low_balance_micros
+    }
 }
 
 /// The validated plans of an application, in the order the file lists them.
@@ -399,6 +487,10 @@ pub struct PlanSet {
     plans: Vec<Plan>,
     /// Index of the one plan with no prices; see the module docs.
     free: usize,
+    /// Index of the plan `paid_plan` names, when the file names one.
+    paid: Option<usize>,
+    /// The wallet's terms, when the application sells credit.
+    wallet: Option<WalletTerms>,
 }
 
 impl PlanSet {
@@ -407,8 +499,9 @@ impl PlanSet {
     /// # Errors
     /// Returns an [`Error`] on malformed YAML, an empty plan list, a duplicate
     /// plan key, a malformed key, limit name, currency, or amount, a Stripe
-    /// price id used by two plans, or a plan list without exactly one free
-    /// plan.
+    /// price id used by two plans, a plan list without exactly one free
+    /// plan, a `paid_plan` naming no plan, or wallet terms Stripe could not
+    /// charge.
     ///
     /// # Examples
     /// ```
@@ -428,16 +521,32 @@ impl PlanSet {
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
         let file: BillingFile = serde_norway::from_str(yaml)
             .map_err(|source| Error::new(format!("billing.yml does not parse: {source}")))?;
+        let BillingFile {
+            mut plans,
+            paid_plan,
+            wallet,
+        } = file;
 
-        if file.plans.is_empty() {
+        if plans.is_empty() {
             return Err(Error::new("billing.yml defines no plans".to_owned()));
         }
+        if let Some(terms) = &wallet {
+            validate_wallet(terms)?;
+        }
+        let paid = match paid_plan.as_deref() {
+            None => None,
+            Some(key) => Some(plans.iter().position(|plan| plan.key == key).ok_or_else(|| {
+                Error::new(format!(
+                    "billing.yml names {key:?} as the paid_plan, and defines no plan by that key"
+                ))
+            })?),
+        };
 
         let mut keys = BTreeSet::new();
         let mut price_ids = BTreeSet::new();
         let mut free = Vec::new();
 
-        for (index, plan) in file.plans.iter().enumerate() {
+        for (index, plan) in plans.iter().enumerate() {
             validate_plan(plan)?;
 
             if !keys.insert(plan.key.as_str()) {
@@ -456,29 +565,43 @@ impl PlanSet {
                     )));
                 }
             }
-            if plan.is_free() {
+            // The paid plan may sell no price, because an application can
+            // reach it only by paying for something else; it is never free.
+            if plan.prices.is_empty() && paid != Some(index) {
                 free.push(index);
             }
         }
 
-        match free.as_slice() {
-            [only] => Ok(Self {
-                plans: file.plans,
-                free: *only,
-            }),
-            [] => Err(Error::new(
-                "billing.yml defines no free plan: exactly one plan must sell no prices, \
-                 because that is what an organization without a subscription is on"
-                    .to_owned(),
-            )),
-            [first, rest @ ..] => Err(Error::new(format!(
-                "billing.yml defines {} free plans ({:?} and {:?}): exactly one plan may sell \
-                 no prices",
-                rest.len() + 1,
-                file.plans[*first].key,
-                file.plans[rest[0]].key,
-            ))),
+        let free = match free.as_slice() {
+            [only] => *only,
+            [] => {
+                return Err(Error::new(
+                    "billing.yml defines no free plan: exactly one plan must sell no prices, \
+                     because that is what an organization without a subscription is on"
+                        .to_owned(),
+                ));
+            }
+            [first, rest @ ..] => {
+                return Err(Error::new(format!(
+                    "billing.yml defines {} free plans ({:?} and {:?}): exactly one plan may \
+                     sell no prices, beside the paid_plan",
+                    rest.len() + 1,
+                    plans[*first].key,
+                    plans[rest[0]].key,
+                )));
+            }
+        };
+
+        plans[free].free = true;
+        if let Some(paid) = paid {
+            plans[paid].paid = true;
         }
+        Ok(Self {
+            plans,
+            free,
+            paid,
+            wallet,
+        })
     }
 
     /// Every plan, in the order the file lists them.
@@ -498,6 +621,22 @@ impl PlanSet {
     pub fn free(&self) -> &Plan {
         // Validated at construction: `free` indexes the one plan with no prices.
         &self.plans[self.free]
+    }
+
+    /// The plan paying for anything resolves to, when `paid_plan` names one.
+    ///
+    /// An organization with no plan subscription is on it while it holds a
+    /// subscription for one of its records, or credit in its wallet. See
+    /// [`crate::billing::limits`].
+    #[must_use]
+    pub fn paid(&self) -> Option<&Plan> {
+        self.paid.map(|index| &self.plans[index])
+    }
+
+    /// The prepaid credit wallet's terms, when the application sells credit.
+    #[must_use]
+    pub fn wallet(&self) -> Option<&WalletTerms> {
+        self.wallet.as_ref()
     }
 
     /// Renders the plan catalog as the frontend's generated TypeScript module.
@@ -565,7 +704,7 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
                 plan.key,
             )));
         }
-        if price.currency.len() != 3 || !price.currency.chars().all(|c| c.is_ascii_lowercase()) {
+        if !is_currency_code(&price.currency) {
             return Err(Error::new(format!(
                 "plan {:?} has currency {:?} for its {interval} price: expected a lowercase \
                  ISO 4217 code, e.g. `usd`",
@@ -592,6 +731,55 @@ fn validate_plan(plan: &Plan) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Checks the wallet's terms, so a top-up can never be offered that Stripe refuses.
+fn validate_wallet(terms: &WalletTerms) -> Result<(), Error> {
+    if terms.name.trim().is_empty() {
+        return Err(Error::new(
+            "the wallet has no name, which is what Stripe Checkout calls a top-up".to_owned(),
+        ));
+    }
+    if !is_currency_code(&terms.currency) {
+        return Err(Error::new(format!(
+            "the wallet's currency {:?} is not a lowercase ISO 4217 code, e.g. `usd`",
+            terms.currency,
+        )));
+    }
+    if !super::currency::is_supported(&terms.currency) {
+        return Err(Error::new(format!(
+            "the wallet cannot hold {:?}: Stripe charges three-decimal currencies by rules the \
+             wallet does not apply, so pick another currency",
+            terms.currency,
+        )));
+    }
+    if super::currency::to_minor(terms.minimum_top_up_micros, &terms.currency)
+        .is_none_or(|minor| minor < 1)
+    {
+        return Err(Error::new(format!(
+            "the wallet's minimum_top_up_micros of {} is not an amount Stripe can charge in {}: \
+             it must be a positive multiple of {} micro-units, and at most {} of the currency's \
+             smallest unit",
+            terms.minimum_top_up_micros,
+            terms.currency,
+            super::currency::charge_step_micros(&terms.currency).unwrap_or_default(),
+            super::currency::MAX_CHARGE_MINOR,
+        )));
+    }
+    if terms.low_balance_micros.is_some_and(|low| low < 0) {
+        return Err(Error::new(
+            "the wallet's low_balance_micros cannot be negative".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a currency is written the way Stripe and this file write one.
+fn is_currency_code(candidate: &str) -> bool {
+    candidate.len() == 3
+        && candidate
+            .chars()
+            .all(|character| character.is_ascii_lowercase())
 }
 
 /// Whether a word may be a plan key or a limit name.
@@ -975,5 +1163,36 @@ plans:
             let error = PlanSet::from_yaml(yaml).expect_err("must be rejected");
             assert!(error.to_string().contains("does not parse"), "got: {error}");
         }
+    }
+
+    #[test]
+    fn a_wallet_refuses_a_currency_whose_charging_rules_it_does_not_apply() {
+        let wallet = |currency: &str, minimum: i64| {
+            format!(
+                "
+plans:
+  - key: free
+    name: Free
+wallet:
+  name: Account credit
+  currency: {currency}
+  minimum_top_up_micros: {minimum}
+"
+            )
+        };
+
+        let refused = PlanSet::from_yaml(&wallet("kwd", 10_000_000)).expect_err("three decimals");
+        assert!(
+            refused.to_string().contains("three-decimal"),
+            "got: {refused}"
+        );
+        let refused =
+            PlanSet::from_yaml(&wallet("ugx", 10_500_000)).expect_err("a fraction of a shilling");
+        assert!(
+            refused.to_string().contains("minimum_top_up_micros"),
+            "got: {refused}"
+        );
+        PlanSet::from_yaml(&wallet("ugx", 5_000_000_000)).expect("whole shillings");
+        PlanSet::from_yaml(&wallet("usd", 10_000_000)).expect("whole cents");
     }
 }

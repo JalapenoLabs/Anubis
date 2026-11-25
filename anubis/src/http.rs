@@ -67,6 +67,15 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, message)
     }
 
+    /// `402 Payment Required`: the request needs money the caller has not paid.
+    ///
+    /// What a spend answers when the organization's credit is used up, so a
+    /// client can tell "add credit" apart from every other refusal.
+    #[must_use]
+    pub fn payment_required(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYMENT_REQUIRED, message)
+    }
+
     /// A `429 Too Many Requests` telling the caller how long to wait.
     ///
     /// The response carries a `Retry-After` header alongside the usual JSON

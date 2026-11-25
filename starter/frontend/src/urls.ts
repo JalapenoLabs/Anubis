@@ -32,6 +32,8 @@ export const UrlTree = {
    * `/billing`: the backend reserves that prefix for the API itself.
    */
   organizationBilling: '/organizations/:organizationId/billing',
+  /** The prepaid credit ledger: every top-up, recharge, spend, and refund. */
+  organizationBillingActivity: '/organizations/:organizationId/billing/activity',
   /** The organization's roles, highest first: the role editor's list. */
   organizationRoles: '/organizations/:organizationId/roles',
   /** One role's own page, where it is renamed, recoloured, and given permissions. */
@@ -197,6 +199,10 @@ export function getOrganizationSettingsUrl(organizationId: string): string {
 
 export function getOrganizationBillingUrl(organizationId: string): string {
   return UrlTree.organizationBilling.replace(':organizationId', organizationId)
+}
+
+export function getOrganizationBillingActivityUrl(organizationId: string): string {
+  return UrlTree.organizationBillingActivity.replace(':organizationId', organizationId)
 }
 
 export function getOrganizationRolesUrl(organizationId: string): string {

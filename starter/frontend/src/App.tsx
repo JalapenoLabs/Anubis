@@ -15,6 +15,7 @@ import { TangibleThingPage } from './pages/TangibleThingPage'
 import { GranularDetailPage } from './pages/GranularDetailPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { BillingPage } from './pages/billing/BillingPage'
+import { CreditActivityPage } from './pages/billing/CreditActivityPage'
 import { DevelopersPage } from './pages/developers/DevelopersPage'
 import { AuditLogPage } from './pages/auditLog/AuditLogPage'
 import { OrganizationSettingsPage } from './pages/tenancy/OrganizationSettingsPage'
@@ -178,6 +179,14 @@ export function App() {
       element={
         <Workspace>
           <BillingPage />
+        </Workspace>
+      }
+    />
+    <Route
+      path={UrlTree.organizationBillingActivity}
+      element={
+        <Workspace>
+          <CreditActivityPage />
         </Workspace>
       }
     />

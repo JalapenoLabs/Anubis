@@ -93,10 +93,10 @@ use super::lifecycle::{self, Origin, Reconciler, move_revision, read_began};
 use super::model::{
     Subject, Subscription, SubscriptionStatus, SubscriptionWithItems, terminal_statuses,
 };
-use super::plans::{Interval, PlanSet};
+use super::plans::{Interval, PlanSet, WalletTerms};
 use super::stripe::{
-    self, CheckoutSession, ItemUpdate, LineItem, NewCheckoutSession, NewCustomer, Purchase,
-    SubscriptionUpdate,
+    self, CheckoutSession, ItemUpdate, LineItem, NewCheckoutSession, NewCustomer, NewTopUpSession,
+    Purchase, SubscriptionUpdate,
 };
 use crate::audit::{self, Changes};
 use crate::config::AppConfig;
@@ -142,6 +142,21 @@ pub struct NewSubscription<'a> {
     /// Where Stripe sends receipts, when the organization becomes a Stripe
     /// customer with this purchase.
     pub email: Option<&'a str>,
+}
+
+/// A top-up about to be bought, as the billing endpoint validated it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TopUp<'a> {
+    /// The terms the wallet sells credit on.
+    pub(super) terms: &'a WalletTerms,
+    /// What to charge, in the currency's smallest unit.
+    pub(super) amount_minor: i64,
+    /// Whether to save the card for auto-recharge.
+    pub(super) save_card: bool,
+    /// The billing page Stripe returns the browser to.
+    pub(super) landing: &'a str,
+    /// Where Stripe sends receipts, when this purchase creates the customer.
+    pub(super) email: Option<&'a str>,
 }
 
 /// One change to a subscription's line items, named by the price it bills.
@@ -419,6 +434,46 @@ impl Subscriptions {
             "checkout {{billing.checkout.session}} opened with {{billing.line_items}} line items",
         );
 
+        Ok(session)
+    }
+
+    /// Opens a Checkout session that buys credit for the organization's wallet.
+    ///
+    /// Shares the customer with every purchase the organization makes, so a
+    /// card saved by a top-up is the customer's, and the portal lists it.
+    pub(super) async fn open_top_up(
+        &self,
+        organization_id: Uuid,
+        top_up: &TopUp<'_>,
+    ) -> Result<CheckoutSession, Error> {
+        let stripe = self.configured()?;
+        let mut connection = self.connection().await?;
+        let customer_id =
+            ensure_customer(&mut connection, stripe, organization_id, top_up.email).await?;
+        drop(connection);
+
+        let success_url = format!("{}?top_up=success", top_up.landing);
+        let cancel_url = format!("{}?top_up=canceled", top_up.landing);
+        let session = stripe
+            .create_top_up_session(&NewTopUpSession {
+                customer_id: &customer_id,
+                organization_id,
+                name: top_up.terms.name(),
+                currency: top_up.terms.currency(),
+                amount_minor: top_up.amount_minor,
+                save_card: top_up.save_card,
+                success_url: &success_url,
+                cancel_url: &cancel_url,
+            })
+            .await?;
+
+        tracing::info!(
+            organization.id = %organization_id,
+            billing.checkout.session = %session.id,
+            billing.top_up.amount = top_up.amount_minor,
+            "top-up {{billing.checkout.session}} opened for {{billing.top_up.amount}} of the \
+             currency's smallest unit",
+        );
         Ok(session)
     }
 

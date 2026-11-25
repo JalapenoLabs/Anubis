@@ -18,7 +18,8 @@
     "yes": "Yes",
     "no": "No",
     "breadcrumbs": "Breadcrumb",
-    "pageOf": "Page {{page}} of {{totalPages}}"
+    "pageOf": "Page {{page}} of {{totalPages}}",
+    "tryAgain": "Try again"
   },
   "auth": {
     "signIn": {
@@ -396,6 +397,8 @@
     "currentPlanTitle": "Current plan: {{plan}}",
     "freeSubtitle": "Everything an organization gets without a subscription.",
     "noSubscription": "No subscription",
+    "paidStatusChip": "Included",
+    "paidStatusLine": "This plan comes with any subscription or credit the organization pays for.",
     "seatsLabel": "Seats",
     "seatsOfLimit": "{{used}} of {{allowed}} in use",
     "seatsUnlimited": "{{used}} in use",
@@ -413,6 +416,7 @@
     "highlightedBadge": "Most popular",
     "chooseAction": "Choose",
     "freePrice": "Free",
+    "paidPlanIncluded": "Included with any subscription or credit",
     "limitLine": "{{count}} {{limit}}",
     "softLimitSuffix": "(soft limit)",
     "per": {
@@ -436,6 +440,67 @@
       "paused": "Paused",
       "incomplete": "Incomplete",
       "incomplete_expired": "Expired"
+    },
+    "wallet": {
+      "title": "Credit",
+      "activityLink": "View activity",
+      "addCredit": "Add credit",
+      "autoRecharge": "Auto-recharge",
+      "autoRechargeOn": "Recharges {{amount}} at or below {{threshold}}",
+      "autoRechargeOff": "Auto-recharge is off",
+      "recharging": "A recharge is on its way.",
+      "rechargeFailed": "The recharge on {{date}} was declined, so auto-recharge turned off. Add credit, or turn it back on.",
+      "belowZero": "The balance is below zero after a refund. Add credit to cover it.",
+      "lowBalance": "The balance is running low. Add credit to keep usage running.",
+      "topUpSuccess": "Thanks! The credit appears here as soon as Stripe confirms the payment.",
+      "topUpCanceled": "The top-up was cancelled. Nothing was charged.",
+      "partialUnit": "Stripe charges in steps of {{step}}.",
+      "kinds": {
+        "top_up": "Top-up",
+        "recharge": "Recharge",
+        "spend": "Usage",
+        "refund": "Refund",
+        "refund_reversal": "Refund reversed"
+      },
+      "topUp": {
+        "title": "Add credit",
+        "amount": "Amount",
+        "saveCard": "Save this card for auto-recharge",
+        "submit": "Continue to Stripe",
+        "amountMissing": "Enter an amount.",
+        "amountBelowMinimum": "Add at least {{minimum}}."
+      },
+      "autoRechargeForm": {
+        "title": "Auto-recharge",
+        "threshold": "Balance threshold",
+        "amount": "Recharge amount",
+        "turnOff": "Turn off",
+        "needsCard": "Top up once with Save this card on, and auto-recharge can use it.",
+        "thresholdMissing": "Enter a threshold.",
+        "thresholdBelowZero": "Set a threshold of zero or more.",
+        "amountMissing": "Enter a recharge amount.",
+        "amountBelowMinimum": "A recharge buys at least {{minimum}}."
+      }
+    },
+    "activity": {
+      "breadcrumb": "Activity",
+      "title": "Credit activity",
+      "date": "Date",
+      "kind": "Kind",
+      "description": "Description",
+      "amount": "Amount",
+      "balance": "Balance",
+      "empty": "No credit has been added or spent yet.",
+      "billingRoleOnly": "An organization admin, or anyone holding the billing role, can read the credit activity.",
+      "partlyCovered": "Covered {{taken}} of {{requested}}",
+      "loadFailed": "The activity could not be loaded.",
+      "descriptions": {
+        "top_up": "Credit bought at checkout",
+        "recharge": "Charged to the saved card",
+        "spend": "Charged for usage",
+        "refund": "Refunded through Stripe",
+        "refund_reversal": "A refund was reversed, so its credit came back"
+      }
     }
   },
   "oauth": {

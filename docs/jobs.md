@@ -86,10 +86,12 @@ Both tables are ordinary Postgres tables and are meant to be queried:
 | Job | Queue | What it does |
 |---|---|---|
 | `anubis::webhooks::DeliverWebhook` | `webhooks` | POSTs one signed outgoing webhook delivery, recording the answer on its row |
-| `anubis::billing::ProcessStripeEvent` | `billing` | Turns one stored Stripe event into one of the organization's subscription rows and its line items |
+| `anubis::billing::ProcessStripeEvent` | `billing` | Turns one stored Stripe event into one of the organization's subscription rows and its line items, or into wallet ledger entries for a payment or a refund |
+| `anubis::billing::SyncSeats` | `billing` | Tells Stripe how many seats an organization uses after a membership change |
+| `anubis::billing::RechargeWallet` | `billing` | Charges a wallet's saved card for its armed auto-recharge, reading Stripe back first so a lost answer is never charged twice. See [billing.md](billing.md#auto-recharge) |
 | `anubis::notifications::PingRecipient` | `notifications` | Publishes the realtime ping that tells one recipient's browsers to refetch their inbox, after the transaction that wrote the notification committed. See [notifications.md](notifications.md#realtime) |
 
-Registering each is three lines on the worker builder, and the starter's `main.rs` shows both. Each runs on its own queue so a customer endpoint that hangs for ten seconds, or Stripe replaying a day of events, cannot hold up an application's own work. An application's own jobs are registered beside it, through `register_jobs` in `backend/src/lib.rs`, which is where `anubis scaffold webhook` writes the job that processes a provider's events. [Webhooks](webhooks.md) covers the rest.
+Registering each is three lines on the worker builder, and the starter's `main.rs` shows every one. Each runs on its own queue so a customer endpoint that hangs for ten seconds, or Stripe replaying a day of events, cannot hold up an application's own work. An application's own jobs are registered beside it, through `register_jobs` in `backend/src/lib.rs`, which is where `anubis scaffold webhook` writes the job that processes a provider's events. [Webhooks](webhooks.md) covers the rest.
 
 ## Roadmap
 

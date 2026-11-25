@@ -1,13 +1,17 @@
 //! The organization-scoped billing endpoints.
 //!
-//! Four routes, mounted by an application under `/billing`:
+//! Eight routes, mounted by an application under `/billing`:
 //!
 //! | Route | Guard | Effect |
 //! |---|---|---|
-//! | `GET /organizations/{organization_id}` | org member | The plan in force, the plan subscription, the seats in use, and, for a member who may spend, every live subscription with its items |
+//! | `GET /organizations/{organization_id}` | org member | The plan in force and why, the plan subscription, the seats in use, and, for a member who may spend, every live subscription with its items and the wallet |
 //! | `POST /organizations/{organization_id}/checkout` | `Billing::Subscription.update` | Opens a Stripe Checkout session and answers with its URL |
 //! | `POST /organizations/{organization_id}/portal` | `Billing::Subscription.update` | Opens the Stripe customer portal and answers with its URL |
-//! | `POST /organizations/{organization_id}/reconcile` | `Billing::Subscription.update` | Reads Stripe and corrects the subscriptions this application shows |
+//! | `POST /organizations/{organization_id}/reconcile` | `Billing::Subscription.update` | Reads Stripe and corrects the subscriptions and wallet payments this application shows |
+//! | `POST /organizations/{organization_id}/wallet/top-up` | `Billing::Subscription.update` | Opens a Stripe Checkout session that buys credit, and answers with its URL |
+//! | `PUT /organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge on, or changes it |
+//! | `DELETE /organizations/{organization_id}/wallet/auto-recharge` | `Billing::Subscription.update` | Turns auto-recharge off |
+//! | `GET /organizations/{organization_id}/wallet/entries` | `Billing::Subscription.update` | One page of the wallet's ledger, newest first |
 //!
 //! Reading is open to every member because the plan and its limits explain
 //! what the whole organization can do. Spending money is not: it takes
@@ -26,24 +30,28 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use diesel_async::AsyncPgConnection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::currency;
 use super::lifecycle::{self, Reconciler};
-use super::limits;
+use super::limits::{self, PlanSource, Standing};
 use super::model::{Subscription, SubscriptionWithItems};
-use super::plans::{Interval, Plan, PlanSet};
+use super::plans::{Interval, Plan, PlanSet, WalletTerms};
 use super::stripe::{self, LineItem, NewPortalSession, Purchase};
-use super::subscriptions::{self, Subscriptions};
+use super::subscriptions::{self, Subscriptions, TopUp};
+use super::wallet::{self, Wallet, WalletEntry};
+use crate::audit;
 use crate::config::AppConfig;
 use crate::db::DbPool;
 use crate::guard::OrganizationMember;
-use crate::http::ApiError;
+use crate::http::{ApiError, ListParams, Pagination};
 use crate::roles::{Action, RoleSet, SUBSCRIPTION};
 use crate::tenancy::OrganizationAccess;
 
@@ -96,6 +104,18 @@ pub fn router(pool: DbPool, roles: RoleSet, plans: PlanSet, config: &AppConfig) 
             "/organizations/{organization_id}/reconcile",
             post(reconcile),
         )
+        .route(
+            "/organizations/{organization_id}/wallet/top-up",
+            post(start_top_up),
+        )
+        .route(
+            "/organizations/{organization_id}/wallet/auto-recharge",
+            put(enable_auto_recharge).delete(disable_auto_recharge),
+        )
+        .route(
+            "/organizations/{organization_id}/wallet/entries",
+            get(list_entries),
+        )
         .with_state(state)
         // The OrganizationMember guard resolves its dependencies from these.
         .layer(crate::guard::layer(pool, roles))
@@ -114,8 +134,10 @@ struct BillingState {
 
 #[derive(Serialize)]
 struct BillingBody {
-    /// The plan in force: the plan subscription's, or the free plan.
+    /// The plan in force: the plan subscription's, the paid plan, or the free plan.
     plan: Plan,
+    /// Why that plan is in force, which every member may read beside it.
+    plan_source: PlanSource,
     /// The plan subscription behind that plan, absent on the free plan.
     subscription: Option<SubscriptionWithItems>,
     /// Every live subscription the organization holds, each with its line
@@ -135,6 +157,86 @@ struct BillingBody {
     /// plan's `seats` limit to show how full the organization is; an
     /// application's own limits are counted by the application.
     seats_used: i64,
+    /// The prepaid credit wallet, when the application sells credit.
+    ///
+    /// `None` for a member who may not manage billing, for the same reason
+    /// `subscriptions` is: the balance says what the organization spends, and
+    /// spending is the business of a member who may spend.
+    wallet: Option<WalletBody>,
+}
+
+/// The wallet as the billing screen renders it; every amount in micro-units.
+#[derive(Serialize)]
+struct WalletBody {
+    /// The wallet's currency, lowercase ISO 4217.
+    currency: String,
+    /// The balance, which a refund can take below zero.
+    balance_micros: i64,
+    /// The smallest top-up, and the smallest recharge.
+    minimum_top_up_micros: i64,
+    /// The smallest step a charge moves in: a cent, or a whole yen.
+    ///
+    /// Sent rather than worked out in the browser, whose currency tables are
+    /// display rules that disagree with Stripe's for some currencies.
+    charge_step_micros: i64,
+    /// The balance below which a spend tells the administrators.
+    low_balance_micros: Option<i64>,
+    /// The auto-recharge settings, when auto-recharge is on.
+    auto_recharge: Option<AutoRechargeBody>,
+    /// Whether a top-up saved a card that auto-recharge can charge.
+    card_saved: bool,
+    /// Whether a recharge is in flight.
+    recharging: bool,
+    /// When the last recharge failed, which is why auto-recharge is off.
+    recharge_failed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AutoRechargeBody {
+    /// A spend that leaves the balance below this arms a recharge.
+    threshold_micros: i64,
+    /// What a recharge charges the saved card.
+    amount_micros: i64,
+}
+
+#[derive(Deserialize)]
+struct TopUpBody {
+    /// What to buy, in micro-units: a whole cent at least the minimum top-up.
+    amount_micros: i64,
+    /// Whether to save the card, which is what auto-recharge charges.
+    #[serde(default)]
+    save_card: bool,
+}
+
+#[derive(Serialize)]
+struct EntriesBody {
+    entries: Vec<WalletEntry>,
+    pagination: Pagination,
+}
+
+impl WalletBody {
+    fn new(terms: &WalletTerms, wallet: Option<&Wallet>) -> Self {
+        Self {
+            // The wallet's own currency when it has one: its balance is
+            // micro-units of that, whatever billing.yml names now.
+            currency: wallet
+                .map_or_else(|| terms.currency().to_owned(), |held| held.currency.clone()),
+            balance_micros: wallet.map_or(0, |held| held.balance_micros),
+            minimum_top_up_micros: terms.minimum_top_up_micros(),
+            charge_step_micros: currency::charge_step_micros(terms.currency())
+                .expect("billing.yml validation refuses a wallet currency with no charge step"),
+            low_balance_micros: terms.low_balance_micros(),
+            auto_recharge: wallet.and_then(Wallet::auto_recharge).map(
+                |(threshold_micros, amount_micros)| AutoRechargeBody {
+                    threshold_micros,
+                    amount_micros,
+                },
+            ),
+            card_saved: wallet.is_some_and(|held| held.recharge_payment_method_id.is_some()),
+            recharging: wallet.is_some_and(|held| held.recharge_attempt_id.is_some()),
+            recharge_failed_at: wallet.and_then(|held| held.recharge_failed_at),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -205,20 +307,30 @@ async fn overview(
         .iter()
         .find(|held| held.subscription.subject_type.is_none())
         .cloned();
+    let standing = Standing::load(connection, &state.plans, organization_id)
+        .await
+        .map_err(log_internal)?;
     // Cloned into the response: a plan is a handful of strings, and the
     // alternative is a body that borrows the request's own state.
-    let plan = limits::plan_in_force(
-        &state.plans,
-        subscription.as_ref().map(|held| &held.subscription),
-    )
-    .clone();
+    let (plan, plan_source) = limits::plan_in_force(&state.plans, &standing);
+    let wallet = match state.plans.wallet().filter(|_terms| list_all) {
+        Some(terms) => {
+            let held = Wallet::find(connection, organization_id)
+                .await
+                .map_err(log_internal)?;
+            Some(WalletBody::new(terms, held.as_ref()))
+        }
+        None => None,
+    };
 
     Ok(BillingBody {
-        plan,
+        plan: plan.clone(),
+        plan_source,
         subscription,
         subscriptions: list_all.then_some(subscriptions),
         billing_enabled: state.stripe.is_some(),
         seats_used,
+        wallet,
     })
 }
 
@@ -364,6 +476,144 @@ async fn open_portal(
     Ok(Json(RedirectBody { url: session.url }))
 }
 
+/// Opens a Stripe Checkout session that buys credit for the organization's wallet.
+///
+/// Nothing is credited here: the payment arrives as an event, and the amount
+/// credited is the one Stripe received.
+async fn start_top_up(
+    State(state): State<BillingState>,
+    member: OrganizationMember,
+    Json(body): Json<TopUpBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_billing_authority(&member)?;
+    let terms = wallet_terms(&state)?;
+    configured(&state)?;
+
+    // A wallet's currency is fixed, so credit in another one could never be
+    // recorded: refused here, before Stripe takes the money for it.
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let held = Wallet::find(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?;
+    drop(connection);
+    if let Some(held) = held.filter(|held| held.currency != terms.currency()) {
+        return Err(ApiError::conflict(format!(
+            "This organization's credit is held in {}, and this deployment now sells credit in \
+             {}. A wallet's currency cannot change, so no top-up can be taken.",
+            held.currency.to_uppercase(),
+            terms.currency().to_uppercase(),
+        )));
+    }
+
+    if body.amount_micros < terms.minimum_top_up_micros() {
+        return Err(ApiError::validation(format!(
+            "A top-up buys at least {}.",
+            currency::display(terms.minimum_top_up_micros(), terms.currency()),
+        )));
+    }
+    let amount_minor =
+        currency::to_minor(body.amount_micros, terms.currency()).ok_or_else(|| {
+            ApiError::validation(format!(
+                "Stripe cannot charge {} micro-units of {}: use whole cents, at most {} of them.",
+                body.amount_micros,
+                terms.currency(),
+                currency::MAX_CHARGE_MINOR,
+            ))
+        })?;
+
+    let landing = return_url(&state.app_url, member.organization.id);
+    let session = state
+        .subscriptions
+        .open_top_up(
+            member.organization.id,
+            &TopUp {
+                terms,
+                amount_minor,
+                save_card: body.save_card,
+                landing: &landing,
+                email: Some(&member.user.email),
+            },
+        )
+        .await?;
+
+    Ok(Json(RedirectBody { url: session.url }))
+}
+
+/// Turns auto-recharge on, or changes it, answering with the wallet.
+async fn enable_auto_recharge(
+    State(state): State<BillingState>,
+    member: OrganizationMember,
+    context: audit::Context,
+    Json(body): Json<AutoRechargeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let settings = Some((body.threshold_micros, body.amount_micros));
+    change_auto_recharge(&state, &member, &context, settings).await
+}
+
+/// Turns auto-recharge off, answering with the wallet.
+async fn disable_auto_recharge(
+    State(state): State<BillingState>,
+    member: OrganizationMember,
+    context: audit::Context,
+) -> Result<impl IntoResponse, ApiError> {
+    change_auto_recharge(&state, &member, &context, None).await
+}
+
+/// The one write both auto-recharge routes make.
+async fn change_auto_recharge(
+    state: &BillingState,
+    member: &OrganizationMember,
+    context: &audit::Context,
+    settings: Option<(i64, i64)>,
+) -> Result<Json<WalletBody>, ApiError> {
+    require_billing_authority(member)?;
+    let terms = wallet_terms(state)?;
+    configured(state)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let wallet = wallet::set_auto_recharge(
+        &mut connection,
+        &context.by(&member.user),
+        terms,
+        member.organization.id,
+        settings,
+    )
+    .await?;
+
+    Ok(Json(WalletBody::new(terms, Some(&wallet))))
+}
+
+/// One page of the wallet's ledger, newest first.
+///
+/// Open only to a member who may spend: a spend names what it paid for, and a
+/// member may not reach every record the organization pays for.
+async fn list_entries(
+    State(state): State<BillingState>,
+    member: OrganizationMember,
+    Query(params): Query<ListParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_billing_authority(&member)?;
+    wallet_terms(&state)?;
+
+    let mut connection = state.pool.get().await.map_err(log_internal)?;
+    let entries = WalletEntry::page(&mut connection, member.organization.id, &params)
+        .await
+        .map_err(log_internal)?;
+    let total_items = WalletEntry::count(&mut connection, member.organization.id)
+        .await
+        .map_err(log_internal)?;
+
+    Ok(Json(EntriesBody {
+        entries,
+        pagination: Pagination::new(&params, total_items),
+    }))
+}
+
+/// The wallet's terms, or `404` for an application that sells no credit.
+fn wallet_terms(state: &BillingState) -> Result<&WalletTerms, ApiError> {
+    state.plans.wallet().ok_or_else(ApiError::not_found)
+}
+
 /// The Stripe client, or the honest answer that this deployment has none.
 fn configured(state: &BillingState) -> Result<&stripe::Client, ApiError> {
     state.stripe.as_ref().ok_or_else(|| {
@@ -393,7 +643,7 @@ fn require_billing_authority(member: &OrganizationMember) -> Result<(), ApiError
         Ok(())
     } else {
         Err(ApiError::forbidden(
-            "You need permission to manage this organization's subscription.",
+            "You need permission to manage this organization's billing.",
         ))
     }
 }

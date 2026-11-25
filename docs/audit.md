@@ -101,6 +101,12 @@ The framework's own surfaces record a dotted verb, and every one is a constant i
 | `OAUTH_DEVICE_CODE_REUSED` | `oauth.device_code_reused` | A device code is polled again after its exchange, revoking its grant |
 | `SUBSCRIPTION_ITEMS_CHANGED` | `subscription.items_changed` | An application adds, resizes, or removes line items on a record's subscription through `billing::Subscriptions`; the change set carries `items` before and after as `{price, quantity}`. See [billing.md](billing.md#subscriptions-per-record) |
 | `SUBSCRIPTION_CANCELED` | `subscription.canceled` | An application cancels a record's subscription; the change set is `cancel_at_period_end` or `status` |
+| `WALLET_TOPPED_UP` | `wallet.topped_up` | A Checkout payment credits the wallet; the subject is the ledger entry (`WalletEntry`), the change set `balance_micros`. See [billing.md](billing.md#the-prepaid-credit-wallet) |
+| `WALLET_RECHARGED` | `wallet.recharged` | An auto-recharge charge credits the wallet |
+| `WALLET_REFUNDED` | `wallet.refunded` | A Stripe refund of a wallet payment is debited |
+| `WALLET_REFUND_REVERSED` | `wallet.refund_reversed` | A refund that failed after its debit is credited back |
+| `WALLET_AUTO_RECHARGE_CHANGED` | `wallet.auto_recharge_changed` | A person turns auto-recharge on, changes it, or turns it off; the change set is `threshold_micros` and `amount_micros` |
+| `WALLET_AUTO_RECHARGE_FAILED` | `wallet.auto_recharge_failed` | A recharge is refused at Stripe and auto-recharge turns off, attributed to the system |
 
 The dot is what tells the two vocabularies apart at a glance, and it is why a scaffolded model's `created` can never collide with a framework verb.
 
